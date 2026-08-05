@@ -92,7 +92,7 @@ class SolanaTrackerClient:
         for attempt in range(3):
             try:
                 async with session.get(url, params=params, headers=headers) as response:
-                    if response.status == 429 and attempt < 2:
+                    if (response.status == 429 or response.status >= 500) and attempt < 2:
                         await asyncio.sleep(2**attempt)
                         continue
                     body = await response.text()

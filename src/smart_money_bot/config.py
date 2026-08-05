@@ -37,6 +37,7 @@ class Settings:
     discord_token: str
     discord_guild_id: int | None
     discord_alert_channel_id: int | None
+    discord_alert_user_id: int | None
     discord_admin_role_ids: frozenset[int]
 
     solana_rpc_url: str
@@ -101,6 +102,7 @@ class Settings:
             discord_token=discord_token,
             discord_guild_id=_optional_int("DISCORD_GUILD_ID"),
             discord_alert_channel_id=_optional_int("DISCORD_ALERT_CHANNEL_ID"),
+            discord_alert_user_id=_optional_int("DISCORD_ALERT_USER_ID"),
             discord_admin_role_ids=_int_set("DISCORD_ADMIN_ROLE_IDS"),
             solana_rpc_url=os.getenv(
                 "SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com"

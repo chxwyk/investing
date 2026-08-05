@@ -39,6 +39,43 @@ def _short(value: str, left: int = 5, right: int = 5) -> str:
     return value if len(value) <= left + right + 3 else f"{value[:left]}…{value[-right:]}"
 
 
+def _price(value: Decimal | None) -> str:
+    return "unavailable" if value is None or value <= 0 else f"${value:,.8f}"
+
+
+def _token_view(mint: str) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    view.add_item(
+        discord.ui.Button(
+            label="Buy on Jupiter",
+            style=discord.ButtonStyle.link,
+            url=f"https://jup.ag/swap/SOL-{mint}",
+        )
+    )
+    view.add_item(
+        discord.ui.Button(
+            label="Chart",
+            style=discord.ButtonStyle.link,
+            url=f"https://dexscreener.com/solana/{mint}",
+        )
+    )
+    view.add_item(
+        discord.ui.Button(
+            label="Token on Solscan",
+            style=discord.ButtonStyle.link,
+            url=f"https://solscan.io/token/{mint}",
+        )
+    )
+    view.add_item(
+        discord.ui.Button(
+            label="Open Fomo",
+            style=discord.ButtonStyle.link,
+            url="https://fomo.family/",
+        )
+    )
+    return view
+
+
 def _discovery_lines(candidates: tuple[DiscoveryCandidate, ...] | list[DiscoveryCandidate]) -> str:
     lines: list[str] = []
     for item in candidates[:10]:
@@ -105,32 +142,59 @@ class SmartMoneyBot(commands.Bot):
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             return None
 
-    async def _send_alert(self, embed: discord.Embed) -> None:
+    async def _send_alert(
+        self,
+        embed: discord.Embed,
+        *,
+        token_mint: str | None = None,
+        ping_user: bool = False,
+    ) -> None:
         channel = await self._alert_channel()
         if channel is None:
             return
+        alert_user_id = self.settings.discord_alert_user_id
+        should_ping = ping_user and alert_user_id is not None
+        content = f"<@{alert_user_id}>" if should_ping else None
+        allowed_mentions = (
+            discord.AllowedMentions(users=True, roles=False, everyone=False)
+            if should_ping
+            else discord.AllowedMentions.none()
+        )
         try:
-            await channel.send(embed=embed)
+            await channel.send(
+                content=content,
+                embed=embed,
+                view=_token_view(token_mint) if token_mint else None,
+                allowed_mentions=allowed_mentions,
+            )
         except (discord.Forbidden, discord.HTTPException):
             logger.exception("Could not post to alert channel")
 
     async def on_swap(self, swap: DetectedSwap, trader: TrackedTrader) -> None:
         color = 0x2ECC71 if swap.side is Side.BUY else 0xE74C3C
         embed = discord.Embed(
-            title=f"{swap.side.value} detected • {trader.alias}",
+            title=f"RAW {swap.side.value} detected • {trader.alias}",
             color=color,
             timestamp=discord.utils.utcnow(),
         )
-        embed.add_field(name="Token", value=f"`{swap.token_mint}`", inline=False)
+        embed.add_field(
+            name="Token contract — copy this into Fomo search",
+            value=f"`{swap.token_mint}`",
+            inline=False,
+        )
         embed.add_field(name="Trade value", value=_money(swap.usd_value))
-        embed.add_field(name="Entry/exit", value=_money(swap.token_price_usd))
+        embed.add_field(name="Detected price", value=_price(swap.token_price_usd))
         embed.add_field(
             name="Transaction",
             value=f"[View on Solscan](https://solscan.io/tx/{swap.signature})",
             inline=False,
         )
-        embed.set_footer(text="Raw wallet activity • wait for consensus/risk result")
-        await self._send_alert(embed)
+        embed.set_footer(text="RAW activity • verify the mint • wait for consensus/risk result")
+        await self._send_alert(
+            embed,
+            token_mint=swap.token_mint,
+            ping_user=swap.side is Side.BUY,
+        )
 
     async def on_discovery(self, refresh: DiscoveryRefresh) -> None:
         embed = discord.Embed(
@@ -175,7 +239,7 @@ class SmartMoneyBot(commands.Bot):
         if decision.reasons:
             embed.add_field(name="Checks", value="\n".join(f"• {r}" for r in decision.reasons)[:1024], inline=False)
         embed.add_field(name="Mint", value=f"`{signal.token_mint}`", inline=False)
-        await self._send_alert(embed)
+        await self._send_alert(embed, token_mint=signal.token_mint)
 
     async def on_execution(self, result: ExecutionResult) -> None:
         color = 0x3498DB if result.success else 0xE74C3C
@@ -193,7 +257,7 @@ class SmartMoneyBot(commands.Bot):
                 value=f"[View on Solscan](https://solscan.io/tx/{result.signature})",
                 inline=False,
             )
-        await self._send_alert(embed)
+        await self._send_alert(embed, token_mint=result.token_mint)
 
     async def on_error(self, context: str, error: Exception) -> None:
         logger.error("%s: %s", context, error)
@@ -507,6 +571,8 @@ class SmartMoneyCommands(
             f"**RPC throttle:** {self.bot.settings.rpc_requests_per_second}/second • "
             f"{self.bot.settings.rpc_max_retries} retries\n"
             f"**Mode:** {status['mode']}\n"
+            f"**Raw-buy pings:** "
+            f"{'ready' if self.bot.settings.discord_alert_user_id else 'user ID not set'}\n"
             f"**Paused:** {status['paused']}\n"
             f"**Tracked wallets:** {status['wallets']}\n"
             f"**Automatic discovery:** "

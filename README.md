@@ -22,12 +22,16 @@ unless four separate controls are deliberately configured.
   momentum between refreshes.
 - Backfills up to 24 hours of transactions when a wallet is first discovered.
 - Throttles Solana RPC calls and retries temporary `429`/server failures with backoff.
+- Retries temporary Solana Tracker leaderboard `5xx` failures before preserving the
+  existing watchlist.
 - Detects SOL/USDC/USDT-to-token buys and sells from wallet balance changes.
 - Maintains an average-cost inventory for each tracked wallet.
 - Calculates realized P&L, realized ROI, win rate, trade count, volume, and maximum drawdown.
 - Scores traders on repeatability, ROI, 24-hour/7-day consistency, activity, and drawdown.
 - Requires independent-wallet consensus inside a configurable time window.
 - Posts raw wallet activity, consensus signals, risk results, and fills to Discord.
+- Adds one-tap Jupiter, DexScreener, Solscan, and Fomo buttons to every token alert.
+- Can mention one Discord user on every newly detected raw buy.
 - Blocks suspicious, low-liquidity, concentrated, mintable, or freezable tokens when the
   required Jupiter safety metadata is available.
 - Paper-trades buys and exits with configurable fee/slippage assumptions.
@@ -138,6 +142,7 @@ The minimum useful variables are:
 DISCORD_TOKEN=...
 DISCORD_GUILD_ID=...
 DISCORD_ALERT_CHANNEL_ID=...
+DISCORD_ALERT_USER_ID=...
 SOLANA_RPC_URL=...
 RPC_REQUESTS_PER_SECOND=8
 RPC_MAX_RETRIES=4
@@ -176,6 +181,11 @@ in that URL private. Helius documents the endpoint format as
 | `/smartmoney pause` | Pause/resume monitoring. |
 | `/smartmoney status` | Check RPC and scanner health. |
 | `/smartmoney limits` | Show active risk limits. |
+
+Set `DISCORD_ALERT_USER_ID` to your numeric Discord user ID if raw wallet buys should
+mention you. The bot uses restricted allowed-mention settings and never permits role or
+`@everyone` pings. In Fomo, paste the exact token contract shown in the alert into search;
+the public Fomo site does not publish a stable token-specific deep-link format.
 
 Mutation commands require Discord Administrator or a role listed in
 `DISCORD_ADMIN_ROLE_IDS`.
