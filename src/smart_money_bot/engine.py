@@ -3,17 +3,20 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from dataclasses import replace
 from decimal import Decimal
 from typing import Protocol
 
 from .config import Settings
 from .database import Database
 from .detector import SwapDetector
-from .errors import JupiterError, RpcError
+from .discovery import DiscoveryPolicy, SolanaTrackerClient
+from .errors import DiscoveryError, JupiterError, RpcError
 from .executor import ExecutionManager
 from .market import JupiterClient
 from .models import (
     DetectedSwap,
+    DiscoveryRefresh,
     ExecutionMode,
     ExecutionResult,
     PaperSummary,
@@ -23,6 +26,7 @@ from .models import (
     Signal,
     TokenInfo,
     TrackedTrader,
+    TraderMetrics,
 )
 from .risk import RiskEngine
 from .rpc import SolanaRPC
@@ -33,6 +37,8 @@ logger = logging.getLogger(__name__)
 
 
 class Notifier(Protocol):
+    async def on_discovery(self, refresh: DiscoveryRefresh) -> None: ...
+
     async def on_swap(self, swap: DetectedSwap, trader: TrackedTrader) -> None: ...
 
     async def on_signal(
@@ -45,6 +51,9 @@ class Notifier(Protocol):
 
 
 class NullNotifier:
+    async def on_discovery(self, refresh: DiscoveryRefresh) -> None:
+        return None
+
     async def on_swap(self, swap: DetectedSwap, trader: TrackedTrader) -> None:
         return None
 
@@ -67,6 +76,12 @@ class SmartMoneyEngine:
         self.database = Database(settings.database_path, settings.paper_starting_usd)
         self.rpc = SolanaRPC(settings.solana_rpc_url)
         self.market = JupiterClient(settings.jupiter_api_key)
+        self.discovery = (
+            SolanaTrackerClient(settings.solana_tracker_api_key)
+            if settings.solana_tracker_api_key
+            else None
+        )
+        self.discovery_policy = DiscoveryPolicy.from_settings(settings)
         self.detector = SwapDetector(self.market, settings.min_source_trade_usd)
         self.strategy = ConsensusStrategy(
             self.database,
@@ -79,10 +94,12 @@ class SmartMoneyEngine:
         self.executor = ExecutionManager(settings, self.database, self.market)
         self._task: asyncio.Task[None] | None = None
         self._scan_lock = asyncio.Lock()
+        self._discovery_lock = asyncio.Lock()
         self._initialized = False
         self.last_scan_started_at: int | None = None
         self.last_scan_finished_at: int | None = None
         self.last_error: str | None = None
+        self.last_discovery_refresh_at: int | None = None
 
     async def initialize(self) -> None:
         if self._initialized:
@@ -92,6 +109,8 @@ class SmartMoneyEngine:
             await self.database.set_setting(
                 "alert_channel_id", str(self.settings.discord_alert_channel_id)
             )
+        raw_refresh = await self.database.get_setting("discovery_last_refresh")
+        self.last_discovery_refresh_at = int(raw_refresh) if raw_refresh else None
         self._initialized = True
 
     async def start(self) -> None:
@@ -110,6 +129,8 @@ class SmartMoneyEngine:
             self._task = None
         await self.rpc.close()
         await self.market.close()
+        if self.discovery:
+            await self.discovery.close()
         await self.database.close()
 
     async def _run_loop(self) -> None:
@@ -117,6 +138,11 @@ class SmartMoneyEngine:
             try:
                 paused = (await self.database.get_setting("paused", "false")) == "true"
                 if not paused:
+                    try:
+                        await self.refresh_discovery()
+                    except DiscoveryError as exc:
+                        self.last_error = f"Discovery: {exc}"
+                        await self.notifier.on_error("Refreshing wallet discovery", exc)
                     await self.scan_once()
             except asyncio.CancelledError:
                 raise
@@ -125,6 +151,33 @@ class SmartMoneyEngine:
                 logger.exception("Monitor loop failed")
                 await self.notifier.on_error("Monitor loop", exc)
             await asyncio.sleep(self.settings.poll_interval_seconds)
+
+    async def refresh_discovery(self, *, force: bool = False) -> DiscoveryRefresh | None:
+        if not self.settings.auto_discovery_enabled or self.discovery is None:
+            return None
+        if self._discovery_lock.locked():
+            return None
+        now = int(time.time())
+        if (
+            not force
+            and self.last_discovery_refresh_at is not None
+            and now - self.last_discovery_refresh_at < self.settings.discovery_refresh_seconds
+        ):
+            return None
+
+        async with self._discovery_lock:
+            candidates = await self.discovery.top_24h(self.discovery_policy)
+            if not candidates:
+                raise DiscoveryError(
+                    "The 24-hour feed returned no wallets matching the configured filters; "
+                    "the existing watchlist was preserved"
+                )
+            refresh = await self.database.apply_discovery(candidates)
+            self.last_discovery_refresh_at = refresh.refreshed_at
+            self.last_error = None
+            if refresh.added_wallets or refresh.disabled_wallets:
+                await self.notifier.on_discovery(refresh)
+            return refresh
 
     async def scan_once(self) -> dict[str, int]:
         if self._scan_lock.locked():
@@ -348,7 +401,74 @@ class SmartMoneyEngine:
         metrics_24h, metrics_7d = await asyncio.gather(
             self.database.metrics(86_400), self.database.metrics(604_800)
         )
-        return rank_traders(metrics_24h, metrics_7d)
+        local_rankings = rank_traders(metrics_24h, metrics_7d)
+        discovered = await self.database.list_discovered(limit=50)
+        merged = {item.metrics_24h.address: item for item in local_rankings}
+        for candidate in discovered:
+            local = merged.get(candidate.address)
+            wins = int(
+                Decimal(candidate.closed_tokens)
+                * candidate.win_rate_percent
+                / Decimal("100")
+            )
+            losses = max(0, candidate.closed_tokens - wins)
+            external_metrics = TraderMetrics(
+                address=candidate.address,
+                alias=candidate.alias,
+                window_seconds=86_400,
+                trades=candidate.trades_24h,
+                buys=candidate.buys_24h,
+                sells=candidate.sells_24h,
+                wins=wins,
+                losses=losses,
+                realized_pnl_usd=candidate.realized_pnl_24h,
+                matched_cost_usd=candidate.invested_24h_usd,
+                volume_usd=candidate.volume_24h_usd,
+                max_drawdown_usd=Decimal("0"),
+            )
+            if local is None:
+                zero_week = replace(
+                    external_metrics,
+                    window_seconds=604_800,
+                    trades=0,
+                    buys=0,
+                    sells=0,
+                    wins=0,
+                    losses=0,
+                    realized_pnl_usd=Decimal("0"),
+                    matched_cost_usd=Decimal("0"),
+                    volume_usd=Decimal("0"),
+                )
+                merged[candidate.address] = ScoredTrader(
+                    metrics_24h=external_metrics,
+                    metrics_7d=zero_week,
+                    score=candidate.score,
+                )
+                continue
+
+            closed_local = local.metrics_24h.wins + local.metrics_24h.losses
+            if local.metrics_24h.trades >= 10 and closed_local >= 3:
+                blended_score = (
+                    local.score * Decimal("0.60")
+                    + candidate.score * Decimal("0.40")
+                ).quantize(Decimal("0.01"))
+            else:
+                blended_score = candidate.score
+            merged[candidate.address] = ScoredTrader(
+                metrics_24h=external_metrics,
+                metrics_7d=local.metrics_7d,
+                score=blended_score,
+            )
+
+        return sorted(
+            merged.values(),
+            key=lambda item: (
+                item.score,
+                item.metrics_24h.realized_pnl_usd,
+                item.metrics_24h.trades,
+            ),
+            reverse=True,
+        )
 
     async def execution_mode(self) -> ExecutionMode:
         raw = await self.database.get_setting("mode", ExecutionMode.PAPER.value)
@@ -390,4 +510,8 @@ class SmartMoneyEngine:
             "last_scan": self.last_scan_finished_at,
             "last_error": self.last_error,
             "live_unlocked": self.settings.live_is_unlocked,
+            "discovery_enabled": self.settings.auto_discovery_enabled,
+            "discovery_configured": self.settings.discovery_is_configured,
+            "discovery_last_refresh": self.last_discovery_refresh_at,
+            "discovered_wallets": len(await self.database.list_discovered(limit=50)),
         }

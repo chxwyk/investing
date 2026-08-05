@@ -5,3 +5,6 @@ class RpcError(RuntimeError):
 class JupiterError(RuntimeError):
     pass
 
+
+class DiscoveryError(RuntimeError):
+    pass

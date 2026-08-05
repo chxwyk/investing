@@ -16,6 +16,7 @@ from smart_money_bot.database import Database
 from smart_money_bot.detector import SwapDetector
 from smart_money_bot.models import (
     DetectedSwap,
+    DiscoveryCandidate,
     ExecutionMode,
     Side,
     Signal,
@@ -196,12 +197,38 @@ async def main() -> None:
                 market_price_usd=Decimal("1"),
             )
             assert decision.allowed
+
+            discovery_candidate = DiscoveryCandidate(
+                address="auto-wallet-one",
+                alias="Auto One",
+                realized_pnl_24h=Decimal("250"),
+                previous_pnl_24h=None,
+                roi_24h_percent=Decimal("18"),
+                win_rate_percent=Decimal("70"),
+                trades_24h=20,
+                buys_24h=10,
+                sells_24h=10,
+                closed_tokens=8,
+                invested_24h_usd=Decimal("1000"),
+                volume_24h_usd=Decimal("2400"),
+                last_trade_ms=None,
+                score=Decimal("72"),
+                rank=1,
+            )
+            refresh = await database.apply_discovery([discovery_candidate])
+            assert refresh.added_wallets == ("auto-wallet-one",)
+            discovered = await database.list_discovered()
+            assert discovered[0].realized_pnl_24h == Decimal("250.0")
+            tracked = await database.resolve_trader("auto-wallet-one")
+            assert tracked and tracked.enabled and tracked.source == "auto"
         finally:
             await database.close()
 
-    print("SELF-CHECK PASSED: detector, scoring, database, paper P&L, and risk gate")
+    print(
+        "SELF-CHECK PASSED: detector, scoring, database, discovery rotation, "
+        "paper P&L, and risk gate"
+    )
 
 
 if __name__ == "__main__":
     asyncio.run(main())
-

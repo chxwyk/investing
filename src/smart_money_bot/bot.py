@@ -12,9 +12,13 @@ from discord.ext import commands
 from solders.pubkey import Pubkey
 
 from .config import Settings
+from .constants import BOT_VERSION
 from .engine import SmartMoneyEngine
+from .errors import DiscoveryError
 from .models import (
     DetectedSwap,
+    DiscoveryCandidate,
+    DiscoveryRefresh,
     ExecutionMode,
     ExecutionResult,
     RiskDecision,
@@ -35,6 +39,20 @@ def _short(value: str, left: int = 5, right: int = 5) -> str:
     return value if len(value) <= left + right + 3 else f"{value[:left]}…{value[-right:]}"
 
 
+def _discovery_lines(candidates: tuple[DiscoveryCandidate, ...] | list[DiscoveryCandidate]) -> str:
+    lines: list[str] = []
+    for item in candidates[:10]:
+        momentum = item.pnl_momentum_usd
+        momentum_text = "new" if momentum is None else f"{momentum:+,.2f} since refresh"
+        lines.append(
+            f"**{item.rank}. {item.alias}** • `{_short(item.address)}`\n"
+            f"PnL `{_money(item.realized_pnl_24h)}` • ROI `{item.roi_24h_percent:.1f}%` • "
+            f"win `{item.win_rate_percent:.1f}%` • trades `{item.trades_24h}` • "
+            f"score `{item.score}` • momentum `{momentum_text}`"
+        )
+    return "\n\n".join(lines) or "No qualified wallets in the latest snapshot."
+
+
 class SmartMoneyBot(commands.Bot):
     def __init__(self, settings: Settings) -> None:
         intents = discord.Intents.default()
@@ -50,8 +68,14 @@ class SmartMoneyBot(commands.Bot):
         await self.add_cog(SmartMoneyCommands(self))
         if self.settings.discord_guild_id:
             guild = discord.Object(id=self.settings.discord_guild_id)
+            # Testing uses guild-scoped commands so updates appear immediately. Clear the
+            # cached guild tree before copying the current command set, then remove any
+            # obsolete global commands left behind by an older deployment.
+            self.tree.clear_commands(guild=guild)
             self.tree.copy_global_to(guild=guild)
             await self.tree.sync(guild=guild)
+            self.tree.clear_commands(guild=None)
+            await self.tree.sync()
         else:
             await self.tree.sync()
 
@@ -106,6 +130,19 @@ class SmartMoneyBot(commands.Bot):
             inline=False,
         )
         embed.set_footer(text="Raw wallet activity • wait for consensus/risk result")
+        await self._send_alert(embed)
+
+    async def on_discovery(self, refresh: DiscoveryRefresh) -> None:
+        embed = discord.Embed(
+            title="Automatic 24H wallet discovery refreshed",
+            description=_discovery_lines(refresh.candidates),
+            color=0x9B59B6,
+            timestamp=discord.utils.utcnow(),
+        )
+        embed.add_field(name="Added", value=str(len(refresh.added_wallets)))
+        embed.add_field(name="Rotated out", value=str(len(refresh.disabled_wallets)))
+        embed.add_field(name="Watching", value=str(len(refresh.candidates)))
+        embed.set_footer(text="Solana Tracker PnL V2 • strict mode • arbitrage excluded")
         await self._send_alert(embed)
 
     async def on_signal(
@@ -277,10 +314,52 @@ class SmartMoneyCommands(
             await interaction.response.send_message("No wallets are being monitored yet.")
             return
         lines = [
-            f"• **{item.alias}** — `{_short(item.address)}` — weight {item.weight}"
+            f"• **{item.alias}** — `{_short(item.address)}` — "
+            f"weight {item.weight} — {item.source} — "
+            f"{'enabled' if item.enabled else 'rotated out'}"
             for item in traders[:25]
         ]
         await interaction.response.send_message("\n".join(lines))
+
+    @app_commands.command(
+        name="discover", description="Refresh and show the automatic 24-hour wallet feed."
+    )
+    async def discover(self, interaction: discord.Interaction) -> None:
+        if not await self._require_admin(interaction):
+            return
+        if not self.bot.settings.discovery_is_configured:
+            await interaction.response.send_message(
+                "Automatic discovery needs `SOLANA_TRACKER_API_KEY` in Railway Variables, "
+                "with `AUTO_DISCOVERY_ENABLED=true`.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        try:
+            refresh = await self.bot.engine.refresh_discovery(force=True)
+        except DiscoveryError as exc:
+            await interaction.followup.send(f"Discovery failed: {exc}", ephemeral=True)
+            return
+        except Exception:
+            logger.exception("Manual wallet discovery failed")
+            await interaction.followup.send(
+                "Discovery hit an unexpected error. Open Railway Logs and copy the newest "
+                "red error line (never include your API key).",
+                ephemeral=True,
+            )
+            return
+        candidates = (
+            list(refresh.candidates)
+            if refresh is not None
+            else await self.bot.engine.database.list_discovered(limit=10)
+        )
+        embed = discord.Embed(
+            title="Automatic Wallet Discovery • 24H",
+            description=_discovery_lines(candidates),
+            color=0x9B59B6,
+        )
+        embed.set_footer(text="Strict PnL • repeatability filters • public Solana wallets")
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     @app_commands.command(name="leaderboard", description="Risk-adjusted tracked-wallet ranking.")
     @app_commands.describe(window="Show 24-hour or 7-day performance")
@@ -417,11 +496,21 @@ class SmartMoneyCommands(
         last_scan = (
             f"<t:{status['last_scan']}:R>" if status["last_scan"] else "not completed yet"
         )
+        discovery_refresh = (
+            f"<t:{status['discovery_last_refresh']}:R>"
+            if status["discovery_last_refresh"]
+            else "not completed yet"
+        )
         text = (
+            f"**Bot version:** {BOT_VERSION}\n"
             f"**RPC:** {status['rpc']}\n"
             f"**Mode:** {status['mode']}\n"
             f"**Paused:** {status['paused']}\n"
             f"**Tracked wallets:** {status['wallets']}\n"
+            f"**Automatic discovery:** "
+            f"{'ready' if status['discovery_configured'] else 'API key needed'}\n"
+            f"**Discovered wallets:** {status['discovered_wallets']}\n"
+            f"**Discovery refresh:** {discovery_refresh}\n"
             f"**Last scan:** {last_scan}\n"
             f"**Last error:** {status['last_error'] or 'none'}"
         )
@@ -433,6 +522,10 @@ class SmartMoneyCommands(
         text = (
             f"**Consensus:** {s.consensus_min_traders} traders within {s.consensus_window_seconds}s\n"
             f"**Minimum trader score:** {s.min_trader_score}/100\n"
+            f"**Discovery:** top {s.discovery_max_wallets} every "
+            f"{s.discovery_refresh_seconds // 60}m • minimum "
+            f"{_money(s.discovery_min_24h_pnl_usd)} 24H PnL • "
+            f"{s.discovery_min_win_rate_percent}% win rate\n"
             f"**Copy size:** {_money(s.default_copy_usd)} (max {_money(s.max_copy_usd)})\n"
             f"**Daily stop:** -{_money(s.max_daily_loss_usd)}\n"
             f"**Minimum liquidity:** {_money(s.min_token_liquidity_usd)}\n"
@@ -447,11 +540,13 @@ class SmartMoneyCommands(
     async def help(self, interaction: discord.Interaction) -> None:
         text = (
             "1. `/smartmoney setup` — choose the alert channel\n"
-            "2. `/smartmoney trader-add` — add each public wallet and alias\n"
-            "3. `/smartmoney scan` — run the 24-hour bootstrap\n"
-            "4. `/smartmoney leaderboard` — inspect risk-adjusted rankings\n"
-            "5. Keep `/smartmoney mode paper` while proving the strategy\n"
-            "6. `/smartmoney paper` — compare net P&L and drawdown"
+            "2. Add `SOLANA_TRACKER_API_KEY` in Railway for automatic discovery\n"
+            "3. `/smartmoney discover` — refresh the 24-hour profitable-wallet feed\n"
+            "4. `/smartmoney scan` — run an immediate on-chain scan\n"
+            "5. `/smartmoney leaderboard` — inspect risk-adjusted rankings\n"
+            "6. Keep `/smartmoney mode paper` while proving the strategy\n"
+            "7. `/smartmoney paper` — compare net P&L and drawdown\n"
+            "Manual `trader-add` and CSV import remain optional overrides."
         )
         await interaction.response.send_message(text, ephemeral=True)
 

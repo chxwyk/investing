@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "smart-money-copy-bot"
-version = "0.1.0"
-description = "Discord bot for monitoring and paper-copying public Solana wallets."
+version = "2.1.0"
+description = "Discord bot for automatically discovering and paper-copying public Solana wallets."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

@@ -41,7 +41,20 @@ class Settings:
 
     solana_rpc_url: str
     jupiter_api_key: str | None
+    solana_tracker_api_key: str | None
     database_path: str
+
+    auto_discovery_enabled: bool
+    discovery_refresh_seconds: int
+    discovery_fetch_limit: int
+    discovery_max_wallets: int
+    discovery_min_24h_pnl_usd: Decimal
+    discovery_min_win_rate_percent: Decimal
+    discovery_min_roi_percent: Decimal
+    discovery_min_trades: int
+    discovery_max_trades: int
+    discovery_min_closed_tokens: int
+    discovery_max_single_token_percent: Decimal
 
     poll_interval_seconds: int
     bootstrap_hours: int
@@ -91,7 +104,23 @@ class Settings:
                 "SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com"
             ).strip(),
             jupiter_api_key=os.getenv("JUPITER_API_KEY", "").strip() or None,
+            solana_tracker_api_key=os.getenv("SOLANA_TRACKER_API_KEY", "").strip() or None,
             database_path=os.getenv("DATABASE_PATH", "./data/smart_money.db").strip(),
+            auto_discovery_enabled=_bool("AUTO_DISCOVERY_ENABLED", True),
+            discovery_refresh_seconds=_int("DISCOVERY_REFRESH_SECONDS", 1200),
+            discovery_fetch_limit=_int("DISCOVERY_FETCH_LIMIT", 100),
+            discovery_max_wallets=_int("DISCOVERY_MAX_WALLETS", 12),
+            discovery_min_24h_pnl_usd=_decimal("DISCOVERY_MIN_24H_PNL_USD", "100"),
+            discovery_min_win_rate_percent=_decimal(
+                "DISCOVERY_MIN_WIN_RATE_PERCENT", "55"
+            ),
+            discovery_min_roi_percent=_decimal("DISCOVERY_MIN_ROI_PERCENT", "3"),
+            discovery_min_trades=_int("DISCOVERY_MIN_TRADES", 5),
+            discovery_max_trades=_int("DISCOVERY_MAX_TRADES", 250),
+            discovery_min_closed_tokens=_int("DISCOVERY_MIN_CLOSED_TOKENS", 2),
+            discovery_max_single_token_percent=_decimal(
+                "DISCOVERY_MAX_SINGLE_TOKEN_PERCENT", "70"
+            ),
             poll_interval_seconds=_int("POLL_INTERVAL_SECONDS", 12),
             bootstrap_hours=_int("BOOTSTRAP_HOURS", 24),
             max_backfill_transactions=_int("MAX_BACKFILL_TRANSACTIONS", 250),
@@ -133,9 +162,33 @@ class Settings:
             and bool(self.jupiter_api_key)
         )
 
+    @property
+    def discovery_is_configured(self) -> bool:
+        return self.auto_discovery_enabled and bool(self.solana_tracker_api_key)
+
     def validate(self) -> None:
         if self.consensus_min_traders < 1:
             raise ValueError("CONSENSUS_MIN_TRADERS must be at least 1")
+        if self.discovery_refresh_seconds < 300:
+            raise ValueError("DISCOVERY_REFRESH_SECONDS must be at least 300")
+        if not 1 <= self.discovery_fetch_limit <= 500:
+            raise ValueError("DISCOVERY_FETCH_LIMIT must be between 1 and 500")
+        if not 1 <= self.discovery_max_wallets <= 50:
+            raise ValueError("DISCOVERY_MAX_WALLETS must be between 1 and 50")
+        if self.discovery_max_wallets > self.discovery_fetch_limit:
+            raise ValueError("DISCOVERY_MAX_WALLETS cannot exceed DISCOVERY_FETCH_LIMIT")
+        if self.discovery_min_24h_pnl_usd < 0:
+            raise ValueError("DISCOVERY_MIN_24H_PNL_USD cannot be negative")
+        if not 0 <= self.discovery_min_win_rate_percent <= 100:
+            raise ValueError("DISCOVERY_MIN_WIN_RATE_PERCENT must be between 0 and 100")
+        if self.discovery_min_trades < 1:
+            raise ValueError("DISCOVERY_MIN_TRADES must be at least 1")
+        if self.discovery_max_trades < self.discovery_min_trades:
+            raise ValueError("DISCOVERY_MAX_TRADES cannot be below DISCOVERY_MIN_TRADES")
+        if self.discovery_min_closed_tokens < 1:
+            raise ValueError("DISCOVERY_MIN_CLOSED_TOKENS must be at least 1")
+        if not 1 <= self.discovery_max_single_token_percent <= 100:
+            raise ValueError("DISCOVERY_MAX_SINGLE_TOKEN_PERCENT must be between 1 and 100")
         if self.poll_interval_seconds < 5:
             raise ValueError("POLL_INTERVAL_SECONDS must be at least 5")
         if self.max_copy_usd <= 0 or self.default_copy_usd <= 0:

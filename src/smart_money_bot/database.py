@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import time
+from dataclasses import replace
 from decimal import Decimal
 from typing import Any
 
@@ -14,6 +15,8 @@ except ImportError:  # pragma: no cover - exercised by the minimal-runtime self-
 
 from .models import (
     DetectedSwap,
+    DiscoveryCandidate,
+    DiscoveryRefresh,
     ExecutionMode,
     PaperSummary,
     Side,
@@ -64,8 +67,32 @@ class Database:
                 enabled INTEGER NOT NULL DEFAULT 1,
                 last_signature TEXT,
                 weight REAL NOT NULL DEFAULT 1,
+                source TEXT NOT NULL DEFAULT 'manual',
                 created_at INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS discovery_wallets (
+                address TEXT PRIMARY KEY,
+                alias TEXT NOT NULL,
+                realized_pnl_24h REAL NOT NULL,
+                previous_pnl_24h REAL,
+                roi_24h_percent REAL NOT NULL,
+                win_rate_percent REAL NOT NULL,
+                trades_24h INTEGER NOT NULL,
+                buys_24h INTEGER NOT NULL,
+                sells_24h INTEGER NOT NULL,
+                closed_tokens INTEGER NOT NULL,
+                invested_24h_usd REAL NOT NULL,
+                volume_24h_usd REAL NOT NULL,
+                last_trade_ms INTEGER,
+                score REAL NOT NULL,
+                rank INTEGER NOT NULL,
+                qualified INTEGER NOT NULL DEFAULT 1,
+                first_seen_at INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_discovery_qualified_rank
+                ON discovery_wallets(qualified, rank);
 
             CREATE TABLE IF NOT EXISTS processed_signatures (
                 signature TEXT PRIMARY KEY,
@@ -181,6 +208,9 @@ class Database:
             );
             """
         )
+        await self._ensure_column(
+            "tracked_traders", "source", "TEXT NOT NULL DEFAULT 'manual'"
+        )
         now = int(time.time())
         await self.db.execute(
             """
@@ -204,17 +234,31 @@ class Database:
         )
         await self.db.commit()
 
-    async def add_trader(self, address: str, alias: str, weight: Decimal = Decimal("1")) -> None:
+    async def _ensure_column(self, table: str, column: str, definition: str) -> None:
+        cursor = await self.db.execute(f"PRAGMA table_info({table})")
+        columns = {row["name"] for row in await cursor.fetchall()}
+        if column not in columns:
+            await self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    async def add_trader(
+        self,
+        address: str,
+        alias: str,
+        weight: Decimal = Decimal("1"),
+        *,
+        source: str = "manual",
+    ) -> None:
         await self.db.execute(
             """
-            INSERT INTO tracked_traders(address, alias, enabled, weight, created_at)
-            VALUES (?, ?, 1, ?, ?)
+            INSERT INTO tracked_traders(address, alias, enabled, weight, source, created_at)
+            VALUES (?, ?, 1, ?, ?, ?)
             ON CONFLICT(address) DO UPDATE SET
                 alias = excluded.alias,
                 enabled = 1,
-                weight = excluded.weight
+                weight = excluded.weight,
+                source = excluded.source
             """,
-            (address, alias, float(weight), int(time.time())),
+            (address, alias, float(weight), source, int(time.time())),
         )
         await self.db.commit()
 
@@ -240,6 +284,7 @@ class Database:
                 enabled=bool(row["enabled"]),
                 last_signature=row["last_signature"],
                 weight=_d(row["weight"]),
+                source=row["source"],
             )
             for row in rows
         ]
@@ -258,6 +303,7 @@ class Database:
             enabled=bool(row["enabled"]),
             last_signature=row["last_signature"],
             weight=_d(row["weight"]),
+            source=row["source"],
         )
 
     async def update_last_signature(self, address: str, signature: str) -> None:
@@ -266,6 +312,179 @@ class Database:
             (signature, address),
         )
         await self.db.commit()
+
+    async def apply_discovery(
+        self, candidates: list[DiscoveryCandidate]
+    ) -> DiscoveryRefresh:
+        """Persist a fresh leaderboard and rotate only API-managed wallets."""
+
+        refreshed_at = int(time.time())
+        if not candidates:
+            return DiscoveryRefresh((), (), (), refreshed_at)
+
+        async with self._write_lock:
+            await self.db.execute("BEGIN IMMEDIATE")
+            try:
+                enabled_cursor = await self.db.execute(
+                    "SELECT address FROM tracked_traders WHERE enabled = 1"
+                )
+                previously_enabled = {
+                    row["address"] for row in await enabled_cursor.fetchall()
+                }
+                auto_cursor = await self.db.execute(
+                    "SELECT address FROM tracked_traders WHERE source = 'auto' AND enabled = 1"
+                )
+                previously_auto = {row["address"] for row in await auto_cursor.fetchall()}
+
+                await self.db.execute("UPDATE discovery_wallets SET qualified = 0")
+                hydrated: list[DiscoveryCandidate] = []
+                selected_addresses: list[str] = []
+                for candidate in candidates:
+                    previous_cursor = await self.db.execute(
+                        "SELECT realized_pnl_24h FROM discovery_wallets WHERE address = ?",
+                        (candidate.address,),
+                    )
+                    previous_row = await previous_cursor.fetchone()
+                    previous_pnl = (
+                        _d(previous_row["realized_pnl_24h"]) if previous_row else None
+                    )
+                    hydrated_candidate = replace(
+                        candidate, previous_pnl_24h=previous_pnl
+                    )
+                    hydrated.append(hydrated_candidate)
+                    selected_addresses.append(candidate.address)
+
+                    await self.db.execute(
+                        """
+                        INSERT INTO discovery_wallets(
+                            address, alias, realized_pnl_24h, previous_pnl_24h,
+                            roi_24h_percent, win_rate_percent, trades_24h,
+                            buys_24h, sells_24h, closed_tokens, invested_24h_usd,
+                            volume_24h_usd, last_trade_ms, score, rank, qualified,
+                            first_seen_at, last_seen_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                        ON CONFLICT(address) DO UPDATE SET
+                            alias = excluded.alias,
+                            previous_pnl_24h = discovery_wallets.realized_pnl_24h,
+                            realized_pnl_24h = excluded.realized_pnl_24h,
+                            roi_24h_percent = excluded.roi_24h_percent,
+                            win_rate_percent = excluded.win_rate_percent,
+                            trades_24h = excluded.trades_24h,
+                            buys_24h = excluded.buys_24h,
+                            sells_24h = excluded.sells_24h,
+                            closed_tokens = excluded.closed_tokens,
+                            invested_24h_usd = excluded.invested_24h_usd,
+                            volume_24h_usd = excluded.volume_24h_usd,
+                            last_trade_ms = excluded.last_trade_ms,
+                            score = excluded.score,
+                            rank = excluded.rank,
+                            qualified = 1,
+                            last_seen_at = excluded.last_seen_at
+                        """,
+                        (
+                            candidate.address,
+                            candidate.alias,
+                            float(candidate.realized_pnl_24h),
+                            float(previous_pnl) if previous_pnl is not None else None,
+                            float(candidate.roi_24h_percent),
+                            float(candidate.win_rate_percent),
+                            candidate.trades_24h,
+                            candidate.buys_24h,
+                            candidate.sells_24h,
+                            candidate.closed_tokens,
+                            float(candidate.invested_24h_usd),
+                            float(candidate.volume_24h_usd),
+                            candidate.last_trade_ms,
+                            float(candidate.score),
+                            candidate.rank,
+                            refreshed_at,
+                            refreshed_at,
+                        ),
+                    )
+
+                    auto_alias = f"Auto {candidate.address}"
+                    await self.db.execute(
+                        """
+                        INSERT INTO tracked_traders(
+                            address, alias, enabled, weight, source, created_at
+                        ) VALUES (?, ?, 1, 1, 'auto', ?)
+                        ON CONFLICT(address) DO UPDATE SET
+                            alias = CASE
+                                WHEN tracked_traders.source = 'manual'
+                                THEN tracked_traders.alias ELSE excluded.alias END,
+                            enabled = 1,
+                            weight = CASE
+                                WHEN tracked_traders.source = 'manual'
+                                THEN tracked_traders.weight ELSE 1 END,
+                            source = CASE
+                                WHEN tracked_traders.source = 'manual'
+                                THEN 'manual' ELSE 'auto' END
+                        """,
+                        (candidate.address, auto_alias, refreshed_at),
+                    )
+
+                placeholders = ",".join("?" for _ in selected_addresses)
+                await self.db.execute(
+                    f"""
+                    UPDATE tracked_traders SET enabled = 0
+                    WHERE source = 'auto' AND address NOT IN ({placeholders})
+                    """,
+                    tuple(selected_addresses),
+                )
+                await self.db.execute(
+                    """
+                    INSERT INTO settings(key, value) VALUES ('discovery_last_refresh', ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    (str(refreshed_at),),
+                )
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+
+        selected = set(selected_addresses)
+        added = tuple(sorted(selected - previously_enabled))
+        disabled = tuple(sorted(previously_auto - selected))
+        return DiscoveryRefresh(tuple(hydrated), added, disabled, refreshed_at)
+
+    async def list_discovered(self, *, limit: int = 25) -> list[DiscoveryCandidate]:
+        cursor = await self.db.execute(
+            """
+            SELECT * FROM discovery_wallets
+            WHERE qualified = 1 ORDER BY rank LIMIT ?
+            """,
+            (limit,),
+        )
+        rows = await cursor.fetchall()
+        return [
+            DiscoveryCandidate(
+                address=row["address"],
+                alias=row["alias"],
+                realized_pnl_24h=_d(row["realized_pnl_24h"]),
+                previous_pnl_24h=(
+                    _d(row["previous_pnl_24h"])
+                    if row["previous_pnl_24h"] is not None
+                    else None
+                ),
+                roi_24h_percent=_d(row["roi_24h_percent"]),
+                win_rate_percent=_d(row["win_rate_percent"]),
+                trades_24h=int(row["trades_24h"]),
+                buys_24h=int(row["buys_24h"]),
+                sells_24h=int(row["sells_24h"]),
+                closed_tokens=int(row["closed_tokens"]),
+                invested_24h_usd=_d(row["invested_24h_usd"]),
+                volume_24h_usd=_d(row["volume_24h_usd"]),
+                last_trade_ms=(
+                    int(row["last_trade_ms"])
+                    if row["last_trade_ms"] is not None
+                    else None
+                ),
+                score=_d(row["score"]),
+                rank=int(row["rank"]),
+            )
+            for row in rows
+        ]
 
     async def is_processed(self, signature: str) -> bool:
         cursor = await self.db.execute(

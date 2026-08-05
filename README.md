@@ -1,15 +1,26 @@
 # Smart Money Copy Bot
 
-A Railway-ready Discord bot that monitors **public Solana wallets**, reconstructs their
-swaps from confirmed on-chain transactions, ranks their recent performance, produces
-multi-wallet consensus signals, and records copy results after simulated fees and slippage.
+A Railway-ready Discord bot that **automatically discovers profitable public Solana
+wallets**, reconstructs their swaps from confirmed on-chain transactions, ranks their recent
+performance, produces multi-wallet consensus signals, and records copy results after
+simulated fees and slippage.
+
+Automatic discovery uses the authorized Solana Tracker PnL V2 API—not Fomo scraping. It
+refreshes a strict rolling 24-hour leaderboard every 20 minutes, rotates the watchlist, and
+starts monitoring qualifying wallets without CSV files or manual wallet entry.
 
 The bot starts in **PAPER** mode. Live Jupiter spot execution exists, but remains locked
 unless four separate controls are deliberately configured.
 
 ## What the bot does
 
-- Backfills up to 24 hours of transactions when a wallet is first added.
+- Pulls a rolling 1-day Solana trader leaderboard with actual public wallet addresses.
+- Requires configurable minimum PnL, win rate, ROI, trade count, and closed positions.
+- Excludes arbitrage wallets, suspicious identity tags, hyperactive bot-like wallets, and
+  one-token wonders through provider filters and local checks.
+- Automatically adds new qualifiers, disables wallets that rotate out, and reports PnL
+  momentum between refreshes.
+- Backfills up to 24 hours of transactions when a wallet is first discovered.
 - Detects SOL/USDC/USDT-to-token buys and sells from wallet balance changes.
 - Maintains an average-cost inventory for each tracked wallet.
 - Calculates realized P&L, realized ROI, win rate, trade count, volume, and maximum drawdown.
@@ -26,8 +37,9 @@ unless four separate controls are deliberately configured.
 ## What it deliberately does not do
 
 - It does not log into, scrape, reverse-engineer, or control a Fomo account.
-- It cannot turn a Fomo username into a wallet address. Add only public wallet addresses
-  that the owner has shared or that you already lawfully possess.
+- It does not map Fomo usernames to wallets or copy Fomo's leaderboard. Fomo does not expose
+  an authorized public leaderboard API; this bot uses an API intended for programmatic
+  Solana wallet discovery instead.
 - It does not promise profit. The paper scoreboard exists specifically to prove or reject
   the strategy with evidence.
 - It does not trade perpetual futures, borrow funds, or use leverage.
@@ -38,24 +50,50 @@ unless four separate controls are deliberately configured.
 The raw 24-hour profit leaderboard is not the signal. A single lucky token can put a risky
 wallet at the top. This bot uses a risk-adjusted pipeline:
 
-1. Ingest confirmed swaps for each watched wallet.
-2. Reconstruct inventory and realized results in chronological order.
-3. Score every wallet from 0–100.
-4. Ignore wallets below `MIN_TRADER_SCORE`.
-5. Require `CONSENSUS_MIN_TRADERS` unique wallets to buy the same mint within
+1. Refresh the authorized rolling 24-hour wallet leaderboard.
+2. Filter for repeatable, copyable performance and rotate the watchlist automatically.
+3. Ingest confirmed swaps for each watched wallet.
+4. Reconstruct inventory and realized results in chronological order.
+5. Blend the provider's strict 24-hour score with locally reconstructed performance.
+6. Ignore wallets below `MIN_TRADER_SCORE`.
+7. Require `CONSENSUS_MIN_TRADERS` unique wallets to buy the same mint within
    `CONSENSUS_WINDOW_SECONDS`; a qualified sell can trigger an exit so positions do not
    remain stuck waiting for full sell consensus.
-6. Reject stale signals and unsafe token conditions.
-7. Record a paper fill including configured fees and slippage.
+8. Reject stale signals and unsafe token conditions.
+9. Record a paper fill including configured fees and slippage.
 
 The defaults require two qualified traders within five minutes. Set
 `CONSENSUS_MIN_TRADERS=3` for a strict three-wallet strategy.
 
 ## Local setup
 
-Requirements: Python 3.12+, a Discord bot token, and a Solana RPC URL. A free Jupiter API
-key is strongly recommended and required for live mode because token safety metadata is
-part of the live risk gate.
+Requirements: Python 3.12+, a Discord bot token, a Solana RPC URL, and a Solana Tracker API
+key for automatic discovery. A Jupiter API key is strongly recommended and required for
+live mode because token safety metadata is part of the live risk gate.
+
+## Automatic wallet discovery
+
+Create a Solana Tracker Data API key at
+<https://www.solanatracker.io/account/data-api>. The free tier supports leaderboard reads
+within its quota. Store the key only in Railway Variables:
+
+```text
+SOLANA_TRACKER_API_KEY=...
+AUTO_DISCOVERY_ENABLED=true
+DISCOVERY_REFRESH_SECONDS=1200
+DISCOVERY_MAX_WALLETS=12
+DISCOVERY_MIN_24H_PNL_USD=100
+DISCOVERY_MIN_WIN_RATE_PERCENT=55
+DISCOVERY_MIN_ROI_PERCENT=3
+DISCOVERY_MIN_TRADES=5
+DISCOVERY_MAX_TRADES=250
+DISCOVERY_MIN_CLOSED_TOKENS=2
+DISCOVERY_MAX_SINGLE_TOKEN_PERCENT=70
+```
+
+The bot calls Solana Tracker's documented `GET /v2/pnl/leaderboard/top` endpoint with
+`days=1`, strict PnL mode, arbitrage exclusion, and concentration filtering. Existing
+manually added wallets are never removed by automatic rotation.
 
 ```bash
 python -m venv .venv
@@ -86,11 +124,12 @@ No privileged Discord gateway intents are required.
 1. Create a new GitHub repository and upload this project.
 2. Create a new Railway service from that repository.
 3. Add a persistent volume mounted at `/data`.
-4. Add the required variables from `.env.example`.
+4. Add the required variables from `.env.example`. Set `RAILWAY_RUN_UID=0` so the
+   process can write to Railway's root-mounted volume.
 5. Set `DISCORD_GUILD_ID` while testing so slash-command updates appear immediately.
 6. Deploy. Railway uses the included `Dockerfile` and `railway.toml`.
-7. In Discord run `/smartmoney setup`, then add wallets with
-   `/smartmoney trader-add`.
+7. In Discord run `/smartmoney setup`, followed by `/smartmoney discover`. Wallets are
+   selected and rotated automatically; manual wallet entry is optional.
 
 The minimum useful variables are:
 
@@ -99,8 +138,10 @@ DISCORD_TOKEN=...
 DISCORD_GUILD_ID=...
 DISCORD_ALERT_CHANNEL_ID=...
 SOLANA_RPC_URL=...
+SOLANA_TRACKER_API_KEY=...
 JUPITER_API_KEY=...
 DATABASE_PATH=/data/smart_money.db
+RAILWAY_RUN_UID=0
 ```
 
 A dedicated RPC is recommended for production. The public Solana endpoint may rate-limit
@@ -111,8 +152,9 @@ A dedicated RPC is recommended for production. The public Solana endpoint may ra
 | Command | Purpose |
 |---|---|
 | `/smartmoney setup` | Select the alert channel. |
-| `/smartmoney trader-add` | Add a public Solana wallet and alias. |
-| `/smartmoney trader-import` | Bulk import `alias,wallet,weight` CSV rows. |
+| `/smartmoney discover` | Refresh and display the automatic 24-hour wallet feed. |
+| `/smartmoney trader-add` | Optionally add a manual public-wallet override. |
+| `/smartmoney trader-import` | Optionally bulk import `alias,wallet,weight` CSV rows. |
 | `/smartmoney trader-remove` | Remove a tracked wallet. |
 | `/smartmoney traders` | List monitored wallets. |
 | `/smartmoney scan` | Run a scan immediately. |
@@ -162,6 +204,10 @@ support ticket, a screenshot, or chat. The default live base asset is Solana USD
 ## Important measurement limits
 
 - The reconstructed ranking covers only swaps that the bot successfully ingests.
+- Solana Tracker's 24-hour values use its PnL methodology and can differ from Fomo's
+  leaderboard. They are used for discovery and bootstrap scoring, not as a profit promise.
+- PnL momentum is the change between rolling-window snapshots; it can fall as old trades
+  age out even when the wallet makes no new trade.
 - Average-cost P&L cannot assign profit to tokens acquired before the available history;
   unmatched sells are recorded but excluded from realized-return calculations.
 - SOL-denominated historical trades are converted using the price available when the bot

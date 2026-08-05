@@ -23,6 +23,40 @@ class TrackedTrader:
     enabled: bool = True
     last_signature: str | None = None
     weight: Decimal = Decimal("1")
+    source: str = "manual"
+
+
+@dataclass(frozen=True, slots=True)
+class DiscoveryCandidate:
+    address: str
+    alias: str
+    realized_pnl_24h: Decimal
+    previous_pnl_24h: Decimal | None
+    roi_24h_percent: Decimal
+    win_rate_percent: Decimal
+    trades_24h: int
+    buys_24h: int
+    sells_24h: int
+    closed_tokens: int
+    invested_24h_usd: Decimal
+    volume_24h_usd: Decimal
+    last_trade_ms: int | None
+    score: Decimal
+    rank: int
+
+    @property
+    def pnl_momentum_usd(self) -> Decimal | None:
+        if self.previous_pnl_24h is None:
+            return None
+        return self.realized_pnl_24h - self.previous_pnl_24h
+
+
+@dataclass(frozen=True, slots=True)
+class DiscoveryRefresh:
+    candidates: tuple[DiscoveryCandidate, ...]
+    added_wallets: tuple[str, ...]
+    disabled_wallets: tuple[str, ...]
+    refreshed_at: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,4 +167,3 @@ class PaperSummary:
     wins: int
     losses: int
     max_drawdown_usd: Decimal
-
