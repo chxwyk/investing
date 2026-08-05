@@ -40,6 +40,8 @@ class Settings:
     discord_admin_role_ids: frozenset[int]
 
     solana_rpc_url: str
+    rpc_requests_per_second: int
+    rpc_max_retries: int
     jupiter_api_key: str | None
     solana_tracker_api_key: str | None
     database_path: str
@@ -103,6 +105,8 @@ class Settings:
             solana_rpc_url=os.getenv(
                 "SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com"
             ).strip(),
+            rpc_requests_per_second=_int("RPC_REQUESTS_PER_SECOND", 8),
+            rpc_max_retries=_int("RPC_MAX_RETRIES", 4),
             jupiter_api_key=os.getenv("JUPITER_API_KEY", "").strip() or None,
             solana_tracker_api_key=os.getenv("SOLANA_TRACKER_API_KEY", "").strip() or None,
             database_path=os.getenv("DATABASE_PATH", "./data/smart_money.db").strip(),
@@ -121,9 +125,9 @@ class Settings:
             discovery_max_single_token_percent=_decimal(
                 "DISCOVERY_MAX_SINGLE_TOKEN_PERCENT", "70"
             ),
-            poll_interval_seconds=_int("POLL_INTERVAL_SECONDS", 12),
+            poll_interval_seconds=_int("POLL_INTERVAL_SECONDS", 60),
             bootstrap_hours=_int("BOOTSTRAP_HOURS", 24),
-            max_backfill_transactions=_int("MAX_BACKFILL_TRANSACTIONS", 250),
+            max_backfill_transactions=_int("MAX_BACKFILL_TRANSACTIONS", 100),
             min_source_trade_usd=_decimal("MIN_SOURCE_TRADE_USD", "100"),
             consensus_min_traders=_int("CONSENSUS_MIN_TRADERS", 2),
             consensus_window_seconds=_int("CONSENSUS_WINDOW_SECONDS", 300),
@@ -169,6 +173,10 @@ class Settings:
     def validate(self) -> None:
         if self.consensus_min_traders < 1:
             raise ValueError("CONSENSUS_MIN_TRADERS must be at least 1")
+        if not 1 <= self.rpc_requests_per_second <= 100:
+            raise ValueError("RPC_REQUESTS_PER_SECOND must be between 1 and 100")
+        if not 0 <= self.rpc_max_retries <= 10:
+            raise ValueError("RPC_MAX_RETRIES must be between 0 and 10")
         if self.discovery_refresh_seconds < 300:
             raise ValueError("DISCOVERY_REFRESH_SECONDS must be at least 300")
         if not 1 <= self.discovery_fetch_limit <= 500:

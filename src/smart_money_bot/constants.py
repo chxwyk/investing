@@ -1,6 +1,6 @@
 """Chain constants used by the monitor and executor."""
 
-BOT_VERSION = "2.1.0"
+BOT_VERSION = "2.2.0"
 
 WRAPPED_SOL_MINT = "So11111111111111111111111111111111111111112"
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"

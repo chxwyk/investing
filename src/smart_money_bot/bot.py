@@ -504,6 +504,8 @@ class SmartMoneyCommands(
         text = (
             f"**Bot version:** {BOT_VERSION}\n"
             f"**RPC:** {status['rpc']}\n"
+            f"**RPC throttle:** {self.bot.settings.rpc_requests_per_second}/second • "
+            f"{self.bot.settings.rpc_max_retries} retries\n"
             f"**Mode:** {status['mode']}\n"
             f"**Paused:** {status['paused']}\n"
             f"**Tracked wallets:** {status['wallets']}\n"
@@ -526,6 +528,8 @@ class SmartMoneyCommands(
             f"{s.discovery_refresh_seconds // 60}m • minimum "
             f"{_money(s.discovery_min_24h_pnl_usd)} 24H PnL • "
             f"{s.discovery_min_win_rate_percent}% win rate\n"
+            f"**RPC scanning:** every {s.poll_interval_seconds}s • "
+            f"{s.rpc_requests_per_second} requests/second maximum\n"
             f"**Copy size:** {_money(s.default_copy_usd)} (max {_money(s.max_copy_usd)})\n"
             f"**Daily stop:** -{_money(s.max_daily_loss_usd)}\n"
             f"**Minimum liquidity:** {_money(s.min_token_liquidity_usd)}\n"

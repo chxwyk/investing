@@ -74,7 +74,11 @@ class SmartMoneyEngine:
         self.settings = settings
         self.notifier: Notifier = notifier or NullNotifier()
         self.database = Database(settings.database_path, settings.paper_starting_usd)
-        self.rpc = SolanaRPC(settings.solana_rpc_url)
+        self.rpc = SolanaRPC(
+            settings.solana_rpc_url,
+            max_requests_per_second=settings.rpc_requests_per_second,
+            max_retries=settings.rpc_max_retries,
+        )
         self.market = JupiterClient(settings.jupiter_api_key)
         self.discovery = (
             SolanaTrackerClient(settings.solana_tracker_api_key)

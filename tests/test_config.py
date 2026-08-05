@@ -36,3 +36,15 @@ def test_discovery_default_refresh_fits_free_monthly_quota(monkeypatch) -> None:
     monkeypatch.delenv("DISCOVERY_REFRESH_SECONDS", raising=False)
     settings = Settings.from_env(require_discord_token=False)
     assert settings.discovery_refresh_seconds == 1200
+
+
+def test_rpc_defaults_are_free_tier_friendly(monkeypatch) -> None:
+    monkeypatch.delenv("RPC_REQUESTS_PER_SECOND", raising=False)
+    monkeypatch.delenv("RPC_MAX_RETRIES", raising=False)
+    monkeypatch.delenv("POLL_INTERVAL_SECONDS", raising=False)
+    monkeypatch.delenv("MAX_BACKFILL_TRANSACTIONS", raising=False)
+    settings = Settings.from_env(require_discord_token=False)
+    assert settings.rpc_requests_per_second == 8
+    assert settings.rpc_max_retries == 4
+    assert settings.poll_interval_seconds == 60
+    assert settings.max_backfill_transactions == 100

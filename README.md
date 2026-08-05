@@ -21,6 +21,7 @@ unless four separate controls are deliberately configured.
 - Automatically adds new qualifiers, disables wallets that rotate out, and reports PnL
   momentum between refreshes.
 - Backfills up to 24 hours of transactions when a wallet is first discovered.
+- Throttles Solana RPC calls and retries temporary `429`/server failures with backoff.
 - Detects SOL/USDC/USDT-to-token buys and sells from wallet balance changes.
 - Maintains an average-cost inventory for each tracked wallet.
 - Calculates realized P&L, realized ROI, win rate, trade count, volume, and maximum drawdown.
@@ -138,14 +139,23 @@ DISCORD_TOKEN=...
 DISCORD_GUILD_ID=...
 DISCORD_ALERT_CHANNEL_ID=...
 SOLANA_RPC_URL=...
+RPC_REQUESTS_PER_SECOND=8
+RPC_MAX_RETRIES=4
 SOLANA_TRACKER_API_KEY=...
 JUPITER_API_KEY=...
 DATABASE_PATH=/data/smart_money.db
 RAILWAY_RUN_UID=0
 ```
 
-A dedicated RPC is recommended for production. The public Solana endpoint may rate-limit
-24-hour backfills for active wallets.
+A provider RPC is required for reliable monitoring. The public Solana endpoint rate-limits
+multi-wallet history scans. The defaults cap RPC traffic at eight requests per second,
+retry temporary failures, scan once per minute, and backfill at most 100 transactions per
+wallet. These settings favor free-tier stability over sub-minute alerts.
+
+For free paper testing, create a Helius account, copy its Mainnet HTTPS RPC endpoint, and
+store the complete endpoint only in Railway as `SOLANA_RPC_URL`. Keep the API key embedded
+in that URL private. Helius documents the endpoint format as
+`https://mainnet.helius-rpc.com/?api-key=YOUR_API_KEY`.
 
 ## Discord commands
 
