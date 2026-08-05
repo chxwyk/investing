@@ -48,3 +48,13 @@ def test_rpc_defaults_are_free_tier_friendly(monkeypatch) -> None:
     assert settings.rpc_max_retries == 4
     assert settings.poll_interval_seconds == 60
     assert settings.max_backfill_transactions == 100
+
+
+def test_fomo_referral_defaults_to_shared_code(monkeypatch) -> None:
+    monkeypatch.delenv("FOMO_REFERRAL_CODE", raising=False)
+    settings = Settings.from_env(require_discord_token=False)
+    assert settings.fomo_referral_code == "WetOuterLemur"
+
+    monkeypatch.setenv("FOMO_REFERRAL_CODE", "")
+    without_referral = Settings.from_env(require_discord_token=False)
+    assert without_referral.fomo_referral_code is None

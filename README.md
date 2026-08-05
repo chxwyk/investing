@@ -30,7 +30,7 @@ unless four separate controls are deliberately configured.
 - Scores traders on repeatability, ROI, 24-hour/7-day consistency, activity, and drawdown.
 - Requires independent-wallet consensus inside a configurable time window.
 - Posts raw wallet activity, consensus signals, risk results, and fills to Discord.
-- Adds one-tap Jupiter, DexScreener, Solscan, and Fomo buttons to every token alert.
+- Adds one-tap Fomo, Pump.fun, Jupiter, DexScreener, and Solscan buttons to every token alert.
 - Can mention one Discord user on every newly detected raw buy.
 - Blocks suspicious, low-liquidity, concentrated, mintable, or freezable tokens when the
   required Jupiter safety metadata is available.
@@ -184,8 +184,11 @@ in that URL private. Helius documents the endpoint format as
 
 Set `DISCORD_ALERT_USER_ID` to your numeric Discord user ID if raw wallet buys should
 mention you. The bot uses restricted allowed-mention settings and never permits role or
-`@everyone` pings. In Fomo, paste the exact token contract shown in the alert into search;
-the public Fomo site does not publish a stable token-specific deep-link format.
+`@everyone` pings. Every Solana token alert builds an exact Fomo coin link using Solana
+`chainId=1399811149` and an exact Pump.fun coin link using the detected mint. Set
+`FOMO_REFERRAL_CODE` to keep a referral code in generated Fomo links, or leave it blank to
+omit the referral parameter. A link button only opens the detected coin; it never places or
+authorizes a trade.
 
 Mutation commands require Discord Administrator or a role listed in
 `DISCORD_ADMIN_ROLE_IDS`.

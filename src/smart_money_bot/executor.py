@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from decimal import Decimal, ROUND_DOWN
+from decimal import ROUND_DOWN, Decimal
 
 from solders.keypair import Keypair
 
@@ -122,9 +122,9 @@ class ExecutionManager:
                     raise JupiterError("Live base-token price unavailable")
                 base_units = size_usd / base_price
                 amount_raw = int(
-                    (base_units * (Decimal(10) ** self.settings.live_base_decimals)).to_integral_value(
-                        rounding=ROUND_DOWN
-                    )
+                    (
+                        base_units * (Decimal(10) ** self.settings.live_base_decimals)
+                    ).to_integral_value(rounding=ROUND_DOWN)
                 )
                 response = await self.market.swap(
                     input_mint=self.settings.live_base_mint,

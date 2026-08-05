@@ -65,7 +65,11 @@ class SwapDetector:
 
         token_amount = abs(token_delta)
         quote_amount = abs(quote_delta)
-        quote_price = Decimal("1") if quote_mint in STABLE_MINTS else await self._safe_price(quote_mint)
+        quote_price = (
+            Decimal("1")
+            if quote_mint in STABLE_MINTS
+            else await self._safe_price(quote_mint)
+        )
         usd_value = quote_amount * quote_price if quote_price is not None else None
         if usd_value is not None and usd_value < self.min_trade_usd:
             return None

@@ -5,6 +5,7 @@ import io
 import logging
 from decimal import Decimal
 from typing import Literal
+from urllib.parse import urlencode
 
 import discord
 from discord import app_commands
@@ -43,13 +44,44 @@ def _price(value: Decimal | None) -> str:
     return "unavailable" if value is None or value <= 0 else f"${value:,.8f}"
 
 
-def _token_view(mint: str) -> discord.ui.View:
+FOMO_SOLANA_CHAIN_ID = "1399811149"
+
+
+def _fomo_coin_url(mint: str, referral_code: str | None = None) -> str:
+    query = {
+        "address": mint,
+        "chainId": FOMO_SOLANA_CHAIN_ID,
+    }
+    if referral_code:
+        query["r"] = referral_code
+    query["source"] = "share_link"
+    return f"https://fomo.family/coin?{urlencode(query)}"
+
+
+def _token_view(mint: str, fomo_referral_code: str | None = None) -> discord.ui.View:
     view = discord.ui.View(timeout=None)
+    view.add_item(
+        discord.ui.Button(
+            label="Open in Fomo",
+            style=discord.ButtonStyle.link,
+            url=_fomo_coin_url(mint, fomo_referral_code),
+            row=0,
+        )
+    )
+    view.add_item(
+        discord.ui.Button(
+            label="Open in Pump.fun",
+            style=discord.ButtonStyle.link,
+            url=f"https://pump.fun/coin/{mint}",
+            row=0,
+        )
+    )
     view.add_item(
         discord.ui.Button(
             label="Buy on Jupiter",
             style=discord.ButtonStyle.link,
             url=f"https://jup.ag/swap/SOL-{mint}",
+            row=0,
         )
     )
     view.add_item(
@@ -57,20 +89,15 @@ def _token_view(mint: str) -> discord.ui.View:
             label="Chart",
             style=discord.ButtonStyle.link,
             url=f"https://dexscreener.com/solana/{mint}",
+            row=1,
         )
     )
     view.add_item(
         discord.ui.Button(
-            label="Token on Solscan",
+            label="Solscan",
             style=discord.ButtonStyle.link,
             url=f"https://solscan.io/token/{mint}",
-        )
-    )
-    view.add_item(
-        discord.ui.Button(
-            label="Open Fomo",
-            style=discord.ButtonStyle.link,
-            url="https://fomo.family/",
+            row=1,
         )
     )
     return view
@@ -164,7 +191,11 @@ class SmartMoneyBot(commands.Bot):
             await channel.send(
                 content=content,
                 embed=embed,
-                view=_token_view(token_mint) if token_mint else None,
+                view=(
+                    _token_view(token_mint, self.settings.fomo_referral_code)
+                    if token_mint
+                    else None
+                ),
                 allowed_mentions=allowed_mentions,
             )
         except (discord.Forbidden, discord.HTTPException):
@@ -178,7 +209,7 @@ class SmartMoneyBot(commands.Bot):
             timestamp=discord.utils.utcnow(),
         )
         embed.add_field(
-            name="Token contract — copy this into Fomo search",
+            name="Token contract",
             value=f"`{swap.token_mint}`",
             inline=False,
         )
@@ -212,7 +243,11 @@ class SmartMoneyBot(commands.Bot):
     async def on_signal(
         self, signal: Signal, token_info: TokenInfo | None, decision: RiskDecision
     ) -> None:
-        symbol = token_info.symbol if token_info and token_info.symbol else _short(signal.token_mint)
+        symbol = (
+            token_info.symbol
+            if token_info and token_info.symbol
+            else _short(signal.token_mint)
+        )
         status = "PASSED" if decision.allowed else "BLOCKED"
         color = 0x00D084 if decision.allowed else 0xF1C40F
         embed = discord.Embed(
@@ -237,14 +272,21 @@ class SmartMoneyBot(commands.Bot):
                 name="Verified", value="Yes" if token_info.verified else "No/unknown"
             )
         if decision.reasons:
-            embed.add_field(name="Checks", value="\n".join(f"• {r}" for r in decision.reasons)[:1024], inline=False)
+            embed.add_field(
+                name="Checks",
+                value="\n".join(f"• {r}" for r in decision.reasons)[:1024],
+                inline=False,
+            )
         embed.add_field(name="Mint", value=f"`{signal.token_mint}`", inline=False)
         await self._send_alert(embed, token_mint=signal.token_mint)
 
     async def on_execution(self, result: ExecutionResult) -> None:
         color = 0x3498DB if result.success else 0xE74C3C
         embed = discord.Embed(
-            title=f"{result.mode.value} {result.side.value} • {'FILLED' if result.success else 'FAILED'}",
+            title=(
+                f"{result.mode.value} {result.side.value} • "
+                f"{'FILLED' if result.success else 'FAILED'}"
+            ),
             description=result.message,
             color=color,
             timestamp=discord.utils.utcnow(),
@@ -285,7 +327,9 @@ class SmartMoneyCommands(
         )
         return False
 
-    @app_commands.command(name="setup", description="Choose where wallet and signal alerts are posted.")
+    @app_commands.command(
+        name="setup", description="Choose where wallet and signal alerts are posted."
+    )
     async def setup(self, interaction: discord.Interaction, channel: discord.TextChannel) -> None:
         if not await self._require_admin(interaction):
             return
@@ -588,7 +632,8 @@ class SmartMoneyCommands(
     async def limits(self, interaction: discord.Interaction) -> None:
         s = self.bot.settings
         text = (
-            f"**Consensus:** {s.consensus_min_traders} traders within {s.consensus_window_seconds}s\n"
+            f"**Consensus:** {s.consensus_min_traders} traders within "
+            f"{s.consensus_window_seconds}s\n"
             f"**Minimum trader score:** {s.min_trader_score}/100\n"
             f"**Discovery:** top {s.discovery_max_wallets} every "
             f"{s.discovery_refresh_seconds // 60}m • minimum "

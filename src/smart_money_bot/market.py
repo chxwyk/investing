@@ -15,6 +15,7 @@ from solders.transaction import VersionedTransaction
 from .errors import JupiterError
 from .models import TokenInfo
 
+
 class JupiterClient:
     BASE_URL = "https://api.jup.ag"
 
@@ -75,7 +76,7 @@ class JupiterClient:
                                 f"Jupiter HTTP {response.status} for {path}: {body_text[:500]}"
                             )
                         break
-                except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                except (TimeoutError, aiohttp.ClientError) as exc:
                     if attempt < 2:
                         await asyncio.sleep(2**attempt)
                         continue

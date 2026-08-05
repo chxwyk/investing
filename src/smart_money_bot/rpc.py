@@ -98,7 +98,7 @@ class SolanaRPC:
                     if rpc_error is not None:
                         raise RpcError(f"RPC {method} error: {rpc_error}")
                     return body.get("result")
-            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            except (TimeoutError, aiohttp.ClientError) as exc:
                 if attempt < self.max_retries:
                     await asyncio.sleep(self._retry_delay(attempt))
                     continue

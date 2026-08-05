@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from contextlib import suppress
 from dataclasses import replace
 from decimal import Decimal
 from typing import Protocol
@@ -126,10 +127,8 @@ class SmartMoneyEngine:
     async def close(self) -> None:
         if self._task:
             self._task.cancel()
-            try:
+            with suppress(asyncio.CancelledError):
                 await self._task
-            except asyncio.CancelledError:
-                pass
             self._task = None
         await self.rpc.close()
         await self.market.close()

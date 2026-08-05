@@ -39,6 +39,7 @@ class Settings:
     discord_alert_channel_id: int | None
     discord_alert_user_id: int | None
     discord_admin_role_ids: frozenset[int]
+    fomo_referral_code: str | None
 
     solana_rpc_url: str
     rpc_requests_per_second: int
@@ -104,6 +105,10 @@ class Settings:
             discord_alert_channel_id=_optional_int("DISCORD_ALERT_CHANNEL_ID"),
             discord_alert_user_id=_optional_int("DISCORD_ALERT_USER_ID"),
             discord_admin_role_ids=_int_set("DISCORD_ADMIN_ROLE_IDS"),
+            fomo_referral_code=os.getenv(
+                "FOMO_REFERRAL_CODE", "WetOuterLemur"
+            ).strip()
+            or None,
             solana_rpc_url=os.getenv(
                 "SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com"
             ).strip(),

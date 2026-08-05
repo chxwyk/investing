@@ -104,7 +104,7 @@ class SolanaTrackerClient:
                         return await response.json(content_type=None)
                     except ValueError as exc:
                         raise DiscoveryError("Solana Tracker returned invalid JSON") from exc
-            except (self._aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            except (TimeoutError, self._aiohttp.ClientError) as exc:
                 if attempt < 2:
                     await asyncio.sleep(2**attempt)
                     continue
