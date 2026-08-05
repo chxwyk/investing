@@ -9,6 +9,7 @@ from decimal import Decimal
 from typing import Protocol
 
 from .config import Settings
+from .constants import PAPER_DEMO_ENTRY_PRICE_USD, PAPER_DEMO_MINT
 from .database import Database
 from .detector import SwapDetector
 from .discovery import DiscoveryPolicy, SolanaTrackerClient
@@ -350,6 +351,9 @@ class SmartMoneyEngine:
             return
         if mode is ExecutionMode.PAPER:
             positions = await self.database.paper_positions()
+            positions = [
+                item for item in positions if item["token_mint"] != PAPER_DEMO_MINT
+            ]
         else:
             positions = await self.database.live_positions()
         if not positions:
@@ -493,11 +497,17 @@ class SmartMoneyEngine:
 
     async def paper_summary(self) -> PaperSummary:
         positions = await self.database.paper_positions()
-        mints = [item["token_mint"] for item in positions]
+        mints = [
+            item["token_mint"]
+            for item in positions
+            if item["token_mint"] != PAPER_DEMO_MINT
+        ]
         try:
             prices = await self.market.prices(mints) if mints else {}
         except JupiterError:
             prices = {}
+        if any(item["token_mint"] == PAPER_DEMO_MINT for item in positions):
+            prices[PAPER_DEMO_MINT] = Decimal(PAPER_DEMO_ENTRY_PRICE_USD)
         return await self.database.paper_summary(prices)
 
     async def status(self) -> dict[str, object]:

@@ -886,7 +886,7 @@ class Database:
         trades_cursor = await self.db.execute(
             """
             SELECT
-                COUNT(*) AS trades,
+                SUM(CASE WHEN side = 'SELL' THEN 1 ELSE 0 END) AS trades,
                 SUM(CASE WHEN side = 'SELL' AND realized_pnl_usd > 0 THEN 1 ELSE 0 END) wins,
                 SUM(CASE WHEN side = 'SELL' AND realized_pnl_usd <= 0 THEN 1 ELSE 0 END) losses
             FROM paper_trades
@@ -896,6 +896,7 @@ class Database:
         refreshed = await self.db.execute("SELECT * FROM paper_account WHERE id = 1")
         account = await refreshed.fetchone()
         return PaperSummary(
+            starting_cash_usd=_d(account["starting_cash_usd"]),
             cash_usd=cash,
             positions_value_usd=positions_value,
             equity_usd=equity,

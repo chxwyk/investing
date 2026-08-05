@@ -176,6 +176,7 @@ in that URL private. Helius documents the endpoint format as
 | `/smartmoney leaderboard` | Show the 24-hour or 7-day risk-adjusted ranking. |
 | `/smartmoney paper` | Show strategy equity, net P&L, win rate, and drawdown. |
 | `/smartmoney positions` | Show open paper positions. |
+| `/smartmoney paper-demo` | Instantly create and close a clearly labeled fake paper trade. |
 | `/smartmoney paper-reset` | Reset the paper challenge after exact confirmation. |
 | `/smartmoney mode` | Show or set alerts, paper, or live mode. |
 | `/smartmoney pause` | Pause/resume monitoring. |
@@ -192,6 +193,22 @@ authorizes a trade.
 
 Mutation commands require Discord Administrator or a role listed in
 `DISCORD_ADMIN_ROLE_IDS`.
+
+### Instant paper walkthrough
+
+The demo command lets you verify the full accounting flow without waiting for a real
+multi-wallet signal and without changing the genuine consensus or risk rules:
+
+1. Run `/smartmoney paper-demo action:open` to spend the configured fake copy size.
+2. Run `/smartmoney positions` to see position value, unrealized P&L, and ROI.
+3. Run `/smartmoney paper` to see account equity, total P&L, and total ROI.
+4. Run `/smartmoney paper-demo action:close-win` to simulate a 30% market rise, or use
+   `close-loss` to simulate a 12% market fall. Configured fees and slippage still apply.
+5. Run `/smartmoney paper` again to see realized P&L, completed trades, and win rate.
+6. Before a real observation period, erase demo history with
+   `/smartmoney paper-reset confirmation:RESET PAPER`.
+
+`paper-demo` never calls a swap API, never accesses a private key, and cannot move funds.
 
 ## Fair bot-versus-human challenge
 

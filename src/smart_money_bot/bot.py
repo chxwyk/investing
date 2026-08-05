@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import io
 import logging
+import time
 from decimal import Decimal
 from typing import Literal
 from urllib.parse import urlencode
@@ -13,9 +14,9 @@ from discord.ext import commands
 from solders.pubkey import Pubkey
 
 from .config import Settings
-from .constants import BOT_VERSION
+from .constants import BOT_VERSION, PAPER_DEMO_ENTRY_PRICE_USD, PAPER_DEMO_MINT
 from .engine import SmartMoneyEngine
-from .errors import DiscoveryError
+from .errors import DiscoveryError, JupiterError
 from .models import (
     DetectedSwap,
     DiscoveryCandidate,
@@ -44,7 +45,14 @@ def _price(value: Decimal | None) -> str:
     return "unavailable" if value is None or value <= 0 else f"${value:,.8f}"
 
 
+def _return_percent(current_value: Decimal, cost_basis: Decimal) -> Decimal:
+    if cost_basis <= 0:
+        return Decimal("0")
+    return (current_value - cost_basis) / cost_basis * Decimal("100")
+
+
 FOMO_SOLANA_CHAIN_ID = "1399811149"
+PAPER_DEMO_ENTRY_PRICE = Decimal(PAPER_DEMO_ENTRY_PRICE_USD)
 
 
 def _fomo_coin_url(mint: str, referral_code: str | None = None) -> str:
@@ -281,12 +289,11 @@ class SmartMoneyBot(commands.Bot):
         await self._send_alert(embed, token_mint=signal.token_mint)
 
     async def on_execution(self, result: ExecutionResult) -> None:
-        color = 0x3498DB if result.success else 0xE74C3C
+        skipped = not result.success and result.message.startswith("Skipped:")
+        status = "FILLED" if result.success else ("SKIPPED" if skipped else "FAILED")
+        color = 0x3498DB if result.success else (0xF1C40F if skipped else 0xE74C3C)
         embed = discord.Embed(
-            title=(
-                f"{result.mode.value} {result.side.value} • "
-                f"{'FILLED' if result.success else 'FAILED'}"
-            ),
+            title=f"{result.mode.value} {result.side.value} • {status}",
             description=result.message,
             color=color,
             timestamp=discord.utils.utcnow(),
@@ -516,8 +523,12 @@ class SmartMoneyCommands(
         summary = await self.bot.engine.paper_summary()
         closed = summary.wins + summary.losses
         win_rate = Decimal(summary.wins) / Decimal(closed) * 100 if closed else Decimal("0")
+        total_pnl = summary.equity_usd - summary.starting_cash_usd
+        total_roi = _return_percent(summary.equity_usd, summary.starting_cash_usd)
         embed = discord.Embed(title="Paper Strategy Scoreboard", color=0x3498DB)
         embed.add_field(name="Equity", value=_money(summary.equity_usd))
+        embed.add_field(name="Total P&L", value=_money(total_pnl))
+        embed.add_field(name="Total ROI", value=f"{total_roi:+.2f}%")
         embed.add_field(name="Cash", value=_money(summary.cash_usd))
         embed.add_field(name="Positions", value=_money(summary.positions_value_usd))
         embed.add_field(name="Realized P&L", value=_money(summary.realized_pnl_usd))
@@ -533,12 +544,156 @@ class SmartMoneyCommands(
         if not positions:
             await interaction.response.send_message("No open paper positions.")
             return
-        lines = [
-            f"• `{_short(item['token_mint'])}` — qty `{Decimal(str(item['quantity'])):.6f}` "
-            f"• cost `{_money(Decimal(str(item['cost_basis_usd'])))}`"
-            for item in positions[:20]
+        real_mints = [
+            str(item["token_mint"])
+            for item in positions
+            if str(item["token_mint"]) != PAPER_DEMO_MINT
         ]
+        try:
+            prices = await self.bot.engine.market.prices(real_mints) if real_mints else {}
+        except JupiterError:
+            prices = {}
+        lines: list[str] = []
+        for item in positions[:20]:
+            mint = str(item["token_mint"])
+            quantity = Decimal(str(item["quantity"]))
+            cost = Decimal(str(item["cost_basis_usd"]))
+            entry = Decimal(str(item["average_entry_usd"]))
+            price = PAPER_DEMO_ENTRY_PRICE if mint == PAPER_DEMO_MINT else prices.get(mint, entry)
+            value = quantity * price
+            pnl = value - cost
+            roi = _return_percent(value, cost)
+            label = "Paper Demo (fake token)" if mint == PAPER_DEMO_MINT else _short(mint)
+            lines.append(
+                f"• **{label}** — qty `{quantity:.6f}` • value `{_money(value)}`\n"
+                f"  cost `{_money(cost)}` • P&L `{_money(pnl)}` • ROI `{roi:+.2f}%`"
+            )
         await interaction.response.send_message("\n".join(lines))
+
+    @app_commands.command(
+        name="paper-demo",
+        description="Instantly test a fake paper buy and a winning or losing paper sell.",
+    )
+    @app_commands.describe(
+        action="Open a fake position, or close it with a simulated win/loss."
+    )
+    async def paper_demo(
+        self,
+        interaction: discord.Interaction,
+        action: Literal["open", "close-win", "close-loss"] = "open",
+    ) -> None:
+        if not await self._require_admin(interaction):
+            return
+        if await self.bot.engine.execution_mode() is not ExecutionMode.PAPER:
+            await interaction.response.send_message(
+                "Paper demo only works in PAPER mode. Run `/smartmoney mode new_mode:paper` first.",
+                ephemeral=True,
+            )
+            return
+
+        positions = await self.bot.engine.database.paper_positions()
+        position = next(
+            (item for item in positions if item["token_mint"] == PAPER_DEMO_MINT),
+            None,
+        )
+        if action == "open" and position is not None:
+            await interaction.response.send_message(
+                "The fake demo position is already open. Run `/smartmoney positions`, then "
+                "close it with `close-win` or `close-loss`.",
+                ephemeral=True,
+            )
+            return
+        if action != "open" and position is None:
+            await interaction.response.send_message(
+                "No fake demo position is open. Run this command with action `open` first.",
+                ephemeral=True,
+            )
+            return
+
+        now = int(time.time())
+        side = Side.BUY if action == "open" else Side.SELL
+        market_price = {
+            "open": PAPER_DEMO_ENTRY_PRICE,
+            "close-win": PAPER_DEMO_ENTRY_PRICE * Decimal("1.30"),
+            "close-loss": PAPER_DEMO_ENTRY_PRICE * Decimal("0.88"),
+        }[action]
+        signal = Signal(
+            token_mint=PAPER_DEMO_MINT,
+            side=side,
+            created_at=now,
+            trader_addresses=("PAPER_DEMO_1", "PAPER_DEMO_2", "PAPER_DEMO_3"),
+            trader_aliases=("Paper Demo 1", "Paper Demo 2", "Paper Demo 3"),
+            source_signatures=(f"paper-demo-{action}-{now}",),
+            combined_score=Decimal("100"),
+            reference_price_usd=market_price,
+        )
+        signal_id = await self.bot.engine.database.record_signal(signal)
+        size = min(
+            self.bot.settings.default_copy_usd,
+            self.bot.settings.max_copy_usd,
+        )
+        fill = await self.bot.engine.database.paper_execute(
+            signal_id=signal_id,
+            token_mint=PAPER_DEMO_MINT,
+            side=side,
+            market_price_usd=market_price,
+            size_usd=size,
+            fee_bps=self.bot.settings.simulated_fee_bps,
+            slippage_bps=self.bot.settings.simulated_slippage_bps,
+        )
+        if fill is None:
+            await interaction.response.send_message(
+                "The demo could not fill because the fake bankroll has no available cash. "
+                "Reset it with `/smartmoney paper-reset confirmation:RESET PAPER`.",
+                ephemeral=True,
+            )
+            return
+
+        summary = await self.bot.engine.database.paper_summary({})
+        if side is Side.BUY:
+            embed = discord.Embed(
+                title="DEMO PAPER BUY • FILLED",
+                description=(
+                    "A forced fake-money purchase was added to the same paper ledger used "
+                    "by detected wallet signals. No real token or wallet was touched."
+                ),
+                color=0x2ECC71,
+            )
+            embed.add_field(name="Fake token", value="Paper Demo")
+            embed.add_field(name="Paper spend", value=_money(size))
+            embed.add_field(name="Execution price", value=_price(fill["price"]))
+            embed.add_field(name="Quantity", value=f"{fill['quantity']:.6f}")
+            embed.add_field(name="Simulated fee", value=_money(fill["fee"]))
+            embed.add_field(name="Fake cash left", value=_money(summary.cash_usd))
+            embed.set_footer(
+                text="Next: /smartmoney positions → /smartmoney paper → paper-demo close-win"
+            )
+        else:
+            cost = Decimal(str(position["cost_basis_usd"]))
+            realized_roi = fill["realized_pnl"] / cost * Decimal("100") if cost else Decimal("0")
+            scenario = "+30% market move" if action == "close-win" else "-12% market move"
+            embed = discord.Embed(
+                title=(
+                    "DEMO PAPER SELL • WIN"
+                    if fill["realized_pnl"] > 0
+                    else "DEMO PAPER SELL • LOSS"
+                ),
+                description=(
+                    "The fake position was sold with configured slippage and fees included. "
+                    "This result now appears in the paper scoreboard."
+                ),
+                color=0x2ECC71 if fill["realized_pnl"] > 0 else 0xE74C3C,
+            )
+            embed.add_field(name="Scenario", value=scenario)
+            embed.add_field(name="Exit price", value=_price(fill["price"]))
+            embed.add_field(name="Sell fee", value=_money(fill["fee"]))
+            embed.add_field(name="Realized P&L", value=_money(fill["realized_pnl"]))
+            embed.add_field(name="Net trade ROI", value=f"{realized_roi:+.2f}%")
+            embed.add_field(name="Ending equity", value=_money(summary.equity_usd))
+            embed.set_footer(
+                text="Run /smartmoney paper. Use paper-reset when you want a clean real test."
+            )
+        await interaction.response.send_message(embed=embed)
 
     @app_commands.command(name="paper-reset", description="Reset the paper bankroll and history.")
     async def paper_reset(self, interaction: discord.Interaction, confirmation: str) -> None:

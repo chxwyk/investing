@@ -65,7 +65,11 @@ class ExecutionManager:
                     token_mint=signal.token_mint,
                     side=signal.side,
                     size_usd=size_usd,
-                    message="No paper cash/position available for this signal",
+                    message=(
+                        "Skipped: the paper account does not own this token"
+                        if signal.side is Side.SELL
+                        else "No paper cash available for this signal"
+                    ),
                 )
             else:
                 result = ExecutionResult(

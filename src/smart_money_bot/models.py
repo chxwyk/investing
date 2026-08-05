@@ -158,6 +158,7 @@ class ExecutionResult:
 
 @dataclass(frozen=True, slots=True)
 class PaperSummary:
+    starting_cash_usd: Decimal
     cash_usd: Decimal
     positions_value_usd: Decimal
     equity_usd: Decimal

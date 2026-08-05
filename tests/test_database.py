@@ -49,8 +49,10 @@ async def test_paper_round_trip_includes_costs(tmp_path) -> None:
         assert sell["realized_pnl"] < 0
 
         summary = await database.paper_summary({})
+        assert summary.starting_cash_usd == Decimal("1000.0")
         assert summary.equity_usd < Decimal("1000")
         assert summary.realized_pnl_usd < 0
+        assert summary.trades == 1
+        assert summary.losses == 1
     finally:
         await database.close()
-
