@@ -3,7 +3,6 @@ from __future__ import annotations
 from decimal import Decimal
 
 import pytest
-
 from smart_money_bot.constants import WRAPPED_SOL_MINT
 from smart_money_bot.detector import SwapDetector
 from smart_money_bot.models import Side

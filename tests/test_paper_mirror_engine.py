@@ -7,7 +7,6 @@ from decimal import Decimal
 from unittest.mock import AsyncMock
 
 import pytest
-
 from smart_money_bot.engine import SmartMoneyEngine
 from smart_money_bot.models import (
     DetectedSwap,

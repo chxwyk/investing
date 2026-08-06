@@ -4,7 +4,6 @@ from decimal import Decimal
 from unittest.mock import AsyncMock
 
 import pytest
-
 from smart_money_bot.errors import JupiterError
 from smart_money_bot.market import JupiterClient
 

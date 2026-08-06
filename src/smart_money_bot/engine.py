@@ -213,7 +213,8 @@ class SmartMoneyEngine:
             not force
             and self._candidate_pool
             and self.last_discovery_refresh_at is not None
-            and now - self.last_discovery_refresh_at < self.settings.discovery_refresh_seconds
+            and now - self.last_discovery_refresh_at
+            < self.settings.effective_discovery_refresh_seconds
         ):
             return None
 
@@ -223,7 +224,7 @@ class SmartMoneyEngine:
                 or not self._weekly_pool
                 or self.last_weekly_refresh_at is None
                 or now - self.last_weekly_refresh_at
-                >= self.settings.discovery_7d_refresh_seconds
+                >= self.settings.effective_discovery_7d_refresh_seconds
             )
             if refresh_weekly:
                 self._weekly_pool = await self.discovery.weekly_pool(

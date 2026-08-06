@@ -51,6 +51,7 @@ class Settings:
     auto_discovery_enabled: bool
     discovery_refresh_seconds: int
     discovery_7d_refresh_seconds: int
+    discovery_candidate_pages: int
     discovery_fetch_limit: int
     discovery_max_wallets: int
     discovery_min_24h_pnl_usd: Decimal
@@ -156,6 +157,7 @@ class Settings:
             auto_discovery_enabled=_bool("AUTO_DISCOVERY_ENABLED", True),
             discovery_refresh_seconds=_int("DISCOVERY_REFRESH_SECONDS", 1200),
             discovery_7d_refresh_seconds=_int("DISCOVERY_7D_REFRESH_SECONDS", 21600),
+            discovery_candidate_pages=_int("DISCOVERY_CANDIDATE_PAGES", 5),
             discovery_fetch_limit=_int("DISCOVERY_FETCH_LIMIT", 100),
             discovery_max_wallets=_int("DISCOVERY_MAX_WALLETS", 25),
             discovery_min_24h_pnl_usd=_decimal("DISCOVERY_MIN_24H_PNL_USD", "100"),
@@ -283,6 +285,26 @@ class Settings:
     def discovery_is_configured(self) -> bool:
         return self.auto_discovery_enabled and bool(self.solana_tracker_api_key)
 
+    @property
+    def effective_discovery_refresh_seconds(self) -> int:
+        """Clamp multi-page reads to a free-tier-friendly daily request budget."""
+
+        if self.discovery_candidate_pages <= 1:
+            return self.discovery_refresh_seconds
+        return max(
+            self.discovery_refresh_seconds,
+            self.discovery_candidate_pages * 2_160,
+        )
+
+    @property
+    def effective_discovery_7d_refresh_seconds(self) -> int:
+        if self.discovery_candidate_pages <= 1:
+            return self.discovery_7d_refresh_seconds
+        return max(
+            self.discovery_7d_refresh_seconds,
+            self.discovery_candidate_pages * 8_640,
+        )
+
     def validate(self) -> None:
         if self.consensus_min_traders < 1:
             raise ValueError("CONSENSUS_MIN_TRADERS must be at least 1")
@@ -296,6 +318,8 @@ class Settings:
             raise ValueError(
                 "DISCOVERY_7D_REFRESH_SECONDS cannot be below DISCOVERY_REFRESH_SECONDS"
             )
+        if not 1 <= self.discovery_candidate_pages <= 5:
+            raise ValueError("DISCOVERY_CANDIDATE_PAGES must be between 1 and 5")
         if not 1 <= self.discovery_fetch_limit <= 500:
             raise ValueError("DISCOVERY_FETCH_LIMIT must be between 1 and 500")
         if not 1 <= self.discovery_max_wallets <= 50:

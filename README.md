@@ -7,9 +7,10 @@ transactions, mirrors every newly detected hot-wallet swap in PAPER mode, and re
 results from quote-only Jupiter Swap V2 orders plus a conservative output buffer.
 
 Automatic discovery uses the authorized Solana Tracker PnL V2 API—not Fomo scraping. It
-refreshes a strict rolling 24-hour pool every 20 minutes, caches an independently filtered
-7-day pool on a quota-safe schedule, and intersects both windows. The resulting candidates
-must then show recent on-chain Pump activity before entering the 25-wallet hot set. A
+paginates five strict leaderboard pages per window, refreshes the 24-hour pool every three
+hours, caches an independently filtered 7-day pool for twelve hours, and intersects both
+windows. The resulting candidates must then show recent on-chain Pump activity before
+entering the 25-wallet hot set. A
 reconnecting Solana/Helius WebSocket reduces detection latency while one-minute polling stays
 enabled as a fallback.
 
@@ -107,7 +108,7 @@ sell can also show `SKIPPED` if its matching buy happened before raw mirroring w
 A new detected buy must occur first. Set `PAPER_MIRROR_RAW_SWAPS=false` to restore the older
 consensus-only paper behavior.
 
-The v2.9 quote, rotation, and exit guardrails are intentionally configurable:
+The v2.9.1 quote, rotation, and exit guardrails are intentionally configurable:
 
 ```text
 PAPER_REQUIRE_CURRENT_PRICE=true
@@ -138,7 +139,7 @@ settings. Use `/smartmoney paper`, `/smartmoney positions`, `/smartmoney paper-t
 
 ## Official PAPER readiness trial
 
-After deploying v2.9, run `/smartmoney paper-reset confirmation:RESET PAPER` once to begin a
+After deploying v2.9.1, run `/smartmoney paper-reset confirmation:RESET PAPER` once to begin a
 clean trial. `/smartmoney readiness` reports **KEEP TESTING** until all defaults pass:
 
 - 14 separate active test days;
@@ -178,7 +179,7 @@ The defaults require two qualified traders within five minutes. Set
 ## Local setup
 
 Requirements: Python 3.12+, a Discord bot token, a Solana RPC URL, and a Solana Tracker API
-key for automatic discovery. A Jupiter API key is required for v2.9 quote-shadow PAPER and
+key for automatic discovery. A Jupiter API key is required for v2.9.1 quote-shadow PAPER and
 live mode because the current Swap V2 order endpoints require it.
 
 ## Automatic wallet discovery
@@ -192,6 +193,7 @@ SOLANA_TRACKER_API_KEY=...
 AUTO_DISCOVERY_ENABLED=true
 DISCOVERY_REFRESH_SECONDS=1200
 DISCOVERY_7D_REFRESH_SECONDS=21600
+DISCOVERY_CANDIDATE_PAGES=5
 DISCOVERY_FETCH_LIMIT=100
 DISCOVERY_MAX_WALLETS=25
 DISCOVERY_MIN_24H_PNL_USD=100
@@ -216,9 +218,11 @@ REALTIME_WALLET_STREAM_ENABLED=true
 ```
 
 The bot calls Solana Tracker's documented `GET /v2/pnl/leaderboard/top` endpoint with
-`days=1` and `days=7`, strict PnL mode, arbitrage exclusion, and concentration filtering.
-The 7-day request is cached for six hours so the default 20-minute daily refresh remains
-inside a 2.5K monthly request budget. Every five minutes the cached intersection is checked
+`days=1` and `days=7`, strict PnL mode, arbitrage exclusion, concentration filtering, and
+cursor pagination. Five pages widen each source pool before intersection. To remain inside a
+2.5K monthly request budget, the runtime automatically clamps full multi-page refreshes to at
+least three hours for 24H data and twelve hours for 7D data, even if older Railway variables
+still contain `1200` and `21600`. Every five minutes the cached intersection is checked
 against recent on-chain swaps. Existing manually added wallets are never removed by automatic
 rotation.
 
@@ -390,7 +394,7 @@ support ticket, a screenshot, or chat. The default live base asset is Solana USD
   results worse.
 - Paper stops are evaluated after each scanner cycle. Fast markets can gap through a threshold,
   so an 8% configured stop does not guarantee an 8% maximum loss.
-- The v2.9 quote, rotation, raw-entry, and raw-lot guards are PAPER-only. Live mode remains
+- The v2.9.1 quote, rotation, raw-entry, and raw-lot guards are PAPER-only. Live mode remains
   the independent-wallet consensus spot strategy and is never enabled automatically by this
   upgrade.
 - A wallet can pass every historical filter and lose immediately afterward. “Verified” means

@@ -34,8 +34,13 @@ def test_discovery_requires_api_key(monkeypatch) -> None:
 
 def test_discovery_default_refresh_fits_free_monthly_quota(monkeypatch) -> None:
     monkeypatch.delenv("DISCOVERY_REFRESH_SECONDS", raising=False)
+    monkeypatch.delenv("DISCOVERY_7D_REFRESH_SECONDS", raising=False)
+    monkeypatch.delenv("DISCOVERY_CANDIDATE_PAGES", raising=False)
     settings = Settings.from_env(require_discord_token=False)
     assert settings.discovery_refresh_seconds == 1200
+    assert settings.discovery_candidate_pages == 5
+    assert settings.effective_discovery_refresh_seconds == 10800
+    assert settings.effective_discovery_7d_refresh_seconds == 43200
 
 
 def test_rpc_defaults_are_free_tier_friendly(monkeypatch) -> None:

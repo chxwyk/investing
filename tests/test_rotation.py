@@ -4,7 +4,6 @@ from dataclasses import replace
 from decimal import Decimal
 
 import pytest
-
 from smart_money_bot.models import DetectedSwap, DiscoveryCandidate, Side
 from smart_money_bot.rotation import (
     PUMP_PROGRAM_ID,

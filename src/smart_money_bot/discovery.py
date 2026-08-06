@@ -29,6 +29,7 @@ class DiscoveryPolicy:
     minimum_7d_roi_percent: Decimal = Decimal("5")
     minimum_7d_trades: int = 10
     maximum_7d_trades: int = 1000
+    candidate_pages: int = 1
 
     @classmethod
     def from_settings(cls, settings: Settings) -> DiscoveryPolicy:
@@ -47,6 +48,7 @@ class DiscoveryPolicy:
             minimum_7d_roi_percent=settings.discovery_min_7d_roi_percent,
             minimum_7d_trades=settings.discovery_min_7d_trades,
             maximum_7d_trades=settings.discovery_max_7d_trades,
+            candidate_pages=settings.discovery_candidate_pages,
         )
 
 
@@ -108,11 +110,11 @@ class SolanaTrackerClient:
 
     async def _leaderboard_payload(self, policy: DiscoveryPolicy, *, days: int) -> Any:
         weekly = days == 7
-        params = {
+        base_params = {
             "days": str(days),
             "sort": "realized",
             "direction": "desc",
-            "limit": str(policy.fetch_limit),
+            "limit": str(min(policy.fetch_limit, 100)),
             "excludeArbitrage": "true",
             "pnlMode": "strict",
             "minDays": "2" if weekly else "1",
@@ -131,7 +133,38 @@ class SolanaTrackerClient:
             "minClosedTokens": str(policy.minimum_closed_tokens),
             "maxSingleTokenPct": str(policy.maximum_single_token_percent),
         }
-        return await self._request("/v2/pnl/leaderboard/top", params=params)
+        traders: list[dict[str, Any]] = []
+        seen_wallets: set[str] = set()
+        cursor: str | None = None
+        pagination: dict[str, Any] = {}
+        for _ in range(policy.candidate_pages):
+            params = dict(base_params)
+            if cursor:
+                params["cursor"] = cursor
+            payload = await self._request("/v2/pnl/leaderboard/top", params=params)
+            if not isinstance(payload, dict) or not isinstance(
+                payload.get("traders"), list
+            ):
+                raise DiscoveryError(
+                    "Solana Tracker leaderboard response has an unexpected shape"
+                )
+            for row in payload["traders"]:
+                if not isinstance(row, dict):
+                    continue
+                wallet = str(row.get("wallet") or "")
+                if wallet and wallet not in seen_wallets:
+                    seen_wallets.add(wallet)
+                    traders.append(row)
+            pagination = (
+                payload.get("pagination")
+                if isinstance(payload.get("pagination"), dict)
+                else {}
+            )
+            next_cursor = pagination.get("nextCursor")
+            if not pagination.get("hasMore") or not isinstance(next_cursor, str):
+                break
+            cursor = next_cursor
+        return {"traders": traders, "pagination": pagination}
 
     async def _request(self, path: str, *, params: dict[str, str]) -> Any:
         session = await self._get_session()
@@ -278,7 +311,8 @@ def parse_window_candidates(
                 last_trade_ms=_optional_integer(timing.get("lastTrade")),
             )
         )
-    return candidates[: policy.fetch_limit]
+    source_pool_limit = min(policy.fetch_limit, 100) * policy.candidate_pages
+    return candidates[:source_pool_limit]
 
 
 def merge_verified_windows(
