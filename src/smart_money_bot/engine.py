@@ -241,9 +241,18 @@ class SmartMoneyEngine:
                 inserted = await self.database.record_swap(swap)
                 if inserted:
                     counts["swaps"] += 1
-                    if not is_bootstrap:
-                        await self.notifier.on_swap(swap, trader)
-                        await self._consider_signal(swap)
+                should_handle = inserted
+                if (
+                    not inserted
+                    and not is_bootstrap
+                    and self.settings.paper_mirror_raw_swaps
+                    and await self.execution_mode() is ExecutionMode.PAPER
+                ):
+                    should_handle = not await self.database.has_paper_mirror_execution(
+                        swap.signature
+                    )
+                if should_handle and not is_bootstrap:
+                    await self._handle_new_swap(swap, trader)
             await self.database.mark_processed(signature, trader.address, block_time)
 
         if not had_retryable_failure:
@@ -299,6 +308,54 @@ class SmartMoneyEngine:
         if signal is None:
             return
         await self._process_signal(signal)
+
+    async def _handle_new_swap(
+        self, swap: DetectedSwap, trader: TrackedTrader
+    ) -> None:
+        await self.notifier.on_swap(swap, trader)
+        mode = await self.execution_mode()
+        if mode is ExecutionMode.PAPER and self.settings.paper_mirror_raw_swaps:
+            await self._mirror_paper_swap(swap, trader)
+        else:
+            await self._consider_signal(swap)
+
+    async def _mirror_paper_swap(
+        self, swap: DetectedSwap, trader: TrackedTrader
+    ) -> None:
+        price = swap.token_price_usd
+        if price is None or price <= 0:
+            try:
+                price = await self.market.price(swap.token_mint)
+            except JupiterError:
+                price = None
+        size = min(self.settings.default_copy_usd, self.settings.max_copy_usd)
+        if price is None or price <= 0:
+            result = ExecutionResult(
+                success=False,
+                mode=ExecutionMode.PAPER,
+                token_mint=swap.token_mint,
+                side=swap.side,
+                size_usd=size,
+                message="Skipped: no reliable token price was available for the paper fill",
+            )
+            await self.database.log_execution(
+                signal_id=None,
+                mode=result.mode,
+                token_mint=result.token_mint,
+                side=result.side,
+                size_usd=result.size_usd,
+                success=result.success,
+                signature=None,
+                message=result.message,
+            )
+        else:
+            result = await self.executor.execute_paper_mirror(
+                swap=swap,
+                trader=trader,
+                market_price_usd=price,
+                size_usd=size,
+            )
+        await self.notifier.on_execution(result)
 
     async def _process_signal(
         self, signal: Signal, *, known_price: Decimal | None = None
@@ -496,12 +553,14 @@ class SmartMoneyEngine:
         return (await self.database.get_setting("paused", "false")) == "true"
 
     async def paper_summary(self) -> PaperSummary:
-        positions = await self.database.paper_positions()
-        mints = [
-            item["token_mint"]
-            for item in positions
-            if item["token_mint"] != PAPER_DEMO_MINT
-        ]
+        positions = await self.database.paper_all_positions()
+        mints = sorted(
+            {
+                item["token_mint"]
+                for item in positions
+                if item["token_mint"] != PAPER_DEMO_MINT
+            }
+        )
         try:
             prices = await self.market.prices(mints) if mints else {}
         except JupiterError:
@@ -527,4 +586,5 @@ class SmartMoneyEngine:
             "discovery_configured": self.settings.discovery_is_configured,
             "discovery_last_refresh": self.last_discovery_refresh_at,
             "discovered_wallets": len(await self.database.list_discovered(limit=50)),
+            "paper_mirror_raw_swaps": self.settings.paper_mirror_raw_swaps,
         }

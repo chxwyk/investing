@@ -74,6 +74,7 @@ class Settings:
     default_copy_usd: Decimal
     simulated_fee_bps: int
     simulated_slippage_bps: int
+    paper_mirror_raw_swaps: bool
 
     max_copy_usd: Decimal
     max_daily_loss_usd: Decimal
@@ -144,6 +145,7 @@ class Settings:
             default_copy_usd=_decimal("DEFAULT_COPY_USD", "10"),
             simulated_fee_bps=_int("SIMULATED_FEE_BPS", 60),
             simulated_slippage_bps=_int("SIMULATED_SLIPPAGE_BPS", 100),
+            paper_mirror_raw_swaps=_bool("PAPER_MIRROR_RAW_SWAPS", True),
             max_copy_usd=_decimal("MAX_COPY_USD", "25"),
             max_daily_loss_usd=_decimal("MAX_DAILY_LOSS_USD", "30"),
             max_open_positions=_int("MAX_OPEN_POSITIONS", 6),

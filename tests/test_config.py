@@ -58,3 +58,13 @@ def test_fomo_referral_defaults_to_shared_code(monkeypatch) -> None:
     monkeypatch.setenv("FOMO_REFERRAL_CODE", "")
     without_referral = Settings.from_env(require_discord_token=False)
     assert without_referral.fomo_referral_code is None
+
+
+def test_raw_paper_mirroring_defaults_on_and_can_be_disabled(monkeypatch) -> None:
+    monkeypatch.delenv("PAPER_MIRROR_RAW_SWAPS", raising=False)
+    settings = Settings.from_env(require_discord_token=False)
+    assert settings.paper_mirror_raw_swaps is True
+
+    monkeypatch.setenv("PAPER_MIRROR_RAW_SWAPS", "false")
+    disabled = Settings.from_env(require_discord_token=False)
+    assert disabled.paper_mirror_raw_swaps is False

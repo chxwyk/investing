@@ -9,11 +9,13 @@ from .database import Database
 from .errors import JupiterError
 from .market import JupiterClient, load_keypair
 from .models import (
+    DetectedSwap,
     ExecutionMode,
     ExecutionResult,
     Side,
     Signal,
     TokenInfo,
+    TrackedTrader,
 )
 
 
@@ -97,6 +99,72 @@ class ExecutionManager:
         await self._log(signal_id, result)
         return result
 
+    async def execute_paper_mirror(
+        self,
+        *,
+        swap: DetectedSwap,
+        trader: TrackedTrader,
+        market_price_usd: Decimal,
+        size_usd: Decimal,
+    ) -> ExecutionResult:
+        fill = await self.database.paper_mirror_execute(
+            trader_address=trader.address,
+            source_signature=swap.signature,
+            token_mint=swap.token_mint,
+            side=swap.side,
+            source_token_amount=swap.token_amount,
+            market_price_usd=market_price_usd,
+            size_usd=size_usd,
+            fee_bps=self.settings.simulated_fee_bps,
+            slippage_bps=self.settings.simulated_slippage_bps,
+        )
+        if fill is None:
+            message = (
+                "No paper cash available to mirror this tracked-wallet buy"
+                if swap.side is Side.BUY
+                else (
+                    "Skipped: no matching paper buy exists for this tracked wallet. "
+                    "Only buys detected after raw mirroring is deployed can be sold."
+                )
+            )
+            result = ExecutionResult(
+                success=False,
+                mode=ExecutionMode.PAPER,
+                token_mint=swap.token_mint,
+                side=swap.side,
+                size_usd=size_usd,
+                message=message,
+            )
+        elif swap.side is Side.BUY:
+            result = ExecutionResult(
+                success=True,
+                mode=ExecutionMode.PAPER,
+                token_mint=swap.token_mint,
+                side=swap.side,
+                size_usd=size_usd,
+                message=(
+                    f"Raw mirror of {trader.alias}: bought {fill['quantity']:.6f} paper "
+                    f"tokens at ${fill['price']:.8f}; fee ${fill['fee']:.4f}. "
+                    "This fake lot is linked to that source wallet."
+                ),
+            )
+        else:
+            sold_percent = fill["source_fraction"] * Decimal("100")
+            result = ExecutionResult(
+                success=True,
+                mode=ExecutionMode.PAPER,
+                token_mint=swap.token_mint,
+                side=swap.side,
+                size_usd=size_usd,
+                message=(
+                    f"Raw mirror of {trader.alias}: sold {sold_percent:.1f}% of that "
+                    f"wallet's linked paper lot at ${fill['price']:.8f}; fee "
+                    f"${fill['fee']:.4f}; realized P&L ${fill['realized_pnl']:.2f}."
+                ),
+            )
+        await self._log(None, result)
+        return result
+
     async def _execute_live(
         self,
         *,
@@ -175,7 +243,7 @@ class ExecutionManager:
                 message=str(exc),
             )
 
-    async def _log(self, signal_id: int, result: ExecutionResult) -> None:
+    async def _log(self, signal_id: int | None, result: ExecutionResult) -> None:
         await self.database.log_execution(
             signal_id=signal_id,
             mode=result.mode,

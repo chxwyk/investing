@@ -165,6 +165,20 @@ class Database:
                 updated_at INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS paper_mirror_positions (
+                trader_address TEXT NOT NULL,
+                token_mint TEXT NOT NULL,
+                source_quantity REAL NOT NULL,
+                paper_quantity REAL NOT NULL,
+                cost_basis_usd REAL NOT NULL,
+                average_entry_usd REAL NOT NULL,
+                opened_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (trader_address, token_mint)
+            );
+            CREATE INDEX IF NOT EXISTS idx_paper_mirror_token
+                ON paper_mirror_positions(token_mint);
+
             CREATE TABLE IF NOT EXISTS paper_trades (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 signal_id INTEGER,
@@ -175,6 +189,9 @@ class Database:
                 gross_value_usd REAL NOT NULL,
                 fee_usd REAL NOT NULL,
                 realized_pnl_usd REAL NOT NULL DEFAULT 0,
+                source_trader TEXT,
+                source_signature TEXT,
+                execution_kind TEXT NOT NULL DEFAULT 'CONSENSUS',
                 created_at INTEGER NOT NULL,
                 FOREIGN KEY (signal_id) REFERENCES signals(id)
             );
@@ -210,6 +227,17 @@ class Database:
         )
         await self._ensure_column(
             "tracked_traders", "source", "TEXT NOT NULL DEFAULT 'manual'"
+        )
+        await self._ensure_column("paper_trades", "source_trader", "TEXT")
+        await self._ensure_column("paper_trades", "source_signature", "TEXT")
+        await self._ensure_column(
+            "paper_trades", "execution_kind", "TEXT NOT NULL DEFAULT 'CONSENSUS'"
+        )
+        await self.db.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_trades_source_signature
+            ON paper_trades(source_signature) WHERE source_signature IS NOT NULL
+            """
         )
         now = int(time.time())
         await self.db.execute(
@@ -847,16 +875,261 @@ class Database:
                 await self.db.rollback()
                 raise
 
+    async def paper_mirror_execute(
+        self,
+        *,
+        trader_address: str,
+        source_signature: str,
+        token_mint: str,
+        side: Side,
+        source_token_amount: Decimal,
+        market_price_usd: Decimal,
+        size_usd: Decimal,
+        fee_bps: int,
+        slippage_bps: int,
+    ) -> dict[str, Decimal] | None:
+        """Mirror one source wallet while keeping each wallet's paper lot separate."""
+
+        if source_token_amount <= 0 or market_price_usd <= 0:
+            return None
+        fee_rate = Decimal(fee_bps) / Decimal(10_000)
+        slip_rate = Decimal(slippage_bps) / Decimal(10_000)
+        now = int(time.time())
+        async with self._write_lock:
+            await self.db.execute("BEGIN IMMEDIATE")
+            try:
+                duplicate_cursor = await self.db.execute(
+                    "SELECT 1 FROM paper_trades WHERE source_signature = ?",
+                    (source_signature,),
+                )
+                if await duplicate_cursor.fetchone():
+                    await self.db.rollback()
+                    return None
+                account_cursor = await self.db.execute(
+                    "SELECT * FROM paper_account WHERE id = 1"
+                )
+                account = await account_cursor.fetchone()
+                cash = _d(account["cash_usd"])
+                realized_total = _d(account["realized_pnl_usd"])
+                position_cursor = await self.db.execute(
+                    """
+                    SELECT * FROM paper_mirror_positions
+                    WHERE trader_address = ? AND token_mint = ?
+                    """,
+                    (trader_address, token_mint),
+                )
+                position = await position_cursor.fetchone()
+
+                if side is Side.BUY:
+                    notional = min(size_usd, cash)
+                    if notional <= Decimal("0.01"):
+                        await self.db.rollback()
+                        return None
+                    fee = notional * fee_rate
+                    effective_price = market_price_usd * (Decimal("1") + slip_rate)
+                    paper_quantity = (notional - fee) / effective_price
+                    old_source_quantity = (
+                        _d(position["source_quantity"]) if position else Decimal("0")
+                    )
+                    old_paper_quantity = (
+                        _d(position["paper_quantity"]) if position else Decimal("0")
+                    )
+                    old_cost = _d(position["cost_basis_usd"]) if position else Decimal("0")
+                    new_source_quantity = old_source_quantity + source_token_amount
+                    new_paper_quantity = old_paper_quantity + paper_quantity
+                    new_cost = old_cost + notional
+                    average_entry = new_cost / new_paper_quantity
+                    await self.db.execute(
+                        """
+                        INSERT INTO paper_mirror_positions(
+                            trader_address, token_mint, source_quantity, paper_quantity,
+                            cost_basis_usd, average_entry_usd, opened_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(trader_address, token_mint) DO UPDATE SET
+                            source_quantity = excluded.source_quantity,
+                            paper_quantity = excluded.paper_quantity,
+                            cost_basis_usd = excluded.cost_basis_usd,
+                            average_entry_usd = excluded.average_entry_usd,
+                            updated_at = excluded.updated_at
+                        """,
+                        (
+                            trader_address,
+                            token_mint,
+                            float(new_source_quantity),
+                            float(new_paper_quantity),
+                            float(new_cost),
+                            float(average_entry),
+                            now,
+                            now,
+                        ),
+                    )
+                    cash -= notional
+                    gross = notional
+                    realized = Decimal("0")
+                    source_fraction = Decimal("1")
+                    remaining_quantity = new_paper_quantity
+                    remaining_cost = new_cost
+                else:
+                    if not position:
+                        await self.db.rollback()
+                        return None
+                    observed_source_quantity = _d(position["source_quantity"])
+                    held_paper_quantity = _d(position["paper_quantity"])
+                    held_cost = _d(position["cost_basis_usd"])
+                    if observed_source_quantity <= 0 or held_paper_quantity <= 0:
+                        await self.db.rollback()
+                        return None
+                    source_fraction = min(
+                        Decimal("1"), source_token_amount / observed_source_quantity
+                    )
+                    paper_quantity = held_paper_quantity * source_fraction
+                    matched_cost = held_cost * source_fraction
+                    effective_price = market_price_usd * (Decimal("1") - slip_rate)
+                    gross = paper_quantity * effective_price
+                    fee = gross * fee_rate
+                    net = gross - fee
+                    realized = net - matched_cost
+                    cash += net
+                    realized_total += realized
+                    remaining_source_quantity = (
+                        observed_source_quantity
+                        - min(source_token_amount, observed_source_quantity)
+                    )
+                    remaining_quantity = held_paper_quantity - paper_quantity
+                    remaining_cost = held_cost - matched_cost
+                    if (
+                        remaining_source_quantity <= Decimal("0.000000001")
+                        or remaining_quantity <= Decimal("0.000000001")
+                    ):
+                        await self.db.execute(
+                            """
+                            DELETE FROM paper_mirror_positions
+                            WHERE trader_address = ? AND token_mint = ?
+                            """,
+                            (trader_address, token_mint),
+                        )
+                        remaining_quantity = Decimal("0")
+                        remaining_cost = Decimal("0")
+                    else:
+                        average_entry = remaining_cost / remaining_quantity
+                        await self.db.execute(
+                            """
+                            UPDATE paper_mirror_positions SET
+                                source_quantity = ?, paper_quantity = ?,
+                                cost_basis_usd = ?, average_entry_usd = ?, updated_at = ?
+                            WHERE trader_address = ? AND token_mint = ?
+                            """,
+                            (
+                                float(remaining_source_quantity),
+                                float(remaining_quantity),
+                                float(remaining_cost),
+                                float(average_entry),
+                                now,
+                                trader_address,
+                                token_mint,
+                            ),
+                        )
+
+                await self.db.execute(
+                    """
+                    UPDATE paper_account
+                    SET cash_usd = ?, realized_pnl_usd = ?, updated_at = ?
+                    WHERE id = 1
+                    """,
+                    (float(cash), float(realized_total), now),
+                )
+                await self.db.execute(
+                    """
+                    INSERT INTO paper_trades(
+                        signal_id, token_mint, side, quantity, execution_price_usd,
+                        gross_value_usd, fee_usd, realized_pnl_usd, source_trader,
+                        source_signature, execution_kind, created_at
+                    ) VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'RAW_MIRROR', ?)
+                    """,
+                    (
+                        token_mint,
+                        side.value,
+                        float(paper_quantity),
+                        float(effective_price),
+                        float(gross),
+                        float(fee),
+                        float(realized),
+                        trader_address,
+                        source_signature,
+                        now,
+                    ),
+                )
+                await self.db.commit()
+                return {
+                    "quantity": paper_quantity,
+                    "price": effective_price,
+                    "gross": gross,
+                    "fee": fee,
+                    "realized_pnl": realized,
+                    "source_fraction": source_fraction,
+                    "remaining_quantity": remaining_quantity,
+                    "remaining_cost_basis": remaining_cost,
+                }
+            except Exception:
+                await self.db.rollback()
+                raise
+
+    async def has_paper_mirror_execution(self, source_signature: str) -> bool:
+        cursor = await self.db.execute(
+            "SELECT 1 FROM paper_trades WHERE source_signature = ?",
+            (source_signature,),
+        )
+        return await cursor.fetchone() is not None
+
     async def paper_positions(self) -> list[dict[str, Any]]:
         cursor = await self.db.execute(
             "SELECT * FROM paper_positions ORDER BY opened_at"
         )
         return [dict(row) for row in await cursor.fetchall()]
 
+    async def paper_mirror_positions(self) -> list[dict[str, Any]]:
+        cursor = await self.db.execute(
+            "SELECT * FROM paper_mirror_positions ORDER BY opened_at"
+        )
+        return [dict(row) for row in await cursor.fetchall()]
+
+    async def paper_all_positions(self) -> list[dict[str, Any]]:
+        standard = await self.paper_positions()
+        mirror = await self.paper_mirror_positions()
+        combined = [
+            {
+                **item,
+                "position_kind": "STRATEGY",
+                "source_trader": None,
+            }
+            for item in standard
+        ]
+        combined.extend(
+            {
+                "token_mint": item["token_mint"],
+                "quantity": item["paper_quantity"],
+                "cost_basis_usd": item["cost_basis_usd"],
+                "average_entry_usd": item["average_entry_usd"],
+                "opened_at": item["opened_at"],
+                "updated_at": item["updated_at"],
+                "position_kind": "RAW_MIRROR",
+                "source_trader": item["trader_address"],
+                "source_quantity": item["source_quantity"],
+            }
+            for item in mirror
+        )
+        return sorted(combined, key=lambda item: int(item["opened_at"]))
+
     async def paper_position_count(self) -> int:
-        cursor = await self.db.execute("SELECT COUNT(*) AS count FROM paper_positions")
-        row = await cursor.fetchone()
-        return int(row["count"])
+        standard_cursor = await self.db.execute(
+            "SELECT COUNT(*) AS count FROM paper_positions"
+        )
+        mirror_cursor = await self.db.execute(
+            "SELECT COUNT(*) AS count FROM paper_mirror_positions"
+        )
+        standard = await standard_cursor.fetchone()
+        mirror = await mirror_cursor.fetchone()
+        return int(standard["count"]) + int(mirror["count"])
 
     async def paper_daily_realized_pnl(self) -> Decimal:
         cursor = await self.db.execute(
@@ -872,7 +1145,7 @@ class Database:
     async def paper_summary(self, prices: dict[str, Decimal]) -> PaperSummary:
         account_cursor = await self.db.execute("SELECT * FROM paper_account WHERE id = 1")
         account = await account_cursor.fetchone()
-        positions = await self.paper_positions()
+        positions = await self.paper_all_positions()
         positions_value = Decimal("0")
         cost_basis = Decimal("0")
         for position in positions:
@@ -928,6 +1201,7 @@ class Database:
         now = int(time.time())
         async with self._write_lock:
             await self.db.execute("DELETE FROM paper_positions")
+            await self.db.execute("DELETE FROM paper_mirror_positions")
             await self.db.execute("DELETE FROM paper_trades")
             await self.db.execute(
                 """
@@ -1000,7 +1274,7 @@ class Database:
     async def log_execution(
         self,
         *,
-        signal_id: int,
+        signal_id: int | None,
         mode: ExecutionMode,
         token_mint: str,
         side: Side,

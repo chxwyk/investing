@@ -228,7 +228,17 @@ class SmartMoneyBot(commands.Bot):
             value=f"[View on Solscan](https://solscan.io/tx/{swap.signature})",
             inline=False,
         )
-        embed.set_footer(text="RAW activity • verify the mint • wait for consensus/risk result")
+        mirrors_immediately = (
+            self.settings.paper_mirror_raw_swaps
+            and await self.engine.execution_mode() is ExecutionMode.PAPER
+        )
+        embed.set_footer(
+            text=(
+                "RAW activity • an automatic fake-money mirror fill follows this alert"
+                if mirrors_immediately
+                else "RAW activity • verify the mint • wait for consensus/risk result"
+            )
+        )
         await self._send_alert(
             embed,
             token_mint=swap.token_mint,
@@ -540,15 +550,21 @@ class SmartMoneyCommands(
 
     @app_commands.command(name="positions", description="Show open paper positions.")
     async def positions(self, interaction: discord.Interaction) -> None:
-        positions = await self.bot.engine.database.paper_positions()
+        positions = await self.bot.engine.database.paper_all_positions()
         if not positions:
             await interaction.response.send_message("No open paper positions.")
             return
-        real_mints = [
-            str(item["token_mint"])
-            for item in positions
-            if str(item["token_mint"]) != PAPER_DEMO_MINT
-        ]
+        traders = {
+            trader.address: trader.alias
+            for trader in await self.bot.engine.database.list_traders()
+        }
+        real_mints = sorted(
+            {
+                str(item["token_mint"])
+                for item in positions
+                if str(item["token_mint"]) != PAPER_DEMO_MINT
+            }
+        )
         try:
             prices = await self.bot.engine.market.prices(real_mints) if real_mints else {}
         except JupiterError:
@@ -563,7 +579,13 @@ class SmartMoneyCommands(
             value = quantity * price
             pnl = value - cost
             roi = _return_percent(value, cost)
-            label = "Paper Demo (fake token)" if mint == PAPER_DEMO_MINT else _short(mint)
+            if mint == PAPER_DEMO_MINT:
+                label = "Paper Demo (fake token)"
+            elif item.get("position_kind") == "RAW_MIRROR":
+                source = str(item.get("source_trader") or "unknown")
+                label = f"Raw mirror • {traders.get(source, _short(source))} • {_short(mint)}"
+            else:
+                label = _short(mint)
             lines.append(
                 f"• **{label}** — qty `{quantity:.6f}` • value `{_money(value)}`\n"
                 f"  cost `{_money(cost)}` • P&L `{_money(pnl)}` • ROI `{roi:+.2f}%`"
@@ -764,12 +786,18 @@ class SmartMoneyCommands(
             if status["discovery_last_refresh"]
             else "not completed yet"
         )
+        paper_copy = (
+            "every new tracked-wallet BUY/SELL"
+            if status["paper_mirror_raw_swaps"]
+            else "consensus signals only"
+        )
         text = (
             f"**Bot version:** {BOT_VERSION}\n"
             f"**RPC:** {status['rpc']}\n"
             f"**RPC throttle:** {self.bot.settings.rpc_requests_per_second}/second • "
             f"{self.bot.settings.rpc_max_retries} retries\n"
             f"**Mode:** {status['mode']}\n"
+            f"**Paper auto-copy:** {paper_copy}\n"
             f"**Raw-buy pings:** "
             f"{'ready' if self.bot.settings.discord_alert_user_id else 'user ID not set'}\n"
             f"**Paused:** {status['paused']}\n"
@@ -786,7 +814,13 @@ class SmartMoneyCommands(
     @app_commands.command(name="limits", description="Show the active strategy and risk limits.")
     async def limits(self, interaction: discord.Interaction) -> None:
         s = self.bot.settings
+        paper_copy = (
+            "every new raw tracked-wallet swap"
+            if s.paper_mirror_raw_swaps
+            else "consensus only"
+        )
         text = (
+            f"**Paper auto-copy:** {paper_copy}\n"
             f"**Consensus:** {s.consensus_min_traders} traders within "
             f"{s.consensus_window_seconds}s\n"
             f"**Minimum trader score:** {s.min_trader_score}/100\n"
@@ -801,7 +835,9 @@ class SmartMoneyCommands(
             f"**Minimum liquidity:** {_money(s.min_token_liquidity_usd)}\n"
             f"**Max positions:** {s.max_open_positions}\n"
             f"**Signal max age:** {s.max_signal_age_seconds}s\n"
-            f"**Stop loss / take profit:** {s.stop_loss_percent}% / {s.take_profit_percent}%\n"
+            f"**Raw-mirror exits:** follow each source wallet's sells proportionally\n"
+            f"**Consensus/live stop / take profit:** "
+            f"{s.stop_loss_percent}% / {s.take_profit_percent}%\n"
             f"**Maximum hold:** {s.max_hold_seconds // 3600}h"
         )
         await interaction.response.send_message(text, ephemeral=True)
@@ -814,8 +850,8 @@ class SmartMoneyCommands(
             "3. `/smartmoney discover` — refresh the 24-hour profitable-wallet feed\n"
             "4. `/smartmoney scan` — run an immediate on-chain scan\n"
             "5. `/smartmoney leaderboard` — inspect risk-adjusted rankings\n"
-            "6. Keep `/smartmoney mode paper` while proving the strategy\n"
-            "7. `/smartmoney paper` — compare net P&L and drawdown\n"
+            "6. Keep `/smartmoney mode paper` to auto-mirror every new tracked-wallet swap\n"
+            "7. `/smartmoney positions` and `/smartmoney paper` — inspect fills and ROI\n"
             "Manual `trader-add` and CSV import remain optional overrides."
         )
         await interaction.response.send_message(text, ephemeral=True)

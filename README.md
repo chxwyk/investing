@@ -2,8 +2,8 @@
 
 A Railway-ready Discord bot that **automatically discovers profitable public Solana
 wallets**, reconstructs their swaps from confirmed on-chain transactions, ranks their recent
-performance, produces multi-wallet consensus signals, and records copy results after
-simulated fees and slippage.
+performance, mirrors every newly detected tracked-wallet swap in PAPER mode, and records
+copy results after simulated fees and slippage.
 
 Automatic discovery uses the authorized Solana Tracker PnL V2 API—not Fomo scraping. It
 refreshes a strict rolling 24-hour leaderboard every 20 minutes, rotates the watchlist, and
@@ -28,14 +28,18 @@ unless four separate controls are deliberately configured.
 - Maintains an average-cost inventory for each tracked wallet.
 - Calculates realized P&L, realized ROI, win rate, trade count, volume, and maximum drawdown.
 - Scores traders on repeatability, ROI, 24-hour/7-day consistency, activity, and drawdown.
-- Requires independent-wallet consensus inside a configurable time window.
-- Posts raw wallet activity, consensus signals, risk results, and fills to Discord.
+- In PAPER mode, immediately copies every newly detected tracked-wallet buy with fake money.
+- Keeps a separate fake lot for each source wallet and mirrors its partial/full sells
+  proportionally.
+- Uses independent-wallet consensus and risk gates for alert/live strategy execution.
+- Posts raw wallet activity and the matching paper fills to Discord.
 - Adds one-tap Fomo, Pump.fun, Jupiter, DexScreener, and Solscan buttons to every token alert.
 - Can mention one Discord user on every newly detected raw buy.
 - Blocks suspicious, low-liquidity, concentrated, mintable, or freezable tokens when the
   required Jupiter safety metadata is available.
-- Paper-trades buys and exits with configurable fee/slippage assumptions.
-- Enforces configurable stop-loss, take-profit, and maximum-hold exits.
+- Paper-mirrors raw wallet buys and sells with configurable fee/slippage assumptions.
+- Enforces configurable stop-loss, take-profit, and maximum-hold exits on consensus/live
+  positions; raw-mirror paper lots follow the source wallet's sell activity instead.
 - Tracks equity, realized/unrealized P&L, win rate, and maximum drawdown.
 - Optionally executes personal-wallet **spot** swaps through Jupiter Swap API V2.
 
@@ -50,7 +54,20 @@ unless four separate controls are deliberately configured.
 - It does not trade perpetual futures, borrow funds, or use leverage.
 - It never asks for a seed phrase in Discord or chat.
 
-## Strategy
+## Paper raw-mirror strategy
+
+`PAPER_MIRROR_RAW_SWAPS=true` is the default. After a wallet's initial bootstrap finishes,
+every new raw BUY alert immediately spends `DEFAULT_COPY_USD` from the fake bankroll. The
+next raw SELL from that same wallet sells the matching fake lot. If the source sells only
+part of its observed token balance, the bot sells the same percentage of that wallet's
+paper lot. Different wallets remain separate even when they trade the same token.
+
+Bootstrap history is recorded for scoring but is not purchased retroactively. Therefore a
+sell can correctly show `SKIPPED` if its matching buy happened before raw mirroring was
+deployed. A new detected buy must occur first. Set `PAPER_MIRROR_RAW_SWAPS=false` to restore
+the older consensus-only paper behavior.
+
+## Consensus and live strategy
 
 The raw 24-hour profit leaderboard is not the signal. A single lucky token can put a risky
 wallet at the top. This bot uses a risk-adjusted pipeline:
@@ -61,11 +78,11 @@ wallet at the top. This bot uses a risk-adjusted pipeline:
 4. Reconstruct inventory and realized results in chronological order.
 5. Blend the provider's strict 24-hour score with locally reconstructed performance.
 6. Ignore wallets below `MIN_TRADER_SCORE`.
-7. Require `CONSENSUS_MIN_TRADERS` unique wallets to buy the same mint within
-   `CONSENSUS_WINDOW_SECONDS`; a qualified sell can trigger an exit so positions do not
-   remain stuck waiting for full sell consensus.
+7. For consensus/live execution, require `CONSENSUS_MIN_TRADERS` unique wallets to buy the
+   same mint within `CONSENSUS_WINDOW_SECONDS`; a qualified sell can trigger an exit so
+   positions do not remain stuck waiting for full sell consensus.
 8. Reject stale signals and unsafe token conditions.
-9. Record a paper fill including configured fees and slippage.
+9. Record the resulting fill including configured fees and slippage.
 
 The defaults require two qualified traders within five minutes. Set
 `CONSENSUS_MIN_TRADERS=3` for a strict three-wallet strategy.
