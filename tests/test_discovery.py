@@ -1,6 +1,11 @@
 from decimal import Decimal
 
-from smart_money_bot.discovery import DiscoveryPolicy, parse_candidates
+from smart_money_bot.discovery import (
+    DiscoveryPolicy,
+    merge_verified_windows,
+    parse_candidates,
+    parse_window_candidates,
+)
 
 WALLET_ONE = "HkFGQsW8mr8DTC2AE2WcC7MzwSnynfEryGMQSht271nf"
 WALLET_TWO = "ApAKzJEqfnP7F74Za5xdTQxZMK4nD8dFTVBQ9bksTtGM"
@@ -63,3 +68,25 @@ def test_parse_candidates_rejects_hyperactive_bot_like_wallet() -> None:
     payload = {"traders": [row(WALLET_ONE, trades=5000)]}
 
     assert parse_candidates(payload, policy()) == []
+
+
+def test_merge_verified_windows_requires_profit_in_both_periods() -> None:
+    daily = parse_window_candidates(
+        {"traders": [row(WALLET_ONE), row(WALLET_TWO)]}, policy(), days=1
+    )
+    weekly = parse_window_candidates(
+        {
+            "traders": [
+                row(WALLET_ONE, pnl=2000, roi=35, win_rate=72, trades=80),
+            ]
+        },
+        policy(),
+        days=7,
+    )
+
+    merged = merge_verified_windows(daily, weekly, policy())
+
+    assert [candidate.address for candidate in merged] == [WALLET_ONE]
+    assert merged[0].realized_pnl_7d == Decimal("2000")
+    assert merged[0].roi_7d_percent == Decimal("35")
+    assert "24H + 7D" in merged[0].selection_reason

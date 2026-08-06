@@ -4,7 +4,6 @@ import asyncio
 import logging
 import time
 from contextlib import suppress
-from dataclasses import replace
 from decimal import Decimal
 from typing import Protocol
 
@@ -12,7 +11,12 @@ from .config import Settings
 from .constants import PAPER_DEMO_ENTRY_PRICE_USD, PAPER_DEMO_MINT
 from .database import Database
 from .detector import SwapDetector
-from .discovery import DiscoveryPolicy, SolanaTrackerClient
+from .discovery import (
+    DiscoveryPolicy,
+    SolanaTrackerClient,
+    WindowCandidate,
+    merge_verified_windows,
+)
 from .errors import DiscoveryError, JupiterError, RpcError
 from .executor import ExecutionManager
 from .market import JupiterClient
@@ -32,9 +36,11 @@ from .models import (
     TraderMetrics,
 )
 from .risk import RiskEngine
+from .rotation import CandidateRotator
 from .rpc import SolanaRPC
 from .scoring import rank_traders
 from .strategy import ConsensusStrategy
+from .stream import RealtimeWalletStream, StreamEvent
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +96,13 @@ class SmartMoneyEngine:
         )
         self.discovery_policy = DiscoveryPolicy.from_settings(settings)
         self.detector = SwapDetector(self.market, settings.min_source_trade_usd)
+        self.rotator = CandidateRotator(settings, self.rpc, self.detector)
+        self.stream = RealtimeWalletStream(
+            self.database,
+            rpc_url=settings.solana_rpc_url,
+            explicit_ws_url=settings.solana_ws_url,
+            enabled=settings.realtime_wallet_stream_enabled,
+        )
         self.strategy = ConsensusStrategy(
             self.database,
             minimum_traders=settings.consensus_min_traders,
@@ -100,13 +113,20 @@ class SmartMoneyEngine:
         self.risk = RiskEngine(settings, self.database)
         self.executor = ExecutionManager(settings, self.database, self.market)
         self._task: asyncio.Task[None] | None = None
+        self._stream_task: asyncio.Task[None] | None = None
+        self._stream_consumer_task: asyncio.Task[None] | None = None
         self._scan_lock = asyncio.Lock()
         self._discovery_lock = asyncio.Lock()
+        self._processing_signatures: set[str] = set()
         self._initialized = False
         self.last_scan_started_at: int | None = None
         self.last_scan_finished_at: int | None = None
         self.last_error: str | None = None
         self.last_discovery_refresh_at: int | None = None
+        self.last_weekly_refresh_at: int | None = None
+        self.last_rotation_at: int | None = None
+        self._weekly_pool: list[WindowCandidate] = []
+        self._candidate_pool = []
 
     async def initialize(self) -> None:
         if self._initialized:
@@ -118,6 +138,10 @@ class SmartMoneyEngine:
             )
         raw_refresh = await self.database.get_setting("discovery_last_refresh")
         self.last_discovery_refresh_at = int(raw_refresh) if raw_refresh else None
+        raw_weekly = await self.database.get_setting("discovery_7d_last_refresh")
+        self.last_weekly_refresh_at = int(raw_weekly) if raw_weekly else None
+        raw_rotation = await self.database.get_setting("rotation_last_refresh")
+        self.last_rotation_at = int(raw_rotation) if raw_rotation else None
         self._initialized = True
 
     async def start(self) -> None:
@@ -125,6 +149,13 @@ class SmartMoneyEngine:
         if self._task and not self._task.done():
             return
         self._task = asyncio.create_task(self._run_loop(), name="smart-money-monitor")
+        if self.stream.enabled:
+            self._stream_task = asyncio.create_task(
+                self.stream.run(), name="smart-money-wallet-stream"
+            )
+            self._stream_consumer_task = asyncio.create_task(
+                self._consume_stream_events(), name="smart-money-stream-consumer"
+            )
 
     async def close(self) -> None:
         if self._task:
@@ -132,6 +163,16 @@ class SmartMoneyEngine:
             with suppress(asyncio.CancelledError):
                 await self._task
             self._task = None
+        for task in (self._stream_task, self._stream_consumer_task):
+            if task:
+                task.cancel()
+        for task in (self._stream_task, self._stream_consumer_task):
+            if task:
+                with suppress(asyncio.CancelledError):
+                    await task
+        self._stream_task = None
+        self._stream_consumer_task = None
+        await self.stream.close()
         await self.rpc.close()
         await self.market.close()
         if self.discovery:
@@ -148,6 +189,11 @@ class SmartMoneyEngine:
                     except DiscoveryError as exc:
                         self.last_error = f"Discovery: {exc}"
                         await self.notifier.on_error("Refreshing wallet discovery", exc)
+                    try:
+                        await self.rotate_wallets()
+                    except DiscoveryError as exc:
+                        self.last_error = f"Rotation: {exc}"
+                        await self.notifier.on_error("Rotating hot wallets", exc)
                     await self.scan_once()
             except asyncio.CancelledError:
                 raise
@@ -165,24 +211,117 @@ class SmartMoneyEngine:
         now = int(time.time())
         if (
             not force
+            and self._candidate_pool
             and self.last_discovery_refresh_at is not None
             and now - self.last_discovery_refresh_at < self.settings.discovery_refresh_seconds
         ):
             return None
 
         async with self._discovery_lock:
-            candidates = await self.discovery.top_24h(self.discovery_policy)
+            refresh_weekly = (
+                force
+                or not self._weekly_pool
+                or self.last_weekly_refresh_at is None
+                or now - self.last_weekly_refresh_at
+                >= self.settings.discovery_7d_refresh_seconds
+            )
+            if refresh_weekly:
+                self._weekly_pool = await self.discovery.weekly_pool(
+                    self.discovery_policy
+                )
+                if not self._weekly_pool:
+                    raise DiscoveryError(
+                        "The strict 7-day feed returned no qualifying wallets; "
+                        "the existing hot set was preserved"
+                    )
+                self.last_weekly_refresh_at = int(time.time())
+                await self.database.set_setting(
+                    "discovery_7d_last_refresh", str(self.last_weekly_refresh_at)
+                )
+
+            daily_pool = await self.discovery.daily_pool(self.discovery_policy)
+            candidates = merge_verified_windows(
+                daily_pool, self._weekly_pool, self.discovery_policy
+            )
             if not candidates:
                 raise DiscoveryError(
-                    "The 24-hour feed returned no wallets matching the configured filters; "
-                    "the existing watchlist was preserved"
+                    "No wallets were independently profitable in both strict 24-hour "
+                    "and 7-day feeds; the existing hot set was preserved"
                 )
-            refresh = await self.database.apply_discovery(candidates)
-            self.last_discovery_refresh_at = refresh.refreshed_at
+            self._candidate_pool = candidates
+            self.last_discovery_refresh_at = int(time.time())
+            await self.database.set_setting(
+                "discovery_last_refresh", str(self.last_discovery_refresh_at)
+            )
             self.last_error = None
-            if refresh.added_wallets or refresh.disabled_wallets:
-                await self.notifier.on_discovery(refresh)
-            return refresh
+        return await self.rotate_wallets(force=True)
+
+    async def rotate_wallets(self, *, force: bool = False) -> DiscoveryRefresh | None:
+        if not self._candidate_pool:
+            return None
+        now = int(time.time())
+        if (
+            not force
+            and self.last_rotation_at is not None
+            and now - self.last_rotation_at < self.settings.rotation_refresh_seconds
+        ):
+            return None
+        result = await self.rotator.evaluate(self._candidate_pool, now=now)
+        if not result.selected:
+            raise DiscoveryError(
+                "No dual-window profitable wallets passed the recent Pump activity checks; "
+                "the existing hot set was preserved"
+            )
+        refresh = await self.database.apply_discovery(
+            list(result.selected),
+            evaluated_candidates=list(result.evaluated),
+            removal_reasons=result.rejection_reasons,
+            candidate_pool_size=result.pool_size,
+            verified_pump_wallets=result.verified_pump_wallets,
+        )
+        self.last_rotation_at = refresh.refreshed_at
+        self.last_error = None
+        if refresh.added_wallets or refresh.disabled_wallets:
+            await self.notifier.on_discovery(refresh)
+        return refresh
+
+    async def _consume_stream_events(self) -> None:
+        while True:
+            event = await self.stream.events.get()
+            try:
+                if await self.is_paused():
+                    continue
+                await self._process_stream_event(event)
+            except asyncio.CancelledError:
+                raise
+            except (RpcError, JupiterError, ValueError) as exc:
+                self.last_error = f"Realtime stream: {exc}"
+                await self.notifier.on_error("Processing realtime wallet event", exc)
+            finally:
+                self.stream.events.task_done()
+
+    async def _process_stream_event(self, event: StreamEvent) -> None:
+        trader = await self.database.resolve_trader(event.wallet)
+        if trader is None or not trader.enabled or trader.last_signature is None:
+            return
+        if await self.database.is_processed(event.signature):
+            return
+        transaction = None
+        for attempt in range(3):
+            transaction = await self.rpc.get_transaction(event.signature)
+            if transaction is not None:
+                break
+            await asyncio.sleep(attempt + 1)
+        if transaction is None:
+            raise RpcError("realtime transaction was unavailable after confirmation retries")
+        block_time = int(transaction.get("blockTime") or time.time())
+        await self._process_transaction(
+            trader,
+            signature=event.signature,
+            transaction=transaction,
+            block_time=block_time,
+            is_bootstrap=False,
+        )
 
     async def scan_once(self) -> dict[str, int]:
         if self._scan_lock.locked():
@@ -231,17 +370,48 @@ class SmartMoneyEngine:
                 continue
 
             block_time = int(item.get("blockTime") or transaction.get("blockTime") or 0)
-            counts["transactions"] += 1
+            processed = await self._process_transaction(
+                trader,
+                signature=str(signature),
+                transaction=transaction,
+                block_time=block_time,
+                is_bootstrap=is_bootstrap,
+            )
+            counts["transactions"] += processed["transactions"]
+            counts["swaps"] += processed["swaps"]
+
+        if not had_retryable_failure:
+            await self.database.update_last_signature(trader.address, newest)
+        return counts
+
+    async def _process_transaction(
+        self,
+        trader: TrackedTrader,
+        *,
+        signature: str,
+        transaction: dict,
+        block_time: int,
+        is_bootstrap: bool,
+    ) -> dict[str, int]:
+        # The websocket stream and polling fallback can observe the same confirmed
+        # transaction concurrently. Keep one task responsible for it so alerts and
+        # paper mirror attempts are never duplicated inside this process.
+        if signature in self._processing_signatures:
+            return {"transactions": 0, "swaps": 0}
+        self._processing_signatures.add(signature)
+        try:
+            if await self.database.is_processed(signature):
+                return {"transactions": 0, "swaps": 0}
             swap = await self.detector.detect(
                 transaction,
                 wallet=trader.address,
                 signature=signature,
                 block_time=block_time,
             )
+            swap_count = 0
             if swap is not None:
                 inserted = await self.database.record_swap(swap)
-                if inserted:
-                    counts["swaps"] += 1
+                swap_count = int(inserted)
                 should_handle = inserted
                 if (
                     not inserted
@@ -255,10 +425,9 @@ class SmartMoneyEngine:
                 if should_handle and not is_bootstrap:
                     await self._handle_new_swap(swap, trader)
             await self.database.mark_processed(signature, trader.address, block_time)
-
-        if not had_retryable_failure:
-            await self.database.update_last_signature(trader.address, newest)
-        return counts
+            return {"transactions": 1, "swaps": swap_count}
+        finally:
+            self._processing_signatures.discard(signature)
 
     async def _signature_candidates(
         self, trader: TrackedTrader
@@ -647,22 +816,36 @@ class SmartMoneyEngine:
                 volume_usd=candidate.volume_24h_usd,
                 max_drawdown_usd=Decimal("0"),
             )
+            weekly_wins = int(
+                Decimal(max(candidate.trades_7d, 0))
+                * candidate.win_rate_7d_percent
+                / Decimal("100")
+            )
+            weekly_losses = max(0, candidate.trades_7d - weekly_wins)
+            weekly_cost = (
+                candidate.realized_pnl_7d
+                / (candidate.roi_7d_percent / Decimal("100"))
+                if candidate.roi_7d_percent > 0
+                else Decimal("0")
+            )
+            external_week = TraderMetrics(
+                address=candidate.address,
+                alias=candidate.alias,
+                window_seconds=604_800,
+                trades=candidate.trades_7d,
+                buys=0,
+                sells=0,
+                wins=weekly_wins,
+                losses=weekly_losses,
+                realized_pnl_usd=candidate.realized_pnl_7d,
+                matched_cost_usd=weekly_cost,
+                volume_usd=Decimal("0"),
+                max_drawdown_usd=Decimal("0"),
+            )
             if local is None:
-                zero_week = replace(
-                    external_metrics,
-                    window_seconds=604_800,
-                    trades=0,
-                    buys=0,
-                    sells=0,
-                    wins=0,
-                    losses=0,
-                    realized_pnl_usd=Decimal("0"),
-                    matched_cost_usd=Decimal("0"),
-                    volume_usd=Decimal("0"),
-                )
                 merged[candidate.address] = ScoredTrader(
                     metrics_24h=external_metrics,
-                    metrics_7d=zero_week,
+                    metrics_7d=external_week,
                     score=candidate.score,
                 )
                 continue
@@ -677,7 +860,7 @@ class SmartMoneyEngine:
                 blended_score = candidate.score
             merged[candidate.address] = ScoredTrader(
                 metrics_24h=external_metrics,
-                metrics_7d=local.metrics_7d,
+                metrics_7d=external_week,
                 score=blended_score,
             )
 
@@ -751,7 +934,16 @@ class SmartMoneyEngine:
             "discovery_enabled": self.settings.auto_discovery_enabled,
             "discovery_configured": self.settings.discovery_is_configured,
             "discovery_last_refresh": self.last_discovery_refresh_at,
+            "discovery_7d_last_refresh": self.last_weekly_refresh_at,
+            "rotation_last_refresh": self.last_rotation_at,
+            "candidate_pool_size": len(self._candidate_pool),
             "discovered_wallets": len(await self.database.list_discovered(limit=50)),
+            "stream_enabled": self.stream.enabled,
+            "stream_connected": self.stream.connected,
+            "stream_subscriptions": self.stream.subscription_count,
+            "stream_last_event": self.stream.last_event_at,
+            "stream_last_error": self.stream.last_error,
+            "stream_reconnects": self.stream.reconnects,
             "paper_mirror_raw_swaps": self.settings.paper_mirror_raw_swaps,
             "paper_use_executable_quotes": self.settings.paper_use_executable_quotes,
             "quote_ready": bool(self.settings.jupiter_api_key),

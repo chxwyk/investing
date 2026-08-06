@@ -24,6 +24,7 @@ from .models import (
     Signal,
     TrackedTrader,
     TraderMetrics,
+    WalletRotationEvent,
 )
 
 
@@ -88,12 +89,42 @@ class Database:
                 last_trade_ms INTEGER,
                 score REAL NOT NULL,
                 rank INTEGER NOT NULL,
+                realized_pnl_7d REAL NOT NULL DEFAULT 0,
+                roi_7d_percent REAL NOT NULL DEFAULT 0,
+                win_rate_7d_percent REAL NOT NULL DEFAULT 0,
+                trades_7d INTEGER NOT NULL DEFAULT 0,
+                recent_swaps INTEGER NOT NULL DEFAULT 0,
+                pump_swaps INTEGER NOT NULL DEFAULT 0,
+                last_activity_at INTEGER,
+                selection_reason TEXT NOT NULL DEFAULT '',
+                removal_reason TEXT,
+                baseline_pnl_24h REAL,
+                baseline_pnl_7d REAL,
+                tracking_started_at INTEGER,
                 qualified INTEGER NOT NULL DEFAULT 1,
                 first_seen_at INTEGER NOT NULL,
                 last_seen_at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_discovery_qualified_rank
                 ON discovery_wallets(qualified, rank);
+
+            CREATE TABLE IF NOT EXISTS wallet_rotation_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                address TEXT NOT NULL,
+                alias TEXT NOT NULL,
+                action TEXT NOT NULL CHECK (action IN ('ADDED', 'REMOVED')),
+                reason TEXT NOT NULL,
+                score REAL NOT NULL,
+                pnl_24h_usd REAL NOT NULL,
+                pnl_7d_usd REAL NOT NULL,
+                baseline_pnl_24h_usd REAL NOT NULL,
+                baseline_pnl_7d_usd REAL NOT NULL,
+                observed_source_pnl_usd REAL NOT NULL DEFAULT 0,
+                paper_pnl_usd REAL NOT NULL DEFAULT 0,
+                recorded_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_wallet_rotation_events_time
+                ON wallet_rotation_events(recorded_at DESC);
 
             CREATE TABLE IF NOT EXISTS processed_signatures (
                 signature TEXT PRIMARY KEY,
@@ -264,6 +295,32 @@ class Database:
         await self._ensure_column(
             "tracked_traders", "source", "TEXT NOT NULL DEFAULT 'manual'"
         )
+        await self._ensure_column(
+            "discovery_wallets", "realized_pnl_7d", "REAL NOT NULL DEFAULT 0"
+        )
+        await self._ensure_column(
+            "discovery_wallets", "roi_7d_percent", "REAL NOT NULL DEFAULT 0"
+        )
+        await self._ensure_column(
+            "discovery_wallets", "win_rate_7d_percent", "REAL NOT NULL DEFAULT 0"
+        )
+        await self._ensure_column(
+            "discovery_wallets", "trades_7d", "INTEGER NOT NULL DEFAULT 0"
+        )
+        await self._ensure_column(
+            "discovery_wallets", "recent_swaps", "INTEGER NOT NULL DEFAULT 0"
+        )
+        await self._ensure_column(
+            "discovery_wallets", "pump_swaps", "INTEGER NOT NULL DEFAULT 0"
+        )
+        await self._ensure_column("discovery_wallets", "last_activity_at", "INTEGER")
+        await self._ensure_column(
+            "discovery_wallets", "selection_reason", "TEXT NOT NULL DEFAULT ''"
+        )
+        await self._ensure_column("discovery_wallets", "removal_reason", "TEXT")
+        await self._ensure_column("discovery_wallets", "baseline_pnl_24h", "REAL")
+        await self._ensure_column("discovery_wallets", "baseline_pnl_7d", "REAL")
+        await self._ensure_column("discovery_wallets", "tracking_started_at", "INTEGER")
         await self._ensure_column("paper_trades", "source_trader", "TEXT")
         await self._ensure_column("paper_trades", "source_signature", "TEXT")
         await self._ensure_column(
@@ -397,14 +454,23 @@ class Database:
         await self.db.commit()
 
     async def apply_discovery(
-        self, candidates: list[DiscoveryCandidate]
+        self,
+        candidates: list[DiscoveryCandidate],
+        *,
+        evaluated_candidates: list[DiscoveryCandidate] | None = None,
+        removal_reasons: dict[str, str] | None = None,
+        candidate_pool_size: int = 0,
+        verified_pump_wallets: int = 0,
     ) -> DiscoveryRefresh:
-        """Persist a fresh leaderboard and rotate only API-managed wallets."""
+        """Persist a hot set and audit every automatic admission/removal."""
 
         refreshed_at = int(time.time())
         if not candidates:
             return DiscoveryRefresh((), (), (), refreshed_at)
 
+        evaluated = {item.address: item for item in (evaluated_candidates or candidates)}
+        reasons = removal_reasons or {}
+        removal_events: list[WalletRotationEvent] = []
         async with self._write_lock:
             await self.db.execute("BEGIN IMMEDIATE")
             try:
@@ -419,12 +485,11 @@ class Database:
                 )
                 previously_auto = {row["address"] for row in await auto_cursor.fetchall()}
 
-                await self.db.execute("UPDATE discovery_wallets SET qualified = 0")
                 hydrated: list[DiscoveryCandidate] = []
                 selected_addresses: list[str] = []
                 for candidate in candidates:
                     previous_cursor = await self.db.execute(
-                        "SELECT realized_pnl_24h FROM discovery_wallets WHERE address = ?",
+                        "SELECT * FROM discovery_wallets WHERE address = ?",
                         (candidate.address,),
                     )
                     previous_row = await previous_cursor.fetchone()
@@ -436,6 +501,28 @@ class Database:
                     )
                     hydrated.append(hydrated_candidate)
                     selected_addresses.append(candidate.address)
+                    continuing = candidate.address in previously_auto
+                    baseline_24h = (
+                        _d(previous_row["baseline_pnl_24h"])
+                        if continuing
+                        and previous_row
+                        and previous_row["baseline_pnl_24h"] is not None
+                        else candidate.realized_pnl_24h
+                    )
+                    baseline_7d = (
+                        _d(previous_row["baseline_pnl_7d"])
+                        if continuing
+                        and previous_row
+                        and previous_row["baseline_pnl_7d"] is not None
+                        else candidate.realized_pnl_7d
+                    )
+                    tracking_started_at = (
+                        int(previous_row["tracking_started_at"])
+                        if continuing
+                        and previous_row
+                        and previous_row["tracking_started_at"] is not None
+                        else refreshed_at
+                    )
 
                     await self.db.execute(
                         """
@@ -443,9 +530,16 @@ class Database:
                             address, alias, realized_pnl_24h, previous_pnl_24h,
                             roi_24h_percent, win_rate_percent, trades_24h,
                             buys_24h, sells_24h, closed_tokens, invested_24h_usd,
-                            volume_24h_usd, last_trade_ms, score, rank, qualified,
+                            volume_24h_usd, last_trade_ms, score, rank,
+                            realized_pnl_7d, roi_7d_percent, win_rate_7d_percent,
+                            trades_7d, recent_swaps, pump_swaps, last_activity_at,
+                            selection_reason, removal_reason, baseline_pnl_24h,
+                            baseline_pnl_7d, tracking_started_at, qualified,
                             first_seen_at, last_seen_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                        ) VALUES (
+                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                            ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, 1, ?, ?
+                        )
                         ON CONFLICT(address) DO UPDATE SET
                             alias = excluded.alias,
                             previous_pnl_24h = discovery_wallets.realized_pnl_24h,
@@ -461,6 +555,18 @@ class Database:
                             last_trade_ms = excluded.last_trade_ms,
                             score = excluded.score,
                             rank = excluded.rank,
+                            realized_pnl_7d = excluded.realized_pnl_7d,
+                            roi_7d_percent = excluded.roi_7d_percent,
+                            win_rate_7d_percent = excluded.win_rate_7d_percent,
+                            trades_7d = excluded.trades_7d,
+                            recent_swaps = excluded.recent_swaps,
+                            pump_swaps = excluded.pump_swaps,
+                            last_activity_at = excluded.last_activity_at,
+                            selection_reason = excluded.selection_reason,
+                            removal_reason = NULL,
+                            baseline_pnl_24h = excluded.baseline_pnl_24h,
+                            baseline_pnl_7d = excluded.baseline_pnl_7d,
+                            tracking_started_at = excluded.tracking_started_at,
                             qualified = 1,
                             last_seen_at = excluded.last_seen_at
                         """,
@@ -480,6 +586,17 @@ class Database:
                             candidate.last_trade_ms,
                             float(candidate.score),
                             candidate.rank,
+                            float(candidate.realized_pnl_7d),
+                            float(candidate.roi_7d_percent),
+                            float(candidate.win_rate_7d_percent),
+                            candidate.trades_7d,
+                            candidate.recent_swaps,
+                            candidate.pump_swaps,
+                            candidate.last_activity_at,
+                            candidate.selection_reason,
+                            float(baseline_24h),
+                            float(baseline_7d),
+                            tracking_started_at,
                             refreshed_at,
                             refreshed_at,
                         ),
@@ -506,7 +623,85 @@ class Database:
                         (candidate.address, auto_alias, refreshed_at),
                     )
 
+                    if candidate.address not in previously_enabled:
+                        await self._insert_rotation_event(
+                            address=candidate.address,
+                            alias=candidate.alias,
+                            action="ADDED",
+                            reason=candidate.selection_reason or "qualified for the hot set",
+                            score=candidate.score,
+                            pnl_24h=candidate.realized_pnl_24h,
+                            pnl_7d=candidate.realized_pnl_7d,
+                            baseline_24h=baseline_24h,
+                            baseline_7d=baseline_7d,
+                            tracking_started_at=tracking_started_at,
+                            recorded_at=refreshed_at,
+                        )
+
                 placeholders = ",".join("?" for _ in selected_addresses)
+                disabled_addresses = sorted(previously_auto - set(selected_addresses))
+                for address in disabled_addresses:
+                    row_cursor = await self.db.execute(
+                        "SELECT * FROM discovery_wallets WHERE address = ?", (address,)
+                    )
+                    row = await row_cursor.fetchone()
+                    if row is None:
+                        continue
+                    current = evaluated.get(address)
+                    pnl_24h = (
+                        current.realized_pnl_24h
+                        if current is not None
+                        else _d(row["realized_pnl_24h"])
+                    )
+                    pnl_7d = (
+                        current.realized_pnl_7d
+                        if current is not None
+                        else _d(row["realized_pnl_7d"])
+                    )
+                    score = current.score if current is not None else _d(row["score"])
+                    baseline_24h = _d(row["baseline_pnl_24h"])
+                    baseline_7d = _d(row["baseline_pnl_7d"])
+                    tracking_started_at = int(
+                        row["tracking_started_at"] or row["first_seen_at"]
+                    )
+                    reason = reasons.get(
+                        address, "rotated out by a higher-ranked active Pump wallet"
+                    )
+                    await self.db.execute(
+                        """
+                        UPDATE discovery_wallets SET
+                            realized_pnl_24h = ?, realized_pnl_7d = ?, score = ?,
+                            recent_swaps = ?, pump_swaps = ?, last_activity_at = ?,
+                            qualified = 0, removal_reason = ?, last_seen_at = ?
+                        WHERE address = ?
+                        """,
+                        (
+                            float(pnl_24h),
+                            float(pnl_7d),
+                            float(score),
+                            current.recent_swaps if current else int(row["recent_swaps"]),
+                            current.pump_swaps if current else int(row["pump_swaps"]),
+                            current.last_activity_at if current else row["last_activity_at"],
+                            reason,
+                            refreshed_at,
+                            address,
+                        ),
+                    )
+                    event = await self._insert_rotation_event(
+                        address=address,
+                        alias=str(row["alias"]),
+                        action="REMOVED",
+                        reason=reason,
+                        score=score,
+                        pnl_24h=pnl_24h,
+                        pnl_7d=pnl_7d,
+                        baseline_24h=baseline_24h,
+                        baseline_7d=baseline_7d,
+                        tracking_started_at=tracking_started_at,
+                        recorded_at=refreshed_at,
+                    )
+                    removal_events.append(event)
+
                 await self.db.execute(
                     f"""
                     UPDATE tracked_traders SET enabled = 0
@@ -516,7 +711,7 @@ class Database:
                 )
                 await self.db.execute(
                     """
-                    INSERT INTO settings(key, value) VALUES ('discovery_last_refresh', ?)
+                    INSERT INTO settings(key, value) VALUES ('rotation_last_refresh', ?)
                     ON CONFLICT(key) DO UPDATE SET value = excluded.value
                     """,
                     (str(refreshed_at),),
@@ -529,7 +724,86 @@ class Database:
         selected = set(selected_addresses)
         added = tuple(sorted(selected - previously_enabled))
         disabled = tuple(sorted(previously_auto - selected))
-        return DiscoveryRefresh(tuple(hydrated), added, disabled, refreshed_at)
+        return DiscoveryRefresh(
+            tuple(hydrated),
+            added,
+            disabled,
+            refreshed_at,
+            candidate_pool_size=candidate_pool_size or len(evaluated),
+            verified_pump_wallets=verified_pump_wallets or len(candidates),
+            removal_events=tuple(removal_events),
+        )
+
+    async def _insert_rotation_event(
+        self,
+        *,
+        address: str,
+        alias: str,
+        action: str,
+        reason: str,
+        score: Decimal,
+        pnl_24h: Decimal,
+        pnl_7d: Decimal,
+        baseline_24h: Decimal,
+        baseline_7d: Decimal,
+        tracking_started_at: int,
+        recorded_at: int,
+    ) -> WalletRotationEvent:
+        source_cursor = await self.db.execute(
+            """
+            SELECT COALESCE(SUM(realized_pnl_usd), 0) AS pnl
+            FROM swaps WHERE trader_address = ? AND block_time >= ?
+            """,
+            (address, tracking_started_at),
+        )
+        source_row = await source_cursor.fetchone()
+        paper_cursor = await self.db.execute(
+            """
+            SELECT COALESCE(SUM(realized_pnl_usd), 0) AS pnl
+            FROM paper_trades WHERE source_trader = ? AND created_at >= ?
+            """,
+            (address, tracking_started_at),
+        )
+        paper_row = await paper_cursor.fetchone()
+        observed_source_pnl = _d(source_row["pnl"] if source_row else 0)
+        paper_pnl = _d(paper_row["pnl"] if paper_row else 0)
+        await self.db.execute(
+            """
+            INSERT INTO wallet_rotation_events(
+                address, alias, action, reason, score, pnl_24h_usd, pnl_7d_usd,
+                baseline_pnl_24h_usd, baseline_pnl_7d_usd,
+                observed_source_pnl_usd, paper_pnl_usd, recorded_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                address,
+                alias,
+                action,
+                reason,
+                float(score),
+                float(pnl_24h),
+                float(pnl_7d),
+                float(baseline_24h),
+                float(baseline_7d),
+                float(observed_source_pnl),
+                float(paper_pnl),
+                recorded_at,
+            ),
+        )
+        return WalletRotationEvent(
+            address=address,
+            alias=alias,
+            action=action,
+            reason=reason,
+            score=score,
+            pnl_24h_usd=pnl_24h,
+            pnl_7d_usd=pnl_7d,
+            baseline_pnl_24h_usd=baseline_24h,
+            baseline_pnl_7d_usd=baseline_7d,
+            observed_source_pnl_usd=observed_source_pnl,
+            paper_pnl_usd=paper_pnl,
+            recorded_at=recorded_at,
+        )
 
     async def list_discovered(self, *, limit: int = 25) -> list[DiscoveryCandidate]:
         cursor = await self.db.execute(
@@ -565,9 +839,98 @@ class Database:
                 ),
                 score=_d(row["score"]),
                 rank=int(row["rank"]),
+                realized_pnl_7d=_d(row["realized_pnl_7d"]),
+                roi_7d_percent=_d(row["roi_7d_percent"]),
+                win_rate_7d_percent=_d(row["win_rate_7d_percent"]),
+                trades_7d=int(row["trades_7d"]),
+                recent_swaps=int(row["recent_swaps"]),
+                pump_swaps=int(row["pump_swaps"]),
+                last_activity_at=(
+                    int(row["last_activity_at"])
+                    if row["last_activity_at"] is not None
+                    else None
+                ),
+                selection_reason=str(row["selection_reason"] or ""),
             )
             for row in rows
         ]
+
+    async def rotation_events(self, *, limit: int = 10) -> list[WalletRotationEvent]:
+        cursor = await self.db.execute(
+            "SELECT * FROM wallet_rotation_events ORDER BY id DESC LIMIT ?", (limit,)
+        )
+        rows = await cursor.fetchall()
+        return [
+            WalletRotationEvent(
+                address=row["address"],
+                alias=row["alias"],
+                action=row["action"],
+                reason=row["reason"],
+                score=_d(row["score"]),
+                pnl_24h_usd=_d(row["pnl_24h_usd"]),
+                pnl_7d_usd=_d(row["pnl_7d_usd"]),
+                baseline_pnl_24h_usd=_d(row["baseline_pnl_24h_usd"]),
+                baseline_pnl_7d_usd=_d(row["baseline_pnl_7d_usd"]),
+                observed_source_pnl_usd=_d(row["observed_source_pnl_usd"]),
+                paper_pnl_usd=_d(row["paper_pnl_usd"]),
+                recorded_at=int(row["recorded_at"]),
+            )
+            for row in rows
+        ]
+
+    async def hot_wallet_reports(self, *, limit: int = 25) -> list[dict[str, Any]]:
+        cursor = await self.db.execute(
+            """
+            SELECT * FROM discovery_wallets
+            WHERE qualified = 1 ORDER BY rank LIMIT ?
+            """,
+            (limit,),
+        )
+        rows = await cursor.fetchall()
+        reports: list[dict[str, Any]] = []
+        for row in rows:
+            started_at = int(row["tracking_started_at"] or row["first_seen_at"])
+            source_cursor = await self.db.execute(
+                """
+                SELECT COUNT(*) AS swaps, COALESCE(SUM(realized_pnl_usd), 0) AS pnl
+                FROM swaps WHERE trader_address = ? AND block_time >= ?
+                """,
+                (row["address"], started_at),
+            )
+            source = await source_cursor.fetchone()
+            paper_cursor = await self.db.execute(
+                """
+                SELECT COUNT(*) AS fills, COALESCE(SUM(realized_pnl_usd), 0) AS pnl
+                FROM paper_trades WHERE source_trader = ? AND created_at >= ?
+                """,
+                (row["address"], started_at),
+            )
+            paper = await paper_cursor.fetchone()
+            reports.append(
+                {
+                    "address": row["address"],
+                    "alias": row["alias"],
+                    "rank": int(row["rank"]),
+                    "score": _d(row["score"]),
+                    "pnl_24h": _d(row["realized_pnl_24h"]),
+                    "pnl_7d": _d(row["realized_pnl_7d"]),
+                    "roi_24h": _d(row["roi_24h_percent"]),
+                    "roi_7d": _d(row["roi_7d_percent"]),
+                    "win_24h": _d(row["win_rate_percent"]),
+                    "win_7d": _d(row["win_rate_7d_percent"]),
+                    "recent_swaps": int(row["recent_swaps"]),
+                    "pump_swaps": int(row["pump_swaps"]),
+                    "started_at": started_at,
+                    "baseline_24h": _d(row["baseline_pnl_24h"]),
+                    "baseline_7d": _d(row["baseline_pnl_7d"]),
+                    "observed_swaps": int(source["swaps"] if source else 0),
+                    "observed_source_pnl": _d(source["pnl"] if source else 0),
+                    "paper_fills": int(paper["fills"] if paper else 0),
+                    "paper_pnl": _d(paper["pnl"] if paper else 0),
+                    "selection_reason": str(row["selection_reason"] or ""),
+                }
+            )
+        return reports
 
     async def is_processed(self, signature: str) -> bool:
         cursor = await self.db.execute(

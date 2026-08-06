@@ -43,6 +43,14 @@ class DiscoveryCandidate:
     last_trade_ms: int | None
     score: Decimal
     rank: int
+    realized_pnl_7d: Decimal = Decimal("0")
+    roi_7d_percent: Decimal = Decimal("0")
+    win_rate_7d_percent: Decimal = Decimal("0")
+    trades_7d: int = 0
+    recent_swaps: int = 0
+    pump_swaps: int = 0
+    last_activity_at: int | None = None
+    selection_reason: str = ""
 
     @property
     def pnl_momentum_usd(self) -> Decimal | None:
@@ -57,6 +65,25 @@ class DiscoveryRefresh:
     added_wallets: tuple[str, ...]
     disabled_wallets: tuple[str, ...]
     refreshed_at: int
+    candidate_pool_size: int = 0
+    verified_pump_wallets: int = 0
+    removal_events: tuple[WalletRotationEvent, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class WalletRotationEvent:
+    address: str
+    alias: str
+    action: str
+    reason: str
+    score: Decimal
+    pnl_24h_usd: Decimal
+    pnl_7d_usd: Decimal
+    baseline_pnl_24h_usd: Decimal
+    baseline_pnl_7d_usd: Decimal
+    observed_source_pnl_usd: Decimal
+    paper_pnl_usd: Decimal
+    recorded_at: int
 
 
 @dataclass(frozen=True, slots=True)

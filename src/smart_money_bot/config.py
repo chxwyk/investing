@@ -50,6 +50,7 @@ class Settings:
 
     auto_discovery_enabled: bool
     discovery_refresh_seconds: int
+    discovery_7d_refresh_seconds: int
     discovery_fetch_limit: int
     discovery_max_wallets: int
     discovery_min_24h_pnl_usd: Decimal
@@ -59,6 +60,20 @@ class Settings:
     discovery_max_trades: int
     discovery_min_closed_tokens: int
     discovery_max_single_token_percent: Decimal
+    discovery_min_7d_pnl_usd: Decimal
+    discovery_min_7d_win_rate_percent: Decimal
+    discovery_min_7d_roi_percent: Decimal
+    discovery_min_7d_trades: int
+    discovery_max_7d_trades: int
+
+    rotation_refresh_seconds: int
+    rotation_max_idle_seconds: int
+    rotation_probe_transactions: int
+    rotation_min_recent_swaps: int
+    rotation_min_pump_swaps: int
+    rotation_require_pump_activity: bool
+    realtime_wallet_stream_enabled: bool
+    solana_ws_url: str | None
 
     poll_interval_seconds: int
     bootstrap_hours: int
@@ -140,8 +155,9 @@ class Settings:
             database_path=os.getenv("DATABASE_PATH", "./data/smart_money.db").strip(),
             auto_discovery_enabled=_bool("AUTO_DISCOVERY_ENABLED", True),
             discovery_refresh_seconds=_int("DISCOVERY_REFRESH_SECONDS", 1200),
+            discovery_7d_refresh_seconds=_int("DISCOVERY_7D_REFRESH_SECONDS", 21600),
             discovery_fetch_limit=_int("DISCOVERY_FETCH_LIMIT", 100),
-            discovery_max_wallets=_int("DISCOVERY_MAX_WALLETS", 12),
+            discovery_max_wallets=_int("DISCOVERY_MAX_WALLETS", 25),
             discovery_min_24h_pnl_usd=_decimal("DISCOVERY_MIN_24H_PNL_USD", "100"),
             discovery_min_win_rate_percent=_decimal(
                 "DISCOVERY_MIN_WIN_RATE_PERCENT", "55"
@@ -153,6 +169,25 @@ class Settings:
             discovery_max_single_token_percent=_decimal(
                 "DISCOVERY_MAX_SINGLE_TOKEN_PERCENT", "70"
             ),
+            discovery_min_7d_pnl_usd=_decimal("DISCOVERY_MIN_7D_PNL_USD", "300"),
+            discovery_min_7d_win_rate_percent=_decimal(
+                "DISCOVERY_MIN_7D_WIN_RATE_PERCENT", "55"
+            ),
+            discovery_min_7d_roi_percent=_decimal("DISCOVERY_MIN_7D_ROI_PERCENT", "5"),
+            discovery_min_7d_trades=_int("DISCOVERY_MIN_7D_TRADES", 10),
+            discovery_max_7d_trades=_int("DISCOVERY_MAX_7D_TRADES", 1000),
+            rotation_refresh_seconds=_int("ROTATION_REFRESH_SECONDS", 300),
+            rotation_max_idle_seconds=_int("ROTATION_MAX_IDLE_SECONDS", 3600),
+            rotation_probe_transactions=_int("ROTATION_PROBE_TRANSACTIONS", 6),
+            rotation_min_recent_swaps=_int("ROTATION_MIN_RECENT_SWAPS", 1),
+            rotation_min_pump_swaps=_int("ROTATION_MIN_PUMP_SWAPS", 1),
+            rotation_require_pump_activity=_bool(
+                "ROTATION_REQUIRE_PUMP_ACTIVITY", True
+            ),
+            realtime_wallet_stream_enabled=_bool(
+                "REALTIME_WALLET_STREAM_ENABLED", True
+            ),
+            solana_ws_url=os.getenv("SOLANA_WS_URL", "").strip() or None,
             poll_interval_seconds=_int("POLL_INTERVAL_SECONDS", 60),
             bootstrap_hours=_int("BOOTSTRAP_HOURS", 24),
             max_backfill_transactions=_int("MAX_BACKFILL_TRANSACTIONS", 100),
@@ -257,6 +292,10 @@ class Settings:
             raise ValueError("RPC_MAX_RETRIES must be between 0 and 10")
         if self.discovery_refresh_seconds < 300:
             raise ValueError("DISCOVERY_REFRESH_SECONDS must be at least 300")
+        if self.discovery_7d_refresh_seconds < self.discovery_refresh_seconds:
+            raise ValueError(
+                "DISCOVERY_7D_REFRESH_SECONDS cannot be below DISCOVERY_REFRESH_SECONDS"
+            )
         if not 1 <= self.discovery_fetch_limit <= 500:
             raise ValueError("DISCOVERY_FETCH_LIMIT must be between 1 and 500")
         if not 1 <= self.discovery_max_wallets <= 50:
@@ -275,6 +314,32 @@ class Settings:
             raise ValueError("DISCOVERY_MIN_CLOSED_TOKENS must be at least 1")
         if not 1 <= self.discovery_max_single_token_percent <= 100:
             raise ValueError("DISCOVERY_MAX_SINGLE_TOKEN_PERCENT must be between 1 and 100")
+        if self.discovery_min_7d_pnl_usd < 0:
+            raise ValueError("DISCOVERY_MIN_7D_PNL_USD cannot be negative")
+        if not 0 <= self.discovery_min_7d_win_rate_percent <= 100:
+            raise ValueError(
+                "DISCOVERY_MIN_7D_WIN_RATE_PERCENT must be between 0 and 100"
+            )
+        if self.discovery_min_7d_roi_percent < 0:
+            raise ValueError("DISCOVERY_MIN_7D_ROI_PERCENT cannot be negative")
+        if self.discovery_min_7d_trades < 1:
+            raise ValueError("DISCOVERY_MIN_7D_TRADES must be at least 1")
+        if self.discovery_max_7d_trades < self.discovery_min_7d_trades:
+            raise ValueError(
+                "DISCOVERY_MAX_7D_TRADES cannot be below DISCOVERY_MIN_7D_TRADES"
+            )
+        if self.rotation_refresh_seconds < 300:
+            raise ValueError("ROTATION_REFRESH_SECONDS must be at least 300")
+        if self.rotation_max_idle_seconds < self.rotation_refresh_seconds:
+            raise ValueError(
+                "ROTATION_MAX_IDLE_SECONDS cannot be below ROTATION_REFRESH_SECONDS"
+            )
+        if not 1 <= self.rotation_probe_transactions <= 25:
+            raise ValueError("ROTATION_PROBE_TRANSACTIONS must be between 1 and 25")
+        if self.rotation_min_recent_swaps < 1:
+            raise ValueError("ROTATION_MIN_RECENT_SWAPS must be at least 1")
+        if self.rotation_min_pump_swaps < 1:
+            raise ValueError("ROTATION_MIN_PUMP_SWAPS must be at least 1")
         if self.poll_interval_seconds < 5:
             raise ValueError("POLL_INTERVAL_SECONDS must be at least 5")
         if self.max_copy_usd <= 0 or self.default_copy_usd <= 0:

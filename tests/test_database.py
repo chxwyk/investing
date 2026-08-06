@@ -2,12 +2,41 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from dataclasses import replace
 from decimal import Decimal
 
 import pytest
 
 from smart_money_bot.database import Database
-from smart_money_bot.models import Side, Signal
+from smart_money_bot.models import DiscoveryCandidate, Side, Signal
+
+
+def _discovery_candidate(address: str, *, rank: int, pnl: str) -> DiscoveryCandidate:
+    return DiscoveryCandidate(
+        address=address,
+        alias=f"Wallet {address}",
+        realized_pnl_24h=Decimal(pnl),
+        previous_pnl_24h=None,
+        roi_24h_percent=Decimal("20"),
+        win_rate_percent=Decimal("70"),
+        trades_24h=20,
+        buys_24h=10,
+        sells_24h=10,
+        closed_tokens=10,
+        invested_24h_usd=Decimal("2000"),
+        volume_24h_usd=Decimal("5000"),
+        last_trade_ms=int(time.time() * 1000),
+        score=Decimal("80"),
+        rank=rank,
+        realized_pnl_7d=Decimal("2500"),
+        roi_7d_percent=Decimal("35"),
+        win_rate_7d_percent=Decimal("68"),
+        trades_7d=80,
+        recent_swaps=3,
+        pump_swaps=2,
+        last_activity_at=int(time.time()),
+        selection_reason="strict 24H/7D + recent Pump activity",
+    )
 
 
 @pytest.mark.asyncio
@@ -73,6 +102,38 @@ async def test_existing_paper_database_migrates_raw_mirror_columns(tmp_path) -> 
         mirror_columns = {row["name"] for row in await mirror_cursor.fetchall()}
         assert {"peak_price_usd", "token_decimals"} <= mirror_columns
         assert await database.paper_mirror_positions() == []
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_hot_wallet_rotation_records_add_and_remove_audit(tmp_path) -> None:
+    database = Database(str(tmp_path / "rotation.db"), Decimal("1000"))
+    await database.connect()
+    try:
+        first = _discovery_candidate("wallet-a", rank=1, pnl="500")
+        second = _discovery_candidate("wallet-b", rank=2, pnl="400")
+        initial = await database.apply_discovery(
+            [first, second], candidate_pool_size=100, verified_pump_wallets=2
+        )
+        assert set(initial.added_wallets) == {"wallet-a", "wallet-b"}
+
+        weakened = replace(first, realized_pnl_24h=Decimal("25"), recent_swaps=0)
+        refreshed = await database.apply_discovery(
+            [second],
+            evaluated_candidates=[weakened, second],
+            removal_reasons={"wallet-a": "24H profit fell below the strict minimum"},
+            candidate_pool_size=100,
+            verified_pump_wallets=1,
+        )
+
+        assert refreshed.disabled_wallets == ("wallet-a",)
+        assert refreshed.removal_events[0].reason.startswith("24H profit fell")
+        events = await database.rotation_events(limit=10)
+        assert events[0].action == "REMOVED"
+        reports = await database.hot_wallet_reports(limit=25)
+        assert [report["address"] for report in reports] == ["wallet-b"]
+        assert reports[0]["pump_swaps"] == 2
     finally:
         await database.close()
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import replace
 from decimal import Decimal
@@ -63,6 +64,52 @@ def _swap(side: Side, signature: str, price: str) -> DetectedSwap:
         usd_value=Decimal("100"),
         token_price_usd=Decimal(price),
     )
+
+
+@pytest.mark.asyncio
+async def test_realtime_and_polling_do_not_process_same_signature_twice(settings) -> None:
+    notifier = CaptureNotifier()
+    engine = SmartMoneyEngine(settings, notifier=notifier)
+    await engine.initialize()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_detection(*args, **kwargs):
+        del args, kwargs
+        started.set()
+        await release.wait()
+        return None
+
+    try:
+        engine.detector.detect = AsyncMock(side_effect=slow_detection)
+        trader = TrackedTrader(address="wallet-a", alias="Auto wallet-a")
+        first = asyncio.create_task(
+            engine._process_transaction(
+                trader,
+                signature="same-signature",
+                transaction={},
+                block_time=int(time.time()),
+                is_bootstrap=False,
+            )
+        )
+        await started.wait()
+
+        duplicate = await engine._process_transaction(
+            trader,
+            signature="same-signature",
+            transaction={},
+            block_time=int(time.time()),
+            is_bootstrap=False,
+        )
+        release.set()
+        processed = await first
+
+        assert duplicate == {"transactions": 0, "swaps": 0}
+        assert processed == {"transactions": 1, "swaps": 0}
+        engine.detector.detect.assert_awaited_once()
+    finally:
+        release.set()
+        await engine.close()
 
 
 @pytest.mark.asyncio

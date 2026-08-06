@@ -24,6 +24,11 @@ class DiscoveryPolicy:
     maximum_trades: int
     minimum_closed_tokens: int
     maximum_single_token_percent: Decimal
+    minimum_7d_pnl_usd: Decimal = Decimal("300")
+    minimum_7d_win_rate_percent: Decimal = Decimal("55")
+    minimum_7d_roi_percent: Decimal = Decimal("5")
+    minimum_7d_trades: int = 10
+    maximum_7d_trades: int = 1000
 
     @classmethod
     def from_settings(cls, settings: Settings) -> DiscoveryPolicy:
@@ -37,11 +42,32 @@ class DiscoveryPolicy:
             maximum_trades=settings.discovery_max_trades,
             minimum_closed_tokens=settings.discovery_min_closed_tokens,
             maximum_single_token_percent=settings.discovery_max_single_token_percent,
+            minimum_7d_pnl_usd=settings.discovery_min_7d_pnl_usd,
+            minimum_7d_win_rate_percent=settings.discovery_min_7d_win_rate_percent,
+            minimum_7d_roi_percent=settings.discovery_min_7d_roi_percent,
+            minimum_7d_trades=settings.discovery_min_7d_trades,
+            maximum_7d_trades=settings.discovery_max_7d_trades,
         )
 
 
+@dataclass(frozen=True, slots=True)
+class WindowCandidate:
+    address: str
+    alias: str
+    realized_pnl_usd: Decimal
+    roi_percent: Decimal
+    win_rate_percent: Decimal
+    trades: int
+    buys: int
+    sells: int
+    closed_tokens: int
+    invested_usd: Decimal
+    volume_usd: Decimal
+    last_trade_ms: int | None
+
+
 class SolanaTrackerClient:
-    """Authorized 24-hour Solana wallet discovery through Solana Tracker PnL V2."""
+    """Authorized multi-window Solana discovery through Solana Tracker PnL V2."""
 
     BASE_URL = "https://data.solanatracker.io"
 
@@ -67,23 +93,45 @@ class SolanaTrackerClient:
             await self._session.close()
 
     async def top_24h(self, policy: DiscoveryPolicy) -> list[DiscoveryCandidate]:
+        """Backward-compatible daily-only discovery used by older integrations/tests."""
+
+        payload = await self._leaderboard_payload(policy, days=1)
+        return parse_candidates(payload, policy)
+
+    async def daily_pool(self, policy: DiscoveryPolicy) -> list[WindowCandidate]:
+        payload = await self._leaderboard_payload(policy, days=1)
+        return parse_window_candidates(payload, policy, days=1)
+
+    async def weekly_pool(self, policy: DiscoveryPolicy) -> list[WindowCandidate]:
+        payload = await self._leaderboard_payload(policy, days=7)
+        return parse_window_candidates(payload, policy, days=7)
+
+    async def _leaderboard_payload(self, policy: DiscoveryPolicy, *, days: int) -> Any:
+        weekly = days == 7
         params = {
-            "days": "1",
+            "days": str(days),
             "sort": "realized",
             "direction": "desc",
             "limit": str(policy.fetch_limit),
             "excludeArbitrage": "true",
             "pnlMode": "strict",
-            "minDays": "1",
-            "minTrades": str(policy.minimum_trades),
+            "minDays": "2" if weekly else "1",
+            "minTrades": str(
+                policy.minimum_7d_trades if weekly else policy.minimum_trades
+            ),
             "minInvested": "1",
-            "minWinRate": str(policy.minimum_win_rate_percent),
-            "minRoi": str(policy.minimum_roi_percent),
+            "minWinRate": str(
+                policy.minimum_7d_win_rate_percent
+                if weekly
+                else policy.minimum_win_rate_percent
+            ),
+            "minRoi": str(
+                policy.minimum_7d_roi_percent if weekly else policy.minimum_roi_percent
+            ),
             "minClosedTokens": str(policy.minimum_closed_tokens),
             "maxSingleTokenPct": str(policy.maximum_single_token_percent),
         }
-        payload = await self._request("/v2/pnl/leaderboard/top", params=params)
-        return parse_candidates(payload, policy)
+        return await self._request("/v2/pnl/leaderboard/top", params=params)
 
     async def _request(self, path: str, *, params: dict[str, str]) -> Any:
         session = await self._get_session()
@@ -113,8 +161,50 @@ class SolanaTrackerClient:
 
 
 def parse_candidates(payload: Any, policy: DiscoveryPolicy) -> list[DiscoveryCandidate]:
+    """Parse the strict daily feed without claiming seven-day verification."""
+
+    rows = parse_window_candidates(payload, policy, days=1)
+    candidates = [
+        DiscoveryCandidate(
+            address=row.address,
+            alias=row.alias,
+            realized_pnl_24h=row.realized_pnl_usd,
+            previous_pnl_24h=None,
+            roi_24h_percent=row.roi_percent,
+            win_rate_percent=row.win_rate_percent,
+            trades_24h=row.trades,
+            buys_24h=row.buys,
+            sells_24h=row.sells,
+            closed_tokens=row.closed_tokens,
+            invested_24h_usd=row.invested_usd,
+            volume_24h_usd=row.volume_usd,
+            last_trade_ms=row.last_trade_ms,
+            score=score_candidate(
+                pnl=row.realized_pnl_usd,
+                roi_percent=row.roi_percent,
+                win_rate_percent=row.win_rate_percent,
+                trades=row.trades,
+                closed_tokens=row.closed_tokens,
+                minimum_pnl=policy.minimum_pnl_usd,
+            ),
+            rank=0,
+        )
+        for row in rows
+    ]
+    candidates.sort(key=_candidate_sort_key, reverse=True)
+    return [
+        replace(candidate, rank=index)
+        for index, candidate in enumerate(candidates[: policy.max_wallets], start=1)
+    ]
+
+
+def parse_window_candidates(
+    payload: Any, policy: DiscoveryPolicy, *, days: int
+) -> list[WindowCandidate]:
     if not isinstance(payload, dict) or not isinstance(payload.get("traders"), list):
         raise DiscoveryError("Solana Tracker leaderboard response has an unexpected shape")
+    if days not in {1, 7}:
+        raise ValueError("Only 1-day and 7-day discovery windows are supported")
 
     blocked_tags = {
         "arbitrage",
@@ -126,7 +216,20 @@ def parse_candidates(payload: Any, policy: DiscoveryPolicy) -> list[DiscoveryCan
         "hacker",
         "drainer",
     }
-    candidates: list[DiscoveryCandidate] = []
+    if days == 7:
+        min_pnl = policy.minimum_7d_pnl_usd
+        min_roi = policy.minimum_7d_roi_percent
+        min_win = policy.minimum_7d_win_rate_percent
+        min_trades = policy.minimum_7d_trades
+        max_trades = policy.maximum_7d_trades
+    else:
+        min_pnl = policy.minimum_pnl_usd
+        min_roi = policy.minimum_roi_percent
+        min_win = policy.minimum_win_rate_percent
+        min_trades = policy.minimum_trades
+        max_trades = policy.maximum_trades
+
+    candidates: list[WindowCandidate] = []
     for row in payload["traders"]:
         if not isinstance(row, dict):
             continue
@@ -148,60 +251,98 @@ def parse_candidates(payload: Any, policy: DiscoveryPolicy) -> list[DiscoveryCan
         trades = _integer(counts.get("trades"))
         closed_tokens = _integer(tokens.get("closed"))
         if (
-            pnl < policy.minimum_pnl_usd
-            or roi < policy.minimum_roi_percent
-            or win_rate < policy.minimum_win_rate_percent
-            or trades < policy.minimum_trades
-            or trades > policy.maximum_trades
+            pnl < min_pnl
+            or roi < min_roi
+            or win_rate < min_win
+            or trades < min_trades
+            or trades > max_trades
             or closed_tokens < policy.minimum_closed_tokens
         ):
             continue
-
-        tags = _tags(row, identity)
-        if tags & blocked_tags:
+        if _tags(row, identity) & blocked_tags:
             continue
 
-        alias = _identity_alias(identity, wallet)
-        score = score_candidate(
-            pnl=pnl,
-            roi_percent=roi,
-            win_rate_percent=win_rate,
-            trades=trades,
-            closed_tokens=closed_tokens,
-            minimum_pnl=policy.minimum_pnl_usd,
-        )
         candidates.append(
-            DiscoveryCandidate(
+            WindowCandidate(
                 address=wallet,
-                alias=alias,
-                realized_pnl_24h=pnl,
-                previous_pnl_24h=None,
-                roi_24h_percent=roi,
+                alias=_identity_alias(identity, wallet),
+                realized_pnl_usd=pnl,
+                roi_percent=roi,
                 win_rate_percent=win_rate,
-                trades_24h=trades,
-                buys_24h=_integer(counts.get("buys")),
-                sells_24h=_integer(counts.get("sells")),
+                trades=trades,
+                buys=_integer(counts.get("buys")),
+                sells=_integer(counts.get("sells")),
                 closed_tokens=closed_tokens,
-                invested_24h_usd=_decimal(row.get("invested")),
-                volume_24h_usd=_decimal(period.get("volume")),
+                invested_usd=_decimal(row.get("invested")),
+                volume_usd=_decimal(period.get("volume")),
                 last_trade_ms=_optional_integer(timing.get("lastTrade")),
+            )
+        )
+    return candidates[: policy.fetch_limit]
+
+
+def merge_verified_windows(
+    daily: list[WindowCandidate],
+    weekly: list[WindowCandidate],
+    policy: DiscoveryPolicy,
+) -> list[DiscoveryCandidate]:
+    """Return only wallets independently profitable in both strict windows."""
+
+    weekly_by_wallet = {candidate.address: candidate for candidate in weekly}
+    merged: list[DiscoveryCandidate] = []
+    for day in daily:
+        week = weekly_by_wallet.get(day.address)
+        if week is None:
+            continue
+        score = score_candidate(
+            pnl=day.realized_pnl_usd,
+            roi_percent=day.roi_percent,
+            win_rate_percent=day.win_rate_percent,
+            trades=day.trades,
+            closed_tokens=day.closed_tokens,
+            minimum_pnl=policy.minimum_pnl_usd,
+            pnl_7d=week.realized_pnl_usd,
+            roi_7d_percent=week.roi_percent,
+            win_rate_7d_percent=week.win_rate_percent,
+            trades_7d=week.trades,
+            minimum_pnl_7d=policy.minimum_7d_pnl_usd,
+        )
+        merged.append(
+            DiscoveryCandidate(
+                address=day.address,
+                alias=day.alias,
+                realized_pnl_24h=day.realized_pnl_usd,
+                previous_pnl_24h=None,
+                roi_24h_percent=day.roi_percent,
+                win_rate_percent=day.win_rate_percent,
+                trades_24h=day.trades,
+                buys_24h=day.buys,
+                sells_24h=day.sells,
+                closed_tokens=day.closed_tokens,
+                invested_24h_usd=day.invested_usd,
+                volume_24h_usd=day.volume_usd,
+                last_trade_ms=max(
+                    value
+                    for value in (day.last_trade_ms, week.last_trade_ms, 0)
+                )
+                or None,
                 score=score,
                 rank=0,
+                realized_pnl_7d=week.realized_pnl_usd,
+                roi_7d_percent=week.roi_percent,
+                win_rate_7d_percent=week.win_rate_percent,
+                trades_7d=week.trades,
+                selection_reason=(
+                    f"strict 24H + 7D profit verified; 24H ${day.realized_pnl_usd:,.2f}, "
+                    f"7D ${week.realized_pnl_usd:,.2f}"
+                ),
             )
         )
 
-    candidates.sort(
-        key=lambda item: (
-            item.score,
-            item.realized_pnl_24h,
-            item.win_rate_percent,
-            item.trades_24h,
-        ),
-        reverse=True,
-    )
+    merged.sort(key=_candidate_sort_key, reverse=True)
     return [
         replace(candidate, rank=index)
-        for index, candidate in enumerate(candidates[: policy.max_wallets], start=1)
+        for index, candidate in enumerate(merged[: policy.fetch_limit], start=1)
     ]
 
 
@@ -213,26 +354,58 @@ def score_candidate(
     trades: int,
     closed_tokens: int,
     minimum_pnl: Decimal,
+    pnl_7d: Decimal | None = None,
+    roi_7d_percent: Decimal | None = None,
+    win_rate_7d_percent: Decimal | None = None,
+    trades_7d: int | None = None,
+    minimum_pnl_7d: Decimal | None = None,
 ) -> Decimal:
-    """Risk-adjusted bootstrap score used until local history becomes reliable."""
+    """Risk-adjusted score; two-window evidence receives the full weighting."""
 
-    pnl_denominator = max(minimum_pnl * Decimal("10"), Decimal("1"))
-    profit_component = _clamp(pnl / pnl_denominator, Decimal("0"), Decimal("1")) * 15
-    win_component = _clamp(win_rate_percent / Decimal("100"), Decimal("0"), Decimal("1")) * 35
-    roi_component = _clamp(roi_percent / Decimal("50"), Decimal("0"), Decimal("1")) * 20
-    activity_component = _clamp(Decimal(trades) / Decimal("20"), Decimal("0"), Decimal("1")) * 15
-    diversity_component = (
-        _clamp(Decimal(closed_tokens) / Decimal("10"), Decimal("0"), Decimal("1")) * 15
-    )
+    weekly_pnl = pnl if pnl_7d is None else pnl_7d
+    weekly_roi = roi_percent if roi_7d_percent is None else roi_7d_percent
+    weekly_win = win_rate_percent if win_rate_7d_percent is None else win_rate_7d_percent
+    weekly_trades = trades if trades_7d is None else trades_7d
+    weekly_minimum = minimum_pnl if minimum_pnl_7d is None else minimum_pnl_7d
+
+    day_profit = _ratio_score(pnl, minimum_pnl * Decimal("10"), 10)
+    week_profit = _ratio_score(weekly_pnl, weekly_minimum * Decimal("10"), 10)
+    day_win = _ratio_score(win_rate_percent, Decimal("100"), 15)
+    week_win = _ratio_score(weekly_win, Decimal("100"), 15)
+    day_roi = _ratio_score(roi_percent, Decimal("50"), 10)
+    week_roi = _ratio_score(weekly_roi, Decimal("100"), 15)
+    day_activity = _ratio_score(Decimal(trades), Decimal("20"), 8)
+    week_activity = _ratio_score(Decimal(weekly_trades), Decimal("100"), 7)
+    diversity = _ratio_score(Decimal(closed_tokens), Decimal("10"), 8)
+    consistency = Decimal("2") if pnl > 0 and weekly_pnl > 0 else Decimal("0")
     return _clamp(
-        profit_component
-        + win_component
-        + roi_component
-        + activity_component
-        + diversity_component,
+        day_profit
+        + week_profit
+        + day_win
+        + week_win
+        + day_roi
+        + week_roi
+        + day_activity
+        + week_activity
+        + diversity
+        + consistency,
         Decimal("0"),
         Decimal("100"),
     ).quantize(Decimal("0.01"))
+
+
+def _ratio_score(value: Decimal, denominator: Decimal, weight: int) -> Decimal:
+    safe_denominator = max(denominator, Decimal("1"))
+    return _clamp(value / safe_denominator, Decimal("0"), Decimal("1")) * weight
+
+
+def _candidate_sort_key(candidate: DiscoveryCandidate) -> tuple[Decimal, Decimal, Decimal, int]:
+    return (
+        candidate.score,
+        candidate.realized_pnl_24h,
+        candidate.realized_pnl_7d,
+        candidate.trades_24h,
+    )
 
 
 def _identity_alias(identity: dict[str, Any], wallet: str) -> str:

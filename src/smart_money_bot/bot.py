@@ -118,8 +118,10 @@ def _discovery_lines(candidates: tuple[DiscoveryCandidate, ...] | list[Discovery
         momentum_text = "new" if momentum is None else f"{momentum:+,.2f} since refresh"
         lines.append(
             f"**{item.rank}. {item.alias}** • `{_short(item.address)}`\n"
-            f"PnL `{_money(item.realized_pnl_24h)}` • ROI `{item.roi_24h_percent:.1f}%` • "
-            f"win `{item.win_rate_percent:.1f}%` • trades `{item.trades_24h}` • "
+            f"24H `{_money(item.realized_pnl_24h)}` / `{item.roi_24h_percent:.1f}%` ROI • "
+            f"7D `{_money(item.realized_pnl_7d)}` / `{item.roi_7d_percent:.1f}%` ROI\n"
+            f"win `24H {item.win_rate_percent:.1f}%` / `7D {item.win_rate_7d_percent:.1f}%` • "
+            f"recent `{item.recent_swaps}` • Pump `{item.pump_swaps}` • "
             f"score `{item.score}` • momentum `{momentum_text}`"
         )
     return "\n\n".join(lines) or "No qualified wallets in the latest snapshot."
@@ -247,7 +249,7 @@ class SmartMoneyBot(commands.Bot):
 
     async def on_discovery(self, refresh: DiscoveryRefresh) -> None:
         embed = discord.Embed(
-            title="Automatic 24H wallet discovery refreshed",
+            title="Verified Pump hot-wallet rotation refreshed",
             description=_discovery_lines(refresh.candidates),
             color=0x9B59B6,
             timestamp=discord.utils.utcnow(),
@@ -255,7 +257,21 @@ class SmartMoneyBot(commands.Bot):
         embed.add_field(name="Added", value=str(len(refresh.added_wallets)))
         embed.add_field(name="Rotated out", value=str(len(refresh.disabled_wallets)))
         embed.add_field(name="Watching", value=str(len(refresh.candidates)))
-        embed.set_footer(text="Solana Tracker PnL V2 • strict mode • arbitrage excluded")
+        embed.add_field(name="Strict candidate pool", value=str(refresh.candidate_pool_size))
+        embed.add_field(
+            name="Pump-verified", value=str(refresh.verified_pump_wallets)
+        )
+        if refresh.removal_events:
+            removal_text = "\n".join(
+                f"• `{_short(event.address)}` — {event.reason}; "
+                f"observed `{_money(event.observed_source_pnl_usd)}`, "
+                f"paper `{_money(event.paper_pnl_usd)}`"
+                for event in refresh.removal_events[:3]
+            )
+            embed.add_field(name="Why wallets left", value=removal_text[:1024], inline=False)
+        embed.set_footer(
+            text="Strict 24H + 7D PnL • recent Pump activity required • arbitrage excluded"
+        )
         await self._send_alert(embed)
 
     async def on_signal(
@@ -447,7 +463,7 @@ class SmartMoneyCommands(
         await interaction.response.send_message("\n".join(lines))
 
     @app_commands.command(
-        name="discover", description="Refresh and show the automatic 24-hour wallet feed."
+        name="discover", description="Refresh strict 24H/7D metrics and rotate Pump wallets."
     )
     async def discover(self, interaction: discord.Interaction) -> None:
         if not await self._require_admin(interaction):
@@ -479,12 +495,110 @@ class SmartMoneyCommands(
             else await self.bot.engine.database.list_discovered(limit=10)
         )
         embed = discord.Embed(
-            title="Automatic Wallet Discovery • 24H",
+            title="Verified Pump Hot Wallets • 24H + 7D",
             description=_discovery_lines(candidates),
             color=0x9B59B6,
         )
-        embed.set_footer(text="Strict PnL • repeatability filters • public Solana wallets")
+        embed.set_footer(
+            text="Strict PnL • recent on-chain Pump activity • public Solana wallets"
+        )
         await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @app_commands.command(
+        name="hot-wallets",
+        description="Show why each rotating Pump wallet is active and how it performed.",
+    )
+    async def hot_wallets(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        reports = await self.bot.engine.database.hot_wallet_reports(limit=25)
+        if not reports:
+            await interaction.followup.send(
+                "No Pump-verified hot wallets are active yet. Run `/smartmoney discover`.",
+                ephemeral=True,
+            )
+            return
+        lines: list[str] = []
+        for report in reports[:10]:
+            rolling_24h_change = report["pnl_24h"] - report["baseline_24h"]
+            rolling_7d_change = report["pnl_7d"] - report["baseline_7d"]
+            lines.append(
+                f"**{report['rank']}. {report['alias']}** • `{_short(report['address'])}` • "
+                f"score `{report['score']}`\n"
+                f"24H `{_money(report['pnl_24h'])}` / `{report['roi_24h']:.1f}%` ROI / "
+                f"`{report['win_24h']:.1f}%` win • "
+                f"7D `{_money(report['pnl_7d'])}` / `{report['roi_7d']:.1f}%` ROI / "
+                f"`{report['win_7d']:.1f}%` win\n"
+                f"Recent swaps `{report['recent_swaps']}` • Pump `{report['pump_swaps']}` • "
+                f"rolling change `24H {rolling_24h_change:+,.2f}` / "
+                f"`7D {rolling_7d_change:+,.2f}`\n"
+                f"Observed after admission: source PnL `{_money(report['observed_source_pnl'])}` "
+                f"from `{report['observed_swaps']}` swaps • our PAPER PnL "
+                f"`{_money(report['paper_pnl'])}` from `{report['paper_fills']}` fills"
+            )
+        embed = discord.Embed(
+            title="Pump Hot-Wallet Evidence",
+            description="\n\n".join(lines)[:4096],
+            color=0x00B894,
+        )
+        embed.set_footer(
+            text=(
+                "Rolling PnL change is not exact period profit because old trades roll out; "
+                "observed and PAPER PnL use only activity recorded after admission."
+            )
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @app_commands.command(
+        name="rotation", description="Show recent automatic wallet admissions and removals."
+    )
+    async def rotation(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        events = await self.bot.engine.database.rotation_events(limit=10)
+        if not events:
+            await interaction.followup.send(
+                "No rotation events recorded yet.", ephemeral=True
+            )
+            return
+        lines = []
+        for event in events:
+            pnl_24h_change = event.pnl_24h_usd - event.baseline_pnl_24h_usd
+            pnl_7d_change = event.pnl_7d_usd - event.baseline_pnl_7d_usd
+            lines.append(
+                f"**{event.action} • {event.alias}** • `{_short(event.address)}` • "
+                f"<t:{event.recorded_at}:R>\n"
+                f"{event.reason}\n"
+                f"Rolling change `24H {pnl_24h_change:+,.2f}` / "
+                f"`7D {pnl_7d_change:+,.2f}` • observed source "
+                f"`{_money(event.observed_source_pnl_usd)}` • our PAPER "
+                f"`{_money(event.paper_pnl_usd)}`"
+            )
+        embed = discord.Embed(
+            title="Wallet Rotation Audit",
+            description="\n\n".join(lines)[:4096],
+            color=0x6C5CE7,
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @app_commands.command(
+        name="sources", description="Show which platform data sources are actually connected."
+    )
+    async def sources(self, interaction: discord.Interaction) -> None:
+        status = await self.bot.engine.status()
+        stream_status = (
+            f"connected ({status['stream_subscriptions']} subscriptions)"
+            if status["stream_connected"]
+            else "polling fallback"
+        )
+        text = (
+            "**Solana Tracker:** connected for strict 24H + 7D profitability screening\n"
+            f"**Pump.fun:** verified through public Solana swaps and Pump mint identity\n"
+            f"**Graduated Pump/Jupiter routes:** covered by the same persistent token mint\n"
+            f"**Helius/Solana realtime:** {stream_status}\n"
+            "**Fomo:** not connected — no documented official API/webhook credentials are "
+            "configured. Fomo-native alerts or legitimately obtained public wallet addresses "
+            "can be used; scraping is not used."
+        )
+        await interaction.response.send_message(text, ephemeral=True)
 
     @app_commands.command(name="leaderboard", description="Risk-adjusted tracked-wallet ranking.")
     @app_commands.describe(window="Show 24-hour or 7-day performance")
@@ -966,6 +1080,25 @@ class SmartMoneyCommands(
             if status["discovery_last_refresh"]
             else "not completed yet"
         )
+        weekly_refresh = (
+            f"<t:{status['discovery_7d_last_refresh']}:R>"
+            if status["discovery_7d_last_refresh"]
+            else "not completed yet"
+        )
+        rotation_refresh = (
+            f"<t:{status['rotation_last_refresh']}:R>"
+            if status["rotation_last_refresh"]
+            else "not completed yet"
+        )
+        stream_status = (
+            f"connected • {status['stream_subscriptions']} wallet subscriptions"
+            if status["stream_connected"]
+            else (
+                f"fallback polling • {status['stream_last_error']}"
+                if status["stream_last_error"]
+                else "starting/fallback polling"
+            )
+        )
         paper_copy = (
             "every new tracked-wallet BUY/SELL"
             if status["paper_mirror_raw_swaps"]
@@ -993,7 +1126,11 @@ class SmartMoneyCommands(
             f"**Automatic discovery:** "
             f"{'ready' if status['discovery_configured'] else 'API key needed'}\n"
             f"**Discovered wallets:** {status['discovered_wallets']}\n"
-            f"**Discovery refresh:** {discovery_refresh}\n"
+            f"**Strict candidate pool:** {status['candidate_pool_size']}\n"
+            f"**24H discovery refresh:** {discovery_refresh}\n"
+            f"**7D verification refresh:** {weekly_refresh}\n"
+            f"**Five-minute rotation:** {rotation_refresh}\n"
+            f"**Realtime wallet stream:** {stream_status}\n"
             f"**Last scan:** {last_scan}\n"
             f"**Last error:** {status['last_error'] or 'none'}"
         )
@@ -1023,10 +1160,20 @@ class SmartMoneyCommands(
             f"**Consensus:** {s.consensus_min_traders} traders within "
             f"{s.consensus_window_seconds}s\n"
             f"**Minimum trader score:** {s.min_trader_score}/100\n"
-            f"**Discovery:** top {s.discovery_max_wallets} every "
-            f"{s.discovery_refresh_seconds // 60}m • minimum "
-            f"{_money(s.discovery_min_24h_pnl_usd)} 24H PnL • "
-            f"{s.discovery_min_win_rate_percent}% win rate\n"
+            f"**Candidate pool / hot set:** up to {s.discovery_fetch_limit} / "
+            f"{s.discovery_max_wallets}\n"
+            f"**24H verification:** every {s.discovery_refresh_seconds // 60}m • "
+            f"minimum {_money(s.discovery_min_24h_pnl_usd)} PnL • "
+            f"{s.discovery_min_roi_percent}% ROI • "
+            f"{s.discovery_min_win_rate_percent}% win\n"
+            f"**7D verification:** every {s.discovery_7d_refresh_seconds // 3600}h • "
+            f"minimum {_money(s.discovery_min_7d_pnl_usd)} PnL • "
+            f"{s.discovery_min_7d_roi_percent}% ROI • "
+            f"{s.discovery_min_7d_win_rate_percent}% win\n"
+            f"**Hot rotation:** every {s.rotation_refresh_seconds // 60}m • "
+            f"idle after {s.rotation_max_idle_seconds // 60}m • "
+            f"minimum {s.rotation_min_recent_swaps} recent swap / "
+            f"{s.rotation_min_pump_swaps} Pump swap\n"
             f"**RPC scanning:** every {s.poll_interval_seconds}s • "
             f"{s.rpc_requests_per_second} requests/second maximum\n"
             f"**Copy size:** {_money(s.default_copy_usd)} (max {_money(s.max_copy_usd)})\n"
@@ -1054,9 +1201,9 @@ class SmartMoneyCommands(
         text = (
             "1. `/smartmoney setup` — choose the alert channel\n"
             "2. Add `SOLANA_TRACKER_API_KEY` in Railway for automatic discovery\n"
-            "3. `/smartmoney discover` — refresh the 24-hour profitable-wallet feed\n"
+            "3. `/smartmoney discover` — verify 24H + 7D profit and recent Pump activity\n"
             "4. `/smartmoney scan` — run an immediate on-chain scan\n"
-            "5. `/smartmoney leaderboard` — inspect risk-adjusted rankings\n"
+            "5. `/smartmoney hot-wallets` and `rotation` — inspect evidence and changes\n"
             "6. Keep `/smartmoney mode paper` to auto-mirror every new tracked-wallet swap\n"
             "7. `/smartmoney positions`, `paper`, and `paper-trades` — inspect results\n"
             "8. `/smartmoney readiness` — see the exact gates before any tiny live pilot\n"
