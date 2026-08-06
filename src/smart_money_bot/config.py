@@ -78,6 +78,18 @@ class Settings:
     paper_require_current_price: bool
     paper_raw_entry_filter_enabled: bool
     paper_daily_target_usd: Decimal
+    paper_use_executable_quotes: bool
+    paper_quote_output_buffer_bps: int
+    max_adverse_entry_drift_percent: Decimal
+    max_quote_price_impact_percent: Decimal
+    max_quote_latency_ms: int
+    max_consecutive_quote_failures: int
+
+    readiness_min_active_days: int
+    readiness_min_closed_trades: int
+    readiness_min_profit_factor: Decimal
+    readiness_max_drawdown_percent: Decimal
+    readiness_min_quote_success_percent: Decimal
 
     max_copy_usd: Decimal
     max_daily_loss_usd: Decimal
@@ -159,6 +171,35 @@ class Settings:
                 "PAPER_RAW_ENTRY_FILTER_ENABLED", True
             ),
             paper_daily_target_usd=_decimal("PAPER_DAILY_TARGET_USD", "100"),
+            paper_use_executable_quotes=_bool(
+                "PAPER_USE_EXECUTABLE_QUOTES", True
+            ),
+            paper_quote_output_buffer_bps=_int(
+                "PAPER_QUOTE_OUTPUT_BUFFER_BPS", 50
+            ),
+            max_adverse_entry_drift_percent=_decimal(
+                "MAX_ADVERSE_ENTRY_DRIFT_PERCENT", "8"
+            ),
+            max_quote_price_impact_percent=_decimal(
+                "MAX_QUOTE_PRICE_IMPACT_PERCENT", "2"
+            ),
+            max_quote_latency_ms=_int("MAX_QUOTE_LATENCY_MS", 5000),
+            max_consecutive_quote_failures=_int(
+                "MAX_CONSECUTIVE_QUOTE_FAILURES", 5
+            ),
+            readiness_min_active_days=_int("READINESS_MIN_ACTIVE_DAYS", 14),
+            readiness_min_closed_trades=_int(
+                "READINESS_MIN_CLOSED_TRADES", 100
+            ),
+            readiness_min_profit_factor=_decimal(
+                "READINESS_MIN_PROFIT_FACTOR", "1.25"
+            ),
+            readiness_max_drawdown_percent=_decimal(
+                "READINESS_MAX_DRAWDOWN_PERCENT", "10"
+            ),
+            readiness_min_quote_success_percent=_decimal(
+                "READINESS_MIN_QUOTE_SUCCESS_PERCENT", "95"
+            ),
             max_copy_usd=_decimal("MAX_COPY_USD", "25"),
             max_daily_loss_usd=_decimal("MAX_DAILY_LOSS_USD", "30"),
             max_open_positions=_int("MAX_OPEN_POSITIONS", 6),
@@ -250,6 +291,28 @@ class Settings:
             raise ValueError("MAX_HOLD_SECONDS must be at least 60")
         if self.paper_daily_target_usd <= 0:
             raise ValueError("PAPER_DAILY_TARGET_USD must be positive")
+        if not 0 <= self.paper_quote_output_buffer_bps < 10_000:
+            raise ValueError("PAPER_QUOTE_OUTPUT_BUFFER_BPS must be between 0 and 9999")
+        if self.max_adverse_entry_drift_percent < 0:
+            raise ValueError("MAX_ADVERSE_ENTRY_DRIFT_PERCENT cannot be negative")
+        if self.max_quote_price_impact_percent <= 0:
+            raise ValueError("MAX_QUOTE_PRICE_IMPACT_PERCENT must be positive")
+        if self.max_quote_latency_ms < 100:
+            raise ValueError("MAX_QUOTE_LATENCY_MS must be at least 100")
+        if self.max_consecutive_quote_failures < 1:
+            raise ValueError("MAX_CONSECUTIVE_QUOTE_FAILURES must be at least 1")
+        if self.readiness_min_active_days < 1:
+            raise ValueError("READINESS_MIN_ACTIVE_DAYS must be at least 1")
+        if self.readiness_min_closed_trades < 1:
+            raise ValueError("READINESS_MIN_CLOSED_TRADES must be at least 1")
+        if self.readiness_min_profit_factor <= 0:
+            raise ValueError("READINESS_MIN_PROFIT_FACTOR must be positive")
+        if not 0 < self.readiness_max_drawdown_percent <= 100:
+            raise ValueError("READINESS_MAX_DRAWDOWN_PERCENT must be between 0 and 100")
+        if not 0 <= self.readiness_min_quote_success_percent <= 100:
+            raise ValueError(
+                "READINESS_MIN_QUOTE_SUCCESS_PERCENT must be between 0 and 100"
+            )
         raw_percentages = (
             self.raw_mirror_stop_loss_percent,
             self.raw_mirror_take_profit_percent,

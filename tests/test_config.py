@@ -90,3 +90,27 @@ def test_v27_paper_risk_guards_default_on(monkeypatch) -> None:
     assert settings.raw_mirror_trailing_activation_percent == 8
     assert settings.raw_mirror_trailing_stop_percent == 4
     assert settings.raw_mirror_max_hold_seconds == 7200
+
+
+def test_v28_quote_shadow_and_readiness_defaults(monkeypatch) -> None:
+    names = (
+        "PAPER_USE_EXECUTABLE_QUOTES",
+        "PAPER_QUOTE_OUTPUT_BUFFER_BPS",
+        "MAX_ADVERSE_ENTRY_DRIFT_PERCENT",
+        "MAX_QUOTE_PRICE_IMPACT_PERCENT",
+        "MAX_QUOTE_LATENCY_MS",
+        "MAX_CONSECUTIVE_QUOTE_FAILURES",
+        "READINESS_MIN_ACTIVE_DAYS",
+        "READINESS_MIN_CLOSED_TRADES",
+    )
+    for name in names:
+        monkeypatch.delenv(name, raising=False)
+    settings = Settings.from_env(require_discord_token=False)
+    assert settings.paper_use_executable_quotes is True
+    assert settings.paper_quote_output_buffer_bps == 50
+    assert settings.max_adverse_entry_drift_percent == 8
+    assert settings.max_quote_price_impact_percent == 2
+    assert settings.max_quote_latency_ms == 5000
+    assert settings.max_consecutive_quote_failures == 5
+    assert settings.readiness_min_active_days == 14
+    assert settings.readiness_min_closed_trades == 100

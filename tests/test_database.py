@@ -30,6 +30,21 @@ async def test_existing_paper_database_migrates_raw_mirror_columns(tmp_path) -> 
         )
         """
     )
+    connection.execute(
+        """
+        CREATE TABLE paper_mirror_positions (
+            trader_address TEXT NOT NULL,
+            token_mint TEXT NOT NULL,
+            source_quantity REAL NOT NULL,
+            paper_quantity REAL NOT NULL,
+            cost_basis_usd REAL NOT NULL,
+            average_entry_usd REAL NOT NULL,
+            opened_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (trader_address, token_mint)
+        )
+        """
+    )
     connection.commit()
     connection.close()
 
@@ -43,12 +58,20 @@ async def test_existing_paper_database_migrates_raw_mirror_columns(tmp_path) -> 
             "source_signature",
             "execution_kind",
             "exit_reason",
+            "source_price_usd",
+            "quote_price_usd",
+            "price_drift_percent",
+            "price_impact_percent",
+            "quote_router",
+            "quote_latency_ms",
+            "quote_fee_bps",
+            "quote_based",
         } <= columns
         mirror_cursor = await database.db.execute(
             "PRAGMA table_info(paper_mirror_positions)"
         )
         mirror_columns = {row["name"] for row in await mirror_cursor.fetchall()}
-        assert "peak_price_usd" in mirror_columns
+        assert {"peak_price_usd", "token_decimals"} <= mirror_columns
         assert await database.paper_mirror_positions() == []
     finally:
         await database.close()
@@ -289,5 +312,94 @@ async def test_paper_summary_reports_expectancy_and_profit_factor(tmp_path) -> N
         assert float(summary.average_loss_usd) == pytest.approx(10)
         assert float(summary.expectancy_usd) == pytest.approx(5)
         assert float(summary.realized_pnl_24h_usd) == pytest.approx(10)
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_quote_based_round_trip_and_readiness(tmp_path) -> None:
+    database = Database(str(tmp_path / "quoted.db"), Decimal("1000"))
+    await database.connect()
+    try:
+        await database.record_paper_quote_attempt(
+            source_signature="quote-buy",
+            token_mint="mint",
+            side=Side.BUY,
+            quote_success=True,
+            accepted=True,
+            reason=None,
+            latency_ms=100,
+            price_impact_percent=Decimal("0.2"),
+            price_drift_percent=Decimal("1"),
+        )
+        buy = await database.paper_mirror_execute(
+            trader_address="wallet-a",
+            source_signature="quote-buy",
+            token_mint="mint",
+            side=Side.BUY,
+            source_token_amount=Decimal("100"),
+            market_price_usd=Decimal("1"),
+            size_usd=Decimal("10"),
+            fee_bps=0,
+            slippage_bps=0,
+            quoted_input_amount=Decimal("10"),
+            quoted_output_amount=Decimal("10"),
+            token_decimals=6,
+            source_price_usd=Decimal("1"),
+            quote_price_usd=Decimal("1"),
+            price_drift_percent=Decimal("0"),
+            price_impact_percent=Decimal("0.2"),
+            quote_router="metis",
+            quote_latency_ms=100,
+            quote_fee_bps=10,
+        )
+        assert buy is not None
+        await database.record_paper_quote_attempt(
+            source_signature="quote-sell",
+            token_mint="mint",
+            side=Side.SELL,
+            quote_success=True,
+            accepted=True,
+            reason=None,
+            latency_ms=100,
+            price_impact_percent=Decimal("0.1"),
+        )
+        sell = await database.paper_mirror_execute(
+            trader_address="wallet-a",
+            source_signature="quote-sell",
+            token_mint="mint",
+            side=Side.SELL,
+            source_token_amount=Decimal("100"),
+            market_price_usd=Decimal("1.2"),
+            size_usd=Decimal("10"),
+            fee_bps=0,
+            slippage_bps=0,
+            quoted_input_amount=Decimal("10"),
+            quoted_output_amount=Decimal("12"),
+            token_decimals=6,
+            quote_price_usd=Decimal("1.2"),
+            price_impact_percent=Decimal("0.1"),
+            quote_router="metis",
+            quote_latency_ms=100,
+            quote_fee_bps=10,
+        )
+        assert sell is not None
+        assert sell["realized_pnl"] == Decimal("2")
+        await database.paper_summary({})
+
+        report = await database.paper_readiness(
+            min_active_days=1,
+            min_closed_trades=1,
+            min_profit_factor=Decimal("1"),
+            max_drawdown_percent=Decimal("10"),
+            min_quote_success_percent=Decimal("95"),
+        )
+        assert report.ready is True
+        assert report.closed_trades == 1
+        assert report.quote_success_percent == Decimal("100")
+        assert report.expectancy_usd == Decimal("2.0")
+        trades = await database.paper_recent_trades()
+        assert trades[0]["quote_based"] == 1
+        assert trades[0]["quote_router"] == "metis"
     finally:
         await database.close()

@@ -18,6 +18,7 @@ from .models import (
     DiscoveryCandidate,
     DiscoveryRefresh,
     ExecutionMode,
+    PaperReadiness,
     PaperSummary,
     Side,
     Signal,
@@ -173,6 +174,7 @@ class Database:
                 cost_basis_usd REAL NOT NULL,
                 average_entry_usd REAL NOT NULL,
                 peak_price_usd REAL NOT NULL DEFAULT 0,
+                token_decimals INTEGER,
                 opened_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
                 PRIMARY KEY (trader_address, token_mint)
@@ -194,6 +196,14 @@ class Database:
                 source_signature TEXT,
                 execution_kind TEXT NOT NULL DEFAULT 'CONSENSUS',
                 exit_reason TEXT,
+                source_price_usd REAL,
+                quote_price_usd REAL,
+                price_drift_percent REAL,
+                price_impact_percent REAL,
+                quote_router TEXT,
+                quote_latency_ms INTEGER,
+                quote_fee_bps INTEGER,
+                quote_based INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL,
                 FOREIGN KEY (signal_id) REFERENCES signals(id)
             );
@@ -221,6 +231,30 @@ class Database:
                 FOREIGN KEY (signal_id) REFERENCES signals(id)
             );
 
+            CREATE TABLE IF NOT EXISTS paper_quote_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_signature TEXT,
+                token_mint TEXT NOT NULL,
+                side TEXT NOT NULL,
+                quote_success INTEGER NOT NULL,
+                accepted INTEGER NOT NULL,
+                reason TEXT,
+                latency_ms INTEGER,
+                price_impact_percent REAL,
+                price_drift_percent REAL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_paper_quote_attempts_time
+                ON paper_quote_attempts(created_at);
+
+            CREATE TABLE IF NOT EXISTS paper_equity_samples (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                equity_usd REAL NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_paper_equity_samples_time
+                ON paper_equity_samples(created_at);
+
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -238,6 +272,17 @@ class Database:
         await self._ensure_column("paper_trades", "exit_reason", "TEXT")
         await self._ensure_column(
             "paper_mirror_positions", "peak_price_usd", "REAL NOT NULL DEFAULT 0"
+        )
+        await self._ensure_column("paper_mirror_positions", "token_decimals", "INTEGER")
+        await self._ensure_column("paper_trades", "source_price_usd", "REAL")
+        await self._ensure_column("paper_trades", "quote_price_usd", "REAL")
+        await self._ensure_column("paper_trades", "price_drift_percent", "REAL")
+        await self._ensure_column("paper_trades", "price_impact_percent", "REAL")
+        await self._ensure_column("paper_trades", "quote_router", "TEXT")
+        await self._ensure_column("paper_trades", "quote_latency_ms", "INTEGER")
+        await self._ensure_column("paper_trades", "quote_fee_bps", "INTEGER")
+        await self._ensure_column(
+            "paper_trades", "quote_based", "INTEGER NOT NULL DEFAULT 0"
         )
         await self.db.execute(
             """
@@ -265,6 +310,10 @@ class Database:
         )
         await self.db.execute(
             "INSERT OR IGNORE INTO settings(key, value) VALUES ('paused', 'false')"
+        )
+        await self.db.execute(
+            "INSERT OR IGNORE INTO settings(key, value) VALUES ('paper_trial_started_at', ?)",
+            (str(now),),
         )
         await self.db.commit()
 
@@ -896,13 +945,25 @@ class Database:
         max_position_usd: Decimal | None = None,
         execution_kind: str = "RAW_MIRROR",
         exit_reason: str | None = None,
+        quoted_input_amount: Decimal | None = None,
+        quoted_output_amount: Decimal | None = None,
+        token_decimals: int | None = None,
+        source_price_usd: Decimal | None = None,
+        quote_price_usd: Decimal | None = None,
+        price_drift_percent: Decimal | None = None,
+        price_impact_percent: Decimal | None = None,
+        quote_router: str | None = None,
+        quote_latency_ms: int | None = None,
+        quote_fee_bps: int | None = None,
     ) -> dict[str, Decimal] | None:
         """Mirror one source wallet while keeping each wallet's paper lot separate."""
 
         if source_token_amount <= 0 or market_price_usd <= 0:
             return None
-        fee_rate = Decimal(fee_bps) / Decimal(10_000)
+        effective_fee_bps = quote_fee_bps if quote_fee_bps is not None else fee_bps
+        fee_rate = Decimal(effective_fee_bps) / Decimal(10_000)
         slip_rate = Decimal(slippage_bps) / Decimal(10_000)
+        quote_based = quoted_output_amount is not None
         now = int(time.time())
         async with self._write_lock:
             await self.db.execute("BEGIN IMMEDIATE")
@@ -941,8 +1002,15 @@ class Database:
                         await self.db.rollback()
                         return None
                     fee = notional * fee_rate
-                    effective_price = market_price_usd * (Decimal("1") + slip_rate)
-                    paper_quantity = (notional - fee) / effective_price
+                    if quote_based:
+                        if quoted_output_amount is None or quoted_output_amount <= 0:
+                            await self.db.rollback()
+                            return None
+                        paper_quantity = quoted_output_amount
+                        effective_price = notional / paper_quantity
+                    else:
+                        effective_price = market_price_usd * (Decimal("1") + slip_rate)
+                        paper_quantity = (notional - fee) / effective_price
                     old_source_quantity = (
                         _d(position["source_quantity"]) if position else Decimal("0")
                     )
@@ -960,14 +1028,18 @@ class Database:
                         INSERT INTO paper_mirror_positions(
                             trader_address, token_mint, source_quantity, paper_quantity,
                             cost_basis_usd, average_entry_usd, peak_price_usd,
-                            opened_at, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            token_decimals, opened_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(trader_address, token_mint) DO UPDATE SET
                             source_quantity = excluded.source_quantity,
                             paper_quantity = excluded.paper_quantity,
                             cost_basis_usd = excluded.cost_basis_usd,
                             average_entry_usd = excluded.average_entry_usd,
                             peak_price_usd = excluded.peak_price_usd,
+                            token_decimals = COALESCE(
+                                excluded.token_decimals,
+                                paper_mirror_positions.token_decimals
+                            ),
                             updated_at = excluded.updated_at
                         """,
                         (
@@ -978,6 +1050,7 @@ class Database:
                             float(new_cost),
                             float(average_entry),
                             float(peak_price),
+                            token_decimals,
                             now,
                             now,
                         ),
@@ -1003,10 +1076,29 @@ class Database:
                     )
                     paper_quantity = held_paper_quantity * source_fraction
                     matched_cost = held_cost * source_fraction
-                    effective_price = market_price_usd * (Decimal("1") - slip_rate)
-                    gross = paper_quantity * effective_price
-                    fee = gross * fee_rate
-                    net = gross - fee
+                    if quote_based:
+                        if (
+                            quoted_input_amount is None
+                            or quoted_input_amount <= 0
+                            or quoted_output_amount is None
+                            or quoted_output_amount <= 0
+                        ):
+                            await self.db.rollback()
+                            return None
+                        paper_quantity = min(paper_quantity, quoted_input_amount)
+                        net = quoted_output_amount
+                        fee = (
+                            net * fee_rate / (Decimal("1") - fee_rate)
+                            if fee_rate < 1
+                            else Decimal("0")
+                        )
+                        gross = net + fee
+                        effective_price = net / paper_quantity
+                    else:
+                        effective_price = market_price_usd * (Decimal("1") - slip_rate)
+                        gross = paper_quantity * effective_price
+                        fee = gross * fee_rate
+                        net = gross - fee
                     realized = net - matched_cost
                     cash += net
                     realized_total += realized
@@ -1062,8 +1154,13 @@ class Database:
                     INSERT INTO paper_trades(
                         signal_id, token_mint, side, quantity, execution_price_usd,
                         gross_value_usd, fee_usd, realized_pnl_usd, source_trader,
-                        source_signature, execution_kind, exit_reason, created_at
-                    ) VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        source_signature, execution_kind, exit_reason, source_price_usd,
+                        quote_price_usd, price_drift_percent, price_impact_percent,
+                        quote_router, quote_latency_ms, quote_fee_bps, quote_based,
+                        created_at
+                    ) VALUES (
+                        NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    )
                     """,
                     (
                         token_mint,
@@ -1077,6 +1174,22 @@ class Database:
                         source_signature,
                         execution_kind,
                         exit_reason,
+                        float(source_price_usd) if source_price_usd is not None else None,
+                        float(quote_price_usd) if quote_price_usd is not None else None,
+                        (
+                            float(price_drift_percent)
+                            if price_drift_percent is not None
+                            else None
+                        ),
+                        (
+                            float(price_impact_percent)
+                            if price_impact_percent is not None
+                            else None
+                        ),
+                        quote_router,
+                        quote_latency_ms,
+                        effective_fee_bps if quote_based else None,
+                        1 if quote_based else 0,
                         now,
                     ),
                 )
@@ -1090,6 +1203,7 @@ class Database:
                     "source_fraction": source_fraction,
                     "remaining_quantity": remaining_quantity,
                     "remaining_cost_basis": remaining_cost,
+                    "quote_based": Decimal("1") if quote_based else Decimal("0"),
                 }
             except Exception:
                 await self.db.rollback()
@@ -1113,6 +1227,101 @@ class Database:
             (trader_address, token_mint),
         )
         return await cursor.fetchone() is not None
+
+    async def paper_mirror_buy_capacity(
+        self,
+        trader_address: str,
+        token_mint: str,
+        requested_usd: Decimal,
+        max_position_usd: Decimal,
+    ) -> Decimal:
+        account_cursor = await self.db.execute(
+            "SELECT cash_usd FROM paper_account WHERE id = 1"
+        )
+        account = await account_cursor.fetchone()
+        position_cursor = await self.db.execute(
+            """
+            SELECT cost_basis_usd FROM paper_mirror_positions
+            WHERE trader_address = ? AND token_mint = ?
+            """,
+            (trader_address, token_mint),
+        )
+        position = await position_cursor.fetchone()
+        current_cost = _d(position["cost_basis_usd"]) if position else Decimal("0")
+        remaining = max(Decimal("0"), max_position_usd - current_cost)
+        return max(
+            Decimal("0"),
+            min(requested_usd, _d(account["cash_usd"]), remaining),
+        )
+
+    async def paper_mirror_sell_preview(
+        self,
+        trader_address: str,
+        token_mint: str,
+        source_token_amount: Decimal,
+    ) -> dict[str, Decimal | int | None] | None:
+        cursor = await self.db.execute(
+            """
+            SELECT * FROM paper_mirror_positions
+            WHERE trader_address = ? AND token_mint = ?
+            """,
+            (trader_address, token_mint),
+        )
+        position = await cursor.fetchone()
+        if position is None:
+            return None
+        source_quantity = _d(position["source_quantity"])
+        paper_quantity = _d(position["paper_quantity"])
+        cost_basis = _d(position["cost_basis_usd"])
+        if source_quantity <= 0 or paper_quantity <= 0:
+            return None
+        source_fraction = min(Decimal("1"), source_token_amount / source_quantity)
+        return {
+            "source_fraction": source_fraction,
+            "paper_quantity": paper_quantity * source_fraction,
+            "matched_cost_usd": cost_basis * source_fraction,
+            "token_decimals": position["token_decimals"],
+        }
+
+    async def record_paper_quote_attempt(
+        self,
+        *,
+        source_signature: str | None,
+        token_mint: str,
+        side: Side,
+        quote_success: bool,
+        accepted: bool,
+        reason: str | None,
+        latency_ms: int | None = None,
+        price_impact_percent: Decimal | None = None,
+        price_drift_percent: Decimal | None = None,
+    ) -> None:
+        await self.db.execute(
+            """
+            INSERT INTO paper_quote_attempts(
+                source_signature, token_mint, side, quote_success, accepted,
+                reason, latency_ms, price_impact_percent, price_drift_percent,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                source_signature,
+                token_mint,
+                side.value,
+                1 if quote_success else 0,
+                1 if accepted else 0,
+                reason,
+                latency_ms,
+                (
+                    float(price_impact_percent)
+                    if price_impact_percent is not None
+                    else None
+                ),
+                float(price_drift_percent) if price_drift_percent is not None else None,
+                int(time.time()),
+            ),
+        )
+        await self.db.commit()
 
     async def update_paper_mirror_peak(
         self,
@@ -1292,6 +1501,138 @@ class Database:
             profit_factor=(gross_profit / gross_loss if gross_loss > 0 else None),
         )
 
+    async def paper_readiness(
+        self,
+        *,
+        min_active_days: int,
+        min_closed_trades: int,
+        min_profit_factor: Decimal,
+        max_drawdown_percent: Decimal,
+        min_quote_success_percent: Decimal,
+    ) -> PaperReadiness:
+        now = int(time.time())
+        raw_start = await self.get_setting("paper_trial_started_at", str(now))
+        trial_started_at = int(raw_start or now)
+
+        active_cursor = await self.db.execute(
+            """
+            SELECT COUNT(DISTINCT day) AS active_days FROM (
+                SELECT date(created_at, 'unixepoch') AS day
+                FROM paper_quote_attempts WHERE created_at >= ?
+                UNION ALL
+                SELECT date(created_at, 'unixepoch') AS day
+                FROM paper_trades WHERE quote_based = 1 AND created_at >= ?
+            )
+            """,
+            (trial_started_at, trial_started_at),
+        )
+        active_row = await active_cursor.fetchone()
+        active_days = int(active_row["active_days"] or 0)
+
+        quote_cursor = await self.db.execute(
+            """
+            SELECT
+                COUNT(*) AS attempts,
+                SUM(quote_success) AS successes,
+                SUM(CASE WHEN side = 'BUY' AND accepted = 1 THEN 1 ELSE 0 END)
+                    AS accepted_entries
+            FROM paper_quote_attempts WHERE created_at >= ?
+            """,
+            (trial_started_at,),
+        )
+        quote_row = await quote_cursor.fetchone()
+        quote_attempts = int(quote_row["attempts"] or 0)
+        quote_successes = int(quote_row["successes"] or 0)
+        quote_success_percent = (
+            Decimal(quote_successes) / Decimal(quote_attempts) * Decimal("100")
+            if quote_attempts
+            else Decimal("0")
+        )
+
+        trade_cursor = await self.db.execute(
+            """
+            SELECT
+                COUNT(*) AS closed_trades,
+                SUM(CASE WHEN realized_pnl_usd > 0 THEN realized_pnl_usd ELSE 0 END)
+                    AS gross_profit,
+                ABS(SUM(CASE WHEN realized_pnl_usd < 0 THEN realized_pnl_usd ELSE 0 END))
+                    AS gross_loss,
+                SUM(realized_pnl_usd) AS net_pnl
+            FROM paper_trades
+            WHERE side = 'SELL' AND quote_based = 1 AND created_at >= ?
+            """,
+            (trial_started_at,),
+        )
+        trade_row = await trade_cursor.fetchone()
+        closed_trades = int(trade_row["closed_trades"] or 0)
+        gross_profit = _d(trade_row["gross_profit"])
+        gross_loss = _d(trade_row["gross_loss"])
+        net_pnl = _d(trade_row["net_pnl"])
+        expectancy = (
+            net_pnl / Decimal(closed_trades) if closed_trades else Decimal("0")
+        )
+        profit_factor = gross_profit / gross_loss if gross_loss > 0 else None
+
+        samples_cursor = await self.db.execute(
+            """
+            SELECT equity_usd FROM paper_equity_samples
+            WHERE created_at >= ? ORDER BY created_at, id
+            """,
+            (trial_started_at,),
+        )
+        samples = [_d(row["equity_usd"]) for row in await samples_cursor.fetchall()]
+        peak = samples[0] if samples else Decimal("0")
+        max_drawdown = Decimal("0")
+        max_drawdown_pct = Decimal("0")
+        for equity in samples:
+            peak = max(peak, equity)
+            drawdown = max(Decimal("0"), peak - equity)
+            drawdown_pct = drawdown / peak * Decimal("100") if peak > 0 else Decimal("0")
+            max_drawdown = max(max_drawdown, drawdown)
+            max_drawdown_pct = max(max_drawdown_pct, drawdown_pct)
+
+        blockers: list[str] = []
+        if active_days < min_active_days:
+            blockers.append(f"{min_active_days - active_days} more active test day(s)")
+        if closed_trades < min_closed_trades:
+            blockers.append(f"{min_closed_trades - closed_trades} more quoted exits")
+        profit_factor_passes = (
+            profit_factor >= min_profit_factor
+            if profit_factor is not None
+            else gross_profit > 0 and gross_loss == 0
+        )
+        if not profit_factor_passes:
+            blockers.append(f"profit factor below {min_profit_factor:.2f}")
+        if expectancy <= 0:
+            blockers.append("expectancy is not positive")
+        if max_drawdown_pct > max_drawdown_percent:
+            blockers.append(
+                f"drawdown {max_drawdown_pct:.2f}% exceeds {max_drawdown_percent:.2f}%"
+            )
+        if quote_success_percent < min_quote_success_percent:
+            blockers.append(
+                f"quote success {quote_success_percent:.1f}% is below "
+                f"{min_quote_success_percent:.1f}%"
+            )
+
+        return PaperReadiness(
+            trial_started_at=trial_started_at,
+            active_days=active_days,
+            quote_attempts=quote_attempts,
+            quote_successes=quote_successes,
+            quote_success_percent=quote_success_percent,
+            accepted_entries=int(quote_row["accepted_entries"] or 0),
+            closed_trades=closed_trades,
+            gross_profit_usd=gross_profit,
+            gross_loss_usd=gross_loss,
+            expectancy_usd=expectancy,
+            profit_factor=profit_factor,
+            max_drawdown_usd=max_drawdown,
+            max_drawdown_percent=max_drawdown_pct,
+            ready=not blockers,
+            blockers=tuple(blockers),
+        )
+
     async def _update_paper_drawdown(self, equity: Decimal) -> None:
         cursor = await self.db.execute(
             "SELECT high_watermark_usd, max_drawdown_usd FROM paper_account WHERE id = 1"
@@ -1306,6 +1647,10 @@ class Database:
             """,
             (float(high), float(drawdown), int(time.time())),
         )
+        await self.db.execute(
+            "INSERT INTO paper_equity_samples(equity_usd, created_at) VALUES (?, ?)",
+            (float(equity), int(time.time())),
+        )
         await self.db.commit()
 
     async def reset_paper(self) -> None:
@@ -1314,6 +1659,8 @@ class Database:
             await self.db.execute("DELETE FROM paper_positions")
             await self.db.execute("DELETE FROM paper_mirror_positions")
             await self.db.execute("DELETE FROM paper_trades")
+            await self.db.execute("DELETE FROM paper_quote_attempts")
+            await self.db.execute("DELETE FROM paper_equity_samples")
             await self.db.execute(
                 """
                 UPDATE paper_account SET
@@ -1325,6 +1672,13 @@ class Database:
                 WHERE id = 1
                 """,
                 (now,),
+            )
+            await self.db.execute(
+                """
+                INSERT INTO settings(key, value) VALUES ('paper_trial_started_at', ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (str(now),),
             )
             await self.db.commit()
 

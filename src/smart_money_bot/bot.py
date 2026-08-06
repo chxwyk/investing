@@ -580,8 +580,77 @@ class SmartMoneyCommands(
         )
         embed.set_footer(
             text=(
-                "Paper simulation uses current observed prices plus configured costs; "
+                "Quote-shadow PAPER uses Jupiter order quotes plus a conservative output buffer; "
                 "the target is a benchmark, not a profit promise."
+            )
+        )
+        await interaction.followup.send(embed=embed)
+
+    @app_commands.command(
+        name="readiness",
+        description="Show whether the quote-shadow trial has passed every live-review gate.",
+    )
+    async def readiness(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(thinking=True)
+        report = await self.bot.engine.paper_readiness()
+        s = self.bot.settings
+        quote_configured = s.paper_use_executable_quotes and bool(s.jupiter_api_key)
+        display_ready = report.ready and quote_configured
+        status = "READY FOR MICRO-LIVE REVIEW" if display_ready else "KEEP TESTING"
+        color = 0x2ECC71 if display_ready else 0xF1C40F
+        profit_factor = (
+            f"{report.profit_factor:.2f}"
+            if report.profit_factor is not None
+            else ("no quoted losses yet" if report.gross_profit_usd > 0 else "n/a")
+        )
+        blockers = (
+            "All configured gates passed. This is not a profit guarantee."
+            if display_ready
+            else "\n".join(f"• {item}" for item in report.blockers)
+        )
+        if not quote_configured:
+            blockers = "• JUPITER_API_KEY is missing or quote-shadow PAPER is disabled\n" + blockers
+        embed = discord.Embed(title=f"Paper Trial Readiness • {status}", color=color)
+        embed.add_field(
+            name="Trial started",
+            value=f"<t:{report.trial_started_at}:f>",
+            inline=False,
+        )
+        embed.add_field(
+            name="Active test days",
+            value=f"{report.active_days} / {s.readiness_min_active_days}",
+        )
+        embed.add_field(
+            name="Quoted exits",
+            value=f"{report.closed_trades} / {s.readiness_min_closed_trades}",
+        )
+        embed.add_field(name="Accepted entries", value=str(report.accepted_entries))
+        embed.add_field(
+            name="Quote reliability",
+            value=(
+                f"{report.quote_success_percent:.1f}% "
+                f"({report.quote_successes}/{report.quote_attempts})"
+            ),
+        )
+        embed.add_field(
+            name="Profit factor",
+            value=f"{profit_factor} / {s.readiness_min_profit_factor:.2f}+",
+        )
+        embed.add_field(name="Expectancy / exit", value=_money(report.expectancy_usd))
+        embed.add_field(
+            name="Trial max drawdown",
+            value=(
+                f"{_money(report.max_drawdown_usd)} "
+                f"({report.max_drawdown_percent:.2f}% / "
+                f"{s.readiness_max_drawdown_percent:.2f}% max)"
+            ),
+            inline=False,
+        )
+        embed.add_field(name="Remaining gates", value=blockers[:1024], inline=False)
+        embed.set_footer(
+            text=(
+                "Passing means review a tiny live pilot next—not that $50-$100/day "
+                "is guaranteed."
             )
         )
         await interaction.followup.send(embed=embed)
@@ -623,6 +692,18 @@ class SmartMoneyCommands(
                 )
             else:
                 detail = f"spent `{_money(gross)}` • fee `{_money(fee)}`"
+            if bool(item.get("quote_based")):
+                router = str(item.get("quote_router") or "unknown")
+                impact = Decimal(str(item.get("price_impact_percent") or 0))
+                drift_raw = item.get("price_drift_percent")
+                drift_text = (
+                    f" • drift `{Decimal(str(drift_raw)):+.2f}%`"
+                    if drift_raw is not None
+                    else ""
+                )
+                detail += (
+                    f" • quote `{router}` • impact `{impact:.2f}%`{drift_text}"
+                )
             lines.append(
                 f"**{side} • {kind}** • `{_short(mint)}` • <t:{timestamp}:R>\n"
                 f"qty `{quantity:.6f}` @ `{_price(price)}` • {detail}"
@@ -808,7 +889,10 @@ class SmartMoneyCommands(
             )
             return
         await self.bot.engine.database.reset_paper()
-        await interaction.response.send_message("Paper account reset.", ephemeral=True)
+        await interaction.response.send_message(
+            "Paper account and quote-readiness trial reset. The new test clock starts now.",
+            ephemeral=True,
+        )
 
     @app_commands.command(name="mode", description="Show or change execution mode.")
     async def mode(
@@ -855,6 +939,20 @@ class SmartMoneyCommands(
             "Monitoring paused." if paused else "Monitoring resumed.", ephemeral=True
         )
 
+    @app_commands.command(
+        name="kill-switch",
+        description="Immediately pause discovery, scanning, and new paper actions.",
+    )
+    async def kill_switch(self, interaction: discord.Interaction) -> None:
+        if not await self._require_admin(interaction):
+            return
+        await self.bot.engine.set_paused(True)
+        await interaction.response.send_message(
+            "Kill switch engaged. Monitoring is paused; existing PAPER data is preserved. "
+            "Resume with `/smartmoney pause action:resume`.",
+            ephemeral=True,
+        )
+
     @app_commands.command(name="status", description="Check bot, RPC, and monitor health.")
     async def status(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(thinking=True, ephemeral=True)
@@ -884,6 +982,10 @@ class SmartMoneyCommands(
             f"{'current price required' if s.paper_require_current_price else 'fallback allowed'}\n"
             f"**Raw entry safety gate:** "
             f"{'enabled' if s.paper_raw_entry_filter_enabled else 'disabled'}\n"
+            f"**Executable quote shadow:** "
+            f"{'ready' if status['quote_ready'] else 'JUPITER_API_KEY needed'}\n"
+            f"**Consecutive quote failures:** {status['consecutive_quote_failures']} / "
+            f"{s.max_consecutive_quote_failures}\n"
             f"**Raw-buy pings:** "
             f"{'ready' if self.bot.settings.discord_alert_user_id else 'user ID not set'}\n"
             f"**Paused:** {status['paused']}\n"
@@ -911,6 +1013,13 @@ class SmartMoneyCommands(
             f"{'current price required' if s.paper_require_current_price else 'fallback allowed'}\n"
             f"**Raw entry safety gate:** "
             f"{'enabled' if s.paper_raw_entry_filter_enabled else 'disabled'}\n"
+            f"**Quote-shadow PAPER:** "
+            f"{'enabled' if s.paper_use_executable_quotes else 'disabled'}\n"
+            f"**Entry chase limit:** +{s.max_adverse_entry_drift_percent}%\n"
+            f"**Maximum entry price impact:** {s.max_quote_price_impact_percent}%\n"
+            f"**Quote latency / failure lock:** {s.max_quote_latency_ms}ms / "
+            f"{s.max_consecutive_quote_failures} consecutive failures\n"
+            f"**Paper quote output buffer:** {s.paper_quote_output_buffer_bps}bps\n"
             f"**Consensus:** {s.consensus_min_traders} traders within "
             f"{s.consensus_window_seconds}s\n"
             f"**Minimum trader score:** {s.min_trader_score}/100\n"
@@ -950,6 +1059,8 @@ class SmartMoneyCommands(
             "5. `/smartmoney leaderboard` — inspect risk-adjusted rankings\n"
             "6. Keep `/smartmoney mode paper` to auto-mirror every new tracked-wallet swap\n"
             "7. `/smartmoney positions`, `paper`, and `paper-trades` — inspect results\n"
+            "8. `/smartmoney readiness` — see the exact gates before any tiny live pilot\n"
+            "Emergency stop: `/smartmoney kill-switch`\n"
             "Manual `trader-add` and CSV import remain optional overrides."
         )
         await interaction.response.send_message(text, ephemeral=True)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 from decimal import Decimal
 from unittest.mock import AsyncMock
 
@@ -14,6 +15,7 @@ from smart_money_bot.models import (
     RiskDecision,
     Side,
     Signal,
+    SwapQuote,
     TokenInfo,
     TrackedTrader,
 )
@@ -219,5 +221,133 @@ async def test_scan_loop_closes_raw_lot_at_maximum_hold(settings) -> None:
 
         assert await engine.database.paper_mirror_positions() == []
         assert "maximum raw hold time" in notifier.executions[-1].message
+    finally:
+        await engine.close()
+
+
+def _quote(*, output: str, impact: str = "0.2", latency_ms: int = 100) -> SwapQuote:
+    output_amount = Decimal(output)
+    return SwapQuote(
+        input_mint="base",
+        output_mint="mint",
+        input_amount_raw=10_000_000,
+        output_amount_raw=int(output_amount * Decimal("1000000")),
+        other_amount_threshold_raw=None,
+        input_amount=Decimal("10"),
+        output_amount=output_amount,
+        input_usd_value=Decimal("10"),
+        output_usd_value=Decimal("10"),
+        price_impact_percent=Decimal(impact),
+        router="metis",
+        fee_bps=10,
+        api_time_ms=50,
+        observed_latency_ms=latency_ms,
+        quoted_at=int(time.time()),
+    )
+
+
+@pytest.mark.asyncio
+async def test_quote_shadow_blocks_25_percent_entry_chase(settings) -> None:
+    quoted = replace(
+        settings,
+        paper_use_executable_quotes=True,
+        jupiter_api_key="jup-test",
+        live_base_mint="base",
+    )
+    notifier = CaptureNotifier()
+    engine = SmartMoneyEngine(quoted, notifier=notifier)
+    await engine.initialize()
+    try:
+        engine.market.price = AsyncMock(return_value=Decimal("1"))
+        engine.market.token_info = AsyncMock(
+            return_value=TokenInfo(mint="mint", decimals=6)
+        )
+        engine.market.quote_order = AsyncMock(return_value=_quote(output="8"))
+        trader = TrackedTrader(address="wallet-a", alias="Auto wallet-a")
+        await engine.database.add_trader(trader.address, trader.alias)
+
+        await engine._handle_new_swap(_swap(Side.BUY, "chased-buy", "1"), trader)
+
+        assert notifier.executions[-1].success is False
+        assert "entry drift +25.00%" in notifier.executions[-1].message
+        assert await engine.database.paper_mirror_positions() == []
+    finally:
+        await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_quote_shadow_records_buffered_buy_and_quoted_sell(settings) -> None:
+    quoted = replace(
+        settings,
+        paper_use_executable_quotes=True,
+        jupiter_api_key="jup-test",
+        live_base_mint="base",
+    )
+    notifier = CaptureNotifier()
+    engine = SmartMoneyEngine(quoted, notifier=notifier)
+    await engine.initialize()
+    try:
+        engine.market.price = AsyncMock(return_value=Decimal("1"))
+        engine.market.token_info = AsyncMock(
+            return_value=TokenInfo(mint="mint", decimals=6)
+        )
+        buy_quote = _quote(output="10")
+        sell_quote = replace(
+            _quote(output="12"),
+            input_mint="mint",
+            output_mint="base",
+            input_amount=Decimal("9.95"),
+            input_amount_raw=9_950_000,
+            output_amount=Decimal("12"),
+            output_amount_raw=12_000_000,
+            output_usd_value=Decimal("12"),
+        )
+        engine.market.quote_order = AsyncMock(side_effect=(buy_quote, sell_quote))
+        trader = TrackedTrader(address="wallet-a", alias="Auto wallet-a")
+        await engine.database.add_trader(trader.address, trader.alias)
+
+        await engine._handle_new_swap(_swap(Side.BUY, "quoted-buy", "1"), trader)
+        positions = await engine.database.paper_mirror_positions()
+        assert notifier.executions[-1].success is True
+        assert len(positions) == 1
+        assert float(positions[0]["paper_quantity"]) == pytest.approx(9.95)
+
+        await engine._handle_new_swap(_swap(Side.SELL, "quoted-sell", "1.2"), trader)
+        assert notifier.executions[-1].success is True
+        assert await engine.database.paper_mirror_positions() == []
+        trades = await engine.database.paper_recent_trades()
+        assert trades[0]["quote_based"] == 1
+        assert trades[0]["quote_router"] == "metis"
+        assert Decimal(str(trades[0]["realized_pnl_usd"])) > 0
+    finally:
+        await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_quote_shadow_blocks_high_entry_price_impact(settings) -> None:
+    quoted = replace(
+        settings,
+        paper_use_executable_quotes=True,
+        jupiter_api_key="jup-test",
+        live_base_mint="base",
+    )
+    notifier = CaptureNotifier()
+    engine = SmartMoneyEngine(quoted, notifier=notifier)
+    await engine.initialize()
+    try:
+        engine.market.price = AsyncMock(return_value=Decimal("1"))
+        engine.market.token_info = AsyncMock(
+            return_value=TokenInfo(mint="mint", decimals=6)
+        )
+        engine.market.quote_order = AsyncMock(
+            return_value=_quote(output="10", impact="3")
+        )
+        trader = TrackedTrader(address="wallet-a", alias="Auto wallet-a")
+        await engine.database.add_trader(trader.address, trader.alias)
+
+        await engine._handle_new_swap(_swap(Side.BUY, "impact-buy", "1"), trader)
+
+        assert notifier.executions[-1].success is False
+        assert "price impact 3.00%" in notifier.executions[-1].message
     finally:
         await engine.close()

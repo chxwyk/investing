@@ -3,7 +3,7 @@
 A Railway-ready Discord bot that **automatically discovers profitable public Solana
 wallets**, reconstructs their swaps from confirmed on-chain transactions, ranks their recent
 performance, mirrors every newly detected tracked-wallet swap in PAPER mode, and records
-copy results after simulated fees and slippage.
+copy results from quote-only Jupiter Swap V2 orders plus a conservative output buffer.
 
 Automatic discovery uses the authorized Solana Tracker PnL V2 API—not Fomo scraping. It
 refreshes a strict rolling 24-hour leaderboard every 20 minutes, rotates the watchlist, and
@@ -38,10 +38,13 @@ unless four separate controls are deliberately configured.
 - Can mention one Discord user on every newly detected raw buy.
 - Blocks suspicious, low-liquidity, concentrated, mintable, or freezable tokens when the
   required Jupiter safety metadata is available.
-- Prices new raw paper fills at the current observed Jupiter price so detection latency is
-  represented instead of granting the tracked wallet's earlier transaction price.
-- Caps each wallet/token raw lot, applies token/capital entry gates, and includes configurable
-  fee/slippage assumptions.
+- Requests a quote-only Jupiter Swap V2 order for the configured copy size, without a wallet,
+  signature, or real transaction.
+- Rejects late entries when the executable route has drifted too far above the source-wallet
+  price, has excessive price impact, or arrives too slowly.
+- Records the winning Jupiter router, route fee, price impact, entry drift, and quote latency.
+- Applies a conservative output buffer and quotes exits too, so weak sell liquidity appears in
+  PAPER P&L instead of being hidden by a clean reference price.
 - Protects every raw-mirror paper lot with an independent hard stop, take-profit,
   trailing-profit lock, and maximum-hold exit while still mirroring source-wallet sells.
 - Tracks equity, realized/unrealized P&L, win rate, maximum drawdown, profit factor,
@@ -68,10 +71,19 @@ daily-loss/open-position limits, and pass any available Jupiter safety metadata.
 entry spends `DEFAULT_COPY_USD`; repeated buys cannot push one wallet/token lot above
 `MAX_COPY_USD`.
 
-The paper fill uses the current observed Jupiter price at detection time—not the tracked
-wallet's earlier transaction price—and then applies `SIMULATED_FEE_BPS` and
-`SIMULATED_SLIPPAGE_BPS`. This is a more demanding shadow test, though it is still not a
-guaranteed executable quote or a prediction of live results.
+With `PAPER_USE_EXECUTABLE_QUOTES=true`, the paper fill requests Jupiter's quote-only
+`GET /swap/v2/order` route for the exact configured size. It compares that route price with
+the tracked wallet's transaction price. A buy is skipped when adverse entry drift exceeds
+`MAX_ADVERSE_ENTRY_DRIFT_PERCENT`, price impact exceeds
+`MAX_QUOTE_PRICE_IMPACT_PERCENT`, or quote latency exceeds `MAX_QUOTE_LATENCY_MS`. An
+accepted fill uses the quoted output after `PAPER_QUOTE_OUTPUT_BUFFER_BPS`; it does not
+double-subtract the older generic fee/slippage assumptions. `SIMULATED_FEE_BPS` and
+`SIMULATED_SLIPPAGE_BPS` remain in use for the paper demo, consensus-paper flow, and legacy
+mode.
+
+Quote-only orders do not need a trading wallet or private key, but Jupiter requires
+`JUPITER_API_KEY`. The route is much closer to a tradeable result than a spot price; it is
+still not a confirmed fill because the bot does not sign or land a PAPER transaction.
 
 The next raw SELL from that same wallet sells the matching fake lot proportionally while it
 remains open. Separately, the paper risk manager can close the entire lot first at the raw
@@ -84,11 +96,17 @@ sell can also show `SKIPPED` if its matching buy happened before raw mirroring w
 A new detected buy must occur first. Set `PAPER_MIRROR_RAW_SWAPS=false` to restore the older
 consensus-only paper behavior.
 
-The v2.7 starter guardrails are intentionally configurable:
+The v2.8 quote and exit guardrails are intentionally configurable:
 
 ```text
 PAPER_REQUIRE_CURRENT_PRICE=true
 PAPER_RAW_ENTRY_FILTER_ENABLED=true
+PAPER_USE_EXECUTABLE_QUOTES=true
+PAPER_QUOTE_OUTPUT_BUFFER_BPS=50
+MAX_ADVERSE_ENTRY_DRIFT_PERCENT=8
+MAX_QUOTE_PRICE_IMPACT_PERCENT=2
+MAX_QUOTE_LATENCY_MS=5000
+MAX_CONSECUTIVE_QUOTE_FAILURES=5
 RAW_MIRROR_STOP_LOSS_PERCENT=8
 RAW_MIRROR_TAKE_PROFIT_PERCENT=20
 RAW_MIRROR_TRAILING_ACTIVATION_PERCENT=8
@@ -97,8 +115,25 @@ RAW_MIRROR_MAX_HOLD_SECONDS=7200
 ```
 
 These values are hypotheses to validate in PAPER mode, not optimized or guaranteed-profit
-settings. Use `/smartmoney paper`, `/smartmoney positions`, and
-`/smartmoney paper-trades` to evaluate them across a meaningful sample before changing size.
+settings. Use `/smartmoney paper`, `/smartmoney positions`, `/smartmoney paper-trades`, and
+`/smartmoney readiness` to evaluate them before changing size.
+
+## Official PAPER readiness trial
+
+After deploying v2.8, run `/smartmoney paper-reset confirmation:RESET PAPER` once to begin a
+clean trial. `/smartmoney readiness` reports **KEEP TESTING** until all defaults pass:
+
+- 14 separate active test days;
+- at least 100 quote-based exits;
+- positive expectancy and profit factor of at least 1.25;
+- trial maximum drawdown no higher than 10%; and
+- at least 95% quote-request reliability.
+
+Historical replay can help find obvious strategy bugs faster, but it cannot reproduce the
+future route, latency, failed landing, liquidity, and wallet-selection conditions this bot will
+face. Coding cannot honestly compress 14 forward-observation days into one afternoon. Passing
+the report means review a tiny live pilot; it never guarantees a daily profit or automatically
+unlocks LIVE mode.
 
 ## Consensus and live strategy
 
@@ -123,8 +158,8 @@ The defaults require two qualified traders within five minutes. Set
 ## Local setup
 
 Requirements: Python 3.12+, a Discord bot token, a Solana RPC URL, and a Solana Tracker API
-key for automatic discovery. A Jupiter API key is strongly recommended and required for
-live mode because token safety metadata is part of the live risk gate.
+key for automatic discovery. A Jupiter API key is required for v2.8 quote-shadow PAPER and
+live mode because the current Swap V2 order endpoints require it.
 
 ## Automatic wallet discovery
 
@@ -227,10 +262,12 @@ in that URL private. Helius documents the endpoint format as
 | `/smartmoney paper` | Show P&L, drawdown, profit factor, expectancy, and 24H progress. |
 | `/smartmoney positions` | Show open paper positions. |
 | `/smartmoney paper-trades` | Show recent fills, realized ROI, and automatic exit reasons. |
+| `/smartmoney readiness` | Show the 14-day, sample-size, expectancy, drawdown, and quote gates. |
 | `/smartmoney paper-demo` | Instantly create and close a clearly labeled fake paper trade. |
 | `/smartmoney paper-reset` | Reset the paper challenge after exact confirmation. |
 | `/smartmoney mode` | Show or set alerts, paper, or live mode. |
 | `/smartmoney pause` | Pause/resume monitoring. |
+| `/smartmoney kill-switch` | Immediately pause discovery, scanning, and new paper actions. |
 | `/smartmoney status` | Check RPC and scanner health. |
 | `/smartmoney limits` | Show active risk limits. |
 
@@ -258,6 +295,8 @@ multi-wallet signal and without changing the genuine consensus or risk rules:
 5. Run `/smartmoney paper` again to see realized P&L, completed trades, and win rate.
 6. Before a real observation period, erase demo history with
    `/smartmoney paper-reset confirmation:RESET PAPER`.
+7. Run `/smartmoney readiness` during the official trial; do not treat a short green streak as
+   proof.
 
 `paper-demo` never calls a swap API, never accesses a private key, and cannot move funds.
 
@@ -305,12 +344,13 @@ support ticket, a screenshot, or chat. The default live base asset is Solana USD
   processes them, so backfilled dollar P&L is approximate.
 - Transfers, liquidity operations, multi-output transactions, and non-quote token swaps are
   intentionally ignored to avoid false copy signals.
-- Current Jupiter reference prices are not guaranteed executable quotes. Configured fees and
-  slippage make the simulation less optimistic, but live routing, price impact, priority fees,
-  failed transactions, and price movement can produce worse fills.
+- Quote-only Jupiter orders provide a current route and expected output before slippage, not a
+  confirmed transaction. The output buffer makes PAPER more conservative, but priority fees,
+  route expiry, failed landing, token-account rent, and price movement can still make live
+  results worse.
 - Paper stops are evaluated after each scanner cycle. Fast markets can gap through a threshold,
   so an 8% configured stop does not guarantee an 8% maximum loss.
-- The v2.7 raw-entry and raw-lot guards are PAPER-only. Live mode remains the independent-wallet
+- The v2.8 quote, raw-entry, and raw-lot guards are PAPER-only. Live mode remains the independent-wallet
   consensus spot strategy and is never enabled automatically by this upgrade.
 - A source wallet can still dump after followers enter. Consensus and liquidity filters
   reduce this risk; they cannot remove it.
@@ -322,6 +362,6 @@ ruff check .
 pytest -q
 ```
 
-The tests cover swap detection, score behavior, current-price paper fills, raw-lot caps,
-hard/trailing/time exits, performance metrics, risk gating, database migration, and live-mode
-locking.
+The tests cover swap detection, score behavior, Swap V2 quote parsing, entry-drift and
+price-impact rejection, quote-based round trips, readiness metrics, raw-lot caps,
+hard/trailing/time exits, risk gating, database migration, and live-mode locking.

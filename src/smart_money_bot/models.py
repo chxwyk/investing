@@ -93,6 +93,27 @@ class TokenInfo:
 
 
 @dataclass(frozen=True, slots=True)
+class SwapQuote:
+    """A quote-only Jupiter Swap V2 order normalized for paper execution."""
+
+    input_mint: str
+    output_mint: str
+    input_amount_raw: int
+    output_amount_raw: int
+    other_amount_threshold_raw: int | None
+    input_amount: Decimal
+    output_amount: Decimal
+    input_usd_value: Decimal | None
+    output_usd_value: Decimal | None
+    price_impact_percent: Decimal
+    router: str
+    fee_bps: int
+    api_time_ms: int | None
+    observed_latency_ms: int
+    quoted_at: int
+
+
+@dataclass(frozen=True, slots=True)
 class TraderMetrics:
     address: str
     alias: str
@@ -176,3 +197,22 @@ class PaperSummary:
     average_loss_usd: Decimal
     expectancy_usd: Decimal
     profit_factor: Decimal | None
+
+
+@dataclass(frozen=True, slots=True)
+class PaperReadiness:
+    trial_started_at: int
+    active_days: int
+    quote_attempts: int
+    quote_successes: int
+    quote_success_percent: Decimal
+    accepted_entries: int
+    closed_trades: int
+    gross_profit_usd: Decimal
+    gross_loss_usd: Decimal
+    expectancy_usd: Decimal
+    profit_factor: Decimal | None
+    max_drawdown_usd: Decimal
+    max_drawdown_percent: Decimal
+    ready: bool
+    blockers: tuple[str, ...]

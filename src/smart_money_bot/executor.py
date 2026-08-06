@@ -6,6 +6,7 @@ from decimal import ROUND_DOWN, Decimal
 from solders.keypair import Keypair
 
 from .config import Settings
+from .constants import USDC_MINT
 from .database import Database
 from .errors import JupiterError
 from .market import JupiterClient, load_keypair
@@ -27,6 +28,7 @@ class ExecutionManager:
         self.settings = settings
         self.database = database
         self.market = market
+        self.consecutive_quote_failures = 0
         self.keypair: Keypair | None = None
         if settings.trading_private_key:
             self.keypair = load_keypair(settings.trading_private_key)
@@ -107,7 +109,19 @@ class ExecutionManager:
         trader: TrackedTrader,
         market_price_usd: Decimal,
         size_usd: Decimal,
+        token_info: TokenInfo | None = None,
     ) -> ExecutionResult:
+        if self.settings.paper_use_executable_quotes:
+            result = await self._execute_quoted_paper_mirror(
+                swap=swap,
+                trader=trader,
+                market_price_usd=market_price_usd,
+                size_usd=size_usd,
+                token_info=token_info,
+            )
+            await self._log(None, result)
+            return result
+
         fill = await self.database.paper_mirror_execute(
             trader_address=trader.address,
             source_signature=swap.signature,
@@ -167,6 +181,306 @@ class ExecutionManager:
         await self._log(None, result)
         return result
 
+    async def _execute_quoted_paper_mirror(
+        self,
+        *,
+        swap: DetectedSwap,
+        trader: TrackedTrader,
+        market_price_usd: Decimal,
+        size_usd: Decimal,
+        token_info: TokenInfo | None,
+        execution_kind: str = "RAW_MIRROR",
+        exit_reason: str | None = None,
+    ) -> ExecutionResult:
+        """Shadow a raw swap using a quote-only Jupiter Swap V2 order."""
+
+        if swap.side is Side.BUY:
+            capacity = await self.database.paper_mirror_buy_capacity(
+                trader.address,
+                swap.token_mint,
+                size_usd,
+                self.settings.max_copy_usd,
+            )
+            if capacity <= Decimal("0.01"):
+                return self._paper_skip(
+                    swap,
+                    size_usd,
+                    "no paper cash or raw-lot capacity remains for this buy",
+                )
+            if swap.token_price_usd is None or swap.token_price_usd <= 0:
+                return await self._quote_failure(
+                    swap=swap,
+                    size_usd=capacity,
+                    reason="source transaction price is unavailable; entry drift cannot be checked",
+                )
+            if token_info is None or token_info.decimals is None:
+                return await self._quote_failure(
+                    swap=swap,
+                    size_usd=capacity,
+                    reason="token decimals are unavailable for an executable quote",
+                )
+            amount_usd = capacity
+            token_decimals = token_info.decimals
+            try:
+                input_amount_raw = await self._paper_base_amount_raw(amount_usd)
+            except JupiterError as exc:
+                return await self._quote_failure(
+                    swap=swap,
+                    size_usd=capacity,
+                    reason=str(exc),
+                )
+            input_decimals = self.settings.live_base_decimals
+            output_decimals = token_decimals
+            input_mint = self.settings.live_base_mint
+            output_mint = swap.token_mint
+        else:
+            preview = await self.database.paper_mirror_sell_preview(
+                trader.address,
+                swap.token_mint,
+                swap.token_amount,
+            )
+            if preview is None:
+                return self._paper_skip(
+                    swap,
+                    size_usd,
+                    "no open paper lot remains for this tracked wallet; "
+                    "a risk guard may have closed it",
+                )
+            raw_decimals = preview["token_decimals"]
+            if raw_decimals is None:
+                if token_info is None:
+                    try:
+                        token_info = await self.market.token_info(swap.token_mint)
+                    except JupiterError:
+                        token_info = None
+                raw_decimals = token_info.decimals if token_info else None
+            if raw_decimals is None:
+                return await self._quote_failure(
+                    swap=swap,
+                    size_usd=Decimal(str(preview["matched_cost_usd"])),
+                    reason="token decimals are unavailable for the exit quote",
+                )
+            token_decimals = int(raw_decimals)
+            input_amount = Decimal(str(preview["paper_quantity"]))
+            input_amount_raw = int(
+                (input_amount * (Decimal(10) ** token_decimals)).to_integral_value(
+                    rounding=ROUND_DOWN
+                )
+            )
+            if input_amount_raw <= 0:
+                return self._paper_skip(swap, size_usd, "paper position is only token dust")
+            amount_usd = Decimal(str(preview["matched_cost_usd"]))
+            input_decimals = token_decimals
+            output_decimals = self.settings.live_base_decimals
+            input_mint = swap.token_mint
+            output_mint = self.settings.live_base_mint
+
+        try:
+            quote = await self.market.quote_order(
+                input_mint=input_mint,
+                output_mint=output_mint,
+                amount_raw=input_amount_raw,
+                input_decimals=input_decimals,
+                output_decimals=output_decimals,
+            )
+        except (JupiterError, ValueError) as exc:
+            return await self._quote_failure(
+                swap=swap,
+                size_usd=amount_usd,
+                reason=str(exc),
+            )
+
+        self.consecutive_quote_failures = 0
+        buffer_multiplier = Decimal("1") - (
+            Decimal(self.settings.paper_quote_output_buffer_bps) / Decimal(10_000)
+        )
+        price_impact = quote.price_impact_percent
+
+        if swap.side is Side.BUY:
+            quote_price = amount_usd / quote.output_amount
+            drift = (
+                (quote_price / swap.token_price_usd) - Decimal("1")
+            ) * Decimal("100")
+            blocker: str | None = None
+            if drift > self.settings.max_adverse_entry_drift_percent:
+                blocker = (
+                    f"entry drift +{drift:.2f}% exceeds the "
+                    f"{self.settings.max_adverse_entry_drift_percent:.2f}% chase limit"
+                )
+            elif price_impact > self.settings.max_quote_price_impact_percent:
+                blocker = (
+                    f"Jupiter price impact {price_impact:.2f}% exceeds "
+                    f"{self.settings.max_quote_price_impact_percent:.2f}%"
+                )
+            elif quote.observed_latency_ms > self.settings.max_quote_latency_ms:
+                blocker = (
+                    f"quote latency {quote.observed_latency_ms}ms exceeds "
+                    f"{self.settings.max_quote_latency_ms}ms"
+                )
+            if blocker:
+                await self.database.record_paper_quote_attempt(
+                    source_signature=swap.signature,
+                    token_mint=swap.token_mint,
+                    side=swap.side,
+                    quote_success=True,
+                    accepted=False,
+                    reason=blocker,
+                    latency_ms=quote.observed_latency_ms,
+                    price_impact_percent=price_impact,
+                    price_drift_percent=drift,
+                )
+                return self._paper_skip(swap, amount_usd, blocker)
+            quoted_input_amount = quote.input_amount
+            quoted_output_amount = quote.output_amount * buffer_multiplier
+            source_price = swap.token_price_usd
+        else:
+            base_price = await self._paper_base_price()
+            unbuffered_output_usd = (
+                quote.output_usd_value
+                if quote.output_usd_value is not None and quote.output_usd_value > 0
+                else quote.output_amount * base_price
+            )
+            quote_price = unbuffered_output_usd / quote.input_amount
+            drift = None
+            quoted_input_amount = quote.input_amount
+            quoted_output_amount = unbuffered_output_usd * buffer_multiplier
+            source_price = swap.token_price_usd
+
+        await self.database.record_paper_quote_attempt(
+            source_signature=swap.signature,
+            token_mint=swap.token_mint,
+            side=swap.side,
+            quote_success=True,
+            accepted=True,
+            reason=None,
+            latency_ms=quote.observed_latency_ms,
+            price_impact_percent=price_impact,
+            price_drift_percent=drift,
+        )
+        fill = await self.database.paper_mirror_execute(
+            trader_address=trader.address,
+            source_signature=swap.signature,
+            token_mint=swap.token_mint,
+            side=swap.side,
+            source_token_amount=swap.token_amount,
+            market_price_usd=quote_price,
+            size_usd=amount_usd,
+            fee_bps=0,
+            slippage_bps=0,
+            max_position_usd=self.settings.max_copy_usd,
+            execution_kind=execution_kind,
+            exit_reason=exit_reason,
+            quoted_input_amount=quoted_input_amount,
+            quoted_output_amount=quoted_output_amount,
+            token_decimals=token_decimals,
+            source_price_usd=source_price,
+            quote_price_usd=quote_price,
+            price_drift_percent=drift,
+            price_impact_percent=price_impact,
+            quote_router=quote.router,
+            quote_latency_ms=quote.observed_latency_ms,
+            quote_fee_bps=quote.fee_bps,
+        )
+        if fill is None:
+            return self._paper_skip(
+                swap,
+                amount_usd,
+                "paper lot changed before the quoted fill could be recorded",
+            )
+        if swap.side is Side.BUY:
+            return ExecutionResult(
+                success=True,
+                mode=ExecutionMode.PAPER,
+                token_mint=swap.token_mint,
+                side=swap.side,
+                size_usd=amount_usd,
+                message=(
+                    f"Quote-shadow BUY of {trader.alias}: {fill['quantity']:.6f} paper "
+                    f"tokens at ${fill['price']:.8f}. Jupiter {quote.router}; drift "
+                    f"{drift:+.2f}%; impact {price_impact:.2f}%; "
+                    f"{quote.observed_latency_ms}ms. The "
+                    f"{self.settings.paper_quote_output_buffer_bps}bps "
+                    "output buffer is already included."
+                ),
+            )
+
+        sold_percent = fill["source_fraction"] * Decimal("100")
+        prefix = "Automatic quote-shadow risk exit" if execution_kind == "RISK_EXIT" else (
+            f"Quote-shadow SELL of {trader.alias}"
+        )
+        reason_text = f": {exit_reason}" if exit_reason else ""
+        return ExecutionResult(
+            success=True,
+            mode=ExecutionMode.PAPER,
+            token_mint=swap.token_mint,
+            side=swap.side,
+            size_usd=amount_usd,
+            message=(
+                f"{prefix}{reason_text}. Sold {sold_percent:.1f}% of the linked paper lot "
+                f"at ${fill['price']:.8f}; realized P&L ${fill['realized_pnl']:.2f}. "
+                f"Jupiter {quote.router}; impact {price_impact:.2f}%; "
+                f"{quote.observed_latency_ms}ms."
+            ),
+        )
+
+    async def _paper_base_price(self) -> Decimal:
+        if self.settings.live_base_mint == USDC_MINT:
+            return Decimal("1")
+        price = await self.market.price(self.settings.live_base_mint)
+        if price is None or price <= 0:
+            raise JupiterError("paper quote base-token price is unavailable")
+        return price
+
+    async def _paper_base_amount_raw(self, size_usd: Decimal) -> int:
+        base_price = await self._paper_base_price()
+        amount_raw = int(
+            (
+                size_usd
+                / base_price
+                * (Decimal(10) ** self.settings.live_base_decimals)
+            ).to_integral_value(rounding=ROUND_DOWN)
+        )
+        if amount_raw <= 0:
+            raise JupiterError("configured paper size is below one base-token unit")
+        return amount_raw
+
+    def _paper_skip(
+        self, swap: DetectedSwap, size_usd: Decimal, reason: str
+    ) -> ExecutionResult:
+        return ExecutionResult(
+            success=False,
+            mode=ExecutionMode.PAPER,
+            token_mint=swap.token_mint,
+            side=swap.side,
+            size_usd=size_usd,
+            message=f"Skipped: {reason}",
+        )
+
+    async def _quote_failure(
+        self,
+        *,
+        swap: DetectedSwap,
+        size_usd: Decimal,
+        reason: str,
+    ) -> ExecutionResult:
+        self.consecutive_quote_failures += 1
+        await self.database.record_paper_quote_attempt(
+            source_signature=swap.signature,
+            token_mint=swap.token_mint,
+            side=swap.side,
+            quote_success=False,
+            accepted=False,
+            reason=reason,
+        )
+        suffix = ""
+        if self.consecutive_quote_failures >= self.settings.max_consecutive_quote_failures:
+            await self.database.set_setting("paused", "true")
+            suffix = (
+                f" Monitoring auto-paused after {self.consecutive_quote_failures} "
+                "consecutive quote failures; use /smartmoney pause action:resume after fixing it."
+            )
+        return self._paper_skip(swap, size_usd, f"quote unavailable — {reason}.{suffix}")
+
     async def execute_paper_mirror_risk_exit(
         self,
         *,
@@ -179,6 +493,34 @@ class ExecutionManager:
         trader_address = str(position["trader_address"])
         token_mint = str(position["token_mint"])
         cost_basis = Decimal(str(position["cost_basis_usd"]))
+        if self.settings.paper_use_executable_quotes:
+            swap = DetectedSwap(
+                signature=f"paper-risk-{time.time_ns()}",
+                trader_address=trader_address,
+                block_time=int(time.time()),
+                side=Side.SELL,
+                token_mint=token_mint,
+                token_amount=Decimal(str(position["source_quantity"])),
+                quote_mint=self.settings.live_base_mint,
+                quote_amount=Decimal("0"),
+                usd_value=cost_basis,
+                token_price_usd=market_price_usd,
+            )
+            result = await self._execute_quoted_paper_mirror(
+                swap=swap,
+                trader=TrackedTrader(
+                    address=trader_address,
+                    alias="risk engine",
+                ),
+                market_price_usd=market_price_usd,
+                size_usd=cost_basis,
+                token_info=None,
+                execution_kind="RISK_EXIT",
+                exit_reason=reason,
+            )
+            await self._log(None, result)
+            return result
+
         fill = await self.database.paper_mirror_execute(
             trader_address=trader_address,
             source_signature=f"paper-risk-{time.time_ns()}",

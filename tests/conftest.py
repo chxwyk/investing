@@ -19,8 +19,8 @@ def settings(monkeypatch: pytest.MonkeyPatch, tmp_path) -> Settings:
         "MIN_TOKEN_HOLDERS": "100",
         "MIN_ORGANIC_SCORE": "20",
         "MAX_TOP_HOLDERS_PERCENT": "70",
+        "PAPER_USE_EXECUTABLE_QUOTES": "false",
     }
     for key, value in values.items():
         monkeypatch.setenv(key, value)
     return Settings.from_env(require_discord_token=False)
-

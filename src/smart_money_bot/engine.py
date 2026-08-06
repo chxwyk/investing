@@ -21,6 +21,7 @@ from .models import (
     DiscoveryRefresh,
     ExecutionMode,
     ExecutionResult,
+    PaperReadiness,
     PaperSummary,
     RiskDecision,
     ScoredTrader,
@@ -358,11 +359,13 @@ class SmartMoneyEngine:
                 message=result.message,
             )
         else:
-            if swap.side is Side.BUY and self.settings.paper_raw_entry_filter_enabled:
+            token_info: TokenInfo | None = None
+            if swap.side is Side.BUY:
                 try:
                     token_info = await self.market.token_info(swap.token_mint)
                 except JupiterError:
                     token_info = None
+            if swap.side is Side.BUY and self.settings.paper_raw_entry_filter_enabled:
                 signal = Signal(
                     token_mint=swap.token_mint,
                     side=Side.BUY,
@@ -412,6 +415,7 @@ class SmartMoneyEngine:
                 trader=trader,
                 market_price_usd=price,
                 size_usd=size,
+                token_info=token_info,
             )
         await self.notifier.on_execution(result)
 
@@ -722,6 +726,15 @@ class SmartMoneyEngine:
             prices[PAPER_DEMO_MINT] = Decimal(PAPER_DEMO_ENTRY_PRICE_USD)
         return await self.database.paper_summary(prices)
 
+    async def paper_readiness(self) -> PaperReadiness:
+        return await self.database.paper_readiness(
+            min_active_days=self.settings.readiness_min_active_days,
+            min_closed_trades=self.settings.readiness_min_closed_trades,
+            min_profit_factor=self.settings.readiness_min_profit_factor,
+            max_drawdown_percent=self.settings.readiness_max_drawdown_percent,
+            min_quote_success_percent=self.settings.readiness_min_quote_success_percent,
+        )
+
     async def status(self) -> dict[str, object]:
         try:
             rpc_health = await self.rpc.health()
@@ -740,4 +753,7 @@ class SmartMoneyEngine:
             "discovery_last_refresh": self.last_discovery_refresh_at,
             "discovered_wallets": len(await self.database.list_discovered(limit=50)),
             "paper_mirror_raw_swaps": self.settings.paper_mirror_raw_swaps,
+            "paper_use_executable_quotes": self.settings.paper_use_executable_quotes,
+            "quote_ready": bool(self.settings.jupiter_api_key),
+            "consecutive_quote_failures": self.executor.consecutive_quote_failures,
         }

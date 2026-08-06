@@ -13,7 +13,7 @@ from solders.message import to_bytes_versioned
 from solders.transaction import VersionedTransaction
 
 from .errors import JupiterError
-from .models import TokenInfo
+from .models import SwapQuote, TokenInfo
 
 
 class JupiterClient:
@@ -170,6 +170,92 @@ class JupiterClient:
             "taker": taker,
         }
         return await self._request("GET", "/swap/v2/order", params=params)
+
+    async def quote_order(
+        self,
+        *,
+        input_mint: str,
+        output_mint: str,
+        amount_raw: int,
+        input_decimals: int,
+        output_decimals: int,
+    ) -> SwapQuote:
+        """Return a quote-only Swap V2 order without asking for a transaction."""
+
+        if not self.api_key:
+            raise JupiterError(
+                "JUPITER_API_KEY is required for executable PAPER order quotes"
+            )
+        if amount_raw <= 0:
+            raise ValueError("amount_raw must be positive")
+        if input_decimals < 0 or output_decimals < 0:
+            raise ValueError("token decimals cannot be negative")
+
+        started = time.monotonic()
+        data = await self._request(
+            "GET",
+            "/swap/v2/order",
+            params={
+                "inputMint": input_mint,
+                "outputMint": output_mint,
+                "amount": str(amount_raw),
+            },
+        )
+        latency_ms = max(0, round((time.monotonic() - started) * 1000))
+        if not isinstance(data, dict):
+            raise JupiterError("Jupiter returned an invalid order quote")
+        if data.get("error") or data.get("errorMessage"):
+            raise JupiterError(
+                f"Jupiter order quote failed: "
+                f"{data.get('errorMessage') or data.get('error')}"
+            )
+        if data.get("inputMint") != input_mint or data.get("outputMint") != output_mint:
+            raise JupiterError("Jupiter order quote returned the wrong token pair")
+
+        try:
+            quoted_input_raw = int(data["inAmount"])
+            quoted_output_raw = int(data["outAmount"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise JupiterError("Jupiter order quote omitted valid token amounts") from exc
+        if quoted_input_raw <= 0 or quoted_output_raw <= 0:
+            raise JupiterError("Jupiter order quote returned a zero token amount")
+
+        threshold_raw: int | None = None
+        raw_threshold = data.get("otherAmountThreshold")
+        if raw_threshold is not None:
+            try:
+                threshold_raw = int(raw_threshold)
+            except (TypeError, ValueError):
+                threshold_raw = None
+
+        raw_impact = data.get("priceImpact")
+        if raw_impact is not None:
+            price_impact = abs(Decimal(str(raw_impact)))
+        else:
+            deprecated_ratio = _decimal_or_none(data.get("priceImpactPct"))
+            price_impact = (
+                abs(deprecated_ratio * Decimal("100"))
+                if deprecated_ratio
+                else Decimal("0")
+            )
+
+        return SwapQuote(
+            input_mint=input_mint,
+            output_mint=output_mint,
+            input_amount_raw=quoted_input_raw,
+            output_amount_raw=quoted_output_raw,
+            other_amount_threshold_raw=threshold_raw,
+            input_amount=Decimal(quoted_input_raw) / (Decimal(10) ** input_decimals),
+            output_amount=Decimal(quoted_output_raw) / (Decimal(10) ** output_decimals),
+            input_usd_value=_decimal_or_none(data.get("inUsdValue")),
+            output_usd_value=_decimal_or_none(data.get("outUsdValue")),
+            price_impact_percent=price_impact,
+            router=str(data.get("router") or "unknown"),
+            fee_bps=int(data.get("feeBps") or 0),
+            api_time_ms=(int(data["totalTime"]) if data.get("totalTime") is not None else None),
+            observed_latency_ms=latency_ms,
+            quoted_at=int(time.time()),
+        )
 
     async def execute_order(
         self,
