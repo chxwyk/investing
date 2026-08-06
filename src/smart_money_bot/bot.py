@@ -234,7 +234,7 @@ class SmartMoneyBot(commands.Bot):
         )
         embed.set_footer(
             text=(
-                "RAW activity • an automatic fake-money mirror fill follows this alert"
+                "RAW activity • an automatic guarded paper-fill evaluation follows"
                 if mirrors_immediately
                 else "RAW activity • verify the mint • wait for consensus/risk result"
             )
@@ -535,6 +535,16 @@ class SmartMoneyCommands(
         win_rate = Decimal(summary.wins) / Decimal(closed) * 100 if closed else Decimal("0")
         total_pnl = summary.equity_usd - summary.starting_cash_usd
         total_roi = _return_percent(summary.equity_usd, summary.starting_cash_usd)
+        daily_progress = (
+            summary.realized_pnl_24h_usd
+            / self.bot.settings.paper_daily_target_usd
+            * Decimal("100")
+        )
+        profit_factor = (
+            f"{summary.profit_factor:.2f}"
+            if summary.profit_factor is not None
+            else "n/a (no losses yet)"
+        )
         embed = discord.Embed(title="Paper Strategy Scoreboard", color=0x3498DB)
         embed.add_field(name="Equity", value=_money(summary.equity_usd))
         embed.add_field(name="Total P&L", value=_money(total_pnl))
@@ -543,10 +553,81 @@ class SmartMoneyCommands(
         embed.add_field(name="Positions", value=_money(summary.positions_value_usd))
         embed.add_field(name="Realized P&L", value=_money(summary.realized_pnl_usd))
         embed.add_field(name="Unrealized P&L", value=_money(summary.unrealized_pnl_usd))
+        embed.add_field(
+            name="Current giveback",
+            value=_money(summary.current_drawdown_usd),
+        )
         embed.add_field(name="Max drawdown", value=_money(summary.max_drawdown_usd))
-        embed.add_field(name="Trades", value=str(summary.trades))
+        embed.add_field(name="Closed sells", value=str(summary.trades))
         embed.add_field(name="Win rate", value=f"{win_rate:.1f}%")
+        embed.add_field(name="Profit factor", value=profit_factor)
+        embed.add_field(name="Expectancy / exit", value=_money(summary.expectancy_usd))
+        embed.add_field(
+            name="Average win / loss",
+            value=(
+                f"{_money(summary.average_win_usd)} / "
+                f"-{_money(summary.average_loss_usd)}"
+            ),
+        )
+        embed.add_field(
+            name="24H realized / test target",
+            value=(
+                f"{_money(summary.realized_pnl_24h_usd)} / "
+                f"{_money(self.bot.settings.paper_daily_target_usd)} "
+                f"({daily_progress:+.1f}%)"
+            ),
+            inline=False,
+        )
+        embed.set_footer(
+            text=(
+                "Paper simulation uses current observed prices plus configured costs; "
+                "the target is a benchmark, not a profit promise."
+            )
+        )
         await interaction.followup.send(embed=embed)
+
+    @app_commands.command(
+        name="paper-trades",
+        description="Show recent automatic paper buys, sells, ROI, and exit reasons.",
+    )
+    async def paper_trades(
+        self, interaction: discord.Interaction, limit: int = 10
+    ) -> None:
+        trades = await self.bot.engine.database.paper_recent_trades(limit)
+        if not trades:
+            await interaction.response.send_message("No paper fills have been recorded yet.")
+            return
+
+        lines: list[str] = []
+        for item in trades:
+            side = str(item["side"])
+            mint = str(item["token_mint"])
+            quantity = Decimal(str(item["quantity"]))
+            price = Decimal(str(item["execution_price_usd"]))
+            gross = Decimal(str(item["gross_value_usd"]))
+            fee = Decimal(str(item["fee_usd"]))
+            kind = str(item["execution_kind"]).replace("_", " ").title()
+            timestamp = int(item["created_at"])
+            if side == Side.SELL.value:
+                realized = Decimal(str(item["realized_pnl_usd"]))
+                matched_cost = (gross - fee) - realized
+                roi = (
+                    realized / matched_cost * Decimal("100")
+                    if matched_cost > 0
+                    else Decimal("0")
+                )
+                reason = item.get("exit_reason")
+                reason_text = f" • {reason}" if reason else ""
+                detail = (
+                    f"P&L `{_money(realized)}` • ROI `{roi:+.2f}%`{reason_text}"
+                )
+            else:
+                detail = f"spent `{_money(gross)}` • fee `{_money(fee)}`"
+            lines.append(
+                f"**{side} • {kind}** • `{_short(mint)}` • <t:{timestamp}:R>\n"
+                f"qty `{quantity:.6f}` @ `{_price(price)}` • {detail}"
+            )
+        await interaction.response.send_message("\n\n".join(lines)[:2000])
 
     @app_commands.command(name="positions", description="Show open paper positions.")
     async def positions(self, interaction: discord.Interaction) -> None:
@@ -778,6 +859,7 @@ class SmartMoneyCommands(
     async def status(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(thinking=True, ephemeral=True)
         status = await self.bot.engine.status()
+        s = self.bot.settings
         last_scan = (
             f"<t:{status['last_scan']}:R>" if status["last_scan"] else "not completed yet"
         )
@@ -798,6 +880,10 @@ class SmartMoneyCommands(
             f"{self.bot.settings.rpc_max_retries} retries\n"
             f"**Mode:** {status['mode']}\n"
             f"**Paper auto-copy:** {paper_copy}\n"
+            f"**Paper entry price:** "
+            f"{'current price required' if s.paper_require_current_price else 'fallback allowed'}\n"
+            f"**Raw entry safety gate:** "
+            f"{'enabled' if s.paper_raw_entry_filter_enabled else 'disabled'}\n"
             f"**Raw-buy pings:** "
             f"{'ready' if self.bot.settings.discord_alert_user_id else 'user ID not set'}\n"
             f"**Paused:** {status['paused']}\n"
@@ -821,6 +907,10 @@ class SmartMoneyCommands(
         )
         text = (
             f"**Paper auto-copy:** {paper_copy}\n"
+            f"**Paper entry price:** "
+            f"{'current price required' if s.paper_require_current_price else 'fallback allowed'}\n"
+            f"**Raw entry safety gate:** "
+            f"{'enabled' if s.paper_raw_entry_filter_enabled else 'disabled'}\n"
             f"**Consensus:** {s.consensus_min_traders} traders within "
             f"{s.consensus_window_seconds}s\n"
             f"**Minimum trader score:** {s.min_trader_score}/100\n"
@@ -835,7 +925,15 @@ class SmartMoneyCommands(
             f"**Minimum liquidity:** {_money(s.min_token_liquidity_usd)}\n"
             f"**Max positions:** {s.max_open_positions}\n"
             f"**Signal max age:** {s.max_signal_age_seconds}s\n"
-            f"**Raw-mirror exits:** follow each source wallet's sells proportionally\n"
+            f"**Raw-lot exposure cap:** {_money(s.max_copy_usd)} per wallet/token\n"
+            f"**Raw hard stop / take profit:** "
+            f"{s.raw_mirror_stop_loss_percent}% / "
+            f"{s.raw_mirror_take_profit_percent}%\n"
+            f"**Raw trailing lock:** activates +"
+            f"{s.raw_mirror_trailing_activation_percent}% • trails "
+            f"{s.raw_mirror_trailing_stop_percent}%\n"
+            f"**Raw maximum hold:** {s.raw_mirror_max_hold_seconds // 60}m\n"
+            f"**Source sells:** still mirrored while the guarded lot remains open\n"
             f"**Consensus/live stop / take profit:** "
             f"{s.stop_loss_percent}% / {s.take_profit_percent}%\n"
             f"**Maximum hold:** {s.max_hold_seconds // 3600}h"
@@ -851,7 +949,7 @@ class SmartMoneyCommands(
             "4. `/smartmoney scan` — run an immediate on-chain scan\n"
             "5. `/smartmoney leaderboard` — inspect risk-adjusted rankings\n"
             "6. Keep `/smartmoney mode paper` to auto-mirror every new tracked-wallet swap\n"
-            "7. `/smartmoney positions` and `/smartmoney paper` — inspect fills and ROI\n"
+            "7. `/smartmoney positions`, `paper`, and `paper-trades` — inspect results\n"
             "Manual `trader-add` and CSV import remain optional overrides."
         )
         await interaction.response.send_message(text, ephemeral=True)

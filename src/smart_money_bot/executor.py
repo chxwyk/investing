@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from decimal import ROUND_DOWN, Decimal
 
 from solders.keypair import Keypair
@@ -117,14 +118,15 @@ class ExecutionManager:
             size_usd=size_usd,
             fee_bps=self.settings.simulated_fee_bps,
             slippage_bps=self.settings.simulated_slippage_bps,
+            max_position_usd=self.settings.max_copy_usd,
         )
         if fill is None:
             message = (
-                "No paper cash available to mirror this tracked-wallet buy"
+                "Skipped: no paper cash or raw-lot capacity remains for this buy"
                 if swap.side is Side.BUY
                 else (
-                    "Skipped: no matching paper buy exists for this tracked wallet. "
-                    "Only buys detected after raw mirroring is deployed can be sold."
+                    "Skipped: no open paper lot remains for this tracked wallet. "
+                    "It may already have been closed by an automatic paper risk guard."
                 )
             )
             result = ExecutionResult(
@@ -160,6 +162,56 @@ class ExecutionManager:
                     f"Raw mirror of {trader.alias}: sold {sold_percent:.1f}% of that "
                     f"wallet's linked paper lot at ${fill['price']:.8f}; fee "
                     f"${fill['fee']:.4f}; realized P&L ${fill['realized_pnl']:.2f}."
+                ),
+            )
+        await self._log(None, result)
+        return result
+
+    async def execute_paper_mirror_risk_exit(
+        self,
+        *,
+        position: dict[str, object],
+        market_price_usd: Decimal,
+        reason: str,
+    ) -> ExecutionResult:
+        """Close one raw-mirror paper lot independently of the source wallet."""
+
+        trader_address = str(position["trader_address"])
+        token_mint = str(position["token_mint"])
+        cost_basis = Decimal(str(position["cost_basis_usd"]))
+        fill = await self.database.paper_mirror_execute(
+            trader_address=trader_address,
+            source_signature=f"paper-risk-{time.time_ns()}",
+            token_mint=token_mint,
+            side=Side.SELL,
+            source_token_amount=Decimal(str(position["source_quantity"])),
+            market_price_usd=market_price_usd,
+            size_usd=cost_basis,
+            fee_bps=self.settings.simulated_fee_bps,
+            slippage_bps=self.settings.simulated_slippage_bps,
+            execution_kind="RISK_EXIT",
+            exit_reason=reason,
+        )
+        if fill is None:
+            result = ExecutionResult(
+                success=False,
+                mode=ExecutionMode.PAPER,
+                token_mint=token_mint,
+                side=Side.SELL,
+                size_usd=cost_basis,
+                message="Skipped: the raw paper lot was already closed",
+            )
+        else:
+            result = ExecutionResult(
+                success=True,
+                mode=ExecutionMode.PAPER,
+                token_mint=token_mint,
+                side=Side.SELL,
+                size_usd=cost_basis,
+                message=(
+                    f"Automatic raw-mirror risk exit: {reason}. Sold the full linked "
+                    f"paper lot at ${fill['price']:.8f}; fee ${fill['fee']:.4f}; "
+                    f"realized P&L ${fill['realized_pnl']:.2f}."
                 ),
             )
         await self._log(None, result)

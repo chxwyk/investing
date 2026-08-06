@@ -172,6 +172,7 @@ class Database:
                 paper_quantity REAL NOT NULL,
                 cost_basis_usd REAL NOT NULL,
                 average_entry_usd REAL NOT NULL,
+                peak_price_usd REAL NOT NULL DEFAULT 0,
                 opened_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
                 PRIMARY KEY (trader_address, token_mint)
@@ -192,6 +193,7 @@ class Database:
                 source_trader TEXT,
                 source_signature TEXT,
                 execution_kind TEXT NOT NULL DEFAULT 'CONSENSUS',
+                exit_reason TEXT,
                 created_at INTEGER NOT NULL,
                 FOREIGN KEY (signal_id) REFERENCES signals(id)
             );
@@ -232,6 +234,10 @@ class Database:
         await self._ensure_column("paper_trades", "source_signature", "TEXT")
         await self._ensure_column(
             "paper_trades", "execution_kind", "TEXT NOT NULL DEFAULT 'CONSENSUS'"
+        )
+        await self._ensure_column("paper_trades", "exit_reason", "TEXT")
+        await self._ensure_column(
+            "paper_mirror_positions", "peak_price_usd", "REAL NOT NULL DEFAULT 0"
         )
         await self.db.execute(
             """
@@ -887,6 +893,9 @@ class Database:
         size_usd: Decimal,
         fee_bps: int,
         slippage_bps: int,
+        max_position_usd: Decimal | None = None,
+        execution_kind: str = "RAW_MIRROR",
+        exit_reason: str | None = None,
     ) -> dict[str, Decimal] | None:
         """Mirror one source wallet while keeping each wallet's paper lot separate."""
 
@@ -921,7 +930,13 @@ class Database:
                 position = await position_cursor.fetchone()
 
                 if side is Side.BUY:
-                    notional = min(size_usd, cash)
+                    old_cost = _d(position["cost_basis_usd"]) if position else Decimal("0")
+                    remaining_capacity = (
+                        max(Decimal("0"), max_position_usd - old_cost)
+                        if max_position_usd is not None
+                        else size_usd
+                    )
+                    notional = min(size_usd, cash, remaining_capacity)
                     if notional <= Decimal("0.01"):
                         await self.db.rollback()
                         return None
@@ -934,22 +949,25 @@ class Database:
                     old_paper_quantity = (
                         _d(position["paper_quantity"]) if position else Decimal("0")
                     )
-                    old_cost = _d(position["cost_basis_usd"]) if position else Decimal("0")
+                    old_peak = _d(position["peak_price_usd"]) if position else Decimal("0")
                     new_source_quantity = old_source_quantity + source_token_amount
                     new_paper_quantity = old_paper_quantity + paper_quantity
                     new_cost = old_cost + notional
                     average_entry = new_cost / new_paper_quantity
+                    peak_price = max(old_peak, market_price_usd)
                     await self.db.execute(
                         """
                         INSERT INTO paper_mirror_positions(
                             trader_address, token_mint, source_quantity, paper_quantity,
-                            cost_basis_usd, average_entry_usd, opened_at, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            cost_basis_usd, average_entry_usd, peak_price_usd,
+                            opened_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(trader_address, token_mint) DO UPDATE SET
                             source_quantity = excluded.source_quantity,
                             paper_quantity = excluded.paper_quantity,
                             cost_basis_usd = excluded.cost_basis_usd,
                             average_entry_usd = excluded.average_entry_usd,
+                            peak_price_usd = excluded.peak_price_usd,
                             updated_at = excluded.updated_at
                         """,
                         (
@@ -959,6 +977,7 @@ class Database:
                             float(new_paper_quantity),
                             float(new_cost),
                             float(average_entry),
+                            float(peak_price),
                             now,
                             now,
                         ),
@@ -1043,8 +1062,8 @@ class Database:
                     INSERT INTO paper_trades(
                         signal_id, token_mint, side, quantity, execution_price_usd,
                         gross_value_usd, fee_usd, realized_pnl_usd, source_trader,
-                        source_signature, execution_kind, created_at
-                    ) VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'RAW_MIRROR', ?)
+                        source_signature, execution_kind, exit_reason, created_at
+                    ) VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         token_mint,
@@ -1056,6 +1075,8 @@ class Database:
                         float(realized),
                         trader_address,
                         source_signature,
+                        execution_kind,
+                        exit_reason,
                         now,
                     ),
                 )
@@ -1081,6 +1102,52 @@ class Database:
         )
         return await cursor.fetchone() is not None
 
+    async def has_paper_mirror_position(
+        self, trader_address: str, token_mint: str
+    ) -> bool:
+        cursor = await self.db.execute(
+            """
+            SELECT 1 FROM paper_mirror_positions
+            WHERE trader_address = ? AND token_mint = ?
+            """,
+            (trader_address, token_mint),
+        )
+        return await cursor.fetchone() is not None
+
+    async def update_paper_mirror_peak(
+        self,
+        trader_address: str,
+        token_mint: str,
+        market_price_usd: Decimal,
+    ) -> Decimal:
+        """Persist and return the highest observed market price for one mirror lot."""
+
+        async with self._write_lock:
+            cursor = await self.db.execute(
+                """
+                SELECT peak_price_usd FROM paper_mirror_positions
+                WHERE trader_address = ? AND token_mint = ?
+                """,
+                (trader_address, token_mint),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                return market_price_usd
+            previous_peak = _d(row["peak_price_usd"])
+            peak = max(previous_peak, market_price_usd)
+            if peak == previous_peak:
+                return peak
+            await self.db.execute(
+                """
+                UPDATE paper_mirror_positions
+                SET peak_price_usd = ?
+                WHERE trader_address = ? AND token_mint = ?
+                """,
+                (float(peak), trader_address, token_mint),
+            )
+            await self.db.commit()
+            return peak
+
     async def paper_positions(self) -> list[dict[str, Any]]:
         cursor = await self.db.execute(
             "SELECT * FROM paper_positions ORDER BY opened_at"
@@ -1090,6 +1157,17 @@ class Database:
     async def paper_mirror_positions(self) -> list[dict[str, Any]]:
         cursor = await self.db.execute(
             "SELECT * FROM paper_mirror_positions ORDER BY opened_at"
+        )
+        return [dict(row) for row in await cursor.fetchall()]
+
+    async def paper_recent_trades(self, limit: int = 15) -> list[dict[str, Any]]:
+        cursor = await self.db.execute(
+            """
+            SELECT * FROM paper_trades
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            (max(1, min(limit, 50)),),
         )
         return [dict(row) for row in await cursor.fetchall()]
 
@@ -1115,6 +1193,7 @@ class Database:
                 "position_kind": "RAW_MIRROR",
                 "source_trader": item["trader_address"],
                 "source_quantity": item["source_quantity"],
+                "peak_price_usd": item["peak_price_usd"],
             }
             for item in mirror
         )
@@ -1161,11 +1240,31 @@ class Database:
             SELECT
                 SUM(CASE WHEN side = 'SELL' THEN 1 ELSE 0 END) AS trades,
                 SUM(CASE WHEN side = 'SELL' AND realized_pnl_usd > 0 THEN 1 ELSE 0 END) wins,
-                SUM(CASE WHEN side = 'SELL' AND realized_pnl_usd <= 0 THEN 1 ELSE 0 END) losses
+                SUM(CASE WHEN side = 'SELL' AND realized_pnl_usd <= 0 THEN 1 ELSE 0 END) losses,
+                SUM(
+                    CASE WHEN side = 'SELL' AND realized_pnl_usd > 0
+                    THEN realized_pnl_usd ELSE 0 END
+                ) AS gross_profit,
+                ABS(SUM(
+                    CASE WHEN side = 'SELL' AND realized_pnl_usd < 0
+                    THEN realized_pnl_usd ELSE 0 END
+                )) AS gross_loss,
+                AVG(
+                    CASE WHEN side = 'SELL' AND realized_pnl_usd > 0
+                    THEN realized_pnl_usd END
+                ) AS average_win,
+                ABS(AVG(
+                    CASE WHEN side = 'SELL' AND realized_pnl_usd < 0
+                    THEN realized_pnl_usd END
+                )) AS average_loss
             FROM paper_trades
             """
         )
         trade_row = await trades_cursor.fetchone()
+        trade_count = int(trade_row["trades"] or 0)
+        gross_profit = _d(trade_row["gross_profit"])
+        gross_loss = _d(trade_row["gross_loss"])
+        net_closed = gross_profit - gross_loss
         refreshed = await self.db.execute("SELECT * FROM paper_account WHERE id = 1")
         account = await refreshed.fetchone()
         return PaperSummary(
@@ -1175,10 +1274,22 @@ class Database:
             equity_usd=equity,
             realized_pnl_usd=_d(account["realized_pnl_usd"]),
             unrealized_pnl_usd=positions_value - cost_basis,
-            trades=int(trade_row["trades"] or 0),
+            trades=trade_count,
             wins=int(trade_row["wins"] or 0),
             losses=int(trade_row["losses"] or 0),
             max_drawdown_usd=_d(account["max_drawdown_usd"]),
+            current_drawdown_usd=max(
+                Decimal("0"), _d(account["high_watermark_usd"]) - equity
+            ),
+            realized_pnl_24h_usd=await self.paper_daily_realized_pnl(),
+            gross_profit_usd=gross_profit,
+            gross_loss_usd=gross_loss,
+            average_win_usd=_d(trade_row["average_win"]),
+            average_loss_usd=_d(trade_row["average_loss"]),
+            expectancy_usd=(
+                net_closed / Decimal(trade_count) if trade_count else Decimal("0")
+            ),
+            profit_factor=(gross_profit / gross_loss if gross_loss > 0 else None),
         )
 
     async def _update_paper_drawdown(self, equity: Decimal) -> None:

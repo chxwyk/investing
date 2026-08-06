@@ -20,6 +20,8 @@ class RiskEngine:
         mode: ExecutionMode,
         token_info: TokenInfo | None,
         market_price_usd: Decimal | None,
+        require_consensus: bool = True,
+        enforce_position_limit: bool = True,
     ) -> RiskDecision:
         blockers: list[str] = []
         warnings: list[str] = []
@@ -31,6 +33,7 @@ class RiskEngine:
             blockers.append(f"Signal is stale ({age}s old)")
         if (
             signal.side is Side.BUY
+            and require_consensus
             and len(set(signal.trader_addresses)) < self.settings.consensus_min_traders
         ):
             blockers.append("Not enough independent traders")
@@ -76,14 +79,14 @@ class RiskEngine:
             daily_pnl = await self.database.paper_daily_realized_pnl()
             if daily_pnl <= -self.settings.max_daily_loss_usd:
                 blockers.append("Daily loss limit reached")
-            if signal.side is Side.BUY:
+            if signal.side is Side.BUY and enforce_position_limit:
                 positions = await self.database.paper_position_count()
                 if positions >= self.settings.max_open_positions:
                     blockers.append("Maximum open positions reached")
         elif mode is ExecutionMode.LIVE:
             if not self.settings.live_is_unlocked:
                 blockers.append("Live trading is not unlocked in environment settings")
-            if signal.side is Side.BUY:
+            if signal.side is Side.BUY and enforce_position_limit:
                 positions = await self.database.live_position_count()
                 if positions >= self.settings.max_open_positions:
                     blockers.append("Maximum live positions reached")

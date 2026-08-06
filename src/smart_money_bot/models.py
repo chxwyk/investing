@@ -168,3 +168,11 @@ class PaperSummary:
     wins: int
     losses: int
     max_drawdown_usd: Decimal
+    current_drawdown_usd: Decimal
+    realized_pnl_24h_usd: Decimal
+    gross_profit_usd: Decimal
+    gross_loss_usd: Decimal
+    average_win_usd: Decimal
+    average_loss_usd: Decimal
+    expectancy_usd: Decimal
+    profit_factor: Decimal | None

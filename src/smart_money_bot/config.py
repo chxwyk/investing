@@ -75,6 +75,9 @@ class Settings:
     simulated_fee_bps: int
     simulated_slippage_bps: int
     paper_mirror_raw_swaps: bool
+    paper_require_current_price: bool
+    paper_raw_entry_filter_enabled: bool
+    paper_daily_target_usd: Decimal
 
     max_copy_usd: Decimal
     max_daily_loss_usd: Decimal
@@ -87,6 +90,11 @@ class Settings:
     stop_loss_percent: Decimal
     take_profit_percent: Decimal
     max_hold_seconds: int
+    raw_mirror_stop_loss_percent: Decimal
+    raw_mirror_take_profit_percent: Decimal
+    raw_mirror_trailing_activation_percent: Decimal
+    raw_mirror_trailing_stop_percent: Decimal
+    raw_mirror_max_hold_seconds: int
 
     enable_live_trading: bool
     live_trading_ack: str
@@ -146,6 +154,11 @@ class Settings:
             simulated_fee_bps=_int("SIMULATED_FEE_BPS", 60),
             simulated_slippage_bps=_int("SIMULATED_SLIPPAGE_BPS", 100),
             paper_mirror_raw_swaps=_bool("PAPER_MIRROR_RAW_SWAPS", True),
+            paper_require_current_price=_bool("PAPER_REQUIRE_CURRENT_PRICE", True),
+            paper_raw_entry_filter_enabled=_bool(
+                "PAPER_RAW_ENTRY_FILTER_ENABLED", True
+            ),
+            paper_daily_target_usd=_decimal("PAPER_DAILY_TARGET_USD", "100"),
             max_copy_usd=_decimal("MAX_COPY_USD", "25"),
             max_daily_loss_usd=_decimal("MAX_DAILY_LOSS_USD", "30"),
             max_open_positions=_int("MAX_OPEN_POSITIONS", 6),
@@ -157,6 +170,21 @@ class Settings:
             stop_loss_percent=_decimal("STOP_LOSS_PERCENT", "12"),
             take_profit_percent=_decimal("TAKE_PROFIT_PERCENT", "30"),
             max_hold_seconds=_int("MAX_HOLD_SECONDS", 21_600),
+            raw_mirror_stop_loss_percent=_decimal(
+                "RAW_MIRROR_STOP_LOSS_PERCENT", "8"
+            ),
+            raw_mirror_take_profit_percent=_decimal(
+                "RAW_MIRROR_TAKE_PROFIT_PERCENT", "20"
+            ),
+            raw_mirror_trailing_activation_percent=_decimal(
+                "RAW_MIRROR_TRAILING_ACTIVATION_PERCENT", "8"
+            ),
+            raw_mirror_trailing_stop_percent=_decimal(
+                "RAW_MIRROR_TRAILING_STOP_PERCENT", "4"
+            ),
+            raw_mirror_max_hold_seconds=_int(
+                "RAW_MIRROR_MAX_HOLD_SECONDS", 7_200
+            ),
             enable_live_trading=_bool("ENABLE_LIVE_TRADING", False),
             live_trading_ack=os.getenv("LIVE_TRADING_ACK", "").strip(),
             trading_private_key=os.getenv("TRADING_PRIVATE_KEY", "").strip() or None,
@@ -220,3 +248,20 @@ class Settings:
             raise ValueError("Stop-loss and take-profit percentages must be positive")
         if self.max_hold_seconds < 60:
             raise ValueError("MAX_HOLD_SECONDS must be at least 60")
+        if self.paper_daily_target_usd <= 0:
+            raise ValueError("PAPER_DAILY_TARGET_USD must be positive")
+        raw_percentages = (
+            self.raw_mirror_stop_loss_percent,
+            self.raw_mirror_take_profit_percent,
+            self.raw_mirror_trailing_activation_percent,
+            self.raw_mirror_trailing_stop_percent,
+        )
+        if any(value <= 0 or value >= 100 for value in raw_percentages):
+            raise ValueError("Raw-mirror risk percentages must be between 0 and 100")
+        if self.raw_mirror_trailing_stop_percent >= self.raw_mirror_trailing_activation_percent:
+            raise ValueError(
+                "RAW_MIRROR_TRAILING_STOP_PERCENT must be below "
+                "RAW_MIRROR_TRAILING_ACTIVATION_PERCENT"
+            )
+        if self.raw_mirror_max_hold_seconds < 60:
+            raise ValueError("RAW_MIRROR_MAX_HOLD_SECONDS must be at least 60")

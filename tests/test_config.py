@@ -68,3 +68,25 @@ def test_raw_paper_mirroring_defaults_on_and_can_be_disabled(monkeypatch) -> Non
     monkeypatch.setenv("PAPER_MIRROR_RAW_SWAPS", "false")
     disabled = Settings.from_env(require_discord_token=False)
     assert disabled.paper_mirror_raw_swaps is False
+
+
+def test_v27_paper_risk_guards_default_on(monkeypatch) -> None:
+    names = (
+        "PAPER_REQUIRE_CURRENT_PRICE",
+        "PAPER_RAW_ENTRY_FILTER_ENABLED",
+        "RAW_MIRROR_STOP_LOSS_PERCENT",
+        "RAW_MIRROR_TAKE_PROFIT_PERCENT",
+        "RAW_MIRROR_TRAILING_ACTIVATION_PERCENT",
+        "RAW_MIRROR_TRAILING_STOP_PERCENT",
+        "RAW_MIRROR_MAX_HOLD_SECONDS",
+    )
+    for name in names:
+        monkeypatch.delenv(name, raising=False)
+    settings = Settings.from_env(require_discord_token=False)
+    assert settings.paper_require_current_price is True
+    assert settings.paper_raw_entry_filter_enabled is True
+    assert settings.raw_mirror_stop_loss_percent == 8
+    assert settings.raw_mirror_take_profit_percent == 20
+    assert settings.raw_mirror_trailing_activation_percent == 8
+    assert settings.raw_mirror_trailing_stop_percent == 4
+    assert settings.raw_mirror_max_hold_seconds == 7200

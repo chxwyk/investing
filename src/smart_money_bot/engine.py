@@ -322,12 +322,18 @@ class SmartMoneyEngine:
     async def _mirror_paper_swap(
         self, swap: DetectedSwap, trader: TrackedTrader
     ) -> None:
-        price = swap.token_price_usd
-        if price is None or price <= 0:
-            try:
-                price = await self.market.price(swap.token_mint)
-            except JupiterError:
-                price = None
+        # A tracked wallet's transaction price is historical by the time this process
+        # observes it. Price the shadow fill at detection time so PAPER results include
+        # the latency that live copy execution would face.
+        try:
+            price = await self.market.price(swap.token_mint)
+        except JupiterError:
+            price = None
+        if (
+            (price is None or price <= 0)
+            and not self.settings.paper_require_current_price
+        ):
+            price = swap.token_price_usd
         size = min(self.settings.default_copy_usd, self.settings.max_copy_usd)
         if price is None or price <= 0:
             result = ExecutionResult(
@@ -336,7 +342,10 @@ class SmartMoneyEngine:
                 token_mint=swap.token_mint,
                 side=swap.side,
                 size_usd=size,
-                message="Skipped: no reliable token price was available for the paper fill",
+                message=(
+                    "Skipped: no current Jupiter price was available for a realistic "
+                    "paper fill"
+                ),
             )
             await self.database.log_execution(
                 signal_id=None,
@@ -349,6 +358,55 @@ class SmartMoneyEngine:
                 message=result.message,
             )
         else:
+            if swap.side is Side.BUY and self.settings.paper_raw_entry_filter_enabled:
+                try:
+                    token_info = await self.market.token_info(swap.token_mint)
+                except JupiterError:
+                    token_info = None
+                signal = Signal(
+                    token_mint=swap.token_mint,
+                    side=Side.BUY,
+                    created_at=swap.block_time or int(time.time()),
+                    trader_addresses=(trader.address,),
+                    trader_aliases=(trader.alias,),
+                    source_signatures=(swap.signature,),
+                    combined_score=Decimal("100"),
+                    reference_price_usd=price,
+                )
+                already_open = await self.database.has_paper_mirror_position(
+                    trader.address, swap.token_mint
+                )
+                decision = await self.risk.assess(
+                    signal=signal,
+                    mode=ExecutionMode.PAPER,
+                    token_info=token_info,
+                    market_price_usd=price,
+                    require_consensus=False,
+                    enforce_position_limit=not already_open,
+                )
+                size = decision.size_usd
+                if not decision.allowed:
+                    reasons = "; ".join(decision.reasons) or "risk policy blocked entry"
+                    result = ExecutionResult(
+                        success=False,
+                        mode=ExecutionMode.PAPER,
+                        token_mint=swap.token_mint,
+                        side=swap.side,
+                        size_usd=size,
+                        message=f"Skipped: paper entry guard — {reasons}",
+                    )
+                    await self.database.log_execution(
+                        signal_id=None,
+                        mode=result.mode,
+                        token_mint=result.token_mint,
+                        side=result.side,
+                        size_usd=result.size_usd,
+                        success=result.success,
+                        signature=None,
+                        message=result.message,
+                    )
+                    await self.notifier.on_execution(result)
+                    return
             result = await self.executor.execute_paper_mirror(
                 swap=swap,
                 trader=trader,
@@ -407,31 +465,40 @@ class SmartMoneyEngine:
         if mode is ExecutionMode.ALERTS:
             return
         if mode is ExecutionMode.PAPER:
-            positions = await self.database.paper_positions()
-            positions = [
-                item for item in positions if item["token_mint"] != PAPER_DEMO_MINT
+            strategy_positions = await self.database.paper_positions()
+            strategy_positions = [
+                item
+                for item in strategy_positions
+                if item["token_mint"] != PAPER_DEMO_MINT
             ]
+            mirror_positions = await self.database.paper_mirror_positions()
+            positions = strategy_positions + mirror_positions
         else:
             positions = await self.database.live_positions()
         if not positions:
             return
 
         now = int(time.time())
-        prices = await self.market.prices([str(item["token_mint"]) for item in positions])
+        prices = await self.market.prices(
+            list(dict.fromkeys(str(item["token_mint"]) for item in positions))
+        )
+        if mode is ExecutionMode.PAPER:
+            await self._check_strategy_paper_exits(strategy_positions, prices, now)
+            await self._check_raw_mirror_exits(mirror_positions, prices, now)
+            await self.database.paper_summary(prices)
+            return
+
         for position in positions:
             mint = str(position["token_mint"])
             price = prices.get(mint)
             if price is None or price <= 0:
                 continue
-            if mode is ExecutionMode.PAPER:
-                average_entry = Decimal(str(position["average_entry_usd"]))
-            else:
-                quantity = Decimal(str(position["quantity_raw"])) / (
-                    Decimal(10) ** int(position["decimals"])
-                )
-                if quantity <= 0:
-                    continue
-                average_entry = Decimal(str(position["cost_basis_usd"])) / quantity
+            quantity = Decimal(str(position["quantity_raw"])) / (
+                Decimal(10) ** int(position["decimals"])
+            )
+            if quantity <= 0:
+                continue
+            average_entry = Decimal(str(position["cost_basis_usd"])) / quantity
             if average_entry <= 0:
                 continue
 
@@ -460,6 +527,92 @@ class SmartMoneyEngine:
                 reference_price_usd=price,
             )
             await self._process_signal(signal, known_price=price)
+
+    async def _check_strategy_paper_exits(
+        self,
+        positions: list[dict[str, object]],
+        prices: dict[str, Decimal],
+        now: int,
+    ) -> None:
+        for position in positions:
+            mint = str(position["token_mint"])
+            price = prices.get(mint)
+            average_entry = Decimal(str(position["average_entry_usd"]))
+            if price is None or price <= 0 or average_entry <= 0:
+                continue
+            change_percent = ((price / average_entry) - Decimal("1")) * Decimal("100")
+            age_seconds = now - int(position["opened_at"])
+            reason: str | None = None
+            if change_percent <= -self.settings.stop_loss_percent:
+                reason = f"stop loss ({change_percent:.2f}%)"
+            elif change_percent >= self.settings.take_profit_percent:
+                reason = f"take profit (+{change_percent:.2f}%)"
+            elif age_seconds >= self.settings.max_hold_seconds:
+                reason = f"maximum hold time ({age_seconds // 3600}h)"
+            if reason is None:
+                continue
+            if await self.database.recent_signal_exists(mint, Side.SELL, now - 60):
+                continue
+
+            signal = Signal(
+                token_mint=mint,
+                side=Side.SELL,
+                created_at=now,
+                trader_addresses=("RISK_ENGINE",),
+                trader_aliases=(f"Risk engine: {reason}",),
+                source_signatures=(f"risk-{mint}-{now}",),
+                combined_score=Decimal("100"),
+                reference_price_usd=price,
+            )
+            await self._process_signal(signal, known_price=price)
+
+    async def _check_raw_mirror_exits(
+        self,
+        positions: list[dict[str, object]],
+        prices: dict[str, Decimal],
+        now: int,
+    ) -> None:
+        for position in positions:
+            mint = str(position["token_mint"])
+            trader_address = str(position["trader_address"])
+            price = prices.get(mint)
+            average_entry = Decimal(str(position["average_entry_usd"]))
+            if price is None or price <= 0 or average_entry <= 0:
+                continue
+
+            peak = await self.database.update_paper_mirror_peak(
+                trader_address, mint, price
+            )
+            change_percent = ((price / average_entry) - Decimal("1")) * Decimal("100")
+            peak_gain_percent = ((peak / average_entry) - Decimal("1")) * Decimal("100")
+            pullback_percent = ((price / peak) - Decimal("1")) * Decimal("100")
+            age_seconds = now - int(position["opened_at"])
+
+            reason: str | None = None
+            if change_percent <= -self.settings.raw_mirror_stop_loss_percent:
+                reason = f"hard stop ({change_percent:.2f}%)"
+            elif change_percent >= self.settings.raw_mirror_take_profit_percent:
+                reason = f"take profit (+{change_percent:.2f}%)"
+            elif (
+                peak_gain_percent
+                >= self.settings.raw_mirror_trailing_activation_percent
+                and pullback_percent <= -self.settings.raw_mirror_trailing_stop_percent
+            ):
+                reason = (
+                    f"trailing-profit lock (peak +{peak_gain_percent:.2f}%, "
+                    f"pullback {pullback_percent:.2f}%)"
+                )
+            elif age_seconds >= self.settings.raw_mirror_max_hold_seconds:
+                reason = f"maximum raw hold time ({age_seconds // 60}m)"
+            if reason is None:
+                continue
+
+            result = await self.executor.execute_paper_mirror_risk_exit(
+                position=position,
+                market_price_usd=price,
+                reason=reason,
+            )
+            await self.notifier.on_execution(result)
 
     async def rankings(self) -> list[ScoredTrader]:
         metrics_24h, metrics_7d = await asyncio.gather(

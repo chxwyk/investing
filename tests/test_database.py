@@ -38,7 +38,17 @@ async def test_existing_paper_database_migrates_raw_mirror_columns(tmp_path) -> 
     try:
         cursor = await database.db.execute("PRAGMA table_info(paper_trades)")
         columns = {row["name"] for row in await cursor.fetchall()}
-        assert {"source_trader", "source_signature", "execution_kind"} <= columns
+        assert {
+            "source_trader",
+            "source_signature",
+            "execution_kind",
+            "exit_reason",
+        } <= columns
+        mirror_cursor = await database.db.execute(
+            "PRAGMA table_info(paper_mirror_positions)"
+        )
+        mirror_columns = {row["name"] for row in await mirror_cursor.fetchall()}
+        assert "peak_price_usd" in mirror_columns
         assert await database.paper_mirror_positions() == []
     finally:
         await database.close()
@@ -197,5 +207,87 @@ async def test_raw_paper_mirror_keeps_wallet_lots_separate(tmp_path) -> None:
         positions = await database.paper_mirror_positions()
         assert len(positions) == 1
         assert positions[0]["trader_address"] == "wallet-b"
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_raw_paper_mirror_caps_one_wallet_token_lot(tmp_path) -> None:
+    database = Database(str(tmp_path / "cap.db"), Decimal("1000"))
+    await database.connect()
+    try:
+        fills = []
+        for index in range(4):
+            fills.append(
+                await database.paper_mirror_execute(
+                    trader_address="wallet-a",
+                    source_signature=f"buy-{index}",
+                    token_mint="mint",
+                    side=Side.BUY,
+                    source_token_amount=Decimal("100"),
+                    market_price_usd=Decimal("1"),
+                    size_usd=Decimal("10"),
+                    fee_bps=0,
+                    slippage_bps=0,
+                    max_position_usd=Decimal("25"),
+                )
+            )
+
+        assert fills[0] is not None
+        assert fills[1] is not None
+        assert fills[2] is not None
+        assert fills[2]["gross"] == Decimal("5")
+        assert fills[3] is None
+        positions = await database.paper_mirror_positions()
+        assert Decimal(str(positions[0]["cost_basis_usd"])) == Decimal("25.0")
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_paper_summary_reports_expectancy_and_profit_factor(tmp_path) -> None:
+    database = Database(str(tmp_path / "metrics.db"), Decimal("1000"))
+    await database.connect()
+    try:
+        for mint, exit_price in (("winner", "1.2"), ("loser", "0.9")):
+            signal = Signal(
+                token_mint=mint,
+                side=Side.BUY,
+                created_at=int(time.time()),
+                trader_addresses=("a", "b"),
+                trader_aliases=("A", "B"),
+                source_signatures=(f"{mint}-a", f"{mint}-b"),
+                combined_score=Decimal("75"),
+                reference_price_usd=Decimal("1"),
+            )
+            signal_id = await database.record_signal(signal)
+            await database.paper_execute(
+                signal_id=signal_id,
+                token_mint=mint,
+                side=Side.BUY,
+                market_price_usd=Decimal("1"),
+                size_usd=Decimal("100"),
+                fee_bps=0,
+                slippage_bps=0,
+            )
+            await database.paper_execute(
+                signal_id=signal_id,
+                token_mint=mint,
+                side=Side.SELL,
+                market_price_usd=Decimal(exit_price),
+                size_usd=Decimal("100"),
+                fee_bps=0,
+                slippage_bps=0,
+            )
+
+        summary = await database.paper_summary({})
+        assert float(summary.gross_profit_usd) == pytest.approx(20)
+        assert float(summary.gross_loss_usd) == pytest.approx(10)
+        assert summary.profit_factor is not None
+        assert float(summary.profit_factor) == pytest.approx(2)
+        assert float(summary.average_win_usd) == pytest.approx(20)
+        assert float(summary.average_loss_usd) == pytest.approx(10)
+        assert float(summary.expectancy_usd) == pytest.approx(5)
+        assert float(summary.realized_pnl_24h_usd) == pytest.approx(10)
     finally:
         await database.close()

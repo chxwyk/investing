@@ -28,7 +28,8 @@ unless four separate controls are deliberately configured.
 - Maintains an average-cost inventory for each tracked wallet.
 - Calculates realized P&L, realized ROI, win rate, trade count, volume, and maximum drawdown.
 - Scores traders on repeatability, ROI, 24-hour/7-day consistency, activity, and drawdown.
-- In PAPER mode, immediately copies every newly detected tracked-wallet buy with fake money.
+- In PAPER mode, evaluates every newly detected tracked-wallet buy for an immediate,
+  guarded fake-money copy.
 - Keeps a separate fake lot for each source wallet and mirrors its partial/full sells
   proportionally.
 - Uses independent-wallet consensus and risk gates for alert/live strategy execution.
@@ -37,10 +38,14 @@ unless four separate controls are deliberately configured.
 - Can mention one Discord user on every newly detected raw buy.
 - Blocks suspicious, low-liquidity, concentrated, mintable, or freezable tokens when the
   required Jupiter safety metadata is available.
-- Paper-mirrors raw wallet buys and sells with configurable fee/slippage assumptions.
-- Enforces configurable stop-loss, take-profit, and maximum-hold exits on consensus/live
-  positions; raw-mirror paper lots follow the source wallet's sell activity instead.
-- Tracks equity, realized/unrealized P&L, win rate, and maximum drawdown.
+- Prices new raw paper fills at the current observed Jupiter price so detection latency is
+  represented instead of granting the tracked wallet's earlier transaction price.
+- Caps each wallet/token raw lot, applies token/capital entry gates, and includes configurable
+  fee/slippage assumptions.
+- Protects every raw-mirror paper lot with an independent hard stop, take-profit,
+  trailing-profit lock, and maximum-hold exit while still mirroring source-wallet sells.
+- Tracks equity, realized/unrealized P&L, win rate, maximum drawdown, profit factor,
+  average win/loss, expectancy, and rolling 24-hour realized P&L.
 - Optionally executes personal-wallet **spot** swaps through Jupiter Swap API V2.
 
 ## What it deliberately does not do
@@ -57,15 +62,43 @@ unless four separate controls are deliberately configured.
 ## Paper raw-mirror strategy
 
 `PAPER_MIRROR_RAW_SWAPS=true` is the default. After a wallet's initial bootstrap finishes,
-every new raw BUY alert immediately spends `DEFAULT_COPY_USD` from the fake bankroll. The
-next raw SELL from that same wallet sells the matching fake lot. If the source sells only
-part of its observed token balance, the bot sells the same percentage of that wallet's
-paper lot. Different wallets remain separate even when they trade the same token.
+every new raw BUY alert is evaluated automatically. With the default
+`PAPER_RAW_ENTRY_FILTER_ENABLED=true`, a buy must have a current price, be fresh, fit the
+daily-loss/open-position limits, and pass any available Jupiter safety metadata. An allowed
+entry spends `DEFAULT_COPY_USD`; repeated buys cannot push one wallet/token lot above
+`MAX_COPY_USD`.
+
+The paper fill uses the current observed Jupiter price at detection time—not the tracked
+wallet's earlier transaction price—and then applies `SIMULATED_FEE_BPS` and
+`SIMULATED_SLIPPAGE_BPS`. This is a more demanding shadow test, though it is still not a
+guaranteed executable quote or a prediction of live results.
+
+The next raw SELL from that same wallet sells the matching fake lot proportionally while it
+remains open. Separately, the paper risk manager can close the entire lot first at the raw
+hard stop, take-profit, trailing-profit threshold, or maximum hold. A later source SELL will
+then correctly show `SKIPPED` because the protected paper lot is already closed. Different
+wallets remain separate even when they trade the same token.
 
 Bootstrap history is recorded for scoring but is not purchased retroactively. Therefore a
-sell can correctly show `SKIPPED` if its matching buy happened before raw mirroring was
-deployed. A new detected buy must occur first. Set `PAPER_MIRROR_RAW_SWAPS=false` to restore
-the older consensus-only paper behavior.
+sell can also show `SKIPPED` if its matching buy happened before raw mirroring was deployed.
+A new detected buy must occur first. Set `PAPER_MIRROR_RAW_SWAPS=false` to restore the older
+consensus-only paper behavior.
+
+The v2.7 starter guardrails are intentionally configurable:
+
+```text
+PAPER_REQUIRE_CURRENT_PRICE=true
+PAPER_RAW_ENTRY_FILTER_ENABLED=true
+RAW_MIRROR_STOP_LOSS_PERCENT=8
+RAW_MIRROR_TAKE_PROFIT_PERCENT=20
+RAW_MIRROR_TRAILING_ACTIVATION_PERCENT=8
+RAW_MIRROR_TRAILING_STOP_PERCENT=4
+RAW_MIRROR_MAX_HOLD_SECONDS=7200
+```
+
+These values are hypotheses to validate in PAPER mode, not optimized or guaranteed-profit
+settings. Use `/smartmoney paper`, `/smartmoney positions`, and
+`/smartmoney paper-trades` to evaluate them across a meaningful sample before changing size.
 
 ## Consensus and live strategy
 
@@ -191,8 +224,9 @@ in that URL private. Helius documents the endpoint format as
 | `/smartmoney traders` | List monitored wallets. |
 | `/smartmoney scan` | Run a scan immediately. |
 | `/smartmoney leaderboard` | Show the 24-hour or 7-day risk-adjusted ranking. |
-| `/smartmoney paper` | Show strategy equity, net P&L, win rate, and drawdown. |
+| `/smartmoney paper` | Show P&L, drawdown, profit factor, expectancy, and 24H progress. |
 | `/smartmoney positions` | Show open paper positions. |
+| `/smartmoney paper-trades` | Show recent fills, realized ROI, and automatic exit reasons. |
 | `/smartmoney paper-demo` | Instantly create and close a clearly labeled fake paper trade. |
 | `/smartmoney paper-reset` | Reset the paper challenge after exact confirmation. |
 | `/smartmoney mode` | Show or set alerts, paper, or live mode. |
@@ -271,6 +305,13 @@ support ticket, a screenshot, or chat. The default live base asset is Solana USD
   processes them, so backfilled dollar P&L is approximate.
 - Transfers, liquidity operations, multi-output transactions, and non-quote token swaps are
   intentionally ignored to avoid false copy signals.
+- Current Jupiter reference prices are not guaranteed executable quotes. Configured fees and
+  slippage make the simulation less optimistic, but live routing, price impact, priority fees,
+  failed transactions, and price movement can produce worse fills.
+- Paper stops are evaluated after each scanner cycle. Fast markets can gap through a threshold,
+  so an 8% configured stop does not guarantee an 8% maximum loss.
+- The v2.7 raw-entry and raw-lot guards are PAPER-only. Live mode remains the independent-wallet
+  consensus spot strategy and is never enabled automatically by this upgrade.
 - A source wallet can still dump after followers enter. Consensus and liquidity filters
   reduce this risk; they cannot remove it.
 
@@ -281,5 +322,6 @@ ruff check .
 pytest -q
 ```
 
-The tests cover swap detection, score behavior, paper accounting, risk gating, and live-mode
+The tests cover swap detection, score behavior, current-price paper fills, raw-lot caps,
+hard/trailing/time exits, performance metrics, risk gating, database migration, and live-mode
 locking.
