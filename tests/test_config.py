@@ -119,3 +119,15 @@ def test_v28_quote_shadow_and_readiness_defaults(monkeypatch) -> None:
     assert settings.max_consecutive_quote_failures == 5
     assert settings.readiness_min_active_days == 14
     assert settings.readiness_min_closed_trades == 100
+
+
+def test_pump_source_price_fallback_defaults_to_conservative_paper_only_mode(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("PAPER_ALLOW_PUMP_SOURCE_FALLBACK", raising=False)
+    monkeypatch.delenv("PAPER_PUMP_SOURCE_FALLBACK_BPS", raising=False)
+
+    settings = Settings.from_env(require_discord_token=False)
+
+    assert settings.paper_allow_pump_source_fallback is True
+    assert settings.paper_pump_source_fallback_bps == 300

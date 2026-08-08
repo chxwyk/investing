@@ -92,6 +92,8 @@ class Settings:
     simulated_slippage_bps: int
     paper_mirror_raw_swaps: bool
     paper_require_current_price: bool
+    paper_allow_pump_source_fallback: bool
+    paper_pump_source_fallback_bps: int
     paper_raw_entry_filter_enabled: bool
     paper_daily_target_usd: Decimal
     paper_use_executable_quotes: bool
@@ -204,6 +206,12 @@ class Settings:
             simulated_slippage_bps=_int("SIMULATED_SLIPPAGE_BPS", 100),
             paper_mirror_raw_swaps=_bool("PAPER_MIRROR_RAW_SWAPS", True),
             paper_require_current_price=_bool("PAPER_REQUIRE_CURRENT_PRICE", True),
+            paper_allow_pump_source_fallback=_bool(
+                "PAPER_ALLOW_PUMP_SOURCE_FALLBACK", True
+            ),
+            paper_pump_source_fallback_bps=_int(
+                "PAPER_PUMP_SOURCE_FALLBACK_BPS", 300
+            ),
             paper_raw_entry_filter_enabled=_bool(
                 "PAPER_RAW_ENTRY_FILTER_ENABLED", True
             ),
@@ -374,6 +382,10 @@ class Settings:
             raise ValueError("SIMULATED_FEE_BPS must be between 0 and 10000")
         if not 0 <= self.simulated_slippage_bps <= 10_000:
             raise ValueError("SIMULATED_SLIPPAGE_BPS must be between 0 and 10000")
+        if not 0 <= self.paper_pump_source_fallback_bps <= 10_000:
+            raise ValueError(
+                "PAPER_PUMP_SOURCE_FALLBACK_BPS must be between 0 and 10000"
+            )
         if self.stop_loss_percent <= 0 or self.take_profit_percent <= 0:
             raise ValueError("Stop-loss and take-profit percentages must be positive")
         if self.max_hold_seconds < 60:

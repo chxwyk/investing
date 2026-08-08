@@ -6,6 +6,7 @@ from dataclasses import replace
 from decimal import Decimal
 
 import pytest
+
 from smart_money_bot.database import Database
 from smart_money_bot.models import DiscoveryCandidate, Side, Signal
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+
 from smart_money_bot.config import Settings
 
 

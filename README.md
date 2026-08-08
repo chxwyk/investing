@@ -97,6 +97,13 @@ Quote-only orders do not need a trading wallet or private key, but Jupiter requi
 `JUPITER_API_KEY`. The route is much closer to a tradeable result than a spot price; it is
 still not a confirmed fill because the bot does not sign or land a PAPER transaction.
 
+New Pump.fun bonding-curve tokens often do not have a Jupiter price or route yet. In PAPER
+mode only, `PAPER_ALLOW_PUMP_SOURCE_FALLBACK=true` records those detected buys and sells using
+the transaction's on-chain price with an additional adverse
+`PAPER_PUMP_SOURCE_FALLBACK_BPS` penalty before the normal simulated slippage and fee. The bot
+labels these rows `PUMP SOURCE FALLBACK`. They let the strategy ledger advance, but they are
+not executable-quote evidence and do not count toward `/smartmoney readiness`.
+
 The next raw SELL from that same wallet sells the matching fake lot proportionally while it
 remains open. Separately, the paper risk manager can close the entire lot first at the raw
 hard stop, take-profit, trailing-profit threshold, or maximum hold. A later source SELL will
@@ -108,10 +115,12 @@ sell can also show `SKIPPED` if its matching buy happened before raw mirroring w
 A new detected buy must occur first. Set `PAPER_MIRROR_RAW_SWAPS=false` to restore the older
 consensus-only paper behavior.
 
-The v2.9.1 quote, rotation, and exit guardrails are intentionally configurable:
+The v2.9.2 quote, fallback, rotation, and exit guardrails are intentionally configurable:
 
 ```text
 PAPER_REQUIRE_CURRENT_PRICE=true
+PAPER_ALLOW_PUMP_SOURCE_FALLBACK=true
+PAPER_PUMP_SOURCE_FALLBACK_BPS=300
 PAPER_RAW_ENTRY_FILTER_ENABLED=true
 PAPER_USE_EXECUTABLE_QUOTES=true
 PAPER_QUOTE_OUTPUT_BUFFER_BPS=50
@@ -139,7 +148,7 @@ settings. Use `/smartmoney paper`, `/smartmoney positions`, `/smartmoney paper-t
 
 ## Official PAPER readiness trial
 
-After deploying v2.9.1, run `/smartmoney paper-reset confirmation:RESET PAPER` once to begin a
+After deploying v2.9.2, run `/smartmoney paper-reset confirmation:RESET PAPER` once to begin a
 clean trial. `/smartmoney readiness` reports **KEEP TESTING** until all defaults pass:
 
 - 14 separate active test days;
@@ -394,7 +403,7 @@ support ticket, a screenshot, or chat. The default live base asset is Solana USD
   results worse.
 - Paper stops are evaluated after each scanner cycle. Fast markets can gap through a threshold,
   so an 8% configured stop does not guarantee an 8% maximum loss.
-- The v2.9.1 quote, rotation, raw-entry, and raw-lot guards are PAPER-only. Live mode remains
+- The v2.9.2 quote, fallback, rotation, raw-entry, and raw-lot guards are PAPER-only. Live mode remains
   the independent-wallet consensus spot strategy and is never enabled automatically by this
   upgrade.
 - A wallet can pass every historical filter and lose immediately afterward. “Verified” means

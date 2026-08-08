@@ -36,7 +36,7 @@ from .models import (
     TraderMetrics,
 )
 from .risk import RiskEngine
-from .rotation import CandidateRotator
+from .rotation import CandidateRotator, is_pump_mint
 from .rpc import SolanaRPC
 from .scoring import rank_traders
 from .strategy import ConsensusStrategy
@@ -500,11 +500,26 @@ class SmartMoneyEngine:
             price = await self.market.price(swap.token_mint)
         except JupiterError:
             price = None
-        if (
-            (price is None or price <= 0)
-            and not self.settings.paper_require_current_price
-        ):
-            price = swap.token_price_usd
+        pump_source_fallback = False
+        if price is None or price <= 0:
+            source_price = swap.token_price_usd
+            if (
+                self.settings.paper_allow_pump_source_fallback
+                and is_pump_mint(swap.token_mint)
+                and source_price is not None
+                and source_price > 0
+            ):
+                penalty = Decimal(self.settings.paper_pump_source_fallback_bps) / Decimal(
+                    10_000
+                )
+                price = (
+                    source_price * (Decimal("1") + penalty)
+                    if swap.side is Side.BUY
+                    else source_price * (Decimal("1") - penalty)
+                )
+                pump_source_fallback = True
+            elif not self.settings.paper_require_current_price:
+                price = source_price
         size = min(self.settings.default_copy_usd, self.settings.max_copy_usd)
         if price is None or price <= 0:
             result = ExecutionResult(
@@ -586,6 +601,7 @@ class SmartMoneyEngine:
                 market_price_usd=price,
                 size_usd=size,
                 token_info=token_info,
+                pump_source_fallback=pump_source_fallback,
             )
         await self.notifier.on_execution(result)
 

@@ -7,6 +7,7 @@ from decimal import Decimal
 from unittest.mock import AsyncMock
 
 import pytest
+
 from smart_money_bot.engine import SmartMoneyEngine
 from smart_money_bot.models import (
     DetectedSwap,
@@ -50,13 +51,19 @@ class CaptureNotifier:
         raise AssertionError(f"{context}: {error}")
 
 
-def _swap(side: Side, signature: str, price: str) -> DetectedSwap:
+def _swap(
+    side: Side,
+    signature: str,
+    price: str,
+    *,
+    mint: str = "mint",
+) -> DetectedSwap:
     return DetectedSwap(
         signature=signature,
         trader_address="wallet-a",
         block_time=int(time.time()),
         side=side,
-        token_mint="mint",
+        token_mint=mint,
         token_amount=Decimal("100"),
         quote_mint="quote",
         quote_amount=Decimal("100"),
@@ -158,6 +165,80 @@ async def test_raw_paper_buy_uses_current_price_not_source_price(settings) -> No
         assert len(positions) == 1
         average_entry = Decimal(str(positions[0]["average_entry_usd"]))
         assert Decimal("2") < average_entry < Decimal("2.1")
+    finally:
+        await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_unrouted_pump_swap_uses_guarded_source_price_paper_fallback(
+    settings,
+) -> None:
+    quoted = replace(
+        settings,
+        paper_use_executable_quotes=True,
+        paper_require_current_price=True,
+        paper_allow_pump_source_fallback=True,
+        paper_pump_source_fallback_bps=300,
+    )
+    notifier = CaptureNotifier()
+    engine = SmartMoneyEngine(quoted, notifier=notifier)
+    await engine.initialize()
+    pump_mint = "A5G8K3qLzTKhmRL7nRTzG1f8eLTjSfY2uHEdpbt1pump"
+    try:
+        engine.market.price = AsyncMock(return_value=None)
+        engine.market.token_info = AsyncMock(return_value=None)
+        engine.market.quote_order = AsyncMock()
+        trader = TrackedTrader(address="wallet-a", alias="Auto wallet-a")
+        await engine.database.add_trader(trader.address, trader.alias)
+
+        await engine._handle_new_swap(
+            _swap(Side.BUY, "pump-buy", "0.00000282", mint=pump_mint),
+            trader,
+        )
+        assert notifier.executions[-1].success is True
+        assert "not proof" in notifier.executions[-1].message
+        assert len(await engine.database.paper_mirror_positions()) == 1
+
+        await engine._handle_new_swap(
+            _swap(Side.SELL, "pump-sell", "0.00000628", mint=pump_mint),
+            trader,
+        )
+        assert notifier.executions[-1].success is True
+        assert "does not count" in notifier.executions[-1].message
+        assert await engine.database.paper_mirror_positions() == []
+        engine.market.quote_order.assert_not_awaited()
+
+        trades = await engine.database.paper_recent_trades()
+        assert len(trades) == 2
+        assert {item["execution_kind"] for item in trades} == {
+            "PUMP_SOURCE_FALLBACK"
+        }
+        assert all(item["quote_based"] == 0 for item in trades)
+        assert Decimal(str(trades[0]["realized_pnl_usd"])) > 0
+    finally:
+        await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_unrouted_nonpump_swap_still_fails_closed(settings) -> None:
+    strict = replace(
+        settings,
+        paper_require_current_price=True,
+        paper_allow_pump_source_fallback=True,
+    )
+    notifier = CaptureNotifier()
+    engine = SmartMoneyEngine(strict, notifier=notifier)
+    await engine.initialize()
+    try:
+        engine.market.price = AsyncMock(return_value=None)
+        trader = TrackedTrader(address="wallet-a", alias="Auto wallet-a")
+        await engine.database.add_trader(trader.address, trader.alias)
+
+        await engine._handle_new_swap(_swap(Side.BUY, "nonpump-buy", "1"), trader)
+
+        assert notifier.executions[-1].success is False
+        assert "no current Jupiter price" in notifier.executions[-1].message
+        assert await engine.database.paper_mirror_positions() == []
     finally:
         await engine.close()
 

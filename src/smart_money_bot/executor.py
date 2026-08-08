@@ -110,8 +110,9 @@ class ExecutionManager:
         market_price_usd: Decimal,
         size_usd: Decimal,
         token_info: TokenInfo | None = None,
+        pump_source_fallback: bool = False,
     ) -> ExecutionResult:
-        if self.settings.paper_use_executable_quotes:
+        if self.settings.paper_use_executable_quotes and not pump_source_fallback:
             result = await self._execute_quoted_paper_mirror(
                 swap=swap,
                 trader=trader,
@@ -133,6 +134,10 @@ class ExecutionManager:
             fee_bps=self.settings.simulated_fee_bps,
             slippage_bps=self.settings.simulated_slippage_bps,
             max_position_usd=self.settings.max_copy_usd,
+            execution_kind=(
+                "PUMP_SOURCE_FALLBACK" if pump_source_fallback else "RAW_MIRROR"
+            ),
+            source_price_usd=swap.token_price_usd,
         )
         if fill is None:
             message = (
@@ -152,6 +157,13 @@ class ExecutionManager:
                 message=message,
             )
         elif swap.side is Side.BUY:
+            fallback_note = (
+                f" Pump PAPER fallback used the detected on-chain price with a "
+                f"{self.settings.paper_pump_source_fallback_bps}bps adverse penalty; "
+                "this simulated fill is not proof that a live Jupiter order was executable."
+                if pump_source_fallback
+                else ""
+            )
             result = ExecutionResult(
                 success=True,
                 mode=ExecutionMode.PAPER,
@@ -161,11 +173,18 @@ class ExecutionManager:
                 message=(
                     f"Raw mirror of {trader.alias}: bought {fill['quantity']:.6f} paper "
                     f"tokens at ${fill['price']:.8f}; fee ${fill['fee']:.4f}. "
-                    "This fake lot is linked to that source wallet."
+                    f"This fake lot is linked to that source wallet.{fallback_note}"
                 ),
             )
         else:
             sold_percent = fill["source_fraction"] * Decimal("100")
+            fallback_note = (
+                f" Pump PAPER fallback used the detected on-chain price with a "
+                f"{self.settings.paper_pump_source_fallback_bps}bps adverse penalty; "
+                "this exit does not count as live-executable quote evidence."
+                if pump_source_fallback
+                else ""
+            )
             result = ExecutionResult(
                 success=True,
                 mode=ExecutionMode.PAPER,
@@ -176,6 +195,7 @@ class ExecutionManager:
                     f"Raw mirror of {trader.alias}: sold {sold_percent:.1f}% of that "
                     f"wallet's linked paper lot at ${fill['price']:.8f}; fee "
                     f"${fill['fee']:.4f}; realized P&L ${fill['realized_pnl']:.2f}."
+                    f"{fallback_note}"
                 ),
             )
         await self._log(None, result)

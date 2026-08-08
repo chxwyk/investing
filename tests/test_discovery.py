@@ -3,6 +3,7 @@ from decimal import Decimal
 from unittest.mock import AsyncMock
 
 import pytest
+
 from smart_money_bot.discovery import (
     DiscoveryPolicy,
     SolanaTrackerClient,
