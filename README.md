@@ -6,9 +6,10 @@ Pump.fun memecoin activity every five minutes, reconstructs swaps from confirmed
 transactions, mirrors every newly detected hot-wallet swap in PAPER mode, and records copy
 results from quote-only Jupiter Swap V2 orders plus a conservative output buffer.
 
-Automatic discovery uses the authorized Solana Tracker PnL V2 API—not Fomo scraping. It
-paginates five strict leaderboard pages per window, refreshes the 24-hour pool every three
-hours, caches an independently filtered 7-day pool for twelve hours, and intersects both
+Automatic discovery uses the authorized Solana Tracker PnL V2 API—not Fomo or KOLScan
+scraping. It combines the strict general-trader leaderboard with the provider's documented
+public-KOL period leaderboard, refreshes the 24-hour pool every three hours, caches an
+independently filtered 7-day pool for twelve hours, and requires qualifying evidence in both
 windows. The resulting candidates must then show recent on-chain Pump activity before
 entering the 25-wallet hot set. A
 reconnecting Solana/Helius WebSocket reduces detection latency while one-minute polling stays
@@ -19,7 +20,8 @@ unless four separate controls are deliberately configured.
 
 ## What the bot does
 
-- Pulls rolling 1-day and 7-day Solana trader leaderboards with public wallet addresses.
+- Pulls rolling 1-day and 7-day general-trader and public-KOL leaderboards with public wallet
+  addresses.
 - Requires independent positive PnL, win rate, ROI, and trade-count evidence in both windows.
 - Excludes arbitrage wallets, suspicious identity tags, hyperactive bot-like wallets, and
   one-token wonders through provider filters and local checks.
@@ -29,6 +31,8 @@ unless four separate controls are deliberately configured.
   both profit windows, lack Pump activity, or are outranked by stronger active candidates.
 - Records every admission/removal reason, baseline/current rolling PnL, locally observed
   source-wallet PnL, and PAPER PnL attributable to that wallet.
+- Keeps new wallets on forward-PAPER probation, then removes mature candidates whose own
+  copied exits breach the configured loss or profit-factor floor.
 - Backfills up to 24 hours of transactions when a wallet is first discovered.
 - Throttles Solana RPC calls and retries temporary `429`/server failures with backoff.
 - Uses one reconnecting wallet WebSocket when available, with polling retained as a recovery
@@ -65,6 +69,8 @@ unless four separate controls are deliberately configured.
 ## What it deliberately does not do
 
 - It does not log into, scrape, reverse-engineer, or control a Fomo account.
+- It does not scrape or automate KOLScan. Only documented provider APIs and public on-chain
+  activity are used for automatic candidate discovery.
 - It does not map Fomo usernames to wallets or copy Fomo's leaderboard. Fomo does not expose
   documented public API/webhook credentials in this project; this bot uses an API intended
   for programmatic Solana wallet discovery instead. Fomo-native alerts or legitimately
@@ -115,7 +121,8 @@ sell can also show `SKIPPED` if its matching buy happened before raw mirroring w
 A new detected buy must occur first. Set `PAPER_MIRROR_RAW_SWAPS=false` to restore the older
 consensus-only paper behavior.
 
-The v2.9.2 quote, fallback, rotation, and exit guardrails are intentionally configurable:
+The v2.10.0 discovery, quote, fallback, rotation, and exit guardrails are intentionally
+configurable:
 
 ```text
 PAPER_REQUIRE_CURRENT_PRICE=true
@@ -134,11 +141,16 @@ RAW_MIRROR_TRAILING_ACTIVATION_PERCENT=8
 RAW_MIRROR_TRAILING_STOP_PERCENT=4
 RAW_MIRROR_MAX_HOLD_SECONDS=7200
 DISCOVERY_MAX_WALLETS=25
+DISCOVERY_INCLUDE_KOLS=true
+DISCOVERY_KOL_LIMIT=100
 ROTATION_REFRESH_SECONDS=300
 ROTATION_MAX_IDLE_SECONDS=3600
 ROTATION_MIN_RECENT_SWAPS=1
 ROTATION_MIN_PUMP_SWAPS=1
 ROTATION_REQUIRE_PUMP_ACTIVITY=true
+FORWARD_EVIDENCE_MIN_CLOSED_SELLS=8
+FORWARD_EVIDENCE_MIN_PROFIT_FACTOR=0.65
+FORWARD_EVIDENCE_MAX_LOSS_USD=15
 REALTIME_WALLET_STREAM_ENABLED=true
 ```
 
@@ -148,7 +160,7 @@ settings. Use `/smartmoney paper`, `/smartmoney positions`, `/smartmoney paper-t
 
 ## Official PAPER readiness trial
 
-After deploying v2.9.2, run `/smartmoney paper-reset confirmation:RESET PAPER` once to begin a
+After deploying v2.10.0, run `/smartmoney paper-reset confirmation:RESET PAPER` once to begin a
 clean trial. `/smartmoney readiness` reports **KEEP TESTING** until all defaults pass:
 
 - 14 separate active test days;
@@ -168,8 +180,9 @@ unlocks LIVE mode.
 The raw 24-hour profit leaderboard is not the signal. A single lucky token can put a risky
 wallet at the top. This bot uses a risk-adjusted pipeline:
 
-1. Refresh authorized strict 24-hour and 7-day wallet leaderboards.
-2. Intersect both windows so a one-day spike alone cannot qualify a wallet.
+1. Refresh authorized strict general-trader and public-KOL 24-hour and 7-day leaderboards.
+2. Require qualifying metrics in both windows so a one-day spike alone cannot qualify a
+   wallet.
 3. Verify recent Pump-native or graduated-Pump activity on-chain.
 4. Re-rank the hot set every five minutes and rotate inactive or deteriorating wallets.
 5. Ingest confirmed swaps for each watched wallet.
@@ -188,7 +201,7 @@ The defaults require two qualified traders within five minutes. Set
 ## Local setup
 
 Requirements: Python 3.12+, a Discord bot token, a Solana RPC URL, and a Solana Tracker API
-key for automatic discovery. A Jupiter API key is required for v2.9.1 quote-shadow PAPER and
+key for automatic discovery. A Jupiter API key is required for quote-shadow PAPER and
 live mode because the current Swap V2 order endpoints require it.
 
 ## Automatic wallet discovery
@@ -212,6 +225,8 @@ DISCOVERY_MIN_TRADES=5
 DISCOVERY_MAX_TRADES=250
 DISCOVERY_MIN_CLOSED_TOKENS=2
 DISCOVERY_MAX_SINGLE_TOKEN_PERCENT=70
+DISCOVERY_INCLUDE_KOLS=true
+DISCOVERY_KOL_LIMIT=100
 DISCOVERY_MIN_7D_PNL_USD=300
 DISCOVERY_MIN_7D_WIN_RATE_PERCENT=55
 DISCOVERY_MIN_7D_ROI_PERCENT=5
@@ -223,15 +238,19 @@ ROTATION_PROBE_TRANSACTIONS=6
 ROTATION_MIN_RECENT_SWAPS=1
 ROTATION_MIN_PUMP_SWAPS=1
 ROTATION_REQUIRE_PUMP_ACTIVITY=true
+FORWARD_EVIDENCE_MIN_CLOSED_SELLS=8
+FORWARD_EVIDENCE_MIN_PROFIT_FACTOR=0.65
+FORWARD_EVIDENCE_MAX_LOSS_USD=15
 REALTIME_WALLET_STREAM_ENABLED=true
 ```
 
 The bot calls Solana Tracker's documented `GET /v2/pnl/leaderboard/top` endpoint with
-`days=1` and `days=7`, strict PnL mode, arbitrage exclusion, concentration filtering, and
-cursor pagination. Five pages widen each source pool before intersection. To remain inside a
-2.5K monthly request budget, the runtime automatically clamps full multi-page refreshes to at
-least three hours for 24H data and twelve hours for 7D data, even if older Railway variables
-still contain `1200` and `21600`. Every five minutes the cached intersection is checked
+`days=1` and `days=7`, plus the documented
+`GET /v2/pnl/leaderboard/kols/period` endpoint with `period=1d` and `period=7d`. General-feed
+requests use strict PnL mode, arbitrage exclusion, concentration filtering, and cursor
+pagination. A KOL identity never bypasses local PnL, ROI, win-rate, trade-count, or on-chain
+Pump checks. The runtime automatically clamps full multi-page refreshes to at least three
+hours for 24H data and twelve hours for 7D data. Every five minutes the cached pool is checked
 against recent on-chain swaps. Existing manually added wallets are never removed by automatic
 rotation.
 
@@ -304,6 +323,7 @@ in that URL private. Helius documents the endpoint format as
 | `/smartmoney setup` | Select the alert channel. |
 | `/smartmoney discover` | Refresh strict 24H/7D data and run an immediate Pump rotation. |
 | `/smartmoney hot-wallets` | Show each active wallet's metrics, admission evidence, observed PnL, and PAPER PnL. |
+| `/smartmoney candidates` | Show pool size, Pump verification, selected wallets, and exact rejection reasons. |
 | `/smartmoney rotation` | Show recent admissions/removals and the exact reason for each. |
 | `/smartmoney sources` | Show which discovery/platform/stream sources are actually connected. |
 | `/smartmoney trader-add` | Optionally add a manual public-wallet override. |
@@ -403,7 +423,8 @@ support ticket, a screenshot, or chat. The default live base asset is Solana USD
   results worse.
 - Paper stops are evaluated after each scanner cycle. Fast markets can gap through a threshold,
   so an 8% configured stop does not guarantee an 8% maximum loss.
-- The v2.9.2 quote, fallback, rotation, raw-entry, and raw-lot guards are PAPER-only. Live mode remains
+- The v2.10.0 discovery, forward-evidence, quote, fallback, rotation, raw-entry, and raw-lot
+  guards are PAPER-only. Live mode remains
   the independent-wallet consensus spot strategy and is never enabled automatically by this
   upgrade.
 - A wallet can pass every historical filter and lose immediately afterward. “Verified” means
@@ -419,7 +440,8 @@ ruff check .
 pytest -q
 ```
 
-The tests cover dual-window intersection, Pump activity admission, wallet rotation auditing,
-WebSocket derivation, swap detection, score behavior, Swap V2 quote parsing, entry-drift and
-price-impact rejection, quote-based round trips, readiness metrics, raw-lot caps,
-hard/trailing/time exits, risk gating, database migration, and live-mode locking.
+The tests cover multi-source dual-window qualification, public-KOL parsing, Pump activity
+admission, wallet rotation auditing, forward PAPER evidence, WebSocket derivation, swap
+detection, score behavior, Swap V2 quote parsing, entry-drift and price-impact rejection,
+quote-based round trips, readiness metrics, raw-lot caps, hard/trailing/time exits, risk
+gating, database migration, and live-mode locking.

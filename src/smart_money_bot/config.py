@@ -61,6 +61,8 @@ class Settings:
     discovery_max_trades: int
     discovery_min_closed_tokens: int
     discovery_max_single_token_percent: Decimal
+    discovery_include_kols: bool
+    discovery_kol_limit: int
     discovery_min_7d_pnl_usd: Decimal
     discovery_min_7d_win_rate_percent: Decimal
     discovery_min_7d_roi_percent: Decimal
@@ -73,6 +75,9 @@ class Settings:
     rotation_min_recent_swaps: int
     rotation_min_pump_swaps: int
     rotation_require_pump_activity: bool
+    forward_evidence_min_closed_sells: int
+    forward_evidence_min_profit_factor: Decimal
+    forward_evidence_max_loss_usd: Decimal
     realtime_wallet_stream_enabled: bool
     solana_ws_url: str | None
 
@@ -173,6 +178,8 @@ class Settings:
             discovery_max_single_token_percent=_decimal(
                 "DISCOVERY_MAX_SINGLE_TOKEN_PERCENT", "70"
             ),
+            discovery_include_kols=_bool("DISCOVERY_INCLUDE_KOLS", True),
+            discovery_kol_limit=_int("DISCOVERY_KOL_LIMIT", 100),
             discovery_min_7d_pnl_usd=_decimal("DISCOVERY_MIN_7D_PNL_USD", "300"),
             discovery_min_7d_win_rate_percent=_decimal(
                 "DISCOVERY_MIN_7D_WIN_RATE_PERCENT", "55"
@@ -187,6 +194,15 @@ class Settings:
             rotation_min_pump_swaps=_int("ROTATION_MIN_PUMP_SWAPS", 1),
             rotation_require_pump_activity=_bool(
                 "ROTATION_REQUIRE_PUMP_ACTIVITY", True
+            ),
+            forward_evidence_min_closed_sells=_int(
+                "FORWARD_EVIDENCE_MIN_CLOSED_SELLS", 8
+            ),
+            forward_evidence_min_profit_factor=_decimal(
+                "FORWARD_EVIDENCE_MIN_PROFIT_FACTOR", "0.65"
+            ),
+            forward_evidence_max_loss_usd=_decimal(
+                "FORWARD_EVIDENCE_MAX_LOSS_USD", "15"
             ),
             realtime_wallet_stream_enabled=_bool(
                 "REALTIME_WALLET_STREAM_ENABLED", True
@@ -346,6 +362,8 @@ class Settings:
             raise ValueError("DISCOVERY_MIN_CLOSED_TOKENS must be at least 1")
         if not 1 <= self.discovery_max_single_token_percent <= 100:
             raise ValueError("DISCOVERY_MAX_SINGLE_TOKEN_PERCENT must be between 1 and 100")
+        if not 1 <= self.discovery_kol_limit <= 100:
+            raise ValueError("DISCOVERY_KOL_LIMIT must be between 1 and 100")
         if self.discovery_min_7d_pnl_usd < 0:
             raise ValueError("DISCOVERY_MIN_7D_PNL_USD cannot be negative")
         if not 0 <= self.discovery_min_7d_win_rate_percent <= 100:
@@ -372,6 +390,12 @@ class Settings:
             raise ValueError("ROTATION_MIN_RECENT_SWAPS must be at least 1")
         if self.rotation_min_pump_swaps < 1:
             raise ValueError("ROTATION_MIN_PUMP_SWAPS must be at least 1")
+        if self.forward_evidence_min_closed_sells < 1:
+            raise ValueError("FORWARD_EVIDENCE_MIN_CLOSED_SELLS must be at least 1")
+        if self.forward_evidence_min_profit_factor < 0:
+            raise ValueError("FORWARD_EVIDENCE_MIN_PROFIT_FACTOR cannot be negative")
+        if self.forward_evidence_max_loss_usd <= 0:
+            raise ValueError("FORWARD_EVIDENCE_MAX_LOSS_USD must be positive")
         if self.poll_interval_seconds < 5:
             raise ValueError("POLL_INTERVAL_SECONDS must be at least 5")
         if self.max_copy_usd <= 0 or self.default_copy_usd <= 0:

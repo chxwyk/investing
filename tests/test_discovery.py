@@ -9,6 +9,7 @@ from smart_money_bot.discovery import (
     SolanaTrackerClient,
     merge_verified_windows,
     parse_candidates,
+    parse_kol_window_candidates,
     parse_window_candidates,
 )
 
@@ -97,6 +98,76 @@ def test_merge_verified_windows_requires_profit_in_both_periods() -> None:
     assert "24H + 7D" in merged[0].selection_reason
 
 
+def test_public_kol_feed_widens_pool_but_still_uses_local_thresholds() -> None:
+    payload = {
+        "traders": [
+            {
+                "wallet": WALLET_ONE,
+                "period": {
+                    "realized": 900,
+                    "roi": 40,
+                    "volume": 8000,
+                    "invested": 2000,
+                    "counts": {"trades": 30, "buys": 18, "sells": 12},
+                    "tokens": {"profitable": 7, "losing": 3},
+                    "timing": {"lastTrade": 1_700_000_000},
+                    "winRate": 70,
+                },
+                "identity": {"name": "Public KOL", "tags": ["kol"]},
+            },
+            {
+                "wallet": WALLET_TWO,
+                "period": {
+                    "realized": 900,
+                    "roi": 40,
+                    "volume": 8000,
+                    "invested": 2000,
+                    "counts": {"trades": 30},
+                    "tokens": {"closed": 10},
+                    "winRate": 70,
+                },
+                "identity": {"name": "Known bot", "tags": ["bot"]},
+            },
+        ]
+    }
+
+    candidates = parse_kol_window_candidates(payload, policy(), days=1)
+
+    assert [candidate.address for candidate in candidates] == [WALLET_ONE]
+    assert candidates[0].source == "public-KOL"
+    assert candidates[0].last_trade_ms == 1_700_000_000_000
+
+
+def test_merge_can_confirm_a_wallet_across_general_and_public_kol_feeds() -> None:
+    daily = parse_window_candidates(
+        {"traders": [row(WALLET_ONE)]}, policy(), days=1
+    )
+    weekly_payload = {
+        "traders": [
+            {
+                "wallet": WALLET_ONE,
+                "period": {
+                    "realized": 2500,
+                    "roi": 30,
+                    "volume": 15000,
+                    "invested": 7000,
+                    "counts": {"trades": 80, "buys": 45, "sells": 35},
+                    "tokens": {"closed": 20},
+                    "timing": {"lastTrade": 1_700_000_000_000},
+                    "winRate": 68,
+                },
+                "identity": {"name": "Public KOL", "tags": ["kol"]},
+            }
+        ]
+    }
+    weekly = parse_kol_window_candidates(weekly_payload, policy(), days=7)
+
+    merged = merge_verified_windows(daily, weekly, policy())
+
+    assert [candidate.address for candidate in merged] == [WALLET_ONE]
+    assert "general + public-KOL evidence" in merged[0].selection_reason
+
+
 @pytest.mark.asyncio
 async def test_leaderboard_paginates_and_passes_cursor() -> None:
     client = SolanaTrackerClient("test-key")
@@ -124,3 +195,15 @@ async def test_leaderboard_paginates_and_passes_cursor() -> None:
     assert second_params["cursor"] == "page-2"
     assert first_params["limit"] == "1"
     assert client._request.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_kol_period_feed_uses_authorized_endpoint() -> None:
+    client = SolanaTrackerClient("test-key")
+    client._request = AsyncMock(return_value={"traders": []})
+
+    await client.kol_daily_pool(policy())
+
+    args = client._request.await_args
+    assert args.args[0] == "/v2/pnl/leaderboard/kols/period"
+    assert args.kwargs["params"]["period"] == "1d"

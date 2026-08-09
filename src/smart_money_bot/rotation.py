@@ -97,19 +97,6 @@ class CandidateRotator:
     async def _probe(
         self, candidate: DiscoveryCandidate, now: int
     ) -> tuple[DiscoveryCandidate, str | None]:
-        if candidate.last_trade_ms:
-            leaderboard_age = now - int(candidate.last_trade_ms / 1000)
-            if leaderboard_age > self.settings.rotation_max_idle_seconds:
-                stale = replace(
-                    candidate,
-                    recent_swaps=0,
-                    pump_swaps=0,
-                    last_activity_at=int(candidate.last_trade_ms / 1000),
-                )
-                return stale, (
-                    f"inactive: last leaderboard trade was {leaderboard_age // 60}m ago"
-                )
-
         try:
             async with self._semaphore:
                 signatures = await self.rpc.get_signatures_for_address(
@@ -155,6 +142,7 @@ class CandidateRotator:
 
         activity_bonus = min(Decimal(swaps) * Decimal("0.50"), Decimal("4"))
         pump_bonus = min(Decimal(pump_swaps), Decimal("3"))
+        evidence = candidate.selection_reason or "strict 24H/7D profit verified"
         updated = replace(
             candidate,
             score=min(Decimal("100"), candidate.score + activity_bonus + pump_bonus),
@@ -162,9 +150,7 @@ class CandidateRotator:
             pump_swaps=pump_swaps,
             last_activity_at=last_activity_at,
             selection_reason=(
-                f"strict 24H/7D profit + {swaps} recent swaps "
-                f"({pump_swaps} Pump); 24H ${candidate.realized_pnl_24h:,.2f}, "
-                f"7D ${candidate.realized_pnl_7d:,.2f}"
+                f"{evidence}; {swaps} recent swaps ({pump_swaps} Pump)"
             ),
         )
         if swaps < self.settings.rotation_min_recent_swaps:

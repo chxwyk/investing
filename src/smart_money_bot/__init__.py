@@ -1,3 +1,3 @@
 """Smart Money Copy Bot."""
 
-__version__ = "2.9.2"
+__version__ = "2.10.0"

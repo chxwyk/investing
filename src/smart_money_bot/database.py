@@ -900,12 +900,26 @@ class Database:
             source = await source_cursor.fetchone()
             paper_cursor = await self.db.execute(
                 """
-                SELECT COUNT(*) AS fills, COALESCE(SUM(realized_pnl_usd), 0) AS pnl
+                SELECT COUNT(*) AS fills,
+                       COALESCE(SUM(realized_pnl_usd), 0) AS pnl,
+                       COALESCE(SUM(CASE WHEN side = 'SELL' THEN 1 ELSE 0 END), 0)
+                            AS closed_sells,
+                       COALESCE(SUM(CASE WHEN side = 'SELL' AND realized_pnl_usd > 0
+                            THEN realized_pnl_usd ELSE 0 END), 0) AS gross_profit,
+                       COALESCE(SUM(CASE WHEN side = 'SELL' AND realized_pnl_usd < 0
+                            THEN -realized_pnl_usd ELSE 0 END), 0) AS gross_loss
                 FROM paper_trades WHERE source_trader = ? AND created_at >= ?
                 """,
                 (row["address"], started_at),
             )
             paper = await paper_cursor.fetchone()
+            gross_profit = _d(paper["gross_profit"] if paper else 0)
+            gross_loss = _d(paper["gross_loss"] if paper else 0)
+            profit_factor = (
+                gross_profit / gross_loss
+                if gross_loss > 0
+                else Decimal("999") if gross_profit > 0 else Decimal("0")
+            )
             reports.append(
                 {
                     "address": row["address"],
@@ -926,11 +940,58 @@ class Database:
                     "observed_swaps": int(source["swaps"] if source else 0),
                     "observed_source_pnl": _d(source["pnl"] if source else 0),
                     "paper_fills": int(paper["fills"] if paper else 0),
+                    "paper_closed_sells": int(
+                        (paper["closed_sells"] if paper else 0) or 0
+                    ),
                     "paper_pnl": _d(paper["pnl"] if paper else 0),
+                    "paper_profit_factor": profit_factor,
                     "selection_reason": str(row["selection_reason"] or ""),
                 }
             )
         return reports
+
+    async def paper_wallet_performance(
+        self, addresses: list[str]
+    ) -> dict[str, dict[str, Decimal | int]]:
+        """Forward PAPER evidence for candidate admission and removal decisions."""
+
+        unique = list(dict.fromkeys(addresses))
+        if not unique:
+            return {}
+        placeholders = ",".join("?" for _ in unique)
+        cursor = await self.db.execute(
+            f"""
+            SELECT source_trader,
+                   COUNT(*) AS closed_sells,
+                   COALESCE(SUM(realized_pnl_usd), 0) AS pnl,
+                   COALESCE(SUM(CASE WHEN realized_pnl_usd > 0
+                        THEN realized_pnl_usd ELSE 0 END), 0) AS gross_profit,
+                   COALESCE(SUM(CASE WHEN realized_pnl_usd < 0
+                        THEN -realized_pnl_usd ELSE 0 END), 0) AS gross_loss
+            FROM paper_trades
+            WHERE side = 'SELL' AND source_trader IN ({placeholders})
+            GROUP BY source_trader
+            """,
+            tuple(unique),
+        )
+        rows = await cursor.fetchall()
+        performance: dict[str, dict[str, Decimal | int]] = {}
+        for row in rows:
+            gross_profit = _d(row["gross_profit"])
+            gross_loss = _d(row["gross_loss"])
+            profit_factor = (
+                gross_profit / gross_loss
+                if gross_loss > 0
+                else Decimal("999") if gross_profit > 0 else Decimal("0")
+            )
+            performance[str(row["source_trader"])] = {
+                "closed_sells": int(row["closed_sells"]),
+                "pnl": _d(row["pnl"]),
+                "gross_profit": gross_profit,
+                "gross_loss": gross_loss,
+                "profit_factor": profit_factor,
+            }
+        return performance
 
     async def is_processed(self, signature: str) -> bool:
         cursor = await self.db.execute(

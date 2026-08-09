@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from decimal import Decimal
+
 from smart_money_bot.config import Settings
 from smart_money_bot.constants import LIVE_ACK_TEXT
 
@@ -41,6 +43,26 @@ def test_discovery_default_refresh_fits_free_monthly_quota(monkeypatch) -> None:
     assert settings.discovery_candidate_pages == 5
     assert settings.effective_discovery_refresh_seconds == 10800
     assert settings.effective_discovery_7d_refresh_seconds == 43200
+
+
+def test_public_kol_and_forward_evidence_defaults_are_safe(monkeypatch) -> None:
+    names = (
+        "DISCOVERY_INCLUDE_KOLS",
+        "DISCOVERY_KOL_LIMIT",
+        "FORWARD_EVIDENCE_MIN_CLOSED_SELLS",
+        "FORWARD_EVIDENCE_MIN_PROFIT_FACTOR",
+        "FORWARD_EVIDENCE_MAX_LOSS_USD",
+    )
+    for name in names:
+        monkeypatch.delenv(name, raising=False)
+
+    settings = Settings.from_env(require_discord_token=False)
+
+    assert settings.discovery_include_kols is True
+    assert settings.discovery_kol_limit == 100
+    assert settings.forward_evidence_min_closed_sells == 8
+    assert settings.forward_evidence_min_profit_factor == Decimal("0.65")
+    assert settings.forward_evidence_max_loss_usd == Decimal("15")
 
 
 def test_rpc_defaults_are_free_tier_friendly(monkeypatch) -> None:

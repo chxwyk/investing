@@ -122,7 +122,8 @@ def _discovery_lines(candidates: tuple[DiscoveryCandidate, ...] | list[Discovery
             f"7D `{_money(item.realized_pnl_7d)}` / `{item.roi_7d_percent:.1f}%` ROI\n"
             f"win `24H {item.win_rate_percent:.1f}%` / `7D {item.win_rate_7d_percent:.1f}%` • "
             f"recent `{item.recent_swaps}` • Pump `{item.pump_swaps}` • "
-            f"score `{item.score}` • momentum `{momentum_text}`"
+            f"score `{item.score}` • momentum `{momentum_text}`\n"
+            f"why: {item.selection_reason or 'strict dual-window evidence'}"
         )
     return "\n\n".join(lines) or "No qualified wallets in the latest snapshot."
 
@@ -533,7 +534,9 @@ class SmartMoneyCommands(
                 f"`7D {rolling_7d_change:+,.2f}`\n"
                 f"Observed after admission: source PnL `{_money(report['observed_source_pnl'])}` "
                 f"from `{report['observed_swaps']}` swaps • our PAPER PnL "
-                f"`{_money(report['paper_pnl'])}` from `{report['paper_fills']}` fills"
+                f"`{_money(report['paper_pnl'])}` from `{report['paper_fills']}` fills / "
+                f"`{report['paper_closed_sells']}` exits • PAPER PF "
+                f"`{report['paper_profit_factor']:.2f}`"
             )
         embed = discord.Embed(
             title="Pump Hot-Wallet Evidence",
@@ -547,6 +550,45 @@ class SmartMoneyCommands(
             )
         )
         await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @app_commands.command(
+        name="candidates",
+        description="Show the latest discovery funnel and exact rejection reasons.",
+    )
+    async def candidates(self, interaction: discord.Interaction) -> None:
+        result = self.bot.engine.last_rotation_result
+        if result is None:
+            await interaction.response.send_message(
+                "No in-memory candidate funnel yet. Run `/smartmoney discover` once after "
+                "this deployment.",
+                ephemeral=True,
+            )
+            return
+        selected = {candidate.address for candidate in result.selected}
+        lines = [
+            f"Pool `{result.pool_size}` • Pump-verified `{result.verified_pump_wallets}` • "
+            f"active `{len(result.selected)}`"
+        ]
+        for candidate in result.selected[:8]:
+            lines.append(
+                f"✅ **{candidate.alias}** `{_short(candidate.address)}` • "
+                f"score `{candidate.score}` • Pump `{candidate.pump_swaps}`"
+            )
+        rejected = [
+            candidate
+            for candidate in result.evaluated
+            if candidate.address not in selected
+        ]
+        for candidate in rejected[:12]:
+            reason = result.rejection_reasons.get(
+                candidate.address, "outranked by stronger current candidates"
+            )
+            lines.append(
+                f"❌ **{candidate.alias}** `{_short(candidate.address)}` • {reason}"
+            )
+        await interaction.response.send_message(
+            "\n".join(lines)[:4000], ephemeral=True
+        )
 
     @app_commands.command(
         name="rotation", description="Show recent automatic wallet admissions and removals."
@@ -590,7 +632,10 @@ class SmartMoneyCommands(
             else "polling fallback"
         )
         text = (
-            "**Solana Tracker:** connected for strict 24H + 7D profitability screening\n"
+            "**Solana Tracker:** connected for strict 24H + 7D general-trader screening\n"
+            f"**Public-KOL period feed:** "
+            f"{'enabled' if status['kol_discovery_enabled'] else 'disabled'} • authorized "
+            "24H/7D nominations, never automatic trust\n"
             f"**Pump.fun:** verified through public Solana swaps and Pump mint identity\n"
             f"**Graduated Pump/Jupiter routes:** covered by the same persistent token mint\n"
             f"**Helius/Solana realtime:** {stream_status}\n"
@@ -1104,6 +1149,10 @@ class SmartMoneyCommands(
             if status["paper_mirror_raw_swaps"]
             else "consensus signals only"
         )
+        pump_verified = status["rotation_verified_pump_wallets"]
+        pump_verified_text = (
+            str(pump_verified) if pump_verified is not None else "not checked yet"
+        )
         text = (
             f"**Bot version:** {BOT_VERSION}\n"
             f"**RPC:** {status['rpc']}\n"
@@ -1129,7 +1178,8 @@ class SmartMoneyCommands(
             f"**Automatic discovery:** "
             f"{'ready' if status['discovery_configured'] else 'API key needed'}\n"
             f"**Discovered wallets:** {status['discovered_wallets']}\n"
-            f"**Strict candidate pool:** {status['candidate_pool_size']}\n"
+            f"**Multi-source strict candidate pool:** {status['candidate_pool_size']}\n"
+            f"**Pump-verified candidates:** {pump_verified_text}\n"
             f"**24H discovery refresh:** {discovery_refresh}\n"
             f"**7D verification refresh:** {weekly_refresh}\n"
             f"**Five-minute rotation:** {rotation_refresh}\n"
@@ -1171,6 +1221,9 @@ class SmartMoneyCommands(
             f"{s.discovery_max_wallets}\n"
             f"**Leaderboard pages/window:** {s.discovery_candidate_pages} • "
             f"up to {s.discovery_candidate_pages * min(s.discovery_fetch_limit, 100)} rows\n"
+            f"**Public-KOL period feed:** "
+            f"{'enabled' if s.discovery_include_kols else 'disabled'} • up to "
+            f"{s.discovery_kol_limit} rows/window\n"
             f"**24H verification:** every {s.effective_discovery_refresh_seconds // 60}m • "
             f"minimum {_money(s.discovery_min_24h_pnl_usd)} PnL • "
             f"{s.discovery_min_roi_percent}% ROI • "
@@ -1183,6 +1236,10 @@ class SmartMoneyCommands(
             f"idle after {s.rotation_max_idle_seconds // 60}m • "
             f"minimum {s.rotation_min_recent_swaps} recent swap / "
             f"{s.rotation_min_pump_swaps} Pump swap\n"
+            f"**Mature forward-wallet removal:** after "
+            f"{s.forward_evidence_min_closed_sells} PAPER exits • PF below "
+            f"{s.forward_evidence_min_profit_factor} or loss at least "
+            f"-{_money(s.forward_evidence_max_loss_usd)}\n"
             f"**RPC scanning:** every {s.poll_interval_seconds}s • "
             f"{s.rpc_requests_per_second} requests/second maximum\n"
             f"**Copy size:** {_money(s.default_copy_usd)} (max {_money(s.max_copy_usd)})\n"
@@ -1210,9 +1267,11 @@ class SmartMoneyCommands(
         text = (
             "1. `/smartmoney setup` — choose the alert channel\n"
             "2. Add `SOLANA_TRACKER_API_KEY` in Railway for automatic discovery\n"
-            "3. `/smartmoney discover` — verify 24H + 7D profit and recent Pump activity\n"
+            "3. `/smartmoney discover` — verify general + public-KOL 24H/7D profit "
+            "and Pump activity\n"
             "4. `/smartmoney scan` — run an immediate on-chain scan\n"
-            "5. `/smartmoney hot-wallets` and `rotation` — inspect evidence and changes\n"
+            "5. `/smartmoney hot-wallets`, `/smartmoney candidates`, and "
+            "`/smartmoney rotation` — inspect the funnel\n"
             "6. Keep `/smartmoney mode paper` to auto-mirror every new tracked-wallet swap\n"
             "7. `/smartmoney positions`, `paper`, and `paper-trades` — inspect results\n"
             "8. `/smartmoney readiness` — see the exact gates before any tiny live pilot\n"

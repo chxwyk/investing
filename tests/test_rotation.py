@@ -94,6 +94,28 @@ async def test_rotation_selects_recent_pump_wallet_and_rejects_nonpump(settings)
     assert "not Pump-verified" in result.rejection_reasons["nonpump"]
 
 
+@pytest.mark.asyncio
+async def test_rotation_uses_rpc_activity_even_if_leaderboard_timestamp_is_stale(
+    settings,
+) -> None:
+    tuned = replace(
+        settings,
+        rotation_max_idle_seconds=3600,
+        rotation_probe_transactions=6,
+        rotation_min_recent_swaps=1,
+        rotation_min_pump_swaps=1,
+        rotation_require_pump_activity=True,
+    )
+    rotator = CandidateRotator(tuned, FakeRPC(), FakeDetector())
+
+    result = await rotator.evaluate(
+        [candidate("pump", last_trade_ms=1)],
+        now=1_000_000,
+    )
+
+    assert [item.address for item in result.selected] == ["pump"]
+
+
 def test_pump_mint_and_websocket_url_detection() -> None:
     assert is_pump_mint("AbCdPump") is True
     assert is_pump_mint("AbCdElse") is False

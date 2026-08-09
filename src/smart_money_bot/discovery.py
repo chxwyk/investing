@@ -12,6 +12,20 @@ from .models import DiscoveryCandidate
 
 logger = logging.getLogger(__name__)
 
+BLOCKED_WALLET_TAGS = {
+    "arbitrage",
+    "sandwich",
+    "mev",
+    "exchange",
+    "pool",
+    "program",
+    "bot",
+    "potential_bot",
+    "developer",
+    "hacker",
+    "drainer",
+}
+
 
 @dataclass(frozen=True, slots=True)
 class DiscoveryPolicy:
@@ -30,6 +44,8 @@ class DiscoveryPolicy:
     minimum_7d_trades: int = 10
     maximum_7d_trades: int = 1000
     candidate_pages: int = 1
+    include_kols: bool = True
+    kol_limit: int = 100
 
     @classmethod
     def from_settings(cls, settings: Settings) -> DiscoveryPolicy:
@@ -49,6 +65,8 @@ class DiscoveryPolicy:
             minimum_7d_trades=settings.discovery_min_7d_trades,
             maximum_7d_trades=settings.discovery_max_7d_trades,
             candidate_pages=settings.discovery_candidate_pages,
+            include_kols=settings.discovery_include_kols,
+            kol_limit=settings.discovery_kol_limit,
         )
 
 
@@ -66,6 +84,7 @@ class WindowCandidate:
     invested_usd: Decimal
     volume_usd: Decimal
     last_trade_ms: int | None
+    source: str = "general"
 
 
 class SolanaTrackerClient:
@@ -107,6 +126,16 @@ class SolanaTrackerClient:
     async def weekly_pool(self, policy: DiscoveryPolicy) -> list[WindowCandidate]:
         payload = await self._leaderboard_payload(policy, days=7)
         return parse_window_candidates(payload, policy, days=7)
+
+    async def kol_daily_pool(self, policy: DiscoveryPolicy) -> list[WindowCandidate]:
+        """Recent public-KOL candidates from the provider's authorized period feed."""
+
+        payload = await self._kol_period_payload(policy, period="1d")
+        return parse_kol_window_candidates(payload, policy, days=1)
+
+    async def kol_weekly_pool(self, policy: DiscoveryPolicy) -> list[WindowCandidate]:
+        payload = await self._kol_period_payload(policy, period="7d")
+        return parse_kol_window_candidates(payload, policy, days=7)
 
     async def _leaderboard_payload(self, policy: DiscoveryPolicy, *, days: int) -> Any:
         weekly = days == 7
@@ -165,6 +194,21 @@ class SolanaTrackerClient:
                 break
             cursor = next_cursor
         return {"traders": traders, "pagination": pagination}
+
+    async def _kol_period_payload(
+        self, policy: DiscoveryPolicy, *, period: str
+    ) -> Any:
+        if period not in {"1d", "7d"}:
+            raise ValueError("Only 1d and 7d KOL windows are supported")
+        return await self._request(
+            "/v2/pnl/leaderboard/kols/period",
+            params={
+                "period": period,
+                "sort": "realized",
+                "direction": "desc",
+                "limit": str(policy.kol_limit),
+            },
+        )
 
     async def _request(self, path: str, *, params: dict[str, str]) -> Any:
         session = await self._get_session()
@@ -239,16 +283,6 @@ def parse_window_candidates(
     if days not in {1, 7}:
         raise ValueError("Only 1-day and 7-day discovery windows are supported")
 
-    blocked_tags = {
-        "arbitrage",
-        "sandwich",
-        "mev",
-        "exchange",
-        "pool",
-        "program",
-        "hacker",
-        "drainer",
-    }
     if days == 7:
         min_pnl = policy.minimum_7d_pnl_usd
         min_roi = policy.minimum_7d_roi_percent
@@ -292,7 +326,7 @@ def parse_window_candidates(
             or closed_tokens < policy.minimum_closed_tokens
         ):
             continue
-        if _tags(row, identity) & blocked_tags:
+        if _tags(row, identity) & BLOCKED_WALLET_TAGS:
             continue
 
         candidates.append(
@@ -315,17 +349,145 @@ def parse_window_candidates(
     return candidates[:source_pool_limit]
 
 
+def parse_kol_window_candidates(
+    payload: Any, policy: DiscoveryPolicy, *, days: int
+) -> list[WindowCandidate]:
+    """Normalize the public-KOL period feed without trusting its rank by itself.
+
+    Solana Tracker has returned both flat and period-nested KOL rows over time. This
+    parser accepts either documented shape, then applies the same local thresholds and
+    non-human-wallet exclusions used for the general leaderboard.
+    """
+
+    if not isinstance(payload, dict) or not isinstance(payload.get("traders"), list):
+        raise DiscoveryError("Solana Tracker KOL response has an unexpected shape")
+    if days not in {1, 7}:
+        raise ValueError("Only 1-day and 7-day discovery windows are supported")
+
+    if days == 7:
+        min_pnl = policy.minimum_7d_pnl_usd
+        min_roi = policy.minimum_7d_roi_percent
+        min_win = policy.minimum_7d_win_rate_percent
+        min_trades = policy.minimum_7d_trades
+        max_trades = policy.maximum_7d_trades
+    else:
+        min_pnl = policy.minimum_pnl_usd
+        min_roi = policy.minimum_roi_percent
+        min_win = policy.minimum_win_rate_percent
+        min_trades = policy.minimum_trades
+        max_trades = policy.maximum_trades
+
+    candidates: list[WindowCandidate] = []
+    for row in payload["traders"]:
+        if not isinstance(row, dict):
+            continue
+        try:
+            wallet = _normalize_wallet(str(row.get("wallet") or "").strip())
+        except ValueError:
+            continue
+
+        identity = row.get("identity") if isinstance(row.get("identity"), dict) else {}
+        if _tags(row, identity) & BLOCKED_WALLET_TAGS:
+            continue
+
+        period = row.get("period") if isinstance(row.get("period"), dict) else row
+        pnl_object = period.get("pnl") if isinstance(period.get("pnl"), dict) else {}
+        counts = (
+            period.get("counts")
+            if isinstance(period.get("counts"), dict)
+            else row.get("counts")
+            if isinstance(row.get("counts"), dict)
+            else {}
+        )
+        tokens = (
+            period.get("tokens")
+            if isinstance(period.get("tokens"), dict)
+            else row.get("tokens")
+            if isinstance(row.get("tokens"), dict)
+            else {}
+        )
+        timing = (
+            period.get("timing")
+            if isinstance(period.get("timing"), dict)
+            else row.get("timing")
+            if isinstance(row.get("timing"), dict)
+            else {}
+        )
+
+        pnl = _first_decimal(
+            period.get("realized"),
+            period.get("realizedPnl"),
+            pnl_object.get("realized"),
+            row.get("realizedPnl"),
+        )
+        roi = _first_decimal(period.get("roi"), row.get("roi"))
+        win_rate = _first_decimal(
+            period.get("winRate"),
+            period.get("win_rate"),
+            row.get("winRate"),
+            row.get("win_rate"),
+        )
+        trades = _first_integer(counts.get("trades"), counts.get("total"))
+        closed_tokens = _first_integer(
+            tokens.get("closed"),
+            counts.get("closed"),
+            _integer(tokens.get("profitable")) + _integer(tokens.get("losing")),
+        )
+        invested = _first_decimal(period.get("invested"), row.get("invested"))
+        volume = _first_decimal(period.get("volume"), row.get("volume"))
+
+        if (
+            pnl < min_pnl
+            or roi < min_roi
+            or win_rate < min_win
+            or trades < min_trades
+            or trades > max_trades
+            or closed_tokens < policy.minimum_closed_tokens
+        ):
+            continue
+
+        candidates.append(
+            WindowCandidate(
+                address=wallet,
+                alias=_identity_alias(identity, wallet),
+                realized_pnl_usd=pnl,
+                roi_percent=roi,
+                win_rate_percent=win_rate,
+                trades=trades,
+                buys=_first_integer(counts.get("buys"), counts.get("totalBuy")),
+                sells=_first_integer(counts.get("sells"), counts.get("totalSell")),
+                closed_tokens=closed_tokens,
+                invested_usd=invested,
+                volume_usd=volume,
+                last_trade_ms=_optional_timestamp_ms(
+                    timing.get("lastTrade") or period.get("lastTrade") or row.get("lastTrade")
+                ),
+                source="public-KOL",
+            )
+        )
+    return candidates[: policy.kol_limit]
+
+
 def merge_verified_windows(
     daily: list[WindowCandidate],
     weekly: list[WindowCandidate],
     policy: DiscoveryPolicy,
 ) -> list[DiscoveryCandidate]:
-    """Return only wallets independently profitable in both strict windows."""
+    """Return wallets independently profitable in both windows from any approved feed.
 
-    weekly_by_wallet = {candidate.address: candidate for candidate in weekly}
+    The general and public-KOL leaderboards are nomination sources. A wallet still has
+    to appear with qualifying metrics in both 24H and 7D data; a KOL label alone never
+    grants admission.
+    """
+
+    daily_by_wallet = _best_window_by_wallet(daily)
+    weekly_by_wallet = _best_window_by_wallet(weekly)
+    sources_by_wallet: dict[str, set[str]] = {}
+    for window in (*daily, *weekly):
+        sources_by_wallet.setdefault(window.address, set()).add(window.source)
     merged: list[DiscoveryCandidate] = []
-    for day in daily:
-        week = weekly_by_wallet.get(day.address)
+    for address, day in daily_by_wallet.items():
+        week = weekly_by_wallet.get(address)
         if week is None:
             continue
         score = score_candidate(
@@ -341,6 +503,17 @@ def merge_verified_windows(
             trades_7d=week.trades,
             minimum_pnl_7d=policy.minimum_7d_pnl_usd,
         )
+        sources = sorted(sources_by_wallet.get(day.address, {day.source, week.source}))
+        source_bonus = Decimal("3") if len(sources) > 1 else Decimal("0")
+        consistency_adjustment = _consistency_adjustment(
+            day.realized_pnl_usd, week.realized_pnl_usd
+        )
+        score = _clamp(
+            score + source_bonus + consistency_adjustment,
+            Decimal("0"),
+            Decimal("100"),
+        ).quantize(Decimal("0.01"))
+        source_text = " + ".join(sources)
         merged.append(
             DiscoveryCandidate(
                 address=day.address,
@@ -367,8 +540,8 @@ def merge_verified_windows(
                 win_rate_7d_percent=week.win_rate_percent,
                 trades_7d=week.trades,
                 selection_reason=(
-                    f"strict 24H + 7D profit verified; 24H ${day.realized_pnl_usd:,.2f}, "
-                    f"7D ${week.realized_pnl_usd:,.2f}"
+                    f"{source_text} evidence; strict 24H + 7D profit verified; "
+                    f"24H ${day.realized_pnl_usd:,.2f}, 7D ${week.realized_pnl_usd:,.2f}"
                 ),
             )
         )
@@ -378,6 +551,41 @@ def merge_verified_windows(
         replace(candidate, rank=index)
         for index, candidate in enumerate(merged[: policy.fetch_limit], start=1)
     ]
+
+
+def _best_window_by_wallet(
+    candidates: list[WindowCandidate],
+) -> dict[str, WindowCandidate]:
+    best: dict[str, WindowCandidate] = {}
+    for candidate in candidates:
+        previous = best.get(candidate.address)
+        if previous is None or _window_sort_key(candidate) > _window_sort_key(previous):
+            best[candidate.address] = candidate
+    return best
+
+
+def _window_sort_key(candidate: WindowCandidate) -> tuple[Decimal, Decimal, Decimal, int]:
+    return (
+        candidate.realized_pnl_usd,
+        candidate.win_rate_percent,
+        candidate.roi_percent,
+        candidate.closed_tokens,
+    )
+
+
+def _consistency_adjustment(day_pnl: Decimal, week_pnl: Decimal) -> Decimal:
+    """Reward repeatability and penalize a result dominated by the latest day."""
+
+    if day_pnl <= 0 or week_pnl <= 0:
+        return Decimal("-10")
+    day_share = day_pnl / week_pnl
+    if Decimal("0.05") <= day_share <= Decimal("0.60"):
+        return Decimal("4")
+    if day_share > Decimal("1.25"):
+        return Decimal("-8")
+    if day_share > Decimal("0.85"):
+        return Decimal("-3")
+    return Decimal("1")
 
 
 def score_candidate(
@@ -467,6 +675,13 @@ def _decimal(value: Any) -> Decimal:
         return Decimal("0")
 
 
+def _first_decimal(*values: Any) -> Decimal:
+    for value in values:
+        if value is not None:
+            return _decimal(value)
+    return Decimal("0")
+
+
 def _integer(value: Any) -> int:
     try:
         return int(value or 0)
@@ -474,11 +689,25 @@ def _integer(value: Any) -> int:
         return 0
 
 
+def _first_integer(*values: Any) -> int:
+    for value in values:
+        if value is not None:
+            return _integer(value)
+    return 0
+
+
 def _optional_integer(value: Any) -> int | None:
     if value is None:
         return None
     number = _integer(value)
     return number if number > 0 else None
+
+
+def _optional_timestamp_ms(value: Any) -> int | None:
+    number = _optional_integer(value)
+    if number is None:
+        return None
+    return number if number >= 10_000_000_000 else number * 1000
 
 
 def _normalize_wallet(value: str) -> str:

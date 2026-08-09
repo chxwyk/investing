@@ -4,6 +4,7 @@ import asyncio
 import logging
 import time
 from contextlib import suppress
+from dataclasses import replace
 from decimal import Decimal
 from typing import Protocol
 
@@ -22,6 +23,7 @@ from .executor import ExecutionManager
 from .market import JupiterClient
 from .models import (
     DetectedSwap,
+    DiscoveryCandidate,
     DiscoveryRefresh,
     ExecutionMode,
     ExecutionResult,
@@ -36,7 +38,7 @@ from .models import (
     TraderMetrics,
 )
 from .risk import RiskEngine
-from .rotation import CandidateRotator, is_pump_mint
+from .rotation import CandidateRotator, RotationResult, is_pump_mint
 from .rpc import SolanaRPC
 from .scoring import rank_traders
 from .strategy import ConsensusStrategy
@@ -125,6 +127,7 @@ class SmartMoneyEngine:
         self.last_discovery_refresh_at: int | None = None
         self.last_weekly_refresh_at: int | None = None
         self.last_rotation_at: int | None = None
+        self.last_rotation_result: RotationResult | None = None
         self._weekly_pool: list[WindowCandidate] = []
         self._candidate_pool = []
 
@@ -230,6 +233,16 @@ class SmartMoneyEngine:
                 self._weekly_pool = await self.discovery.weekly_pool(
                     self.discovery_policy
                 )
+                if self.discovery_policy.include_kols:
+                    try:
+                        self._weekly_pool.extend(
+                            await self.discovery.kol_weekly_pool(self.discovery_policy)
+                        )
+                    except DiscoveryError as exc:
+                        logger.warning(
+                            "Public-KOL 7D discovery unavailable; using general feed: %s",
+                            exc,
+                        )
                 if not self._weekly_pool:
                     raise DiscoveryError(
                         "The strict 7-day feed returned no qualifying wallets; "
@@ -241,6 +254,16 @@ class SmartMoneyEngine:
                 )
 
             daily_pool = await self.discovery.daily_pool(self.discovery_policy)
+            if self.discovery_policy.include_kols:
+                try:
+                    daily_pool.extend(
+                        await self.discovery.kol_daily_pool(self.discovery_policy)
+                    )
+                except DiscoveryError as exc:
+                    logger.warning(
+                        "Public-KOL 24H discovery unavailable; using general feed: %s",
+                        exc,
+                    )
             candidates = merge_verified_windows(
                 daily_pool, self._weekly_pool, self.discovery_policy
             )
@@ -267,7 +290,50 @@ class SmartMoneyEngine:
             and now - self.last_rotation_at < self.settings.rotation_refresh_seconds
         ):
             return None
-        result = await self.rotator.evaluate(self._candidate_pool, now=now)
+        eligible, forward_rejections, forward_evaluated = (
+            await self._apply_forward_paper_evidence(self._candidate_pool)
+        )
+        if not eligible:
+            self.last_rotation_result = RotationResult(
+                selected=(),
+                evaluated=tuple(forward_evaluated),
+                rejection_reasons=forward_rejections,
+                pool_size=len(self._candidate_pool),
+                verified_pump_wallets=0,
+            )
+            raise DiscoveryError(
+                "Every candidate failed mature forward PAPER evidence; the existing hot set "
+                "was preserved"
+            )
+        raw_result = await self.rotator.evaluate(eligible, now=now)
+        current_hot_set = await self.database.list_discovered(limit=50)
+        current_pool_addresses = {candidate.address for candidate in self._candidate_pool}
+        feed_removed = tuple(
+            candidate
+            for candidate in current_hot_set
+            if candidate.address not in current_pool_addresses
+        )
+        feed_rejections = {
+            candidate.address: (
+                "no longer present in the current dual-window qualifying pool; "
+                "the 24H/7D feed filters or ranking changed"
+            )
+            for candidate in feed_removed
+        }
+        result = RotationResult(
+            selected=raw_result.selected,
+            evaluated=(
+                raw_result.evaluated + tuple(forward_evaluated) + feed_removed
+            ),
+            rejection_reasons={
+                **feed_rejections,
+                **raw_result.rejection_reasons,
+                **forward_rejections,
+            },
+            pool_size=len(self._candidate_pool),
+            verified_pump_wallets=raw_result.verified_pump_wallets,
+        )
+        self.last_rotation_result = result
         if not result.selected:
             raise DiscoveryError(
                 "No dual-window profitable wallets passed the recent Pump activity checks; "
@@ -285,6 +351,62 @@ class SmartMoneyEngine:
         if refresh.added_wallets or refresh.disabled_wallets:
             await self.notifier.on_discovery(refresh)
         return refresh
+
+    async def _apply_forward_paper_evidence(
+        self, candidates: list[DiscoveryCandidate]
+    ) -> tuple[
+        list[DiscoveryCandidate], dict[str, str], list[DiscoveryCandidate]
+    ]:
+        """Penalize proven forward losers without judging brand-new candidates early."""
+
+        performance = await self.database.paper_wallet_performance(
+            [candidate.address for candidate in candidates]
+        )
+        eligible = []
+        rejected: dict[str, str] = {}
+        evaluated = []
+        for candidate in candidates:
+            metrics = performance.get(candidate.address)
+            if metrics is None or int(metrics["closed_sells"]) < (
+                self.settings.forward_evidence_min_closed_sells
+            ):
+                eligible.append(candidate)
+                continue
+            closed_sells = int(metrics["closed_sells"])
+            pnl = Decimal(metrics["pnl"])
+            profit_factor = Decimal(metrics["profit_factor"])
+            reason: str | None = None
+            if pnl <= -self.settings.forward_evidence_max_loss_usd:
+                reason = (
+                    f"forward PAPER failed after {closed_sells} exits: PnL ${pnl:,.2f} "
+                    f"breached -${self.settings.forward_evidence_max_loss_usd:,.2f}"
+                )
+            elif profit_factor < self.settings.forward_evidence_min_profit_factor:
+                reason = (
+                    f"forward PAPER failed after {closed_sells} exits: profit factor "
+                    f"{profit_factor:.2f} is below "
+                    f"{self.settings.forward_evidence_min_profit_factor:.2f}"
+                )
+            if reason is not None:
+                rejected[candidate.address] = reason
+                evaluated.append(candidate)
+                continue
+
+            forward_bonus = min(
+                Decimal("5"),
+                max(Decimal("0"), (profit_factor - Decimal("1")) * Decimal("2")),
+            )
+            eligible.append(
+                replace(
+                    candidate,
+                    score=min(Decimal("100"), candidate.score + forward_bonus),
+                    selection_reason=(
+                        f"{candidate.selection_reason}; forward PAPER {closed_sells} exits, "
+                        f"${pnl:,.2f}, PF {profit_factor:.2f}"
+                    ),
+                )
+            )
+        return eligible, rejected, evaluated
 
     async def _consume_stream_events(self) -> None:
         while True:
@@ -954,6 +1076,12 @@ class SmartMoneyEngine:
             "discovery_7d_last_refresh": self.last_weekly_refresh_at,
             "rotation_last_refresh": self.last_rotation_at,
             "candidate_pool_size": len(self._candidate_pool),
+            "kol_discovery_enabled": self.settings.discovery_include_kols,
+            "rotation_verified_pump_wallets": (
+                self.last_rotation_result.verified_pump_wallets
+                if self.last_rotation_result
+                else None
+            ),
             "discovered_wallets": len(await self.database.list_discovered(limit=50)),
             "stream_enabled": self.stream.enabled,
             "stream_connected": self.stream.connected,
