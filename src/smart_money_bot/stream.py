@@ -30,10 +30,12 @@ class RealtimeWalletStream:
         rpc_url: str,
         explicit_ws_url: str | None,
         enabled: bool,
+        commitment: str = "processed",
     ) -> None:
         self.database = database
         self.url = explicit_ws_url or derive_ws_url(rpc_url)
         self.enabled = enabled and bool(self.url)
+        self.commitment = commitment
         self.events: asyncio.Queue[StreamEvent] = asyncio.Queue(maxsize=1000)
         self.connected = False
         self.subscription_count = 0
@@ -89,7 +91,7 @@ class RealtimeWalletStream:
                         "method": "logsSubscribe",
                         "params": [
                             {"mentions": [wallet]},
-                            {"commitment": "confirmed"},
+                            {"commitment": self.commitment},
                         ],
                     }
                 )
@@ -99,7 +101,7 @@ class RealtimeWalletStream:
             fingerprint = wallets
             while True:
                 try:
-                    message = await websocket.receive(timeout=30)
+                    message = await websocket.receive(timeout=5)
                 except TimeoutError:
                     current = tuple(
                         sorted(

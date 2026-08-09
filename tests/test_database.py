@@ -464,3 +464,25 @@ async def test_quote_based_round_trip_and_readiness(tmp_path) -> None:
         assert trades[0]["quote_router"] == "metis"
     finally:
         await database.close()
+
+
+@pytest.mark.asyncio
+async def test_verified_candidate_pool_survives_reconnect(tmp_path) -> None:
+    path = tmp_path / "candidate-cache.db"
+    candidate = replace(
+        _discovery_candidate("wallet-cache", rank=1, pnl="1234.56"),
+        previous_pnl_24h=Decimal("1000.25"),
+        metrics_limited_24h=True,
+    )
+    database = Database(str(path), Decimal("1000"))
+    await database.connect()
+    await database.cache_discovery_candidates([candidate])
+    await database.close()
+
+    reopened = Database(str(path), Decimal("1000"))
+    await reopened.connect()
+    try:
+        loaded = await reopened.load_discovery_candidates()
+        assert loaded == [candidate]
+    finally:
+        await reopened.close()

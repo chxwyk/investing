@@ -104,6 +104,7 @@ class SmartMoneyEngine:
             rpc_url=settings.solana_rpc_url,
             explicit_ws_url=settings.solana_ws_url,
             enabled=settings.realtime_wallet_stream_enabled,
+            commitment=settings.realtime_stream_commitment,
         )
         self.strategy = ConsensusStrategy(
             self.database,
@@ -145,6 +146,7 @@ class SmartMoneyEngine:
         self.last_weekly_refresh_at = int(raw_weekly) if raw_weekly else None
         raw_rotation = await self.database.get_setting("rotation_last_refresh")
         self.last_rotation_at = int(raw_rotation) if raw_rotation else None
+        self._candidate_pool = await self.database.load_discovery_candidates()
         self._initialized = True
 
     async def start(self) -> None:
@@ -273,6 +275,7 @@ class SmartMoneyEngine:
                     "and 7-day feeds; the existing hot set was preserved"
                 )
             self._candidate_pool = candidates
+            await self.database.cache_discovery_candidates(candidates)
             self.last_discovery_refresh_at = int(time.time())
             await self.database.set_setting(
                 "discovery_last_refresh", str(self.last_discovery_refresh_at)
@@ -430,13 +433,15 @@ class SmartMoneyEngine:
         if await self.database.is_processed(event.signature):
             return
         transaction = None
-        for attempt in range(3):
+        retry_delays = (0, 0.15, 0.35, 0.75, 1.5, 2.5)
+        for delay in retry_delays:
+            if delay:
+                await asyncio.sleep(delay)
             transaction = await self.rpc.get_transaction(event.signature)
             if transaction is not None:
                 break
-            await asyncio.sleep(attempt + 1)
         if transaction is None:
-            raise RpcError("realtime transaction was unavailable after confirmation retries")
+            raise RpcError("realtime transaction was unavailable after rapid fetch retries")
         block_time = int(transaction.get("blockTime") or time.time())
         await self._process_transaction(
             trader,
@@ -615,6 +620,50 @@ class SmartMoneyEngine:
     async def _mirror_paper_swap(
         self, swap: DetectedSwap, trader: TrackedTrader
     ) -> None:
+        if self.settings.paper_force_observation_mode:
+            source_price = swap.token_price_usd
+            size = self.settings.default_copy_usd
+            if source_price is None or source_price <= 0:
+                result = ExecutionResult(
+                    success=False,
+                    mode=ExecutionMode.PAPER,
+                    token_mint=swap.token_mint,
+                    side=swap.side,
+                    size_usd=size,
+                    message=(
+                        "Skipped: the source transaction did not contain a valid token "
+                        "price, so even the forced observation ledger cannot value it"
+                    ),
+                )
+                await self.database.log_execution(
+                    signal_id=None,
+                    mode=result.mode,
+                    token_mint=result.token_mint,
+                    side=result.side,
+                    size_usd=result.size_usd,
+                    success=result.success,
+                    signature=None,
+                    message=result.message,
+                )
+            else:
+                penalty = Decimal(
+                    self.settings.paper_observation_penalty_bps
+                ) / Decimal(10_000)
+                observation_price = (
+                    source_price * (Decimal("1") + penalty)
+                    if swap.side is Side.BUY
+                    else source_price * (Decimal("1") - penalty)
+                )
+                result = await self.executor.execute_paper_mirror(
+                    swap=swap,
+                    trader=trader,
+                    market_price_usd=observation_price,
+                    size_usd=size,
+                    observation_mode=True,
+                )
+            await self.notifier.on_execution(result)
+            return
+
         # A tracked wallet's transaction price is historical by the time this process
         # observes it. Price the shadow fill at detection time so PAPER results include
         # the latency that live copy execution would face.
@@ -796,7 +845,8 @@ class SmartMoneyEngine:
         )
         if mode is ExecutionMode.PAPER:
             await self._check_strategy_paper_exits(strategy_positions, prices, now)
-            await self._check_raw_mirror_exits(mirror_positions, prices, now)
+            if not self.settings.paper_force_observation_mode:
+                await self._check_raw_mirror_exits(mirror_positions, prices, now)
             await self.database.paper_summary(prices)
             return
 
@@ -1089,8 +1139,12 @@ class SmartMoneyEngine:
             "stream_last_event": self.stream.last_event_at,
             "stream_last_error": self.stream.last_error,
             "stream_reconnects": self.stream.reconnects,
+            "stream_commitment": self.stream.commitment,
             "paper_mirror_raw_swaps": self.settings.paper_mirror_raw_swaps,
             "paper_use_executable_quotes": self.settings.paper_use_executable_quotes,
+            "paper_force_observation_mode": (
+                self.settings.paper_force_observation_mode
+            ),
             "quote_ready": bool(self.settings.jupiter_api_key),
             "consecutive_quote_failures": self.executor.consecutive_quote_failures,
         }

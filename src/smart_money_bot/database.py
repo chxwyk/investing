@@ -4,7 +4,7 @@ import asyncio
 import json
 import os
 import time
-from dataclasses import replace
+from dataclasses import asdict, replace
 from decimal import Decimal
 from typing import Any
 
@@ -2207,3 +2207,48 @@ class Database:
             (key, value),
         )
         await self.db.commit()
+
+    async def cache_discovery_candidates(
+        self, candidates: list[DiscoveryCandidate]
+    ) -> None:
+        """Persist the verified pre-rotation pool across Railway redeploys."""
+
+        payload = [asdict(candidate) for candidate in candidates]
+        await self.set_setting(
+            "discovery_candidate_pool_v1",
+            json.dumps(payload, default=str, separators=(",", ":")),
+        )
+
+    async def load_discovery_candidates(self) -> list[DiscoveryCandidate]:
+        raw = await self.get_setting("discovery_candidate_pool_v1")
+        if not raw:
+            return []
+        decimal_fields = {
+            "realized_pnl_24h",
+            "previous_pnl_24h",
+            "roi_24h_percent",
+            "win_rate_percent",
+            "invested_24h_usd",
+            "volume_24h_usd",
+            "score",
+            "realized_pnl_7d",
+            "roi_7d_percent",
+            "win_rate_7d_percent",
+        }
+        try:
+            decoded = json.loads(raw)
+            if not isinstance(decoded, list):
+                return []
+            candidates = []
+            for item in decoded:
+                if not isinstance(item, dict):
+                    continue
+                values = dict(item)
+                for field_name in decimal_fields:
+                    value = values.get(field_name)
+                    if value is not None:
+                        values[field_name] = Decimal(str(value))
+                candidates.append(DiscoveryCandidate(**values))
+            return candidates
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return []

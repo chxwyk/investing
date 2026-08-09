@@ -80,6 +80,7 @@ class Settings:
     forward_evidence_max_loss_usd: Decimal
     realtime_wallet_stream_enabled: bool
     solana_ws_url: str | None
+    realtime_stream_commitment: str
 
     poll_interval_seconds: int
     bootstrap_hours: int
@@ -100,6 +101,8 @@ class Settings:
     paper_allow_pump_source_fallback: bool
     paper_pump_source_fallback_bps: int
     paper_raw_entry_filter_enabled: bool
+    paper_force_observation_mode: bool
+    paper_observation_penalty_bps: int
     paper_daily_target_usd: Decimal
     paper_use_executable_quotes: bool
     paper_quote_output_buffer_bps: int
@@ -208,6 +211,9 @@ class Settings:
                 "REALTIME_WALLET_STREAM_ENABLED", True
             ),
             solana_ws_url=os.getenv("SOLANA_WS_URL", "").strip() or None,
+            realtime_stream_commitment=os.getenv(
+                "REALTIME_STREAM_COMMITMENT", "processed"
+            ).strip().lower(),
             poll_interval_seconds=_int("POLL_INTERVAL_SECONDS", 60),
             bootstrap_hours=_int("BOOTSTRAP_HOURS", 24),
             max_backfill_transactions=_int("MAX_BACKFILL_TRANSACTIONS", 100),
@@ -230,6 +236,12 @@ class Settings:
             ),
             paper_raw_entry_filter_enabled=_bool(
                 "PAPER_RAW_ENTRY_FILTER_ENABLED", True
+            ),
+            paper_force_observation_mode=_bool(
+                "PAPER_FORCE_OBSERVATION_MODE", False
+            ),
+            paper_observation_penalty_bps=_int(
+                "PAPER_OBSERVATION_PENALTY_BPS", 300
             ),
             paper_daily_target_usd=_decimal("PAPER_DAILY_TARGET_USD", "100"),
             paper_use_executable_quotes=_bool(
@@ -396,6 +408,10 @@ class Settings:
             raise ValueError("FORWARD_EVIDENCE_MIN_PROFIT_FACTOR cannot be negative")
         if self.forward_evidence_max_loss_usd <= 0:
             raise ValueError("FORWARD_EVIDENCE_MAX_LOSS_USD must be positive")
+        if self.realtime_stream_commitment not in {"processed", "confirmed"}:
+            raise ValueError(
+                "REALTIME_STREAM_COMMITMENT must be processed or confirmed"
+            )
         if self.poll_interval_seconds < 5:
             raise ValueError("POLL_INTERVAL_SECONDS must be at least 5")
         if self.max_copy_usd <= 0 or self.default_copy_usd <= 0:
@@ -409,6 +425,10 @@ class Settings:
         if not 0 <= self.paper_pump_source_fallback_bps <= 10_000:
             raise ValueError(
                 "PAPER_PUMP_SOURCE_FALLBACK_BPS must be between 0 and 10000"
+            )
+        if not 0 <= self.paper_observation_penalty_bps <= 10_000:
+            raise ValueError(
+                "PAPER_OBSERVATION_PENALTY_BPS must be between 0 and 10000"
             )
         if self.stop_loss_percent <= 0 or self.take_profit_percent <= 0:
             raise ValueError("Stop-loss and take-profit percentages must be positive")

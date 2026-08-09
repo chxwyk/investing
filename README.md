@@ -3,17 +3,19 @@
 A Railway-ready Discord bot that **automatically discovers profitable public Solana
 wallets**, independently verifies strict 24-hour and 7-day performance, rotates toward recent
 Pump.fun memecoin activity every five minutes, reconstructs swaps from confirmed on-chain
-transactions, mirrors every newly detected hot-wallet swap in PAPER mode, and records copy
-results from quote-only Jupiter Swap V2 orders plus a conservative output buffer.
+transactions, and mirrors every newly detected hot-wallet swap in PAPER mode. PAPER can run
+as either a forced source-price observation ledger or an executable Jupiter quote-shadow
+trial; the two answer different questions and are labeled separately.
 
 Automatic discovery uses the authorized Solana Tracker PnL V2 API—not Fomo or KOLScan
 scraping. It combines the strict general-trader leaderboard with the provider's documented
 public-KOL period leaderboard, refreshes the 24-hour pool every three hours, caches an
 independently filtered 7-day pool for twelve hours, and requires qualifying evidence in both
 windows. The resulting candidates must then show recent on-chain Pump activity before
-entering the 25-wallet hot set. A
-reconnecting Solana/Helius WebSocket reduces detection latency while one-minute polling stays
-enabled as a fallback.
+entering the 25-wallet hot set. A reconnecting Solana/Helius WebSocket uses an early
+`processed` trigger and rapid full-transaction fetch retries while one-minute polling stays
+enabled as a fallback. The verified candidate pool is stored in SQLite so a Railway redeploy
+does not erase it.
 
 The bot starts in **PAPER** mode. Live Jupiter spot execution exists, but remains locked
 unless four separate controls are deliberately configured.
@@ -93,6 +95,38 @@ daily-loss/open-position limits, and pass any available Jupiter safety metadata.
 entry spends `DEFAULT_COPY_USD`; repeated buys cannot push one wallet/token lot above
 `MAX_COPY_USD`.
 
+### Forced PAPER observation
+
+Set `PAPER_FORCE_OBSERVATION_MODE=true` when the goal is to see a complete PAPER outcome for
+every valid detected source-wallet swap. This mode records a buy immediately from the source
+transaction price plus `PAPER_OBSERVATION_PENALTY_BPS`; sells use the source price minus the
+same penalty. Normal simulated slippage and fees are then applied. It does not wait for a
+Jupiter route and bypasses liquidity, holder, organic-score, entry-drift, price-impact,
+quote-latency, position-count, and per-wallet/token capacity gates. Automatic paper risk exits
+are disabled so the source wallet's later sell controls the linked fake lot.
+
+This is deliberately an **observation ledger**, not evidence that a live transaction could
+have landed at that price. Its trades are labeled `FORCED_OBSERVATION`, remain `quote_based=0`,
+and are excluded from `/smartmoney readiness`. It can still skip when the source transaction
+contains no usable token price, fake cash is exhausted, a duplicate signature arrives, or a
+sell has no earlier matching PAPER buy. A processed WebSocket trigger reduces delay, but no
+bot can react before the tracked transaction is publicly observed, and a tracked purchase can
+itself move a low-liquidity token before a copy order exists.
+
+For a full-results learning run:
+
+```text
+PAPER_FORCE_OBSERVATION_MODE=true
+PAPER_OBSERVATION_PENALTY_BPS=300
+PAPER_MIRROR_RAW_SWAPS=true
+REALTIME_WALLET_STREAM_ENABLED=true
+REALTIME_STREAM_COMMITMENT=processed
+ENABLE_LIVE_TRADING=false
+```
+
+When the observation ledger has enough trades, disable forced observation and run the separate
+quote-shadow readiness trial below. Do not treat forced-observation P&L as expected live P&L.
+
 With `PAPER_USE_EXECUTABLE_QUOTES=true`, the paper fill requests Jupiter's quote-only
 `GET /swap/v2/order` route for the exact configured size. It compares that route price with
 the tracked wallet's transaction price. A buy is skipped when adverse entry drift exceeds
@@ -125,14 +159,16 @@ sell can also show `SKIPPED` if its matching buy happened before raw mirroring w
 A new detected buy must occur first. Set `PAPER_MIRROR_RAW_SWAPS=false` to restore the older
 consensus-only paper behavior.
 
-The v2.10.1 discovery, quote, fallback, rotation, and exit guardrails are intentionally
-configurable:
+The v2.11.0 discovery, observation, quote, fallback, rotation, and exit controls are
+intentionally configurable:
 
 ```text
 PAPER_REQUIRE_CURRENT_PRICE=true
 PAPER_ALLOW_PUMP_SOURCE_FALLBACK=true
 PAPER_PUMP_SOURCE_FALLBACK_BPS=300
 PAPER_RAW_ENTRY_FILTER_ENABLED=true
+PAPER_FORCE_OBSERVATION_MODE=false
+PAPER_OBSERVATION_PENALTY_BPS=300
 PAPER_USE_EXECUTABLE_QUOTES=true
 PAPER_QUOTE_OUTPUT_BUFFER_BPS=50
 MAX_ADVERSE_ENTRY_DRIFT_PERCENT=8
@@ -156,6 +192,7 @@ FORWARD_EVIDENCE_MIN_CLOSED_SELLS=8
 FORWARD_EVIDENCE_MIN_PROFIT_FACTOR=0.65
 FORWARD_EVIDENCE_MAX_LOSS_USD=15
 REALTIME_WALLET_STREAM_ENABLED=true
+REALTIME_STREAM_COMMITMENT=processed
 ```
 
 These values are hypotheses to validate in PAPER mode, not optimized or guaranteed-profit
@@ -164,8 +201,9 @@ settings. Use `/smartmoney paper`, `/smartmoney positions`, `/smartmoney paper-t
 
 ## Official PAPER readiness trial
 
-After deploying v2.10.1, run `/smartmoney paper-reset confirmation:RESET PAPER` once to begin a
-clean trial. `/smartmoney readiness` reports **KEEP TESTING** until all defaults pass:
+After deploying v2.11.0 and disabling forced observation, run
+`/smartmoney paper-reset confirmation:RESET PAPER` once to begin a clean trial.
+`/smartmoney readiness` reports **KEEP TESTING** until all defaults pass:
 
 - 14 separate active test days;
 - at least 100 quote-based exits;
@@ -429,7 +467,8 @@ support ticket, a screenshot, or chat. The default live base asset is Solana USD
   results worse.
 - Paper stops are evaluated after each scanner cycle. Fast markets can gap through a threshold,
   so an 8% configured stop does not guarantee an 8% maximum loss.
-- The v2.10.1 discovery, forward-evidence, quote, fallback, rotation, raw-entry, and raw-lot
+- The v2.11.0 discovery, observation, forward-evidence, quote, fallback, rotation, raw-entry,
+  and raw-lot
   guards are PAPER-only. Live mode remains
   the independent-wallet consensus spot strategy and is never enabled automatically by this
   upgrade.

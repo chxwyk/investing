@@ -170,6 +170,75 @@ async def test_raw_paper_buy_uses_current_price_not_source_price(settings) -> No
 
 
 @pytest.mark.asyncio
+async def test_forced_observation_fills_without_market_or_risk_gates(settings) -> None:
+    observation = replace(
+        settings,
+        paper_force_observation_mode=True,
+        paper_observation_penalty_bps=300,
+        paper_raw_entry_filter_enabled=True,
+        paper_use_executable_quotes=True,
+    )
+    notifier = CaptureNotifier()
+    engine = SmartMoneyEngine(observation, notifier=notifier)
+    await engine.initialize()
+    try:
+        engine.market.price = AsyncMock()
+        engine.market.token_info = AsyncMock()
+        engine.market.quote_order = AsyncMock()
+        trader = TrackedTrader(address="wallet-a", alias="Auto wallet-a")
+        await engine.database.add_trader(trader.address, trader.alias)
+
+        await engine._handle_new_swap(_swap(Side.BUY, "observe-buy", "1"), trader)
+        assert notifier.executions[-1].success is True
+        assert "Forced PAPER observation" in notifier.executions[-1].message
+        positions = await engine.database.paper_mirror_positions()
+        assert len(positions) == 1
+        assert Decimal(str(positions[0]["average_entry_usd"])) > Decimal("1.03")
+
+        await engine._handle_new_swap(_swap(Side.SELL, "observe-sell", "1.5"), trader)
+        assert notifier.executions[-1].success is True
+        assert await engine.database.paper_mirror_positions() == []
+
+        engine.market.price.assert_not_awaited()
+        engine.market.token_info.assert_not_awaited()
+        engine.market.quote_order.assert_not_awaited()
+        trades = await engine.database.paper_recent_trades()
+        assert len(trades) == 2
+        assert {item["execution_kind"] for item in trades} == {"FORCED_OBSERVATION"}
+        assert all(item["quote_based"] == 0 for item in trades)
+        assert Decimal(str(trades[0]["realized_pnl_usd"])) > 0
+    finally:
+        await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_forced_observation_allows_repeated_buys_and_source_only_exits(
+    settings,
+) -> None:
+    observation = replace(settings, paper_force_observation_mode=True)
+    notifier = CaptureNotifier()
+    engine = SmartMoneyEngine(observation, notifier=notifier)
+    await engine.initialize()
+    try:
+        trader = TrackedTrader(address="wallet-a", alias="Auto wallet-a")
+        await engine.database.add_trader(trader.address, trader.alias)
+        for index in range(3):
+            await engine._handle_new_swap(
+                _swap(Side.BUY, f"observe-buy-{index}", "1"), trader
+            )
+
+        positions = await engine.database.paper_mirror_positions()
+        assert len(positions) == 1
+        assert Decimal(str(positions[0]["cost_basis_usd"])) == Decimal("30")
+
+        engine.market.prices = AsyncMock(return_value={"mint": Decimal("0.01")})
+        await engine._check_position_exits()
+        assert len(await engine.database.paper_mirror_positions()) == 1
+    finally:
+        await engine.close()
+
+
+@pytest.mark.asyncio
 async def test_unrouted_pump_swap_uses_guarded_source_price_paper_fallback(
     settings,
 ) -> None:

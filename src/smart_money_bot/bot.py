@@ -765,7 +765,11 @@ class SmartMoneyCommands(
         await interaction.response.defer(thinking=True)
         report = await self.bot.engine.paper_readiness()
         s = self.bot.settings
-        quote_configured = s.paper_use_executable_quotes and bool(s.jupiter_api_key)
+        quote_configured = (
+            s.paper_use_executable_quotes
+            and bool(s.jupiter_api_key)
+            and not s.paper_force_observation_mode
+        )
         display_ready = report.ready and quote_configured
         status = "READY FOR MICRO-LIVE REVIEW" if display_ready else "KEEP TESTING"
         color = 0x2ECC71 if display_ready else 0xF1C40F
@@ -780,7 +784,13 @@ class SmartMoneyCommands(
             else "\n".join(f"• {item}" for item in report.blockers)
         )
         if not quote_configured:
-            blockers = "• JUPITER_API_KEY is missing or quote-shadow PAPER is disabled\n" + blockers
+            quote_blocker = (
+                "• Forced observation mode is enabled; those fills are excluded from "
+                "live-executable readiness. Disable it for the later quote-shadow trial.\n"
+                if s.paper_force_observation_mode
+                else "• JUPITER_API_KEY is missing or quote-shadow PAPER is disabled\n"
+            )
+            blockers = quote_blocker + blockers
         embed = discord.Embed(title=f"Paper Trial Readiness • {status}", color=color)
         embed.add_field(
             name="Trial started",
@@ -1161,6 +1171,26 @@ class SmartMoneyCommands(
             if status["paper_mirror_raw_swaps"]
             else "consensus signals only"
         )
+        observation_mode = bool(status["paper_force_observation_mode"])
+        paper_entry = (
+            "source transaction price + configured adverse penalty"
+            if observation_mode
+            else (
+                "current price required"
+                if s.paper_require_current_price
+                else "fallback allowed"
+            )
+        )
+        fill_policy = (
+            "FORCE OBSERVATION (PAPER only)"
+            if observation_mode
+            else "executable quote shadow"
+        )
+        raw_entry_gate = (
+            "bypassed by forced PAPER observation"
+            if observation_mode
+            else _raw_entry_gate_status(s.paper_raw_entry_filter_enabled)
+        )
         pump_verified = status["rotation_verified_pump_wallets"]
         pump_verified_text = (
             str(pump_verified) if pump_verified is not None else "not checked yet"
@@ -1172,13 +1202,13 @@ class SmartMoneyCommands(
             f"{self.bot.settings.rpc_max_retries} retries\n"
             f"**Mode:** {status['mode']}\n"
             f"**Paper auto-copy:** {paper_copy}\n"
-            f"**Paper entry price:** "
-            f"{'current price required' if s.paper_require_current_price else 'fallback allowed'}\n"
+            f"**Paper fill policy:** {fill_policy}\n"
+            f"**Paper entry price:** {paper_entry}\n"
+            f"**Observation penalty:** {s.paper_observation_penalty_bps}bps/side\n"
             f"**Pump PAPER fallback:** "
             f"{'enabled' if s.paper_allow_pump_source_fallback else 'disabled'}"
             f" • {s.paper_pump_source_fallback_bps}bps adverse penalty\n"
-            f"**Raw entry safety gate:** "
-            f"{_raw_entry_gate_status(s.paper_raw_entry_filter_enabled)}\n"
+            f"**Raw entry safety gate:** {raw_entry_gate}\n"
             f"**Executable quote shadow:** "
             f"{'ready' if status['quote_ready'] else 'JUPITER_API_KEY needed'}\n"
             f"**Consecutive quote failures:** {status['consecutive_quote_failures']} / "
@@ -1195,7 +1225,8 @@ class SmartMoneyCommands(
             f"**24H discovery refresh:** {discovery_refresh}\n"
             f"**7D verification refresh:** {weekly_refresh}\n"
             f"**Five-minute rotation:** {rotation_refresh}\n"
-            f"**Realtime wallet stream:** {stream_status}\n"
+            f"**Realtime wallet stream:** {stream_status} • "
+            f"{status['stream_commitment']} trigger\n"
             f"**Last scan:** {last_scan}\n"
             f"**Last error:** {status['last_error'] or 'none'}"
         )
@@ -1209,16 +1240,27 @@ class SmartMoneyCommands(
             if s.paper_mirror_raw_swaps
             else "consensus only"
         )
+        fill_policy = (
+            "force every valid detected swap (observation only)"
+            if s.paper_force_observation_mode
+            else "executable quote shadow"
+        )
+        raw_entry_gate = (
+            "bypassed by forced PAPER observation"
+            if s.paper_force_observation_mode
+            else _raw_entry_gate_status(s.paper_raw_entry_filter_enabled)
+        )
         text = (
             f"**Paper auto-copy:** {paper_copy}\n"
+            f"**Paper fill policy:** {fill_policy}\n"
+            f"**Observation penalty:** {s.paper_observation_penalty_bps}bps/side\n"
             f"**Paper entry price:** "
             f"{'current price required' if s.paper_require_current_price else 'fallback allowed'}\n"
             f"**Pump source-price fallback:** "
             f"{'enabled' if s.paper_allow_pump_source_fallback else 'disabled'}"
             f" • {s.paper_pump_source_fallback_bps}bps adverse penalty"
             " • PAPER only\n"
-            f"**Raw entry safety gate:** "
-            f"{_raw_entry_gate_status(s.paper_raw_entry_filter_enabled)}\n"
+            f"**Raw entry safety gate:** {raw_entry_gate}\n"
             f"**Quote-shadow PAPER:** "
             f"{'enabled' if s.paper_use_executable_quotes else 'disabled'}\n"
             f"**Entry chase limit:** +{s.max_adverse_entry_drift_percent}%\n"

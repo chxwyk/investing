@@ -111,8 +111,13 @@ class ExecutionManager:
         size_usd: Decimal,
         token_info: TokenInfo | None = None,
         pump_source_fallback: bool = False,
+        observation_mode: bool = False,
     ) -> ExecutionResult:
-        if self.settings.paper_use_executable_quotes and not pump_source_fallback:
+        if (
+            self.settings.paper_use_executable_quotes
+            and not pump_source_fallback
+            and not observation_mode
+        ):
             result = await self._execute_quoted_paper_mirror(
                 swap=swap,
                 trader=trader,
@@ -133,9 +138,17 @@ class ExecutionManager:
             size_usd=size_usd,
             fee_bps=self.settings.simulated_fee_bps,
             slippage_bps=self.settings.simulated_slippage_bps,
-            max_position_usd=self.settings.max_copy_usd,
+            max_position_usd=(
+                None if observation_mode else self.settings.max_copy_usd
+            ),
             execution_kind=(
-                "PUMP_SOURCE_FALLBACK" if pump_source_fallback else "RAW_MIRROR"
+                "FORCED_OBSERVATION"
+                if observation_mode
+                else (
+                    "PUMP_SOURCE_FALLBACK"
+                    if pump_source_fallback
+                    else "RAW_MIRROR"
+                )
             ),
             source_price_usd=swap.token_price_usd,
         )
@@ -157,6 +170,14 @@ class ExecutionManager:
                 message=message,
             )
         elif swap.side is Side.BUY:
+            observation_note = (
+                " Forced PAPER observation used the source transaction price plus "
+                f"{self.settings.paper_observation_penalty_bps}bps and bypassed "
+                "liquidity, holder, route, drift, and quote gates. It records strategy "
+                "behavior, not a price a live order could necessarily obtain."
+                if observation_mode
+                else ""
+            )
             fallback_note = (
                 f" Pump PAPER fallback used the detected on-chain price with a "
                 f"{self.settings.paper_pump_source_fallback_bps}bps adverse penalty; "
@@ -173,11 +194,19 @@ class ExecutionManager:
                 message=(
                     f"Raw mirror of {trader.alias}: bought {fill['quantity']:.6f} paper "
                     f"tokens at ${fill['price']:.8f}; fee ${fill['fee']:.4f}. "
-                    f"This fake lot is linked to that source wallet.{fallback_note}"
+                    f"This fake lot is linked to that source wallet.{observation_note}"
+                    f"{fallback_note}"
                 ),
             )
         else:
             sold_percent = fill["source_fraction"] * Decimal("100")
+            observation_note = (
+                " Forced PAPER observation used the source transaction price minus "
+                f"{self.settings.paper_observation_penalty_bps}bps; it is excluded "
+                "from live-executable readiness evidence."
+                if observation_mode
+                else ""
+            )
             fallback_note = (
                 f" Pump PAPER fallback used the detected on-chain price with a "
                 f"{self.settings.paper_pump_source_fallback_bps}bps adverse penalty; "
@@ -195,7 +224,7 @@ class ExecutionManager:
                     f"Raw mirror of {trader.alias}: sold {sold_percent:.1f}% of that "
                     f"wallet's linked paper lot at ${fill['price']:.8f}; fee "
                     f"${fill['fee']:.4f}; realized P&L ${fill['realized_pnl']:.2f}."
-                    f"{fallback_note}"
+                    f"{observation_note}{fallback_note}"
                 ),
             )
         await self._log(None, result)

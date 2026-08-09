@@ -143,6 +143,16 @@ def test_v28_quote_shadow_and_readiness_defaults(monkeypatch) -> None:
     assert settings.readiness_min_closed_trades == 100
 
 
+def test_v211_observation_and_low_latency_stream_defaults(monkeypatch) -> None:
+    monkeypatch.delenv("PAPER_FORCE_OBSERVATION_MODE", raising=False)
+    monkeypatch.delenv("PAPER_OBSERVATION_PENALTY_BPS", raising=False)
+    monkeypatch.delenv("REALTIME_STREAM_COMMITMENT", raising=False)
+    settings = Settings.from_env(require_discord_token=False)
+    assert settings.paper_force_observation_mode is False
+    assert settings.paper_observation_penalty_bps == 300
+    assert settings.realtime_stream_commitment == "processed"
+
+
 def test_pump_source_price_fallback_defaults_to_conservative_paper_only_mode(
     monkeypatch,
 ) -> None:
