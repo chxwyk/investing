@@ -51,6 +51,14 @@ def _return_percent(current_value: Decimal, cost_basis: Decimal) -> Decimal:
     return (current_value - cost_basis) / cost_basis * Decimal("100")
 
 
+def _raw_entry_gate_status(enabled: bool) -> str:
+    return (
+        "enabled"
+        if enabled
+        else "DISABLED — set PAPER_RAW_ENTRY_FILTER_ENABLED=true"
+    )
+
+
 FOMO_SOLANA_CHAIN_ID = "1399811149"
 PAPER_DEMO_ENTRY_PRICE = Decimal(PAPER_DEMO_ENTRY_PRICE_USD)
 
@@ -116,11 +124,15 @@ def _discovery_lines(candidates: tuple[DiscoveryCandidate, ...] | list[Discovery
     for item in candidates[:10]:
         momentum = item.pnl_momentum_usd
         momentum_text = "new" if momentum is None else f"{momentum:+,.2f} since refresh"
+        roi_24h = "unavailable" if item.metrics_limited_24h else f"{item.roi_24h_percent:.1f}%"
+        roi_7d = "unavailable" if item.metrics_limited_7d else f"{item.roi_7d_percent:.1f}%"
+        win_24h = "unavailable" if item.metrics_limited_24h else f"{item.win_rate_percent:.1f}%"
+        win_7d = "unavailable" if item.metrics_limited_7d else f"{item.win_rate_7d_percent:.1f}%"
         lines.append(
             f"**{item.rank}. {item.alias}** • `{_short(item.address)}`\n"
-            f"24H `{_money(item.realized_pnl_24h)}` / `{item.roi_24h_percent:.1f}%` ROI • "
-            f"7D `{_money(item.realized_pnl_7d)}` / `{item.roi_7d_percent:.1f}%` ROI\n"
-            f"win `24H {item.win_rate_percent:.1f}%` / `7D {item.win_rate_7d_percent:.1f}%` • "
+            f"24H `{_money(item.realized_pnl_24h)}` / `{roi_24h}` ROI • "
+            f"7D `{_money(item.realized_pnl_7d)}` / `{roi_7d}` ROI\n"
+            f"win `24H {win_24h}` / `7D {win_7d}` • "
             f"recent `{item.recent_swaps}` • Pump `{item.pump_swaps}` • "
             f"score `{item.score}` • momentum `{momentum_text}`\n"
             f"why: {item.selection_reason or 'strict dual-window evidence'}"
@@ -1166,7 +1178,7 @@ class SmartMoneyCommands(
             f"{'enabled' if s.paper_allow_pump_source_fallback else 'disabled'}"
             f" • {s.paper_pump_source_fallback_bps}bps adverse penalty\n"
             f"**Raw entry safety gate:** "
-            f"{'enabled' if s.paper_raw_entry_filter_enabled else 'disabled'}\n"
+            f"{_raw_entry_gate_status(s.paper_raw_entry_filter_enabled)}\n"
             f"**Executable quote shadow:** "
             f"{'ready' if status['quote_ready'] else 'JUPITER_API_KEY needed'}\n"
             f"**Consecutive quote failures:** {status['consecutive_quote_failures']} / "
@@ -1206,7 +1218,7 @@ class SmartMoneyCommands(
             f" • {s.paper_pump_source_fallback_bps}bps adverse penalty"
             " • PAPER only\n"
             f"**Raw entry safety gate:** "
-            f"{'enabled' if s.paper_raw_entry_filter_enabled else 'disabled'}\n"
+            f"{_raw_entry_gate_status(s.paper_raw_entry_filter_enabled)}\n"
             f"**Quote-shadow PAPER:** "
             f"{'enabled' if s.paper_use_executable_quotes else 'disabled'}\n"
             f"**Entry chase limit:** +{s.max_adverse_entry_drift_percent}%\n"

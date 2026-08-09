@@ -22,7 +22,11 @@ unless four separate controls are deliberately configured.
 
 - Pulls rolling 1-day and 7-day general-trader and public-KOL leaderboards with public wallet
   addresses.
-- Requires independent positive PnL, win rate, ROI, and trade-count evidence in both windows.
+- Requires independent positive PnL evidence in both windows. General-feed rows must also
+  pass ROI, win-rate, trade-count, and token-diversity thresholds. The documented public-KOL
+  period feed omits those period metrics, so KOL rows must instead show repeat trading days
+  and then pass the same recent Pump and forward-PAPER checks; missing metrics are displayed
+  as unavailable and are never invented as zero.
 - Excludes arbitrage wallets, suspicious identity tags, hyperactive bot-like wallets, and
   one-token wonders through provider filters and local checks.
 - Builds a pool of up to 100 strict candidates and rechecks recent on-chain activity every
@@ -121,7 +125,7 @@ sell can also show `SKIPPED` if its matching buy happened before raw mirroring w
 A new detected buy must occur first. Set `PAPER_MIRROR_RAW_SWAPS=false` to restore the older
 consensus-only paper behavior.
 
-The v2.10.0 discovery, quote, fallback, rotation, and exit guardrails are intentionally
+The v2.10.1 discovery, quote, fallback, rotation, and exit guardrails are intentionally
 configurable:
 
 ```text
@@ -160,7 +164,7 @@ settings. Use `/smartmoney paper`, `/smartmoney positions`, `/smartmoney paper-t
 
 ## Official PAPER readiness trial
 
-After deploying v2.10.0, run `/smartmoney paper-reset confirmation:RESET PAPER` once to begin a
+After deploying v2.10.1, run `/smartmoney paper-reset confirmation:RESET PAPER` once to begin a
 clean trial. `/smartmoney readiness` reports **KEEP TESTING** until all defaults pass:
 
 - 14 separate active test days;
@@ -181,8 +185,8 @@ The raw 24-hour profit leaderboard is not the signal. A single lucky token can p
 wallet at the top. This bot uses a risk-adjusted pipeline:
 
 1. Refresh authorized strict general-trader and public-KOL 24-hour and 7-day leaderboards.
-2. Require qualifying metrics in both windows so a one-day spike alone cannot qualify a
-   wallet.
+2. Require qualifying PnL in both windows so a one-day spike alone cannot qualify a wallet;
+   apply every additional metric actually supplied by the source.
 3. Verify recent Pump-native or graduated-Pump activity on-chain.
 4. Re-rank the hot set every five minutes and rotate inactive or deteriorating wallets.
 5. Ingest confirmed swaps for each watched wallet.
@@ -248,8 +252,10 @@ The bot calls Solana Tracker's documented `GET /v2/pnl/leaderboard/top` endpoint
 `days=1` and `days=7`, plus the documented
 `GET /v2/pnl/leaderboard/kols/period` endpoint with `period=1d` and `period=7d`. General-feed
 requests use strict PnL mode, arbitrage exclusion, concentration filtering, and cursor
-pagination. A KOL identity never bypasses local PnL, ROI, win-rate, trade-count, or on-chain
-Pump checks. The runtime automatically clamps full multi-page refreshes to at least three
+pagination. The public-KOL period response only guarantees PnL, volume, and trading days;
+v2.10.1 no longer misreads its missing ROI/win/trade fields as zero. A KOL identity never
+bypasses dual-window PnL, repeat-day, on-chain Pump, or forward-PAPER checks. The runtime
+automatically clamps full multi-page refreshes to at least three
 hours for 24H data and twelve hours for 7D data. Every five minutes the cached pool is checked
 against recent on-chain swaps. Existing manually added wallets are never removed by automatic
 rotation.
@@ -423,7 +429,7 @@ support ticket, a screenshot, or chat. The default live base asset is Solana USD
   results worse.
 - Paper stops are evaluated after each scanner cycle. Fast markets can gap through a threshold,
   so an 8% configured stop does not guarantee an 8% maximum loss.
-- The v2.10.0 discovery, forward-evidence, quote, fallback, rotation, raw-entry, and raw-lot
+- The v2.10.1 discovery, forward-evidence, quote, fallback, rotation, raw-entry, and raw-lot
   guards are PAPER-only. Live mode remains
   the independent-wallet consensus spot strategy and is never enabled automatically by this
   upgrade.

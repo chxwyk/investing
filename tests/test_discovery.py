@@ -138,6 +138,92 @@ def test_public_kol_feed_widens_pool_but_still_uses_local_thresholds() -> None:
     assert candidates[0].last_trade_ms == 1_700_000_000_000
 
 
+def test_documented_kol_period_shape_does_not_treat_missing_metrics_as_zero() -> None:
+    payload = {
+        "traders": [
+            {
+                "wallet": WALLET_ONE,
+                "period": {
+                    "realized": 900,
+                    "volume": 8000,
+                    "tradingDays": 1,
+                },
+                "identity": {"name": "Documented Public KOL", "tags": ["kol"]},
+            }
+        ]
+    }
+
+    candidates = parse_kol_window_candidates(payload, policy(), days=1)
+
+    assert [candidate.address for candidate in candidates] == [WALLET_ONE]
+    assert candidates[0].metrics_limited is True
+    assert candidates[0].trading_days == 1
+    assert candidates[0].roi_percent == Decimal("0")
+    assert candidates[0].trades == 0
+
+
+def test_documented_weekly_kol_shape_requires_repeat_trading_days() -> None:
+    payload = {
+        "traders": [
+            {
+                "wallet": WALLET_ONE,
+                "period": {
+                    "realized": 2500,
+                    "volume": 15000,
+                    "tradingDays": 1,
+                },
+                "identity": {"name": "One Day Wonder", "tags": ["kol"]},
+            },
+            {
+                "wallet": WALLET_TWO,
+                "period": {
+                    "realized": 1800,
+                    "volume": 12000,
+                    "tradingDays": 4,
+                },
+                "identity": {"name": "Repeat Trader", "tags": ["kol"]},
+            },
+        ]
+    }
+
+    candidates = parse_kol_window_candidates(payload, policy(), days=7)
+
+    assert [candidate.address for candidate in candidates] == [WALLET_TWO]
+    assert candidates[0].trading_days == 4
+
+
+def test_merge_labels_metrics_missing_from_documented_kol_feed() -> None:
+    daily_payload = {
+        "traders": [
+            {
+                "wallet": WALLET_ONE,
+                "period": {"realized": 900, "volume": 8000, "tradingDays": 1},
+                "identity": {"name": "Documented Public KOL", "tags": ["kol"]},
+            }
+        ]
+    }
+    weekly_payload = {
+        "traders": [
+            {
+                "wallet": WALLET_ONE,
+                "period": {"realized": 3000, "volume": 25000, "tradingDays": 5},
+                "identity": {"name": "Documented Public KOL", "tags": ["kol"]},
+            }
+        ]
+    }
+
+    merged = merge_verified_windows(
+        parse_kol_window_candidates(daily_payload, policy(), days=1),
+        parse_kol_window_candidates(weekly_payload, policy(), days=7),
+        policy(),
+    )
+
+    assert [candidate.address for candidate in merged] == [WALLET_ONE]
+    assert merged[0].metrics_limited_24h is True
+    assert merged[0].metrics_limited_7d is True
+    assert "provider omits period ROI/win/trade detail" in merged[0].selection_reason
+
+
 def test_merge_can_confirm_a_wallet_across_general_and_public_kol_feeds() -> None:
     daily = parse_window_candidates(
         {"traders": [row(WALLET_ONE)]}, policy(), days=1

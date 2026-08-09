@@ -85,6 +85,8 @@ class WindowCandidate:
     volume_usd: Decimal
     last_trade_ms: int | None
     source: str = "general"
+    metrics_limited: bool = False
+    trading_days: int = 0
 
 
 class SolanaTrackerClient:
@@ -354,9 +356,11 @@ def parse_kol_window_candidates(
 ) -> list[WindowCandidate]:
     """Normalize the public-KOL period feed without trusting its rank by itself.
 
-    Solana Tracker has returned both flat and period-nested KOL rows over time. This
-    parser accepts either documented shape, then applies the same local thresholds and
-    non-human-wallet exclusions used for the general leaderboard.
+    Solana Tracker has returned both flat and period-nested KOL rows over time. The
+    documented period response only guarantees period PnL, volume, and trading days;
+    ROI, win rate, trades, and closed-token counts may be absent. Require the metrics
+    that the provider actually returned instead of incorrectly treating absent fields
+    as zero and rejecting every documented KOL row.
     """
 
     if not isinstance(payload, dict) or not isinstance(payload.get("traders"), list):
@@ -421,28 +425,48 @@ def parse_kol_window_candidates(
             row.get("realizedPnl"),
         )
         roi = _first_decimal(period.get("roi"), row.get("roi"))
+        has_roi = any(value is not None for value in (period.get("roi"), row.get("roi")))
         win_rate = _first_decimal(
             period.get("winRate"),
             period.get("win_rate"),
             row.get("winRate"),
             row.get("win_rate"),
         )
-        trades = _first_integer(counts.get("trades"), counts.get("total"))
-        closed_tokens = _first_integer(
-            tokens.get("closed"),
-            counts.get("closed"),
-            _integer(tokens.get("profitable")) + _integer(tokens.get("losing")),
+        has_win_rate = any(
+            value is not None
+            for value in (
+                period.get("winRate"),
+                period.get("win_rate"),
+                row.get("winRate"),
+                row.get("win_rate"),
+            )
         )
+        trades = _first_integer(counts.get("trades"), counts.get("total"))
+        has_trades = any(
+            value is not None for value in (counts.get("trades"), counts.get("total"))
+        )
+        closed_values = (tokens.get("closed"), counts.get("closed"))
+        has_token_outcomes = any(
+            value is not None
+            for value in (tokens.get("profitable"), tokens.get("losing"))
+        )
+        has_closed_tokens = any(value is not None for value in closed_values) or has_token_outcomes
+        closed_tokens = _first_integer(*closed_values)
+        if not any(value is not None for value in closed_values) and has_token_outcomes:
+            closed_tokens = _integer(tokens.get("profitable")) + _integer(tokens.get("losing"))
         invested = _first_decimal(period.get("invested"), row.get("invested"))
         volume = _first_decimal(period.get("volume"), row.get("volume"))
+        trading_days = _first_integer(period.get("tradingDays"), row.get("tradingDays"))
+        minimum_trading_days = 2 if days == 7 else 1
+        metrics_limited = not (has_roi and has_win_rate and has_trades and has_closed_tokens)
 
         if (
             pnl < min_pnl
-            or roi < min_roi
-            or win_rate < min_win
-            or trades < min_trades
-            or trades > max_trades
-            or closed_tokens < policy.minimum_closed_tokens
+            or (trading_days and trading_days < minimum_trading_days)
+            or (has_roi and roi < min_roi)
+            or (has_win_rate and win_rate < min_win)
+            or (has_trades and (trades < min_trades or trades > max_trades))
+            or (has_closed_tokens and closed_tokens < policy.minimum_closed_tokens)
         ):
             continue
 
@@ -463,6 +487,8 @@ def parse_kol_window_candidates(
                     timing.get("lastTrade") or period.get("lastTrade") or row.get("lastTrade")
                 ),
                 source="public-KOL",
+                metrics_limited=metrics_limited,
+                trading_days=trading_days,
             )
         )
     return candidates[: policy.kol_limit]
@@ -514,6 +540,16 @@ def merge_verified_windows(
             Decimal("100"),
         ).quantize(Decimal("0.01"))
         source_text = " + ".join(sources)
+        limited_windows: list[str] = []
+        if day.metrics_limited:
+            limited_windows.append("24H")
+        if week.metrics_limited:
+            limited_windows.append("7D")
+        limited_note = (
+            f"; provider omits period ROI/win/trade detail for {' + '.join(limited_windows)}"
+            if limited_windows
+            else ""
+        )
         merged.append(
             DiscoveryCandidate(
                 address=day.address,
@@ -528,10 +564,7 @@ def merge_verified_windows(
                 closed_tokens=day.closed_tokens,
                 invested_24h_usd=day.invested_usd,
                 volume_24h_usd=day.volume_usd,
-                last_trade_ms=max(
-                    value
-                    for value in (day.last_trade_ms, week.last_trade_ms, 0)
-                )
+                last_trade_ms=max(day.last_trade_ms or 0, week.last_trade_ms or 0)
                 or None,
                 score=score,
                 rank=0,
@@ -539,8 +572,11 @@ def merge_verified_windows(
                 roi_7d_percent=week.roi_percent,
                 win_rate_7d_percent=week.win_rate_percent,
                 trades_7d=week.trades,
+                metrics_limited_24h=day.metrics_limited,
+                metrics_limited_7d=week.metrics_limited,
                 selection_reason=(
-                    f"{source_text} evidence; strict 24H + 7D profit verified; "
+                    f"{source_text} evidence; strict 24H + 7D profit verified"
+                    f"{limited_note}; "
                     f"24H ${day.realized_pnl_usd:,.2f}, 7D ${week.realized_pnl_usd:,.2f}"
                 ),
             )

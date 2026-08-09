@@ -51,6 +51,8 @@ class DiscoveryCandidate:
     pump_swaps: int = 0
     last_activity_at: int | None = None
     selection_reason: str = ""
+    metrics_limited_24h: bool = False
+    metrics_limited_7d: bool = False
 
     @property
     def pnl_momentum_usd(self) -> Decimal | None:
