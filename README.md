@@ -159,7 +159,7 @@ sell can also show `SKIPPED` if its matching buy happened before raw mirroring w
 A new detected buy must occur first. Set `PAPER_MIRROR_RAW_SWAPS=false` to restore the older
 consensus-only paper behavior.
 
-The v2.11.0 discovery, observation, quote, fallback, rotation, and exit controls are
+The v2.13.0 discovery, observation, quote, fallback, rotation, and exit controls are
 intentionally configurable:
 
 ```text
@@ -169,6 +169,10 @@ PAPER_PUMP_SOURCE_FALLBACK_BPS=300
 PAPER_RAW_ENTRY_FILTER_ENABLED=true
 PAPER_FORCE_OBSERVATION_MODE=false
 PAPER_OBSERVATION_PENALTY_BPS=300
+PAPER_DAILY_TARGET_USD=100
+PAPER_DAILY_PROFIT_LOCK_ENABLED=true
+PAPER_DAILY_LOCK_TIMEZONE=America/Los_Angeles
+PAPER_DAILY_PROFIT_CHECK_SECONDS=15
 PAPER_USE_EXECUTABLE_QUOTES=true
 PAPER_QUOTE_OUTPUT_BUFFER_BPS=50
 MAX_ADVERSE_ENTRY_DRIFT_PERCENT=8
@@ -201,7 +205,7 @@ settings. Use `/smartmoney paper`, `/smartmoney positions`, `/smartmoney paper-t
 
 ## Official PAPER readiness trial
 
-After deploying v2.11.0 and disabling forced observation, run
+After deploying v2.13.0 and disabling forced observation, run
 `/smartmoney paper-reset confirmation:RESET PAPER` once to begin a clean trial.
 `/smartmoney readiness` reports **KEEP TESTING** until all defaults pass:
 
@@ -377,8 +381,8 @@ in that URL private. Helius documents the endpoint format as
 | `/smartmoney scan` | Run a scan immediately. |
 | `/smartmoney leaderboard` | Show the 24-hour or 7-day risk-adjusted ranking. |
 | `/smartmoney paper` | Show P&L, drawdown, profit factor, expectancy, and 24H progress. |
-| `/smartmoney positions` | Show open paper positions. |
-| `/smartmoney paper-trades` | Show recent fills, realized ROI, and automatic exit reasons. |
+| `/smartmoney positions` | Browse open positions with page, refresh, token-link, and confirmed manual PAPER-sell buttons. |
+| `/smartmoney paper-trades` | Browse every fill, realized ROI, quote details, and exit reasons with page buttons. |
 | `/smartmoney readiness` | Show the 14-day, sample-size, expectancy, drawdown, and quote gates. |
 | `/smartmoney paper-demo` | Instantly create and close a clearly labeled fake paper trade. |
 | `/smartmoney paper-reset` | Reset the paper challenge after exact confirmation. |
@@ -398,6 +402,48 @@ authorizes a trade.
 
 Mutation commands require Discord Administrator or a role listed in
 `DISCORD_ADMIN_ROLE_IDS`.
+
+### Clean PAPER controls and manual exits
+
+`/smartmoney positions` now opens a private one-position-at-a-time panel. Previous/next
+buttons move between fake lots, **Refresh prices** updates their current mark and unrealized
+P&L, and the token links open Fomo, Pump.fun, Jupiter, DexScreener, or Solscan without filling
+the channel with messages. Administrators also see **Sell this PAPER position**. The sell
+requires a second confirmation, closes only that selected fake lot, returns its simulated
+proceeds to PAPER cash, and records the result as realized P&L. It never signs or broadcasts a
+transaction and cannot touch real funds.
+
+A manual exit is deliberately labeled `MANUAL_EXIT` or `MANUAL_OBSERVATION_EXIT` and is
+excluded from `/smartmoney readiness`, so manually locking a winner cannot make the automatic
+strategy appear ready. A later source-wallet SELL correctly skips if the linked lot was already
+closed manually.
+
+`/smartmoney paper-trades` is private and paginated. It reads the complete stored history five
+fills at a time instead of posting only ten rows or flooding the alert channel.
+
+When automatic rotation removes a wallet that still has an open source-linked PAPER lot, the
+wallet now remains subscribed in **exit-only** mode. Fresh buys from that wallet are ignored,
+but the matching sell remains monitored until the fake lot closes. `/smartmoney status` shows
+the number of exit-only wallets. No new Railway variables are required for these controls.
+
+### Daily PAPER profit lock
+
+The v2.13.0 daily lock uses the account's **marked** change for the current local day—realized
+P&L plus the current value of open positions relative to the first account mark that day. With
+the defaults, reaching `+$100` immediately records the lock, attempts to sell every priced
+PAPER position, blocks every new PAPER buy, and suspends automatic discovery/rotation work for
+the rest of the day. A dedicated account guard re-marks positions every 15 seconds without
+performing another leaderboard refresh. A position whose current price is temporarily
+unavailable stays open and is retried on the next guard cycle; the entry lock remains active
+while it retries.
+
+The lock resets automatically on the next day in `America/Los_Angeles`. It is persisted in
+SQLite, so a Railway restart cannot silently unlock the account. `/smartmoney paper`,
+`/smartmoney status`, and `/smartmoney limits` show the target and current lock state. Change
+`PAPER_DAILY_TARGET_USD` later to adjust the target, or set
+`PAPER_DAILY_PROFIT_LOCK_ENABLED=false` to disable the feature. The lock is PAPER-only and does
+not promise an exact $100 realized result: simulated costs and price movement between the mark
+and exit can reduce the final amount.
 
 ### Instant paper walkthrough
 
@@ -467,7 +513,7 @@ support ticket, a screenshot, or chat. The default live base asset is Solana USD
   results worse.
 - Paper stops are evaluated after each scanner cycle. Fast markets can gap through a threshold,
   so an 8% configured stop does not guarantee an 8% maximum loss.
-- The v2.11.0 discovery, observation, forward-evidence, quote, fallback, rotation, raw-entry,
+- The v2.13.0 discovery, observation, forward-evidence, quote, fallback, rotation, raw-entry,
   and raw-lot
   guards are PAPER-only. Live mode remains
   the independent-wallet consensus spot strategy and is never enabled automatically by this

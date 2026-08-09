@@ -429,6 +429,43 @@ class Database:
             for row in rows
         ]
 
+    async def trader_is_exit_only(self, address: str) -> bool:
+        """Return whether an automatic wallet is retained only to close a paper lot."""
+
+        cursor = await self.db.execute(
+            """
+            SELECT tracked_traders.source, discovery_wallets.qualified
+            FROM tracked_traders
+            LEFT JOIN discovery_wallets
+                ON discovery_wallets.address = tracked_traders.address
+            WHERE tracked_traders.address = ?
+            """,
+            (address,),
+        )
+        row = await cursor.fetchone()
+        if row is None or str(row["source"]) != "auto":
+            return False
+        return row["qualified"] is None or not bool(row["qualified"])
+
+    async def exit_only_trader_count(self) -> int:
+        cursor = await self.db.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM tracked_traders
+            LEFT JOIN discovery_wallets
+                ON discovery_wallets.address = tracked_traders.address
+            WHERE tracked_traders.enabled = 1
+              AND tracked_traders.source = 'auto'
+              AND COALESCE(discovery_wallets.qualified, 0) = 0
+              AND EXISTS (
+                  SELECT 1 FROM paper_mirror_positions
+                  WHERE paper_mirror_positions.trader_address = tracked_traders.address
+              )
+            """
+        )
+        row = await cursor.fetchone()
+        return int(row["count"] or 0)
+
     async def resolve_trader(self, address_or_alias: str) -> TrackedTrader | None:
         cursor = await self.db.execute(
             "SELECT * FROM tracked_traders WHERE address = ? OR alias = ? COLLATE NOCASE",
@@ -702,10 +739,18 @@ class Database:
                     )
                     removal_events.append(event)
 
+                # A rotated-out wallet with an open source-linked PAPER lot remains
+                # subscribed in exit-only mode. New buys from it are ignored by the
+                # engine, but its later sell can still close the linked fake position.
                 await self.db.execute(
                     f"""
                     UPDATE tracked_traders SET enabled = 0
-                    WHERE source = 'auto' AND address NOT IN ({placeholders})
+                    WHERE source = 'auto'
+                      AND address NOT IN ({placeholders})
+                      AND address NOT IN (
+                          SELECT DISTINCT trader_address
+                          FROM paper_mirror_positions
+                      )
                     """,
                     tuple(selected_addresses),
                 )
@@ -1243,6 +1288,8 @@ class Database:
         size_usd: Decimal,
         fee_bps: int,
         slippage_bps: int,
+        execution_kind: str = "CONSENSUS",
+        exit_reason: str | None = None,
     ) -> dict[str, Decimal] | None:
         fee_rate = Decimal(fee_bps) / Decimal(10_000)
         slip_rate = Decimal(slippage_bps) / Decimal(10_000)
@@ -1327,8 +1374,9 @@ class Database:
                     """
                     INSERT INTO paper_trades(
                         signal_id, token_mint, side, quantity, execution_price_usd,
-                        gross_value_usd, fee_usd, realized_pnl_usd, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        gross_value_usd, fee_usd, realized_pnl_usd,
+                        execution_kind, exit_reason, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         signal_id,
@@ -1339,6 +1387,8 @@ class Database:
                         float(gross),
                         float(fee),
                         float(realized),
+                        execution_kind,
+                        exit_reason,
                         now,
                     ),
                 )
@@ -1804,6 +1854,24 @@ class Database:
         )
         return [dict(row) for row in await cursor.fetchall()]
 
+    async def paper_trade_count(self) -> int:
+        cursor = await self.db.execute("SELECT COUNT(*) AS count FROM paper_trades")
+        row = await cursor.fetchone()
+        return int(row["count"] or 0)
+
+    async def paper_trades_page(
+        self, *, limit: int = 5, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        cursor = await self.db.execute(
+            """
+            SELECT * FROM paper_trades
+            ORDER BY created_at DESC, id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (max(1, min(limit, 10)), max(0, offset)),
+        )
+        return [dict(row) for row in await cursor.fetchall()]
+
     async def paper_all_positions(self) -> list[dict[str, Any]]:
         standard = await self.paper_positions()
         mirror = await self.paper_mirror_positions()
@@ -1853,6 +1921,23 @@ class Database:
         )
         row = await cursor.fetchone()
         return _d(row["pnl"])
+
+    async def first_paper_equity_between(
+        self, start_timestamp: int, end_timestamp: int
+    ) -> Decimal | None:
+        """Return the first recorded account mark inside one local trading day."""
+
+        cursor = await self.db.execute(
+            """
+            SELECT equity_usd FROM paper_equity_samples
+            WHERE created_at >= ? AND created_at < ?
+            ORDER BY created_at ASC, id ASC
+            LIMIT 1
+            """,
+            (start_timestamp, end_timestamp),
+        )
+        row = await cursor.fetchone()
+        return _d(row["equity_usd"]) if row is not None else None
 
     async def paper_summary(self, prices: dict[str, Decimal]) -> PaperSummary:
         account_cursor = await self.db.execute("SELECT * FROM paper_account WHERE id = 1")
@@ -1983,7 +2068,10 @@ class Database:
                     AS gross_loss,
                 SUM(realized_pnl_usd) AS net_pnl
             FROM paper_trades
-            WHERE side = 'SELL' AND quote_based = 1 AND created_at >= ?
+            WHERE side = 'SELL'
+              AND quote_based = 1
+              AND execution_kind NOT LIKE 'MANUAL%'
+              AND created_at >= ?
             """,
             (trial_started_at,),
         )
@@ -2103,6 +2191,16 @@ class Database:
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value
                 """,
                 (str(now),),
+            )
+            await self.db.execute(
+                """
+                DELETE FROM settings WHERE key IN (
+                    'paper_daily_lock_day',
+                    'paper_daily_lock_baseline_equity_usd',
+                    'paper_daily_lock_triggered',
+                    'paper_daily_lock_triggered_at'
+                )
+                """
             )
             await self.db.commit()
 

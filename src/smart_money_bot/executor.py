@@ -240,6 +240,7 @@ class ExecutionManager:
         token_info: TokenInfo | None,
         execution_kind: str = "RAW_MIRROR",
         exit_reason: str | None = None,
+        readiness_tracking: bool = True,
     ) -> ExecutionResult:
         """Shadow a raw swap using a quote-only Jupiter Swap V2 order."""
 
@@ -261,12 +262,14 @@ class ExecutionManager:
                     swap=swap,
                     size_usd=capacity,
                     reason="source transaction price is unavailable; entry drift cannot be checked",
+                    record_attempt=readiness_tracking,
                 )
             if token_info is None or token_info.decimals is None:
                 return await self._quote_failure(
                     swap=swap,
                     size_usd=capacity,
                     reason="token decimals are unavailable for an executable quote",
+                    record_attempt=readiness_tracking,
                 )
             amount_usd = capacity
             token_decimals = token_info.decimals
@@ -277,6 +280,7 @@ class ExecutionManager:
                     swap=swap,
                     size_usd=capacity,
                     reason=str(exc),
+                    record_attempt=readiness_tracking,
                 )
             input_decimals = self.settings.live_base_decimals
             output_decimals = token_decimals
@@ -308,6 +312,7 @@ class ExecutionManager:
                     swap=swap,
                     size_usd=Decimal(str(preview["matched_cost_usd"])),
                     reason="token decimals are unavailable for the exit quote",
+                    record_attempt=readiness_tracking,
                 )
             token_decimals = int(raw_decimals)
             input_amount = Decimal(str(preview["paper_quantity"]))
@@ -337,6 +342,7 @@ class ExecutionManager:
                 swap=swap,
                 size_usd=amount_usd,
                 reason=str(exc),
+                record_attempt=readiness_tracking,
             )
 
         self.consecutive_quote_failures = 0
@@ -367,17 +373,18 @@ class ExecutionManager:
                     f"{self.settings.max_quote_latency_ms}ms"
                 )
             if blocker:
-                await self.database.record_paper_quote_attempt(
-                    source_signature=swap.signature,
-                    token_mint=swap.token_mint,
-                    side=swap.side,
-                    quote_success=True,
-                    accepted=False,
-                    reason=blocker,
-                    latency_ms=quote.observed_latency_ms,
-                    price_impact_percent=price_impact,
-                    price_drift_percent=drift,
-                )
+                if readiness_tracking:
+                    await self.database.record_paper_quote_attempt(
+                        source_signature=swap.signature,
+                        token_mint=swap.token_mint,
+                        side=swap.side,
+                        quote_success=True,
+                        accepted=False,
+                        reason=blocker,
+                        latency_ms=quote.observed_latency_ms,
+                        price_impact_percent=price_impact,
+                        price_drift_percent=drift,
+                    )
                 return self._paper_skip(swap, amount_usd, blocker)
             quoted_input_amount = quote.input_amount
             quoted_output_amount = quote.output_amount * buffer_multiplier
@@ -395,17 +402,18 @@ class ExecutionManager:
             quoted_output_amount = unbuffered_output_usd * buffer_multiplier
             source_price = swap.token_price_usd
 
-        await self.database.record_paper_quote_attempt(
-            source_signature=swap.signature,
-            token_mint=swap.token_mint,
-            side=swap.side,
-            quote_success=True,
-            accepted=True,
-            reason=None,
-            latency_ms=quote.observed_latency_ms,
-            price_impact_percent=price_impact,
-            price_drift_percent=drift,
-        )
+        if readiness_tracking:
+            await self.database.record_paper_quote_attempt(
+                source_signature=swap.signature,
+                token_mint=swap.token_mint,
+                side=swap.side,
+                quote_success=True,
+                accepted=True,
+                reason=None,
+                latency_ms=quote.observed_latency_ms,
+                price_impact_percent=price_impact,
+                price_drift_percent=drift,
+            )
         fill = await self.database.paper_mirror_execute(
             trader_address=trader.address,
             source_signature=swap.signature,
@@ -454,9 +462,12 @@ class ExecutionManager:
             )
 
         sold_percent = fill["source_fraction"] * Decimal("100")
-        prefix = "Automatic quote-shadow risk exit" if execution_kind == "RISK_EXIT" else (
-            f"Quote-shadow SELL of {trader.alias}"
-        )
+        if execution_kind == "RISK_EXIT":
+            prefix = "Automatic quote-shadow risk exit"
+        elif execution_kind.startswith("MANUAL"):
+            prefix = "Manual PAPER quote exit"
+        else:
+            prefix = f"Quote-shadow SELL of {trader.alias}"
         reason_text = f": {exit_reason}" if exit_reason else ""
         return ExecutionResult(
             success=True,
@@ -511,7 +522,11 @@ class ExecutionManager:
         swap: DetectedSwap,
         size_usd: Decimal,
         reason: str,
+        record_attempt: bool = True,
     ) -> ExecutionResult:
+        if not record_attempt:
+            return self._paper_skip(swap, size_usd, f"quote unavailable — {reason}")
+
         self.consecutive_quote_failures += 1
         await self.database.record_paper_quote_attempt(
             source_signature=swap.signature,
@@ -529,6 +544,136 @@ class ExecutionManager:
                 "consecutive quote failures; use /smartmoney pause action:resume after fixing it."
             )
         return self._paper_skip(swap, size_usd, f"quote unavailable — {reason}.{suffix}")
+
+    async def execute_paper_mirror_manual_exit(
+        self,
+        *,
+        position: dict[str, object],
+        market_price_usd: Decimal,
+        requested_by: str,
+        execution_kind: str = "MANUAL_EXIT",
+        exit_reason: str | None = None,
+        message_label: str = "Manual PAPER SELL",
+    ) -> ExecutionResult:
+        """Close one source-linked fake lot without moving real funds."""
+
+        trader_address = str(position["trader_address"])
+        token_mint = str(position["token_mint"])
+        cost_basis = Decimal(str(position["cost_basis_usd"]))
+        reason = exit_reason or f"manual PAPER sell requested by {requested_by}"
+        signature_kind = execution_kind.lower().replace("_", "-")
+        source_signature = f"paper-{signature_kind}-{time.time_ns()}"
+
+        if self.settings.paper_force_observation_mode:
+            penalty = Decimal(self.settings.paper_observation_penalty_bps) / Decimal(10_000)
+            exit_price = market_price_usd * (Decimal("1") - penalty)
+            fill = await self.database.paper_mirror_execute(
+                trader_address=trader_address,
+                source_signature=source_signature,
+                token_mint=token_mint,
+                side=Side.SELL,
+                source_token_amount=Decimal(str(position["source_quantity"])),
+                market_price_usd=exit_price,
+                size_usd=cost_basis,
+                fee_bps=self.settings.simulated_fee_bps,
+                slippage_bps=self.settings.simulated_slippage_bps,
+                execution_kind=(
+                    "MANUAL_OBSERVATION_EXIT"
+                    if execution_kind == "MANUAL_EXIT"
+                    else execution_kind
+                ),
+                exit_reason=reason,
+                source_price_usd=market_price_usd,
+            )
+            if fill is None:
+                result = ExecutionResult(
+                    success=False,
+                    mode=ExecutionMode.PAPER,
+                    token_mint=token_mint,
+                    side=Side.SELL,
+                    size_usd=cost_basis,
+                    message="Skipped: that paper lot was already closed",
+                )
+            else:
+                result = ExecutionResult(
+                    success=True,
+                    mode=ExecutionMode.PAPER,
+                    token_mint=token_mint,
+                    side=Side.SELL,
+                    size_usd=cost_basis,
+                    message=(
+                        f"{message_label} filled in forced-observation mode. "
+                        f"Sold the full linked fake lot at ${fill['price']:.8f}; fee "
+                        f"${fill['fee']:.4f}; realized P&L ${fill['realized_pnl']:.2f}. "
+                        "This is excluded from quote-readiness evidence."
+                    ),
+                )
+            await self._log(None, result)
+            return result
+
+        if self.settings.paper_use_executable_quotes:
+            swap = DetectedSwap(
+                signature=source_signature,
+                trader_address=trader_address,
+                block_time=int(time.time()),
+                side=Side.SELL,
+                token_mint=token_mint,
+                token_amount=Decimal(str(position["source_quantity"])),
+                quote_mint=self.settings.live_base_mint,
+                quote_amount=Decimal("0"),
+                usd_value=cost_basis,
+                token_price_usd=market_price_usd,
+            )
+            result = await self._execute_quoted_paper_mirror(
+                swap=swap,
+                trader=TrackedTrader(address=trader_address, alias=requested_by),
+                market_price_usd=market_price_usd,
+                size_usd=cost_basis,
+                token_info=None,
+                execution_kind=execution_kind,
+                exit_reason=reason,
+                readiness_tracking=False,
+            )
+            await self._log(None, result)
+            return result
+
+        fill = await self.database.paper_mirror_execute(
+            trader_address=trader_address,
+            source_signature=source_signature,
+            token_mint=token_mint,
+            side=Side.SELL,
+            source_token_amount=Decimal(str(position["source_quantity"])),
+            market_price_usd=market_price_usd,
+            size_usd=cost_basis,
+            fee_bps=self.settings.simulated_fee_bps,
+            slippage_bps=self.settings.simulated_slippage_bps,
+            execution_kind=execution_kind,
+            exit_reason=reason,
+            source_price_usd=market_price_usd,
+        )
+        if fill is None:
+            result = ExecutionResult(
+                success=False,
+                mode=ExecutionMode.PAPER,
+                token_mint=token_mint,
+                side=Side.SELL,
+                size_usd=cost_basis,
+                message="Skipped: that paper lot was already closed",
+            )
+        else:
+            result = ExecutionResult(
+                success=True,
+                mode=ExecutionMode.PAPER,
+                token_mint=token_mint,
+                side=Side.SELL,
+                size_usd=cost_basis,
+                message=(
+                    f"{message_label} filled at ${fill['price']:.8f}; fee "
+                    f"${fill['fee']:.4f}; realized P&L ${fill['realized_pnl']:.2f}."
+                ),
+            )
+        await self._log(None, result)
+        return result
 
     async def execute_paper_mirror_risk_exit(
         self,

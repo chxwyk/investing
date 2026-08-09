@@ -229,6 +229,19 @@ class PaperSummary:
 
 
 @dataclass(frozen=True, slots=True)
+class PaperDailyLockStatus:
+    enabled: bool
+    day: str
+    target_usd: Decimal
+    baseline_equity_usd: Decimal
+    current_equity_usd: Decimal
+    marked_pnl_usd: Decimal
+    locked: bool
+    triggered_at: int | None
+    open_positions: int
+
+
+@dataclass(frozen=True, slots=True)
 class PaperReadiness:
     trial_started_at: int
     active_days: int

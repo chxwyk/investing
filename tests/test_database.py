@@ -139,6 +139,57 @@ async def test_hot_wallet_rotation_records_add_and_remove_audit(tmp_path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_rotated_wallet_with_open_paper_lot_stays_enabled_for_exit(tmp_path) -> None:
+    database = Database(str(tmp_path / "exit-only.db"), Decimal("1000"))
+    await database.connect()
+    try:
+        first = _discovery_candidate("wallet-a", rank=1, pnl="500")
+        second = _discovery_candidate("wallet-b", rank=2, pnl="400")
+        await database.apply_discovery([first, second])
+        await database.paper_mirror_execute(
+            trader_address="wallet-a",
+            source_signature="wallet-a-buy",
+            token_mint="mint-a",
+            side=Side.BUY,
+            source_token_amount=Decimal("100"),
+            market_price_usd=Decimal("1"),
+            size_usd=Decimal("10"),
+            fee_bps=0,
+            slippage_bps=0,
+        )
+
+        refreshed = await database.apply_discovery(
+            [second],
+            evaluated_candidates=[first, second],
+            removal_reasons={"wallet-a": "rotated out"},
+        )
+
+        retained = await database.resolve_trader("wallet-a")
+        assert refreshed.disabled_wallets == ("wallet-a",)
+        assert retained is not None and retained.enabled is True
+        assert await database.trader_is_exit_only("wallet-a") is True
+        assert await database.exit_only_trader_count() == 1
+
+        await database.paper_mirror_execute(
+            trader_address="wallet-a",
+            source_signature="wallet-a-sell",
+            token_mint="mint-a",
+            side=Side.SELL,
+            source_token_amount=Decimal("100"),
+            market_price_usd=Decimal("1.2"),
+            size_usd=Decimal("10"),
+            fee_bps=0,
+            slippage_bps=0,
+        )
+        await database.apply_discovery([second], evaluated_candidates=[second])
+        disabled = await database.resolve_trader("wallet-a")
+        assert disabled is not None and disabled.enabled is False
+        assert await database.exit_only_trader_count() == 0
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
 async def test_paper_round_trip_includes_costs(tmp_path) -> None:
     database = Database(str(tmp_path / "paper.db"), Decimal("1000"))
     await database.connect()
@@ -176,6 +227,12 @@ async def test_paper_round_trip_includes_costs(tmp_path) -> None:
         )
         assert sell is not None
         assert sell["realized_pnl"] < 0
+
+        assert await database.paper_trade_count() == 2
+        newest = await database.paper_trades_page(limit=1, offset=0)
+        oldest = await database.paper_trades_page(limit=1, offset=1)
+        assert newest[0]["side"] == Side.SELL.value
+        assert oldest[0]["side"] == Side.BUY.value
 
         summary = await database.paper_summary({})
         assert summary.starting_cash_usd == Decimal("1000.0")

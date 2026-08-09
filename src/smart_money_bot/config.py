@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from decimal import Decimal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .constants import LIVE_ACK_TEXT, USDC_MINT
 
@@ -104,6 +105,9 @@ class Settings:
     paper_force_observation_mode: bool
     paper_observation_penalty_bps: int
     paper_daily_target_usd: Decimal
+    paper_daily_profit_lock_enabled: bool
+    paper_daily_lock_timezone: str
+    paper_daily_profit_check_seconds: int
     paper_use_executable_quotes: bool
     paper_quote_output_buffer_bps: int
     max_adverse_entry_drift_percent: Decimal
@@ -244,6 +248,15 @@ class Settings:
                 "PAPER_OBSERVATION_PENALTY_BPS", 300
             ),
             paper_daily_target_usd=_decimal("PAPER_DAILY_TARGET_USD", "100"),
+            paper_daily_profit_lock_enabled=_bool(
+                "PAPER_DAILY_PROFIT_LOCK_ENABLED", True
+            ),
+            paper_daily_lock_timezone=os.getenv(
+                "PAPER_DAILY_LOCK_TIMEZONE", "America/Los_Angeles"
+            ).strip(),
+            paper_daily_profit_check_seconds=_int(
+                "PAPER_DAILY_PROFIT_CHECK_SECONDS", 15
+            ),
             paper_use_executable_quotes=_bool(
                 "PAPER_USE_EXECUTABLE_QUOTES", True
             ),
@@ -436,6 +449,16 @@ class Settings:
             raise ValueError("MAX_HOLD_SECONDS must be at least 60")
         if self.paper_daily_target_usd <= 0:
             raise ValueError("PAPER_DAILY_TARGET_USD must be positive")
+        try:
+            ZoneInfo(self.paper_daily_lock_timezone)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError(
+                "PAPER_DAILY_LOCK_TIMEZONE must be a valid IANA timezone"
+            ) from exc
+        if self.paper_daily_profit_check_seconds < 5:
+            raise ValueError(
+                "PAPER_DAILY_PROFIT_CHECK_SECONDS must be at least 5"
+            )
         if not 0 <= self.paper_quote_output_buffer_bps < 10_000:
             raise ValueError("PAPER_QUOTE_OUTPUT_BUFFER_BPS must be between 0 and 9999")
         if self.max_adverse_entry_drift_percent < 0:

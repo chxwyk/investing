@@ -13,6 +13,7 @@ from smart_money_bot.models import (
     DetectedSwap,
     DiscoveryRefresh,
     ExecutionResult,
+    PaperDailyLockStatus,
     RiskDecision,
     Side,
     Signal,
@@ -27,6 +28,7 @@ class CaptureNotifier:
         self.swaps: list[DetectedSwap] = []
         self.signals: list[Signal] = []
         self.executions: list[ExecutionResult] = []
+        self.daily_locks: list[PaperDailyLockStatus] = []
 
     async def on_discovery(self, refresh: DiscoveryRefresh) -> None:
         del refresh
@@ -46,6 +48,9 @@ class CaptureNotifier:
 
     async def on_execution(self, result: ExecutionResult) -> None:
         self.executions.append(result)
+
+    async def on_daily_profit_lock(self, status: PaperDailyLockStatus) -> None:
+        self.daily_locks.append(status)
 
     async def on_error(self, context: str, error: Exception) -> None:
         raise AssertionError(f"{context}: {error}")
@@ -234,6 +239,82 @@ async def test_forced_observation_allows_repeated_buys_and_source_only_exits(
         engine.market.prices = AsyncMock(return_value={"mint": Decimal("0.01")})
         await engine._check_position_exits()
         assert len(await engine.database.paper_mirror_positions()) == 1
+    finally:
+        await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_manual_paper_sell_closes_forced_observation_lot(settings) -> None:
+    observation = replace(
+        settings,
+        paper_force_observation_mode=True,
+        paper_observation_penalty_bps=300,
+    )
+    notifier = CaptureNotifier()
+    engine = SmartMoneyEngine(observation, notifier=notifier)
+    await engine.initialize()
+    try:
+        trader = TrackedTrader(address="wallet-a", alias="Auto wallet-a")
+        await engine.database.add_trader(trader.address, trader.alias)
+        await engine._handle_new_swap(_swap(Side.BUY, "manual-buy", "1"), trader)
+        assert len(await engine.database.paper_mirror_positions()) == 1
+
+        engine.market.price = AsyncMock(return_value=Decimal("1.5"))
+        result = await engine.manual_paper_exit(
+            position_kind="RAW_MIRROR",
+            token_mint="mint",
+            source_trader="wallet-a",
+            requested_by="Discord admin",
+        )
+
+        assert result.success is True
+        assert "Manual PAPER SELL" in result.message
+        assert await engine.database.paper_mirror_positions() == []
+        trades = await engine.database.paper_recent_trades()
+        assert trades[0]["execution_kind"] == "MANUAL_OBSERVATION_EXIT"
+        assert trades[0]["quote_based"] == 0
+        assert Decimal(str(trades[0]["realized_pnl_usd"])) > 0
+    finally:
+        await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_daily_profit_lock_liquidates_and_blocks_new_buys(settings) -> None:
+    observation = replace(
+        settings,
+        paper_force_observation_mode=True,
+        paper_daily_profit_lock_enabled=True,
+        paper_daily_target_usd=Decimal("100"),
+    )
+    notifier = CaptureNotifier()
+    engine = SmartMoneyEngine(observation, notifier=notifier)
+    await engine.initialize()
+    try:
+        trader = TrackedTrader(address="wallet-a", alias="Auto wallet-a")
+        await engine.database.add_trader(trader.address, trader.alias)
+        await engine._handle_new_swap(_swap(Side.BUY, "lock-buy", "1"), trader)
+        assert len(await engine.database.paper_mirror_positions()) == 1
+
+        engine.market.prices = AsyncMock(return_value={"mint": Decimal("1")})
+        armed = await engine.paper_daily_lock_status()
+        assert armed.locked is False
+
+        engine.market.prices = AsyncMock(return_value={"mint": Decimal("20")})
+        assert await engine._enforce_daily_profit_lock() is True
+        assert await engine.database.paper_mirror_positions() == []
+        assert len(notifier.daily_locks) == 1
+        assert notifier.daily_locks[0].marked_pnl_usd >= Decimal("100")
+
+        trades = await engine.database.paper_recent_trades()
+        assert trades[0]["execution_kind"] == "DAILY_PROFIT_LOCK_EXIT"
+        assert Decimal(str(trades[0]["realized_pnl_usd"])) > Decimal("100")
+
+        await engine._handle_new_swap(
+            _swap(Side.BUY, "blocked-after-target", "1", mint="mint-2"),
+            trader,
+        )
+        assert await engine.database.paper_mirror_positions() == []
+        assert all(item.signature != "blocked-after-target" for item in notifier.swaps)
     finally:
         await engine.close()
 
@@ -515,6 +596,58 @@ async def test_quote_shadow_records_buffered_buy_and_quoted_sell(settings) -> No
         assert trades[0]["quote_based"] == 1
         assert trades[0]["quote_router"] == "metis"
         assert Decimal(str(trades[0]["realized_pnl_usd"])) > 0
+    finally:
+        await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_manual_quoted_exit_is_excluded_from_readiness(settings) -> None:
+    quoted = replace(
+        settings,
+        paper_use_executable_quotes=True,
+        jupiter_api_key="jup-test",
+        live_base_mint="base",
+    )
+    notifier = CaptureNotifier()
+    engine = SmartMoneyEngine(quoted, notifier=notifier)
+    await engine.initialize()
+    try:
+        engine.market.price = AsyncMock(
+            side_effect=(Decimal("1"), Decimal("1"), Decimal("1.2"), Decimal("1"))
+        )
+        engine.market.token_info = AsyncMock(
+            return_value=TokenInfo(mint="mint", decimals=6)
+        )
+        buy_quote = _quote(output="10")
+        sell_quote = replace(
+            _quote(output="12"),
+            input_mint="mint",
+            output_mint="base",
+            input_amount=Decimal("9.95"),
+            input_amount_raw=9_950_000,
+            output_amount=Decimal("12"),
+            output_amount_raw=12_000_000,
+            output_usd_value=Decimal("12"),
+        )
+        engine.market.quote_order = AsyncMock(side_effect=(buy_quote, sell_quote))
+        trader = TrackedTrader(address="wallet-a", alias="Auto wallet-a")
+        await engine.database.add_trader(trader.address, trader.alias)
+
+        await engine._handle_new_swap(_swap(Side.BUY, "quoted-manual-buy", "1"), trader)
+        result = await engine.manual_paper_exit(
+            position_kind="RAW_MIRROR",
+            token_mint="mint",
+            source_trader="wallet-a",
+            requested_by="Discord admin",
+        )
+
+        assert result.success is True
+        trades = await engine.database.paper_recent_trades()
+        assert trades[0]["execution_kind"] == "MANUAL_EXIT"
+        assert trades[0]["quote_based"] == 1
+        readiness = await engine.paper_readiness()
+        assert readiness.closed_trades == 0
+        assert readiness.quote_attempts == 1
     finally:
         await engine.close()
 

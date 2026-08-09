@@ -119,6 +119,20 @@ def test_v27_paper_risk_guards_default_on(monkeypatch) -> None:
     assert settings.raw_mirror_max_hold_seconds == 7200
 
 
+def test_daily_paper_profit_lock_defaults_to_100_pacific(monkeypatch) -> None:
+    monkeypatch.delenv("PAPER_DAILY_TARGET_USD", raising=False)
+    monkeypatch.delenv("PAPER_DAILY_PROFIT_LOCK_ENABLED", raising=False)
+    monkeypatch.delenv("PAPER_DAILY_LOCK_TIMEZONE", raising=False)
+    monkeypatch.delenv("PAPER_DAILY_PROFIT_CHECK_SECONDS", raising=False)
+
+    settings = Settings.from_env(require_discord_token=False)
+
+    assert settings.paper_daily_target_usd == Decimal("100")
+    assert settings.paper_daily_profit_lock_enabled is True
+    assert settings.paper_daily_lock_timezone == "America/Los_Angeles"
+    assert settings.paper_daily_profit_check_seconds == 15
+
+
 def test_v28_quote_shadow_and_readiness_defaults(monkeypatch) -> None:
     names = (
         "PAPER_USE_EXECUTABLE_QUOTES",

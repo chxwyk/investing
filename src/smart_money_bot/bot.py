@@ -23,6 +23,7 @@ from .models import (
     DiscoveryRefresh,
     ExecutionMode,
     ExecutionResult,
+    PaperDailyLockStatus,
     RiskDecision,
     Side,
     Signal,
@@ -138,6 +139,494 @@ def _discovery_lines(candidates: tuple[DiscoveryCandidate, ...] | list[Discovery
             f"why: {item.selection_reason or 'strict dual-window evidence'}"
         )
     return "\n\n".join(lines) or "No qualified wallets in the latest snapshot."
+
+
+def _paper_trade_field(
+    item: dict[str, object], traders: dict[str, str]
+) -> tuple[str, str]:
+    side = str(item["side"])
+    mint = str(item["token_mint"])
+    quantity = Decimal(str(item["quantity"]))
+    price = Decimal(str(item["execution_price_usd"]))
+    gross = Decimal(str(item["gross_value_usd"]))
+    fee = Decimal(str(item["fee_usd"]))
+    kind = str(item["execution_kind"]).replace("_", " ").title()
+    timestamp = int(item["created_at"])
+    source = item.get("source_trader")
+    source_text = ""
+    if source:
+        source_address = str(source)
+        source_text = f" • source `{traders.get(source_address, _short(source_address))}`"
+
+    if side == Side.SELL.value:
+        realized = Decimal(str(item["realized_pnl_usd"]))
+        matched_cost = (gross - fee) - realized
+        roi = (
+            realized / matched_cost * Decimal("100")
+            if matched_cost > 0
+            else Decimal("0")
+        )
+        reason = item.get("exit_reason")
+        reason_text = f"\nExit: {reason}" if reason else ""
+        result = f"P&L `{_money(realized)}` • ROI `{roi:+.2f}%`"
+    else:
+        result = f"Spent `{_money(gross)}` • fee `{_money(fee)}`"
+        reason_text = ""
+
+    quote_text = ""
+    if bool(item.get("quote_based")):
+        router = str(item.get("quote_router") or "unknown")
+        impact = Decimal(str(item.get("price_impact_percent") or 0))
+        drift_raw = item.get("price_drift_percent")
+        drift_text = (
+            f" • drift `{Decimal(str(drift_raw)):+.2f}%`"
+            if drift_raw is not None
+            else ""
+        )
+        quote_text = f"\nQuote `{router}` • impact `{impact:.2f}%`{drift_text}"
+
+    name = f"{side} • {kind} • {_short(mint)}"
+    value = (
+        f"<t:{timestamp}:R>{source_text}\n"
+        f"Qty `{quantity:.6f}` @ `{_price(price)}`\n"
+        f"{result}{quote_text}{reason_text}"
+    )
+    return name[:256], value[:1024]
+
+
+def _position_embed(
+    bot: SmartMoneyBot,
+    position: dict[str, object],
+    traders: dict[str, str],
+    prices: dict[str, Decimal],
+    *,
+    index: int,
+    total: int,
+) -> discord.Embed:
+    mint = str(position["token_mint"])
+    quantity = Decimal(str(position["quantity"]))
+    cost = Decimal(str(position["cost_basis_usd"]))
+    entry = Decimal(str(position["average_entry_usd"]))
+    live_price = prices.get(mint)
+    price = PAPER_DEMO_ENTRY_PRICE if mint == PAPER_DEMO_MINT else (live_price or entry)
+    value = quantity * price
+    pnl = value - cost
+    roi = _return_percent(value, cost)
+    source = str(position.get("source_trader") or "")
+    raw_mirror = position.get("position_kind") == "RAW_MIRROR"
+    if mint == PAPER_DEMO_MINT:
+        title = "Paper Demo (fake token)"
+    elif raw_mirror:
+        title = f"Raw mirror • {traders.get(source, _short(source))}"
+    else:
+        title = "Consensus strategy position"
+
+    color = 0x2ECC71 if pnl >= 0 else 0xE74C3C
+    embed = discord.Embed(
+        title=f"Open PAPER Position • {index + 1}/{total}",
+        description=f"**{title}**\n`{mint}`",
+        color=color,
+    )
+    embed.add_field(name="Cost basis", value=_money(cost))
+    embed.add_field(name="Current value", value=_money(value))
+    embed.add_field(name="Unrealized P&L", value=f"{_money(pnl)} ({roi:+.2f}%)")
+    embed.add_field(name="Average entry", value=_price(entry))
+    embed.add_field(
+        name="Current price",
+        value=(
+            _price(price)
+            if live_price is not None or mint == PAPER_DEMO_MINT
+            else f"{_price(entry)} (entry fallback; refresh later)"
+        ),
+    )
+    embed.add_field(name="Quantity", value=f"{quantity:.6f}")
+    embed.add_field(
+        name="Opened",
+        value=f"<t:{int(position['opened_at'])}:R>",
+    )
+    if raw_mirror:
+        if bot.settings.paper_force_observation_mode:
+            exit_policy = (
+                "Waiting for this source wallet's SELL. Automatic stop/take-profit exits "
+                "are off in forced-observation mode; the manual PAPER sell below overrides it."
+            )
+        else:
+            exit_policy = (
+                "Source-wallet SELL, hard stop, take profit, trailing-profit lock, or "
+                "maximum hold—whichever closes the fake lot first."
+            )
+        embed.add_field(name="Automatic exit policy", value=exit_policy, inline=False)
+    embed.set_footer(
+        text=(
+            "Refresh updates the mark. Manual sell changes only fake PAPER accounting; "
+            "it cannot move real funds."
+        )
+    )
+    return embed
+
+
+class PaperTradesView(discord.ui.View):
+    def __init__(
+        self,
+        bot: SmartMoneyBot,
+        requester_id: int,
+        *,
+        page_size: int = 5,
+    ) -> None:
+        super().__init__(timeout=900)
+        self.bot = bot
+        self.requester_id = requester_id
+        self.page_size = max(1, min(page_size, 5))
+        self.page = 0
+        self.total = 0
+        self.rows: list[dict[str, object]] = []
+        self.traders: dict[str, str] = {}
+
+    @classmethod
+    async def create(
+        cls, bot: SmartMoneyBot, requester_id: int, *, page_size: int = 5
+    ) -> PaperTradesView:
+        view = cls(bot, requester_id, page_size=page_size)
+        await view.reload()
+        return view
+
+    @property
+    def page_count(self) -> int:
+        return max(1, (self.total + self.page_size - 1) // self.page_size)
+
+    async def reload(self) -> None:
+        self.total = await self.bot.engine.database.paper_trade_count()
+        self.page = min(self.page, self.page_count - 1)
+        self.rows = await self.bot.engine.database.paper_trades_page(
+            limit=self.page_size,
+            offset=self.page * self.page_size,
+        )
+        self.traders = {
+            trader.address: trader.alias
+            for trader in await self.bot.engine.database.list_traders()
+        }
+        self._sync_buttons()
+
+    def _sync_buttons(self) -> None:
+        self.previous_button.disabled = self.page <= 0
+        self.next_button.disabled = self.page >= self.page_count - 1
+        self.page_button.label = f"{self.page + 1}/{self.page_count}"
+
+    def embed(self) -> discord.Embed:
+        embed = discord.Embed(
+            title="PAPER Trade History",
+            description=(
+                f"Showing {len(self.rows)} fills on page {self.page + 1}. "
+                "Use the buttons instead of posting another wall of text."
+            ),
+            color=0x3498DB,
+        )
+        for row in self.rows:
+            name, value = _paper_trade_field(row, self.traders)
+            embed.add_field(name=name, value=value, inline=False)
+        embed.set_footer(text=f"{self.total} total PAPER fills • newest first")
+        return embed
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.requester_id:
+            return True
+        await interaction.response.send_message(
+            "Run `/smartmoney paper-trades` to open your own controls.",
+            ephemeral=True,
+        )
+        return False
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary, row=0)
+    async def previous_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        del button
+        self.page = max(0, self.page - 1)
+        await self.reload()
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    @discord.ui.button(
+        label="1/1", style=discord.ButtonStyle.secondary, disabled=True, row=0
+    )
+    async def page_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        del interaction, button
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary, row=0)
+    async def next_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        del button
+        self.page = min(self.page_count - 1, self.page + 1)
+        await self.reload()
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.primary, row=0)
+    async def refresh_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        del button
+        await self.reload()
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+
+class PaperPositionsView(discord.ui.View):
+    def __init__(
+        self,
+        bot: SmartMoneyBot,
+        requester_id: int,
+        *,
+        can_sell: bool,
+    ) -> None:
+        super().__init__(timeout=900)
+        self.bot = bot
+        self.requester_id = requester_id
+        self.can_sell = can_sell
+        self.index = 0
+        self.positions: list[dict[str, object]] = []
+        self.traders: dict[str, str] = {}
+        self.prices: dict[str, Decimal] = {}
+        self.link_buttons: list[discord.ui.Button] = []
+
+    @classmethod
+    async def create(
+        cls,
+        bot: SmartMoneyBot,
+        requester_id: int,
+        *,
+        can_sell: bool,
+    ) -> PaperPositionsView:
+        view = cls(bot, requester_id, can_sell=can_sell)
+        await view.reload()
+        return view
+
+    @property
+    def current(self) -> dict[str, object]:
+        return self.positions[self.index]
+
+    async def reload(self) -> None:
+        self.positions = await self.bot.engine.database.paper_all_positions()
+        self.index = min(self.index, max(0, len(self.positions) - 1))
+        self.traders = {
+            trader.address: trader.alias
+            for trader in await self.bot.engine.database.list_traders()
+        }
+        mints = sorted(
+            {
+                str(item["token_mint"])
+                for item in self.positions
+                if str(item["token_mint"]) != PAPER_DEMO_MINT
+            }
+        )
+        try:
+            self.prices = await self.bot.engine.market.prices(mints) if mints else {}
+        except JupiterError:
+            self.prices = {}
+        self._sync_buttons()
+
+    def _sync_buttons(self) -> None:
+        total = len(self.positions)
+        self.previous_button.disabled = self.index <= 0
+        self.next_button.disabled = total == 0 or self.index >= total - 1
+        self.page_button.label = f"{self.index + 1 if total else 0}/{total}"
+        self.sell_button.disabled = not self.can_sell or total == 0
+        for button in self.link_buttons:
+            self.remove_item(button)
+        self.link_buttons = []
+        if not total:
+            return
+        mint = str(self.current["token_mint"])
+        if mint == PAPER_DEMO_MINT:
+            return
+        self.link_buttons = [
+            discord.ui.Button(
+                label="Fomo",
+                style=discord.ButtonStyle.link,
+                url=_fomo_coin_url(mint, self.bot.settings.fomo_referral_code),
+                row=1,
+            ),
+            discord.ui.Button(
+                label="Pump.fun",
+                style=discord.ButtonStyle.link,
+                url=f"https://pump.fun/coin/{mint}",
+                row=1,
+            ),
+            discord.ui.Button(
+                label="Jupiter",
+                style=discord.ButtonStyle.link,
+                url=f"https://jup.ag/swap/SOL-{mint}",
+                row=1,
+            ),
+            discord.ui.Button(
+                label="Chart",
+                style=discord.ButtonStyle.link,
+                url=f"https://dexscreener.com/solana/{mint}",
+                row=1,
+            ),
+            discord.ui.Button(
+                label="Solscan",
+                style=discord.ButtonStyle.link,
+                url=f"https://solscan.io/token/{mint}",
+                row=1,
+            ),
+        ]
+        for button in self.link_buttons:
+            self.add_item(button)
+
+    def embed(self) -> discord.Embed:
+        return _position_embed(
+            self.bot,
+            self.current,
+            self.traders,
+            self.prices,
+            index=self.index,
+            total=len(self.positions),
+        )
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.requester_id:
+            return True
+        await interaction.response.send_message(
+            "Run `/smartmoney positions` to open your own controls.",
+            ephemeral=True,
+        )
+        return False
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary, row=0)
+    async def previous_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        del button
+        self.index = max(0, self.index - 1)
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    @discord.ui.button(
+        label="1/1", style=discord.ButtonStyle.secondary, disabled=True, row=0
+    )
+    async def page_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        del interaction, button
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary, row=0)
+    async def next_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        del button
+        self.index = min(len(self.positions) - 1, self.index + 1)
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    @discord.ui.button(label="Refresh prices", style=discord.ButtonStyle.primary, row=0)
+    async def refresh_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        del button
+        await self.reload()
+        if not self.positions:
+            await interaction.response.edit_message(
+                content="No open paper positions.", embed=None, view=None
+            )
+            return
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    @discord.ui.button(
+        label="Sell this PAPER position",
+        style=discord.ButtonStyle.danger,
+        row=2,
+    )
+    async def sell_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        del button
+        position = dict(self.current)
+        mint = str(position["token_mint"])
+        if mint == PAPER_DEMO_MINT:
+            await interaction.response.send_message(
+                "Use `/smartmoney paper-demo` to close the demo position.",
+                ephemeral=True,
+            )
+            return
+        confirmation = PaperSellConfirmationView(self, position)
+        cost = Decimal(str(position["cost_basis_usd"]))
+        embed = discord.Embed(
+            title="Confirm manual PAPER sell",
+            description=(
+                f"Close this full fake position now?\n`{mint}`\n\n"
+                f"Cost basis: **{_money(cost)}**\n"
+                "This does not touch real money. It will convert the current fake lot "
+                "to realized PAPER P&L, and a later source-wallet SELL will be skipped "
+                "because this linked lot is already closed."
+            ),
+            color=0xE67E22,
+        )
+        await interaction.response.edit_message(embed=embed, view=confirmation)
+
+
+class PaperSellConfirmationView(discord.ui.View):
+    def __init__(
+        self,
+        parent: PaperPositionsView,
+        position: dict[str, object],
+    ) -> None:
+        super().__init__(timeout=60)
+        self.parent = parent
+        self.position = position
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await self.parent.interaction_check(interaction)
+
+    @discord.ui.button(
+        label="Confirm PAPER sell",
+        style=discord.ButtonStyle.danger,
+    )
+    async def confirm_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        del button
+        await interaction.response.defer()
+        result = await self.parent.bot.engine.manual_paper_exit(
+            position_kind=str(self.position.get("position_kind") or "STRATEGY"),
+            token_mint=str(self.position["token_mint"]),
+            source_trader=(
+                str(self.position["source_trader"])
+                if self.position.get("source_trader")
+                else None
+            ),
+            requested_by=str(interaction.user),
+        )
+        result_embed = discord.Embed(
+            title=(
+                "Manual PAPER sell filled"
+                if result.success
+                else "Manual PAPER sell not filled"
+            ),
+            description=result.message,
+            color=0x2ECC71 if result.success else 0xE74C3C,
+        )
+        await self.parent.reload()
+        if not self.parent.positions:
+            await interaction.edit_original_response(embed=result_embed, view=None)
+            return
+        await interaction.edit_original_response(
+            embeds=[result_embed, self.parent.embed()],
+            view=self.parent,
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        del button
+        await self.parent.reload()
+        if not self.parent.positions:
+            await interaction.response.edit_message(
+                content="No open paper positions.", embed=None, view=None
+            )
+            return
+        await interaction.response.edit_message(embed=self.parent.embed(), view=self.parent)
 
 
 class SmartMoneyBot(commands.Bot):
@@ -347,6 +836,30 @@ class SmartMoneyBot(commands.Bot):
             )
         await self._send_alert(embed, token_mint=result.token_mint)
 
+    async def on_daily_profit_lock(self, status: PaperDailyLockStatus) -> None:
+        embed = discord.Embed(
+            title="PAPER daily profit lock triggered",
+            description=(
+                "The account reached today's marked-profit target. All open PAPER "
+                "positions are being sold and new PAPER buys are blocked until the "
+                "next local trading day."
+            ),
+            color=0x2ECC71,
+            timestamp=discord.utils.utcnow(),
+        )
+        embed.add_field(name="Marked profit", value=_money(status.marked_pnl_usd))
+        embed.add_field(name="Target", value=_money(status.target_usd))
+        embed.add_field(name="Positions to close", value=str(status.open_positions))
+        embed.add_field(
+            name="Automatic reset",
+            value=f"Next day in `{self.settings.paper_daily_lock_timezone}`",
+            inline=False,
+        )
+        embed.set_footer(
+            text="PAPER only • exit pricing and configured simulated costs still apply"
+        )
+        await self._send_alert(embed, ping_user=True)
+
     async def on_error(self, context: str, error: Exception) -> None:
         logger.error("%s: %s", context, error)
 
@@ -359,14 +872,17 @@ class SmartMoneyCommands(
     def __init__(self, bot: SmartMoneyBot) -> None:
         self.bot = bot
 
+    def _is_admin(self, user: discord.abc.User) -> bool:
+        if not isinstance(user, discord.Member):
+            return False
+        if user.guild_permissions.administrator:
+            return True
+        role_ids = {role.id for role in user.roles}
+        return bool(role_ids & self.bot.settings.discord_admin_role_ids)
+
     async def _require_admin(self, interaction: discord.Interaction) -> bool:
-        user = interaction.user
-        if isinstance(user, discord.Member):
-            if user.guild_permissions.administrator:
-                return True
-            role_ids = {role.id for role in user.roles}
-            if role_ids & self.bot.settings.discord_admin_role_ids:
-                return True
+        if self._is_admin(interaction.user):
+            return True
         await interaction.response.send_message(
             "You need Administrator or a configured bot-admin role for that command.",
             ephemeral=True,
@@ -702,13 +1218,14 @@ class SmartMoneyCommands(
     async def paper(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(thinking=True)
         summary = await self.bot.engine.paper_summary()
+        daily_lock = await self.bot.engine.paper_daily_lock_status()
         closed = summary.wins + summary.losses
         win_rate = Decimal(summary.wins) / Decimal(closed) * 100 if closed else Decimal("0")
         total_pnl = summary.equity_usd - summary.starting_cash_usd
         total_roi = _return_percent(summary.equity_usd, summary.starting_cash_usd)
         daily_progress = (
-            summary.realized_pnl_24h_usd
-            / self.bot.settings.paper_daily_target_usd
+            daily_lock.marked_pnl_usd
+            / daily_lock.target_usd
             * Decimal("100")
         )
         profit_factor = (
@@ -741,11 +1258,20 @@ class SmartMoneyCommands(
             ),
         )
         embed.add_field(
-            name="24H realized / test target",
+            name="Today marked / profit lock",
             value=(
-                f"{_money(summary.realized_pnl_24h_usd)} / "
-                f"{_money(self.bot.settings.paper_daily_target_usd)} "
+                f"{_money(daily_lock.marked_pnl_usd)} / "
+                f"{_money(daily_lock.target_usd)} "
                 f"({daily_progress:+.1f}%)"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Daily entry status",
+            value=(
+                "LOCKED — positions liquidating; no more buys today"
+                if daily_lock.locked
+                else "ARMED — trading continues until the target is reached"
             ),
             inline=False,
         )
@@ -838,102 +1364,46 @@ class SmartMoneyCommands(
 
     @app_commands.command(
         name="paper-trades",
-        description="Show recent automatic paper buys, sells, ROI, and exit reasons.",
+        description="Browse all paper buys, sells, ROI, and exit reasons with page buttons.",
     )
     async def paper_trades(
-        self, interaction: discord.Interaction, limit: int = 10
+        self,
+        interaction: discord.Interaction,
+        page_size: app_commands.Range[int, 1, 5] = 5,
     ) -> None:
-        trades = await self.bot.engine.database.paper_recent_trades(limit)
-        if not trades:
-            await interaction.response.send_message("No paper fills have been recorded yet.")
-            return
-
-        lines: list[str] = []
-        for item in trades:
-            side = str(item["side"])
-            mint = str(item["token_mint"])
-            quantity = Decimal(str(item["quantity"]))
-            price = Decimal(str(item["execution_price_usd"]))
-            gross = Decimal(str(item["gross_value_usd"]))
-            fee = Decimal(str(item["fee_usd"]))
-            kind = str(item["execution_kind"]).replace("_", " ").title()
-            timestamp = int(item["created_at"])
-            if side == Side.SELL.value:
-                realized = Decimal(str(item["realized_pnl_usd"]))
-                matched_cost = (gross - fee) - realized
-                roi = (
-                    realized / matched_cost * Decimal("100")
-                    if matched_cost > 0
-                    else Decimal("0")
-                )
-                reason = item.get("exit_reason")
-                reason_text = f" • {reason}" if reason else ""
-                detail = (
-                    f"P&L `{_money(realized)}` • ROI `{roi:+.2f}%`{reason_text}"
-                )
-            else:
-                detail = f"spent `{_money(gross)}` • fee `{_money(fee)}`"
-            if bool(item.get("quote_based")):
-                router = str(item.get("quote_router") or "unknown")
-                impact = Decimal(str(item.get("price_impact_percent") or 0))
-                drift_raw = item.get("price_drift_percent")
-                drift_text = (
-                    f" • drift `{Decimal(str(drift_raw)):+.2f}%`"
-                    if drift_raw is not None
-                    else ""
-                )
-                detail += (
-                    f" • quote `{router}` • impact `{impact:.2f}%`{drift_text}"
-                )
-            lines.append(
-                f"**{side} • {kind}** • `{_short(mint)}` • <t:{timestamp}:R>\n"
-                f"qty `{quantity:.6f}` @ `{_price(price)}` • {detail}"
+        view = await PaperTradesView.create(
+            self.bot,
+            interaction.user.id,
+            page_size=page_size,
+        )
+        if not view.rows:
+            await interaction.response.send_message(
+                "No paper fills have been recorded yet.", ephemeral=True
             )
-        await interaction.response.send_message("\n\n".join(lines)[:2000])
+            return
+        await interaction.response.send_message(
+            embed=view.embed(),
+            view=view,
+            ephemeral=True,
+        )
 
     @app_commands.command(name="positions", description="Show open paper positions.")
     async def positions(self, interaction: discord.Interaction) -> None:
-        positions = await self.bot.engine.database.paper_all_positions()
-        if not positions:
-            await interaction.response.send_message("No open paper positions.")
-            return
-        traders = {
-            trader.address: trader.alias
-            for trader in await self.bot.engine.database.list_traders()
-        }
-        real_mints = sorted(
-            {
-                str(item["token_mint"])
-                for item in positions
-                if str(item["token_mint"]) != PAPER_DEMO_MINT
-            }
+        view = await PaperPositionsView.create(
+            self.bot,
+            interaction.user.id,
+            can_sell=self._is_admin(interaction.user),
         )
-        try:
-            prices = await self.bot.engine.market.prices(real_mints) if real_mints else {}
-        except JupiterError:
-            prices = {}
-        lines: list[str] = []
-        for item in positions[:20]:
-            mint = str(item["token_mint"])
-            quantity = Decimal(str(item["quantity"]))
-            cost = Decimal(str(item["cost_basis_usd"]))
-            entry = Decimal(str(item["average_entry_usd"]))
-            price = PAPER_DEMO_ENTRY_PRICE if mint == PAPER_DEMO_MINT else prices.get(mint, entry)
-            value = quantity * price
-            pnl = value - cost
-            roi = _return_percent(value, cost)
-            if mint == PAPER_DEMO_MINT:
-                label = "Paper Demo (fake token)"
-            elif item.get("position_kind") == "RAW_MIRROR":
-                source = str(item.get("source_trader") or "unknown")
-                label = f"Raw mirror • {traders.get(source, _short(source))} • {_short(mint)}"
-            else:
-                label = _short(mint)
-            lines.append(
-                f"• **{label}** — qty `{quantity:.6f}` • value `{_money(value)}`\n"
-                f"  cost `{_money(cost)}` • P&L `{_money(pnl)}` • ROI `{roi:+.2f}%`"
+        if not view.positions:
+            await interaction.response.send_message(
+                "No open paper positions.", ephemeral=True
             )
-        await interaction.response.send_message("\n".join(lines))
+            return
+        await interaction.response.send_message(
+            embed=view.embed(),
+            view=view,
+            ephemeral=True,
+        )
 
     @app_commands.command(
         name="paper-demo",
@@ -1139,6 +1609,8 @@ class SmartMoneyCommands(
         await interaction.response.defer(thinking=True, ephemeral=True)
         status = await self.bot.engine.status()
         s = self.bot.settings
+        daily_lock = status["paper_daily_profit_lock"]
+        assert isinstance(daily_lock, PaperDailyLockStatus)
         last_scan = (
             f"<t:{status['last_scan']}:R>" if status["last_scan"] else "not completed yet"
         )
@@ -1203,6 +1675,13 @@ class SmartMoneyCommands(
             f"**Mode:** {status['mode']}\n"
             f"**Paper auto-copy:** {paper_copy}\n"
             f"**Paper fill policy:** {fill_policy}\n"
+            f"**Daily PAPER profit lock:** "
+            f"{'LOCKED' if daily_lock.locked else 'armed'} • "
+            f"{_money(daily_lock.marked_pnl_usd)} / "
+            f"{_money(daily_lock.target_usd)} • "
+            f"{s.paper_daily_lock_timezone} • "
+            f"check every {s.paper_daily_profit_check_seconds}s\n"
+            f"**Daily-lock open positions:** {daily_lock.open_positions}\n"
             f"**Paper entry price:** {paper_entry}\n"
             f"**Observation penalty:** {s.paper_observation_penalty_bps}bps/side\n"
             f"**Pump PAPER fallback:** "
@@ -1217,6 +1696,8 @@ class SmartMoneyCommands(
             f"{'ready' if self.bot.settings.discord_alert_user_id else 'user ID not set'}\n"
             f"**Paused:** {status['paused']}\n"
             f"**Tracked wallets:** {status['wallets']}\n"
+            f"**Exit-only wallets:** {status['exit_only_wallets']} "
+            "(kept subscribed until linked PAPER lots close)\n"
             f"**Automatic discovery:** "
             f"{'ready' if status['discovery_configured'] else 'API key needed'}\n"
             f"**Discovered wallets:** {status['discovered_wallets']}\n"
@@ -1297,6 +1778,11 @@ class SmartMoneyCommands(
             f"**RPC scanning:** every {s.poll_interval_seconds}s • "
             f"{s.rpc_requests_per_second} requests/second maximum\n"
             f"**Copy size:** {_money(s.default_copy_usd)} (max {_money(s.max_copy_usd)})\n"
+            f"**Daily profit lock:** "
+            f"{'enabled' if s.paper_daily_profit_lock_enabled else 'disabled'} • "
+            f"close all at +{_money(s.paper_daily_target_usd)} marked P&L • "
+            f"check every {s.paper_daily_profit_check_seconds}s • "
+            f"reset {s.paper_daily_lock_timezone}\n"
             f"**Daily stop:** -{_money(s.max_daily_loss_usd)}\n"
             f"**Minimum liquidity:** {_money(s.min_token_liquidity_usd)}\n"
             f"**Max positions:** {s.max_open_positions}\n"
