@@ -64,6 +64,12 @@ class Settings:
     discovery_max_single_token_percent: Decimal
     discovery_include_kols: bool
     discovery_kol_limit: int
+    pump_profile_discovery_enabled: bool
+    pump_profile_pages: int
+    pump_profile_min_followers: int
+    pump_profile_limit: int
+    pump_profile_max_page_fetches: int
+    pump_profile_refresh_seconds: int
     discovery_min_7d_pnl_usd: Decimal
     discovery_min_7d_win_rate_percent: Decimal
     discovery_min_7d_roi_percent: Decimal
@@ -104,6 +110,14 @@ class Settings:
     paper_raw_entry_filter_enabled: bool
     paper_force_observation_mode: bool
     paper_observation_penalty_bps: int
+    paper_sniper_test_enabled: bool
+    paper_sniper_copy_usd: Decimal
+    paper_sniper_min_liquidity_usd: Decimal
+    paper_sniper_min_holders: int
+    paper_sniper_max_top_holders_percent: Decimal
+    paper_sniper_source_penalty_bps: int
+    paper_sniper_max_entry_drift_percent: Decimal
+    paper_sniper_max_quote_price_impact_percent: Decimal
     paper_daily_target_usd: Decimal
     paper_daily_profit_lock_enabled: bool
     paper_daily_lock_timezone: str
@@ -187,6 +201,18 @@ class Settings:
             ),
             discovery_include_kols=_bool("DISCOVERY_INCLUDE_KOLS", True),
             discovery_kol_limit=_int("DISCOVERY_KOL_LIMIT", 100),
+            pump_profile_discovery_enabled=_bool(
+                "PUMP_PROFILE_DISCOVERY_ENABLED", True
+            ),
+            pump_profile_pages=_int("PUMP_PROFILE_PAGES", 1),
+            pump_profile_min_followers=_int("PUMP_PROFILE_MIN_FOLLOWERS", 1000),
+            pump_profile_limit=_int("PUMP_PROFILE_LIMIT", 50),
+            pump_profile_max_page_fetches=_int(
+                "PUMP_PROFILE_MAX_PAGE_FETCHES", 25
+            ),
+            pump_profile_refresh_seconds=_int(
+                "PUMP_PROFILE_REFRESH_SECONDS", 21600
+            ),
             discovery_min_7d_pnl_usd=_decimal("DISCOVERY_MIN_7D_PNL_USD", "300"),
             discovery_min_7d_win_rate_percent=_decimal(
                 "DISCOVERY_MIN_7D_WIN_RATE_PERCENT", "55"
@@ -246,6 +272,24 @@ class Settings:
             ),
             paper_observation_penalty_bps=_int(
                 "PAPER_OBSERVATION_PENALTY_BPS", 300
+            ),
+            paper_sniper_test_enabled=_bool("PAPER_SNIPER_TEST_ENABLED", False),
+            paper_sniper_copy_usd=_decimal("PAPER_SNIPER_COPY_USD", "2"),
+            paper_sniper_min_liquidity_usd=_decimal(
+                "PAPER_SNIPER_MIN_LIQUIDITY_USD", "2000"
+            ),
+            paper_sniper_min_holders=_int("PAPER_SNIPER_MIN_HOLDERS", 20),
+            paper_sniper_max_top_holders_percent=_decimal(
+                "PAPER_SNIPER_MAX_TOP_HOLDERS_PERCENT", "85"
+            ),
+            paper_sniper_source_penalty_bps=_int(
+                "PAPER_SNIPER_SOURCE_PENALTY_BPS", 500
+            ),
+            paper_sniper_max_entry_drift_percent=_decimal(
+                "PAPER_SNIPER_MAX_ENTRY_DRIFT_PERCENT", "20"
+            ),
+            paper_sniper_max_quote_price_impact_percent=_decimal(
+                "PAPER_SNIPER_MAX_QUOTE_PRICE_IMPACT_PERCENT", "5"
             ),
             paper_daily_target_usd=_decimal("PAPER_DAILY_TARGET_USD", "100"),
             paper_daily_profit_lock_enabled=_bool(
@@ -389,6 +433,18 @@ class Settings:
             raise ValueError("DISCOVERY_MAX_SINGLE_TOKEN_PERCENT must be between 1 and 100")
         if not 1 <= self.discovery_kol_limit <= 100:
             raise ValueError("DISCOVERY_KOL_LIMIT must be between 1 and 100")
+        if not 1 <= self.pump_profile_pages <= 10:
+            raise ValueError("PUMP_PROFILE_PAGES must be between 1 and 10")
+        if self.pump_profile_min_followers < 0:
+            raise ValueError("PUMP_PROFILE_MIN_FOLLOWERS cannot be negative")
+        if not 1 <= self.pump_profile_limit <= 500:
+            raise ValueError("PUMP_PROFILE_LIMIT must be between 1 and 500")
+        if not 0 <= self.pump_profile_max_page_fetches <= 100:
+            raise ValueError(
+                "PUMP_PROFILE_MAX_PAGE_FETCHES must be between 0 and 100"
+            )
+        if self.pump_profile_refresh_seconds < 3600:
+            raise ValueError("PUMP_PROFILE_REFRESH_SECONDS must be at least 3600")
         if self.discovery_min_7d_pnl_usd < 0:
             raise ValueError("DISCOVERY_MIN_7D_PNL_USD cannot be negative")
         if not 0 <= self.discovery_min_7d_win_rate_percent <= 100:
@@ -442,6 +498,30 @@ class Settings:
         if not 0 <= self.paper_observation_penalty_bps <= 10_000:
             raise ValueError(
                 "PAPER_OBSERVATION_PENALTY_BPS must be between 0 and 10000"
+            )
+        if self.paper_sniper_copy_usd <= 0:
+            raise ValueError("PAPER_SNIPER_COPY_USD must be positive")
+        if self.paper_sniper_copy_usd > self.max_copy_usd:
+            raise ValueError("PAPER_SNIPER_COPY_USD cannot exceed MAX_COPY_USD")
+        if self.paper_sniper_min_liquidity_usd < 0:
+            raise ValueError("PAPER_SNIPER_MIN_LIQUIDITY_USD cannot be negative")
+        if self.paper_sniper_min_holders < 1:
+            raise ValueError("PAPER_SNIPER_MIN_HOLDERS must be at least 1")
+        if not 1 <= self.paper_sniper_max_top_holders_percent <= 100:
+            raise ValueError(
+                "PAPER_SNIPER_MAX_TOP_HOLDERS_PERCENT must be between 1 and 100"
+            )
+        if not 0 <= self.paper_sniper_source_penalty_bps <= 10_000:
+            raise ValueError(
+                "PAPER_SNIPER_SOURCE_PENALTY_BPS must be between 0 and 10000"
+            )
+        if self.paper_sniper_max_entry_drift_percent < 0:
+            raise ValueError(
+                "PAPER_SNIPER_MAX_ENTRY_DRIFT_PERCENT cannot be negative"
+            )
+        if self.paper_sniper_max_quote_price_impact_percent <= 0:
+            raise ValueError(
+                "PAPER_SNIPER_MAX_QUOTE_PRICE_IMPACT_PERCENT must be positive"
             )
         if self.stop_loss_percent <= 0 or self.take_profit_percent <= 0:
             raise ValueError("Stop-loss and take-profit percentages must be positive")

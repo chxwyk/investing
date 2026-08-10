@@ -167,6 +167,30 @@ def test_v211_observation_and_low_latency_stream_defaults(monkeypatch) -> None:
     assert settings.realtime_stream_commitment == "processed"
 
 
+def test_v216_public_profile_nominations_default_to_slow_fail_closed_mode(
+    monkeypatch,
+) -> None:
+    names = (
+        "PUMP_PROFILE_DISCOVERY_ENABLED",
+        "PUMP_PROFILE_PAGES",
+        "PUMP_PROFILE_MIN_FOLLOWERS",
+        "PUMP_PROFILE_LIMIT",
+        "PUMP_PROFILE_MAX_PAGE_FETCHES",
+        "PUMP_PROFILE_REFRESH_SECONDS",
+    )
+    for name in names:
+        monkeypatch.delenv(name, raising=False)
+
+    settings = Settings.from_env(require_discord_token=False)
+
+    assert settings.pump_profile_discovery_enabled is True
+    assert settings.pump_profile_pages == 1
+    assert settings.pump_profile_min_followers == 1000
+    assert settings.pump_profile_limit == 50
+    assert settings.pump_profile_max_page_fetches == 25
+    assert settings.pump_profile_refresh_seconds == 21600
+
+
 def test_pump_source_price_fallback_defaults_to_conservative_paper_only_mode(
     monkeypatch,
 ) -> None:

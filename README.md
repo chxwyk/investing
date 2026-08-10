@@ -24,11 +24,10 @@ unless four separate controls are deliberately configured.
 
 - Pulls rolling 1-day and 7-day general-trader and public-KOL leaderboards with public wallet
   addresses.
-- Requires independent positive PnL evidence in both windows. General-feed rows must also
-  pass ROI, win-rate, trade-count, and token-diversity thresholds. The documented public-KOL
-  period feed omits those period metrics, so KOL rows must instead show repeat trading days
-  and then pass the same recent Pump and forward-PAPER checks; missing metrics are displayed
-  as unavailable and are never invented as zero.
+- Requires independent positive PnL evidence in both windows. Active rows must also pass
+  ROI, win-rate, trade-count, and token-diversity thresholds. The documented public-KOL
+  period feed can omit those metrics, so incomplete KOL rows are nomination-only and cannot
+  enter the automatically copied hot set until a complete authorized response verifies them.
 - Excludes arbitrage wallets, suspicious identity tags, hyperactive bot-like wallets, and
   one-token wonders through provider filters and local checks.
 - Builds a pool of up to 100 strict candidates and rechecks recent on-chain activity every
@@ -127,6 +126,21 @@ ENABLE_LIVE_TRADING=false
 When the observation ledger has enough trades, disable forced observation and run the separate
 quote-shadow readiness trial below. Do not treat forced-observation P&L as expected live P&L.
 
+### Low-liquidity sniper PAPER lane
+
+`PAPER_SNIPER_TEST_ENABLED=true` adds a smaller, isolated PAPER lane for Pump launch tokens
+that fail the normal entry guard only because of launch-stage liquidity, holder count,
+organic score, or concentration. It does **not** disable suspicious-token, mint-authority,
+freeze-authority, stale-signal, daily-loss, position-count, or account-capacity checks. The
+default simulated size is `$2`, with absolute floors of `$2,000` liquidity and `20` holders.
+
+When Jupiter can quote the token, this lane permits at most `20%` entry drift and `5%` price
+impact. When a Pump bonding-curve token has no executable route, it uses the detected source
+price with a `500bps` adverse penalty. Both kinds are labeled `SNIPER_*` and excluded from
+live-readiness evidence. This produces more launch-stage outcomes without pretending that an
+unroutable paper fill was a real fill. A source SELL after a skipped BUY still cannot create a
+sale: the bot cannot sell fake inventory it never bought.
+
 With `PAPER_USE_EXECUTABLE_QUOTES=true`, the paper fill requests Jupiter's quote-only
 `GET /swap/v2/order` route for the exact configured size. It compares that route price with
 the tracked wallet's transaction price. A buy is skipped when adverse entry drift exceeds
@@ -159,7 +173,7 @@ sell can also show `SKIPPED` if its matching buy happened before raw mirroring w
 A new detected buy must occur first. Set `PAPER_MIRROR_RAW_SWAPS=false` to restore the older
 consensus-only paper behavior.
 
-The v2.13.0 discovery, observation, quote, fallback, rotation, and exit controls are
+The v2.16.0 discovery, social nomination, observation, sniper, quote, fallback, rotation, and exit controls are
 intentionally configurable:
 
 ```text
@@ -169,6 +183,14 @@ PAPER_PUMP_SOURCE_FALLBACK_BPS=300
 PAPER_RAW_ENTRY_FILTER_ENABLED=true
 PAPER_FORCE_OBSERVATION_MODE=false
 PAPER_OBSERVATION_PENALTY_BPS=300
+PAPER_SNIPER_TEST_ENABLED=false
+PAPER_SNIPER_COPY_USD=2
+PAPER_SNIPER_MIN_LIQUIDITY_USD=2000
+PAPER_SNIPER_MIN_HOLDERS=20
+PAPER_SNIPER_MAX_TOP_HOLDERS_PERCENT=85
+PAPER_SNIPER_SOURCE_PENALTY_BPS=500
+PAPER_SNIPER_MAX_ENTRY_DRIFT_PERCENT=20
+PAPER_SNIPER_MAX_QUOTE_PRICE_IMPACT_PERCENT=5
 PAPER_DAILY_TARGET_USD=100
 PAPER_DAILY_PROFIT_LOCK_ENABLED=true
 PAPER_DAILY_LOCK_TIMEZONE=America/Los_Angeles
@@ -273,6 +295,12 @@ DISCOVERY_MIN_CLOSED_TOKENS=2
 DISCOVERY_MAX_SINGLE_TOKEN_PERCENT=70
 DISCOVERY_INCLUDE_KOLS=true
 DISCOVERY_KOL_LIMIT=100
+PUMP_PROFILE_DISCOVERY_ENABLED=true
+PUMP_PROFILE_PAGES=1
+PUMP_PROFILE_MIN_FOLLOWERS=1000
+PUMP_PROFILE_LIMIT=50
+PUMP_PROFILE_MAX_PAGE_FETCHES=25
+PUMP_PROFILE_REFRESH_SECONDS=21600
 DISCOVERY_MIN_7D_PNL_USD=300
 DISCOVERY_MIN_7D_WIN_RATE_PERCENT=55
 DISCOVERY_MIN_7D_ROI_PERCENT=5
@@ -295,8 +323,25 @@ The bot calls Solana Tracker's documented `GET /v2/pnl/leaderboard/top` endpoint
 `GET /v2/pnl/leaderboard/kols/period` endpoint with `period=1d` and `period=7d`. General-feed
 requests use strict PnL mode, arbitrage exclusion, concentration filtering, and cursor
 pagination. The public-KOL period response only guarantees PnL, volume, and trading days;
-v2.10.1 no longer misreads its missing ROI/win/trade fields as zero. A KOL identity never
-bypasses dual-window PnL, repeat-day, on-chain Pump, or forward-PAPER checks. The runtime
+incomplete KOL rows remain nomination-only and are never rendered as verified wallets. A KOL
+identity never bypasses dual-window PnL, ROI, win rate, trade-count, repeat-day, on-chain Pump,
+or forward-PAPER checks.
+
+The optional Pump social source reads Pump's official public profiles pages at a slow six-hour
+cadence, resolves only publicly exposed Solana wallet identities, and records follower counts as
+nomination evidence. Follower count never increases a wallet's financial score and cannot create
+a tracked wallet. The wallet must independently appear with complete qualifying fields in both
+the strict 24H and 7D feeds before it can proceed to recent Pump-activity verification. If Pump's
+public HTML changes or blocks the request, the financial discovery engine keeps working and the
+social source reports zero/newest error instead of trusting an unverified profile.
+
+Fomo's official product exposes in-app leaderboards, profiles, follows, and alerts, but this
+release does not claim access to an undocumented/private Fomo API. A Fomo identity can enter the
+same verifier only after Fomo supplies a documented official feed/webhook or the profile exposes
+a legitimate public wallet identity. The bot does not scrape authenticated pages or replay app
+credentials.
+
+The runtime
 automatically clamps full multi-page refreshes to at least three
 hours for 24H data and twelve hours for 7D data. Every five minutes the cached pool is checked
 against recent on-chain swaps. Existing manually added wallets are never removed by automatic

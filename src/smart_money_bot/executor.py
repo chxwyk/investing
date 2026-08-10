@@ -19,6 +19,7 @@ from .models import (
     TokenInfo,
     TrackedTrader,
 )
+from .rotation import is_pump_mint
 
 
 class ExecutionManager:
@@ -112,6 +113,7 @@ class ExecutionManager:
         token_info: TokenInfo | None = None,
         pump_source_fallback: bool = False,
         observation_mode: bool = False,
+        sniper_mode: bool = False,
     ) -> ExecutionResult:
         if (
             self.settings.paper_use_executable_quotes
@@ -124,9 +126,39 @@ class ExecutionManager:
                 market_price_usd=market_price_usd,
                 size_usd=size_usd,
                 token_info=token_info,
+                execution_kind="SNIPER_QUOTE" if sniper_mode else "RAW_MIRROR",
+                readiness_tracking=not sniper_mode,
+                max_entry_drift_percent=(
+                    self.settings.paper_sniper_max_entry_drift_percent
+                    if sniper_mode
+                    else None
+                ),
+                max_price_impact_percent=(
+                    self.settings.paper_sniper_max_quote_price_impact_percent
+                    if sniper_mode
+                    else None
+                ),
             )
-            await self._log(None, result)
-            return result
+            if (
+                sniper_mode
+                and not result.success
+                and result.message.startswith("Skipped: quote unavailable")
+                and is_pump_mint(swap.token_mint)
+                and swap.token_price_usd is not None
+                and swap.token_price_usd > 0
+            ):
+                penalty = Decimal(
+                    self.settings.paper_sniper_source_penalty_bps
+                ) / Decimal(10_000)
+                market_price_usd = (
+                    swap.token_price_usd * (Decimal("1") + penalty)
+                    if swap.side is Side.BUY
+                    else swap.token_price_usd * (Decimal("1") - penalty)
+                )
+                pump_source_fallback = True
+            else:
+                await self._log(None, result)
+                return result
 
         fill = await self.database.paper_mirror_execute(
             trader_address=trader.address,
@@ -145,22 +177,28 @@ class ExecutionManager:
                 "FORCED_OBSERVATION"
                 if observation_mode
                 else (
-                    "PUMP_SOURCE_FALLBACK"
-                    if pump_source_fallback
-                    else "RAW_MIRROR"
+                    (
+                        "SNIPER_SOURCE_FALLBACK"
+                        if pump_source_fallback
+                        else "SNIPER_PAPER"
+                    )
+                    if sniper_mode
+                    else (
+                        "PUMP_SOURCE_FALLBACK"
+                        if pump_source_fallback
+                        else "RAW_MIRROR"
+                    )
                 )
             ),
             source_price_usd=swap.token_price_usd,
         )
         if fill is None:
-            message = (
-                "Skipped: no paper cash or raw-lot capacity remains for this buy"
-                if swap.side is Side.BUY
-                else (
-                    "Skipped: no open paper lot remains for this tracked wallet. "
-                    "It may already have been closed by an automatic paper risk guard."
+            if swap.side is Side.BUY:
+                message = "Skipped: no paper cash or raw-lot capacity remains for this buy"
+            else:
+                message = await self._unmatched_sell_message(
+                    trader.address, swap.token_mint
                 )
-            )
             result = ExecutionResult(
                 success=False,
                 mode=ExecutionMode.PAPER,
@@ -179,9 +217,22 @@ class ExecutionManager:
                 else ""
             )
             fallback_note = (
-                f" Pump PAPER fallback used the detected on-chain price with a "
-                f"{self.settings.paper_pump_source_fallback_bps}bps adverse penalty; "
-                "this simulated fill is not proof that a live Jupiter order was executable."
+                (
+                    (
+                        f" Sniper PAPER used the detected on-chain price with a "
+                        f"{self.settings.paper_sniper_source_penalty_bps}bps adverse "
+                        "penalty; "
+                    )
+                    if pump_source_fallback
+                    else " Sniper PAPER used the launch-stage test lane; "
+                )
+                + "this simulation is excluded from live-readiness evidence."
+                if sniper_mode
+                else (
+                    f" Pump PAPER fallback used the detected on-chain price with a "
+                    f"{self.settings.paper_pump_source_fallback_bps}bps adverse penalty; "
+                    "this simulated fill is not proof that a live Jupiter order was executable."
+                )
                 if pump_source_fallback
                 else ""
             )
@@ -192,7 +243,8 @@ class ExecutionManager:
                 side=swap.side,
                 size_usd=size_usd,
                 message=(
-                    f"Raw mirror of {trader.alias}: bought {fill['quantity']:.6f} paper "
+                    f"{'Sniper PAPER' if sniper_mode else 'Raw mirror'} of "
+                    f"{trader.alias}: bought {fill['quantity']:.6f} paper "
                     f"tokens at ${fill['price']:.8f}; fee ${fill['fee']:.4f}. "
                     f"This fake lot is linked to that source wallet.{observation_note}"
                     f"{fallback_note}"
@@ -208,9 +260,22 @@ class ExecutionManager:
                 else ""
             )
             fallback_note = (
-                f" Pump PAPER fallback used the detected on-chain price with a "
-                f"{self.settings.paper_pump_source_fallback_bps}bps adverse penalty; "
-                "this exit does not count as live-executable quote evidence."
+                (
+                    (
+                        f" Sniper PAPER used the detected on-chain price with a "
+                        f"{self.settings.paper_sniper_source_penalty_bps}bps adverse "
+                        "penalty; "
+                    )
+                    if pump_source_fallback
+                    else " Sniper PAPER used the launch-stage test lane; "
+                )
+                + "this exit is excluded from live-readiness evidence."
+                if sniper_mode
+                else (
+                    f" Pump PAPER fallback used the detected on-chain price with a "
+                    f"{self.settings.paper_pump_source_fallback_bps}bps adverse penalty; "
+                    "this exit does not count as live-executable quote evidence."
+                )
                 if pump_source_fallback
                 else ""
             )
@@ -221,7 +286,8 @@ class ExecutionManager:
                 side=swap.side,
                 size_usd=size_usd,
                 message=(
-                    f"Raw mirror of {trader.alias}: sold {sold_percent:.1f}% of that "
+                    f"{'Sniper PAPER' if sniper_mode else 'Raw mirror'} of "
+                    f"{trader.alias}: sold {sold_percent:.1f}% of that "
                     f"wallet's linked paper lot at ${fill['price']:.8f}; fee "
                     f"${fill['fee']:.4f}; realized P&L ${fill['realized_pnl']:.2f}."
                     f"{observation_note}{fallback_note}"
@@ -241,6 +307,8 @@ class ExecutionManager:
         execution_kind: str = "RAW_MIRROR",
         exit_reason: str | None = None,
         readiness_tracking: bool = True,
+        max_entry_drift_percent: Decimal | None = None,
+        max_price_impact_percent: Decimal | None = None,
     ) -> ExecutionResult:
         """Shadow a raw swap using a quote-only Jupiter Swap V2 order."""
 
@@ -296,8 +364,11 @@ class ExecutionManager:
                 return self._paper_skip(
                     swap,
                     size_usd,
-                    "no open paper lot remains for this tracked wallet; "
-                    "a risk guard may have closed it",
+                    (
+                        await self._unmatched_sell_message(
+                            trader.address, swap.token_mint, include_prefix=False
+                        )
+                    ),
                 )
             raw_decimals = preview["token_decimals"]
             if raw_decimals is None:
@@ -350,6 +421,16 @@ class ExecutionManager:
             Decimal(self.settings.paper_quote_output_buffer_bps) / Decimal(10_000)
         )
         price_impact = quote.price_impact_percent
+        entry_drift_limit = (
+            max_entry_drift_percent
+            if max_entry_drift_percent is not None
+            else self.settings.max_adverse_entry_drift_percent
+        )
+        price_impact_limit = (
+            max_price_impact_percent
+            if max_price_impact_percent is not None
+            else self.settings.max_quote_price_impact_percent
+        )
 
         if swap.side is Side.BUY:
             quote_price = amount_usd / quote.output_amount
@@ -357,15 +438,15 @@ class ExecutionManager:
                 (quote_price / swap.token_price_usd) - Decimal("1")
             ) * Decimal("100")
             blocker: str | None = None
-            if drift > self.settings.max_adverse_entry_drift_percent:
+            if drift > entry_drift_limit:
                 blocker = (
                     f"entry drift +{drift:.2f}% exceeds the "
-                    f"{self.settings.max_adverse_entry_drift_percent:.2f}% chase limit"
+                    f"{entry_drift_limit:.2f}% chase limit"
                 )
-            elif price_impact > self.settings.max_quote_price_impact_percent:
+            elif price_impact > price_impact_limit:
                 blocker = (
                     f"Jupiter price impact {price_impact:.2f}% exceeds "
-                    f"{self.settings.max_quote_price_impact_percent:.2f}%"
+                    f"{price_impact_limit:.2f}%"
                 )
             elif quote.observed_latency_ms > self.settings.max_quote_latency_ms:
                 blocker = (
@@ -445,6 +526,11 @@ class ExecutionManager:
                 "paper lot changed before the quoted fill could be recorded",
             )
         if swap.side is Side.BUY:
+            label = (
+                "Sniper quote-shadow BUY"
+                if execution_kind.startswith("SNIPER_")
+                else "Quote-shadow BUY"
+            )
             return ExecutionResult(
                 success=True,
                 mode=ExecutionMode.PAPER,
@@ -452,7 +538,7 @@ class ExecutionManager:
                 side=swap.side,
                 size_usd=amount_usd,
                 message=(
-                    f"Quote-shadow BUY of {trader.alias}: {fill['quantity']:.6f} paper "
+                    f"{label} of {trader.alias}: {fill['quantity']:.6f} paper "
                     f"tokens at ${fill['price']:.8f}. Jupiter {quote.router}; drift "
                     f"{drift:+.2f}%; impact {price_impact:.2f}%; "
                     f"{quote.observed_latency_ms}ms. The "
@@ -462,10 +548,12 @@ class ExecutionManager:
             )
 
         sold_percent = fill["source_fraction"] * Decimal("100")
-        if execution_kind == "RISK_EXIT":
+        if execution_kind.endswith("RISK_EXIT"):
             prefix = "Automatic quote-shadow risk exit"
         elif execution_kind.startswith("MANUAL"):
             prefix = "Manual PAPER quote exit"
+        elif execution_kind.startswith("SNIPER_"):
+            prefix = f"Sniper quote-shadow SELL of {trader.alias}"
         else:
             prefix = f"Quote-shadow SELL of {trader.alias}"
         reason_text = f": {exit_reason}" if exit_reason else ""
@@ -515,6 +603,28 @@ class ExecutionManager:
             size_usd=size_usd,
             message=f"Skipped: {reason}",
         )
+
+    async def _unmatched_sell_message(
+        self,
+        trader_address: str,
+        token_mint: str,
+        *,
+        include_prefix: bool = True,
+    ) -> str:
+        latest = await self.database.paper_mirror_latest_event(
+            trader_address, token_mint
+        )
+        if latest is None:
+            reason = (
+                "no open paper lot exists because no earlier BUY for this wallet/token "
+                "was filled; the entry was likely skipped"
+            )
+        elif str(latest["side"]) == Side.SELL.value:
+            exit_reason = str(latest.get("exit_reason") or "a prior source SELL")
+            reason = f"the paper lot was already closed by {exit_reason}"
+        else:
+            reason = "no open paper lot remains; it was closed after the latest recorded BUY"
+        return f"Skipped: {reason}" if include_prefix else reason
 
     async def _quote_failure(
         self,
@@ -687,6 +797,10 @@ class ExecutionManager:
         trader_address = str(position["trader_address"])
         token_mint = str(position["token_mint"])
         cost_basis = Decimal(str(position["cost_basis_usd"]))
+        sniper_lot = await self.database.paper_mirror_open_lot_is_sniper(
+            trader_address, token_mint
+        )
+        execution_kind = "SNIPER_RISK_EXIT" if sniper_lot else "RISK_EXIT"
         if self.settings.paper_use_executable_quotes:
             swap = DetectedSwap(
                 signature=f"paper-risk-{time.time_ns()}",
@@ -709,8 +823,9 @@ class ExecutionManager:
                 market_price_usd=market_price_usd,
                 size_usd=cost_basis,
                 token_info=None,
-                execution_kind="RISK_EXIT",
+                execution_kind=execution_kind,
                 exit_reason=reason,
+                readiness_tracking=not sniper_lot,
             )
             await self._log(None, result)
             return result
@@ -725,7 +840,7 @@ class ExecutionManager:
             size_usd=cost_basis,
             fee_bps=self.settings.simulated_fee_bps,
             slippage_bps=self.settings.simulated_slippage_bps,
-            execution_kind="RISK_EXIT",
+            execution_kind=execution_kind,
             exit_reason=reason,
         )
         if fill is None:

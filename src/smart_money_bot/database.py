@@ -1702,6 +1702,41 @@ class Database:
         )
         return await cursor.fetchone() is not None
 
+    async def paper_mirror_open_lot_is_sniper(
+        self, trader_address: str, token_mint: str
+    ) -> bool:
+        """Return whether the newest buy contributing to an open lot used sniper PAPER."""
+
+        if not await self.has_paper_mirror_position(trader_address, token_mint):
+            return False
+        cursor = await self.db.execute(
+            """
+            SELECT execution_kind FROM paper_trades
+            WHERE source_trader = ? AND token_mint = ? AND side = 'BUY'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (trader_address, token_mint),
+        )
+        row = await cursor.fetchone()
+        return bool(row and str(row["execution_kind"]).startswith("SNIPER_"))
+
+    async def paper_mirror_latest_event(
+        self, trader_address: str, token_mint: str
+    ) -> dict[str, Any] | None:
+        """Return the latest filled paper event for clearer unmatched-sell messages."""
+
+        cursor = await self.db.execute(
+            """
+            SELECT side, execution_kind, exit_reason, realized_pnl_usd, created_at
+            FROM paper_trades
+            WHERE source_trader = ? AND token_mint = ?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (trader_address, token_mint),
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
     async def paper_mirror_buy_capacity(
         self,
         trader_address: str,

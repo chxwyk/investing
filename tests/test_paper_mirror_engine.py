@@ -416,6 +416,103 @@ async def test_raw_paper_entry_filter_blocks_suspicious_token(settings) -> None:
 
 
 @pytest.mark.asyncio
+async def test_sniper_paper_lane_takes_small_low_liquidity_pump_position(
+    settings,
+) -> None:
+    sniper = replace(
+        settings,
+        paper_sniper_test_enabled=True,
+        paper_sniper_copy_usd=Decimal("2"),
+    )
+    notifier = CaptureNotifier()
+    engine = SmartMoneyEngine(sniper, notifier=notifier)
+    await engine.initialize()
+    pump_mint = "A5G8K3qLzTKhmRL7nRTzG1f8eLTjSfY2uHEdpbt1pump"
+    try:
+        engine.market.price = AsyncMock(return_value=Decimal("1"))
+        engine.market.token_info = AsyncMock(
+            return_value=TokenInfo(
+                mint=pump_mint,
+                liquidity_usd=Decimal("5000"),
+                holder_count=25,
+                organic_score=Decimal("0"),
+                top_holders_percent=Decimal("80"),
+                mint_authority_disabled=True,
+                freeze_authority_disabled=True,
+            )
+        )
+        trader = TrackedTrader(address="wallet-a", alias="Auto wallet-a")
+        await engine.database.add_trader(trader.address, trader.alias)
+
+        await engine._handle_new_swap(
+            _swap(Side.BUY, "sniper-buy", "1", mint=pump_mint), trader
+        )
+
+        assert notifier.executions[-1].success is True
+        assert "Sniper PAPER" in notifier.executions[-1].message
+        positions = await engine.database.paper_mirror_positions()
+        assert len(positions) == 1
+        assert Decimal(str(positions[0]["cost_basis_usd"])) == Decimal("2")
+        trades = await engine.database.paper_recent_trades()
+        assert trades[0]["execution_kind"] == "SNIPER_PAPER"
+        assert trades[0]["quote_based"] == 0
+    finally:
+        await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_sniper_paper_lane_keeps_absolute_floor_and_ownership_checks(
+    settings,
+) -> None:
+    sniper = replace(settings, paper_sniper_test_enabled=True)
+    notifier = CaptureNotifier()
+    engine = SmartMoneyEngine(sniper, notifier=notifier)
+    await engine.initialize()
+    pump_mint = "A5G8K3qLzTKhmRL7nRTzG1f8eLTjSfY2uHEdpbt1pump"
+    try:
+        engine.market.price = AsyncMock(return_value=Decimal("1"))
+        engine.market.token_info = AsyncMock(
+            return_value=TokenInfo(
+                mint=pump_mint,
+                liquidity_usd=Decimal("1000"),
+                holder_count=25,
+                mint_authority_disabled=False,
+            )
+        )
+        trader = TrackedTrader(address="wallet-a", alias="Auto wallet-a")
+        await engine.database.add_trader(trader.address, trader.alias)
+
+        await engine._handle_new_swap(
+            _swap(Side.BUY, "sniper-reject", "1", mint=pump_mint), trader
+        )
+
+        assert notifier.executions[-1].success is False
+        assert "sniper lane rejected" in notifier.executions[-1].message
+        assert "Mint authority is enabled" in notifier.executions[-1].message
+        assert await engine.database.paper_mirror_positions() == []
+    finally:
+        await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_unmatched_source_sell_explains_if_buy_never_filled(settings) -> None:
+    notifier = CaptureNotifier()
+    engine = SmartMoneyEngine(settings, notifier=notifier)
+    await engine.initialize()
+    try:
+        engine.market.price = AsyncMock(return_value=Decimal("1"))
+        trader = TrackedTrader(address="wallet-a", alias="Auto wallet-a")
+        await engine.database.add_trader(trader.address, trader.alias)
+
+        await engine._handle_new_swap(_swap(Side.SELL, "orphan-sell", "1"), trader)
+
+        assert notifier.executions[-1].success is False
+        assert "no earlier BUY" in notifier.executions[-1].message
+    finally:
+        await engine.close()
+
+
+@pytest.mark.asyncio
 async def test_raw_paper_hard_stop_closes_source_linked_lot(settings) -> None:
     notifier = CaptureNotifier()
     engine = SmartMoneyEngine(settings, notifier=notifier)
@@ -521,6 +618,64 @@ def _quote(*, output: str, impact: str = "0.2", latency_ms: int = 100) -> SwapQu
         observed_latency_ms=latency_ms,
         quoted_at=int(time.time()),
     )
+
+
+@pytest.mark.asyncio
+async def test_sniper_quote_lane_allows_moderate_drift_but_keeps_its_ceiling(
+    settings,
+) -> None:
+    sniper = replace(
+        settings,
+        paper_sniper_test_enabled=True,
+        paper_use_executable_quotes=True,
+        jupiter_api_key="jup-test",
+        live_base_mint="base",
+    )
+    notifier = CaptureNotifier()
+    engine = SmartMoneyEngine(sniper, notifier=notifier)
+    await engine.initialize()
+    pump_mint = "A5G8K3qLzTKhmRL7nRTzG1f8eLTjSfY2uHEdpbt1pump"
+    try:
+        engine.market.price = AsyncMock(return_value=Decimal("1"))
+        engine.market.token_info = AsyncMock(
+            return_value=TokenInfo(
+                mint=pump_mint,
+                decimals=6,
+                liquidity_usd=Decimal("5000"),
+                holder_count=25,
+                organic_score=Decimal("0"),
+                mint_authority_disabled=True,
+                freeze_authority_disabled=True,
+            )
+        )
+        engine.market.quote_order = AsyncMock(
+            side_effect=(_quote(output="1.8"), _quote(output="1.5"))
+        )
+        trader = TrackedTrader(address="wallet-a", alias="Auto wallet-a")
+        await engine.database.add_trader(trader.address, trader.alias)
+
+        await engine._handle_new_swap(
+            _swap(Side.BUY, "sniper-quoted-buy", "1", mint=pump_mint), trader
+        )
+        assert notifier.executions[-1].success is True
+        assert "Sniper quote-shadow BUY" in notifier.executions[-1].message
+
+        await engine._handle_new_swap(
+            _swap(
+                Side.BUY,
+                "sniper-quoted-too-late",
+                "1",
+                mint="B5G8K3qLzTKhmRL7nRTzG1f8eLTjSfY2uHEdpbt2pump",
+            ),
+            trader,
+        )
+        assert notifier.executions[-1].success is False
+        assert "33.33%" in notifier.executions[-1].message
+        trades = await engine.database.paper_recent_trades()
+        assert len(trades) == 1
+        assert trades[0]["execution_kind"] == "SNIPER_QUOTE"
+    finally:
+        await engine.close()
 
 
 @pytest.mark.asyncio

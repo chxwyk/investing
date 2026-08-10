@@ -45,6 +45,11 @@ from .risk import RiskEngine
 from .rotation import CandidateRotator, RotationResult, is_pump_mint
 from .rpc import SolanaRPC
 from .scoring import rank_traders
+from .social import (
+    PumpProfileDiscovery,
+    SocialNomination,
+    annotate_social_nominations,
+)
 from .strategy import ConsensusStrategy
 from .stream import RealtimeWalletStream, StreamEvent
 
@@ -106,6 +111,9 @@ class SmartMoneyEngine:
             else None
         )
         self.discovery_policy = DiscoveryPolicy.from_settings(settings)
+        self.profile_discovery = (
+            PumpProfileDiscovery() if settings.pump_profile_discovery_enabled else None
+        )
         self.detector = SwapDetector(self.market, settings.min_source_trade_usd)
         self.rotator = CandidateRotator(settings, self.rpc, self.detector)
         self.stream = RealtimeWalletStream(
@@ -138,10 +146,14 @@ class SmartMoneyEngine:
         self.last_error: str | None = None
         self.last_discovery_refresh_at: int | None = None
         self.last_weekly_refresh_at: int | None = None
+        self.last_profile_refresh_at: int | None = None
+        self.profile_discovery_last_error: str | None = None
+        self.profile_verified_matches = 0
         self.last_rotation_at: int | None = None
         self.last_rotation_result: RotationResult | None = None
         self._weekly_pool: list[WindowCandidate] = []
         self._candidate_pool = []
+        self._social_nominations: list[SocialNomination] = []
 
     async def initialize(self) -> None:
         if self._initialized:
@@ -157,6 +169,8 @@ class SmartMoneyEngine:
         self.last_weekly_refresh_at = int(raw_weekly) if raw_weekly else None
         raw_rotation = await self.database.get_setting("rotation_last_refresh")
         self.last_rotation_at = int(raw_rotation) if raw_rotation else None
+        raw_profiles = await self.database.get_setting("pump_profile_last_refresh")
+        self.last_profile_refresh_at = int(raw_profiles) if raw_profiles else None
         self._candidate_pool = await self.database.load_discovery_candidates()
         self._initialized = True
 
@@ -202,6 +216,8 @@ class SmartMoneyEngine:
         await self.market.close()
         if self.discovery:
             await self.discovery.close()
+        if self.profile_discovery:
+            await self.profile_discovery.close()
         await self.database.close()
 
     async def _run_loop(self) -> None:
@@ -304,8 +320,12 @@ class SmartMoneyEngine:
                         "Public-KOL 24H discovery unavailable; using general feed: %s",
                         exc,
                     )
+            await self._refresh_profile_nominations()
             candidates = merge_verified_windows(
                 daily_pool, self._weekly_pool, self.discovery_policy
+            )
+            candidates, self.profile_verified_matches = annotate_social_nominations(
+                candidates, self._social_nominations
             )
             if not candidates:
                 raise DiscoveryError(
@@ -320,6 +340,45 @@ class SmartMoneyEngine:
             )
             self.last_error = None
         return await self.rotate_wallets(force=True)
+
+    async def _refresh_profile_nominations(self) -> None:
+        """Refresh public social candidates without weakening financial admission."""
+
+        if self.profile_discovery is None:
+            return
+        now = int(time.time())
+        if (
+            self._social_nominations
+            and self.last_profile_refresh_at is not None
+            and now - self.last_profile_refresh_at
+            < self.settings.pump_profile_refresh_seconds
+        ):
+            return
+        try:
+            nominations = await self.profile_discovery.nominations(
+                pages=self.settings.pump_profile_pages,
+                minimum_followers=self.settings.pump_profile_min_followers,
+                limit=self.settings.pump_profile_limit,
+                max_profile_fetches=self.settings.pump_profile_max_page_fetches,
+            )
+        except Exception as exc:
+            self.profile_discovery_last_error = str(exc)
+            logger.warning(
+                "Pump public-profile nominations unavailable; strict financial feeds "
+                "remain active: %s",
+                exc,
+            )
+            return
+        if nominations:
+            self._social_nominations = nominations
+        else:
+            logger.info(
+                "Pump public profile page returned no resolvable public wallets; "
+                "the previous nomination cache was preserved"
+            )
+        self.last_profile_refresh_at = now
+        self.profile_discovery_last_error = None
+        await self.database.set_setting("pump_profile_last_refresh", str(now))
 
     async def rotate_wallets(self, *, force: bool = False) -> DiscoveryRefresh | None:
         if not self._candidate_pool:
@@ -735,6 +794,14 @@ class SmartMoneyEngine:
             await self.notifier.on_execution(result)
             return
 
+        sniper_mode = (
+            swap.side is Side.SELL
+            and self.settings.paper_sniper_test_enabled
+            and await self.database.paper_mirror_open_lot_is_sniper(
+                trader.address, swap.token_mint
+            )
+        )
+
         # A tracked wallet's transaction price is historical by the time this process
         # observes it. Price the shadow fill at detection time so PAPER results include
         # the latency that live copy execution would face.
@@ -743,6 +810,7 @@ class SmartMoneyEngine:
         except JupiterError:
             price = None
         pump_source_fallback = False
+        sniper_source_price = False
         if price is None or price <= 0:
             source_price = swap.token_price_usd
             if (
@@ -760,6 +828,22 @@ class SmartMoneyEngine:
                     else source_price * (Decimal("1") - penalty)
                 )
                 pump_source_fallback = True
+            elif (
+                self.settings.paper_sniper_test_enabled
+                and is_pump_mint(swap.token_mint)
+                and source_price is not None
+                and source_price > 0
+            ):
+                penalty = Decimal(
+                    self.settings.paper_sniper_source_penalty_bps
+                ) / Decimal(10_000)
+                price = (
+                    source_price * (Decimal("1") + penalty)
+                    if swap.side is Side.BUY
+                    else source_price * (Decimal("1") - penalty)
+                )
+                pump_source_fallback = True
+                sniper_source_price = True
             elif not self.settings.paper_require_current_price:
                 price = source_price
         size = min(self.settings.default_copy_usd, self.settings.max_copy_usd)
@@ -816,27 +900,79 @@ class SmartMoneyEngine:
                 )
                 size = decision.size_usd
                 if not decision.allowed:
-                    reasons = "; ".join(decision.reasons) or "risk policy blocked entry"
-                    result = ExecutionResult(
-                        success=False,
-                        mode=ExecutionMode.PAPER,
-                        token_mint=swap.token_mint,
-                        side=swap.side,
-                        size_usd=size,
-                        message=f"Skipped: paper entry guard — {reasons}",
+                    sniper_allowed, sniper_reason = self._paper_sniper_entry_allowed(
+                        swap=swap,
+                        token_info=token_info,
+                        decision=decision,
                     )
-                    await self.database.log_execution(
-                        signal_id=None,
-                        mode=result.mode,
-                        token_mint=result.token_mint,
-                        side=result.side,
-                        size_usd=result.size_usd,
-                        success=result.success,
-                        signature=None,
-                        message=result.message,
+                    if sniper_allowed:
+                        sniper_mode = True
+                        size = min(
+                            self.settings.paper_sniper_copy_usd,
+                            self.settings.max_copy_usd,
+                        )
+                    else:
+                        reasons = (
+                            "; ".join(decision.reasons)
+                            or "risk policy blocked entry"
+                        )
+                        if self.settings.paper_sniper_test_enabled and sniper_reason:
+                            reasons = f"{reasons}; sniper lane rejected — {sniper_reason}"
+                        result = ExecutionResult(
+                            success=False,
+                            mode=ExecutionMode.PAPER,
+                            token_mint=swap.token_mint,
+                            side=swap.side,
+                            size_usd=size,
+                            message=f"Skipped: paper entry guard — {reasons}",
+                        )
+                        await self.database.log_execution(
+                            signal_id=None,
+                            mode=result.mode,
+                            token_mint=result.token_mint,
+                            side=result.side,
+                            size_usd=result.size_usd,
+                            success=result.success,
+                            signature=None,
+                            message=result.message,
+                        )
+                        await self.notifier.on_execution(result)
+                        return
+                elif sniper_source_price:
+                    sniper_allowed, sniper_reason = self._paper_sniper_entry_allowed(
+                        swap=swap,
+                        token_info=token_info,
+                        decision=decision,
                     )
-                    await self.notifier.on_execution(result)
-                    return
+                    if not sniper_allowed:
+                        result = ExecutionResult(
+                            success=False,
+                            mode=ExecutionMode.PAPER,
+                            token_mint=swap.token_mint,
+                            side=swap.side,
+                            size_usd=size,
+                            message=(
+                                "Skipped: no executable current route and sniper lane "
+                                f"rejected — {sniper_reason}"
+                            ),
+                        )
+                        await self.database.log_execution(
+                            signal_id=None,
+                            mode=result.mode,
+                            token_mint=result.token_mint,
+                            side=result.side,
+                            size_usd=result.size_usd,
+                            success=result.success,
+                            signature=None,
+                            message=result.message,
+                        )
+                        await self.notifier.on_execution(result)
+                        return
+                    sniper_mode = True
+                    size = min(
+                        self.settings.paper_sniper_copy_usd,
+                        self.settings.max_copy_usd,
+                    )
             result = await self.executor.execute_paper_mirror(
                 swap=swap,
                 trader=trader,
@@ -844,8 +980,74 @@ class SmartMoneyEngine:
                 size_usd=size,
                 token_info=token_info,
                 pump_source_fallback=pump_source_fallback,
+                sniper_mode=sniper_mode,
             )
         await self.notifier.on_execution(result)
+
+    def _paper_sniper_entry_allowed(
+        self,
+        *,
+        swap: DetectedSwap,
+        token_info: TokenInfo | None,
+        decision: RiskDecision,
+    ) -> tuple[bool, str]:
+        """Allow a smaller, separately labeled PAPER launch observation."""
+
+        if not self.settings.paper_sniper_test_enabled:
+            return False, "disabled"
+        if not is_pump_mint(swap.token_mint):
+            return False, "token is not a Pump launch mint"
+        if token_info is None:
+            return False, "token safety metadata is unavailable"
+
+        soft_prefixes = (
+            "Liquidity $",
+            "Only ",
+            "Organic score is only ",
+            "Top-holder concentration is ",
+        )
+        hard_reasons = [
+            reason
+            for reason in decision.reasons
+            if not reason.startswith(soft_prefixes)
+        ]
+        if hard_reasons:
+            return False, "; ".join(hard_reasons)
+        if token_info.suspicious:
+            return False, "Jupiter flags the token as suspicious"
+        if token_info.freeze_authority_disabled is False:
+            return False, "freeze authority is enabled"
+        if token_info.mint_authority_disabled is False:
+            return False, "mint authority is enabled"
+        if token_info.liquidity_usd is None:
+            return False, "liquidity is unknown"
+        if (
+            token_info.liquidity_usd
+            < self.settings.paper_sniper_min_liquidity_usd
+        ):
+            return (
+                False,
+                f"liquidity ${token_info.liquidity_usd:,.0f} is below the sniper floor",
+            )
+        if token_info.holder_count is None:
+            return False, "holder count is unknown"
+        if token_info.holder_count < self.settings.paper_sniper_min_holders:
+            return (
+                False,
+                f"only {token_info.holder_count:,} holders; sniper floor is "
+                f"{self.settings.paper_sniper_min_holders:,}",
+            )
+        if (
+            token_info.top_holders_percent is not None
+            and token_info.top_holders_percent
+            > self.settings.paper_sniper_max_top_holders_percent
+        ):
+            return (
+                False,
+                f"top-holder concentration {token_info.top_holders_percent}% exceeds "
+                f"the sniper ceiling",
+            )
+        return True, "launch-stage PAPER lane"
 
     async def _process_signal(
         self, signal: Signal, *, known_price: Decimal | None = None
@@ -1570,6 +1772,13 @@ class SmartMoneyEngine:
             "rotation_last_refresh": self.last_rotation_at,
             "candidate_pool_size": len(self._candidate_pool),
             "kol_discovery_enabled": self.settings.discovery_include_kols,
+            "pump_profile_discovery_enabled": (
+                self.settings.pump_profile_discovery_enabled
+            ),
+            "pump_profile_nominations": len(self._social_nominations),
+            "pump_profile_verified_matches": self.profile_verified_matches,
+            "pump_profile_last_refresh": self.last_profile_refresh_at,
+            "pump_profile_last_error": self.profile_discovery_last_error,
             "rotation_verified_pump_wallets": (
                 self.last_rotation_result.verified_pump_wallets
                 if self.last_rotation_result

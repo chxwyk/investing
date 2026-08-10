@@ -192,7 +192,7 @@ def test_documented_weekly_kol_shape_requires_repeat_trading_days() -> None:
     assert candidates[0].trading_days == 4
 
 
-def test_merge_labels_metrics_missing_from_documented_kol_feed() -> None:
+def test_merge_rejects_metrics_missing_from_documented_kol_feed() -> None:
     daily_payload = {
         "traders": [
             {
@@ -218,10 +218,43 @@ def test_merge_labels_metrics_missing_from_documented_kol_feed() -> None:
         policy(),
     )
 
+    assert merged == []
+
+
+def test_complete_general_rows_outrank_limited_kol_nominations() -> None:
+    complete_daily = parse_window_candidates(
+        {"traders": [row(WALLET_ONE, pnl=500)]}, policy(), days=1
+    )
+    limited_daily = parse_kol_window_candidates(
+        {
+            "traders": [
+                {
+                    "wallet": WALLET_ONE,
+                    "period": {
+                        "realized": 5000,
+                        "volume": 8000,
+                        "tradingDays": 1,
+                    },
+                    "identity": {"name": "Public KOL", "tags": ["kol"]},
+                }
+            ]
+        },
+        policy(),
+        days=1,
+    )
+    complete_weekly = parse_window_candidates(
+        {"traders": [row(WALLET_ONE, pnl=2000, trades=80)]}, policy(), days=7
+    )
+
+    merged = merge_verified_windows(
+        complete_daily + limited_daily,
+        complete_weekly,
+        policy(),
+    )
+
     assert [candidate.address for candidate in merged] == [WALLET_ONE]
-    assert merged[0].metrics_limited_24h is True
-    assert merged[0].metrics_limited_7d is True
-    assert "provider omits period ROI/win/trade detail" in merged[0].selection_reason
+    assert merged[0].metrics_limited_24h is False
+    assert merged[0].roi_24h_percent == Decimal("20")
 
 
 def test_merge_can_confirm_a_wallet_across_general_and_public_kol_feeds() -> None:

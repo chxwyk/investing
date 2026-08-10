@@ -123,12 +123,16 @@ def _token_view(mint: str, fomo_referral_code: str | None = None) -> discord.ui.
 def _discovery_lines(candidates: tuple[DiscoveryCandidate, ...] | list[DiscoveryCandidate]) -> str:
     lines: list[str] = []
     for item in candidates[:10]:
+        # Incomplete provider rows are nomination-only evidence. They must never
+        # appear as an automatically copied wallet or as an "unavailable" metric.
+        if item.metrics_limited_24h or item.metrics_limited_7d:
+            continue
         momentum = item.pnl_momentum_usd
         momentum_text = "new" if momentum is None else f"{momentum:+,.2f} since refresh"
-        roi_24h = "unavailable" if item.metrics_limited_24h else f"{item.roi_24h_percent:.1f}%"
-        roi_7d = "unavailable" if item.metrics_limited_7d else f"{item.roi_7d_percent:.1f}%"
-        win_24h = "unavailable" if item.metrics_limited_24h else f"{item.win_rate_percent:.1f}%"
-        win_7d = "unavailable" if item.metrics_limited_7d else f"{item.win_rate_7d_percent:.1f}%"
+        roi_24h = f"{item.roi_24h_percent:.1f}%"
+        roi_7d = f"{item.roi_7d_percent:.1f}%"
+        win_24h = f"{item.win_rate_percent:.1f}%"
+        win_7d = f"{item.win_rate_7d_percent:.1f}%"
         lines.append(
             f"**{item.rank}. {item.alias}** • `{_short(item.address)}`\n"
             f"24H `{_money(item.realized_pnl_24h)}` / `{roi_24h}` ROI • "
@@ -1024,12 +1028,24 @@ class SmartMoneyCommands(
             else await self.bot.engine.database.list_discovered(limit=10)
         )
         embed = discord.Embed(
-            title="Verified Pump Hot Wallets • 24H + 7D",
+            title="Verified Meme-Coin Hot Wallets • 24H + 7D",
             description=_discovery_lines(candidates),
             color=0x9B59B6,
         )
+        status = await self.bot.engine.status()
+        embed.add_field(
+            name="Pump social nominations",
+            value=str(status["pump_profile_nominations"]),
+        )
+        embed.add_field(
+            name="Social + financial matches",
+            value=str(status["pump_profile_verified_matches"]),
+        )
         embed.set_footer(
-            text="Strict PnL • recent on-chain Pump activity • public Solana wallets"
+            text=(
+                "Every displayed wallet has complete 24H + 7D PnL/ROI/win/trade "
+                "evidence • social profiles nominate only"
+            )
         )
         await interaction.followup.send(embed=embed, ephemeral=True)
 
@@ -1164,12 +1180,19 @@ class SmartMoneyCommands(
             f"**Public-KOL period feed:** "
             f"{'enabled' if status['kol_discovery_enabled'] else 'disabled'} • authorized "
             "24H/7D nominations, never automatic trust\n"
-            f"**Pump.fun:** verified through public Solana swaps and Pump mint identity\n"
+            f"**Pump public profiles:** "
+            f"{'enabled' if status['pump_profile_discovery_enabled'] else 'disabled'} • "
+            f"{status['pump_profile_nominations']} public-wallet nominations • "
+            f"{status['pump_profile_verified_matches']} also passed complete 24H + 7D "
+            "financial verification\n"
+            f"**Pump.fun activity:** verified through public Solana swaps and Pump mint "
+            "identity\n"
             f"**Graduated Pump/Jupiter routes:** covered by the same persistent token mint\n"
             f"**Helius/Solana realtime:** {stream_status}\n"
-            "**Fomo:** not connected — no documented official API/webhook credentials are "
-            "configured. Fomo-native alerts or legitimately obtained public wallet addresses "
-            "can be used; scraping is not used."
+            "**Fomo:** the official app exposes leaderboards, profiles, follows, and alerts, "
+            "but no documented public API/webhook was found. The bot will not claim a "
+            "private endpoint is authorized; Fomo candidates require an official feed or a "
+            "public wallet identity before the same full verification can run."
         )
         await interaction.response.send_message(text, ephemeral=True)
 
@@ -1687,6 +1710,11 @@ class SmartMoneyCommands(
             f"**Pump PAPER fallback:** "
             f"{'enabled' if s.paper_allow_pump_source_fallback else 'disabled'}"
             f" • {s.paper_pump_source_fallback_bps}bps adverse penalty\n"
+            f"**Sniper PAPER lane:** "
+            f"{'enabled' if s.paper_sniper_test_enabled else 'disabled'} • "
+            f"{_money(s.paper_sniper_copy_usd)} max • "
+            f"minimum {_money(s.paper_sniper_min_liquidity_usd)} liquidity / "
+            f"{s.paper_sniper_min_holders} holders • PAPER only\n"
             f"**Raw entry safety gate:** {raw_entry_gate}\n"
             f"**Executable quote shadow:** "
             f"{'ready' if status['quote_ready'] else 'JUPITER_API_KEY needed'}\n"
@@ -1702,6 +1730,8 @@ class SmartMoneyCommands(
             f"{'ready' if status['discovery_configured'] else 'API key needed'}\n"
             f"**Discovered wallets:** {status['discovered_wallets']}\n"
             f"**Multi-source strict candidate pool:** {status['candidate_pool_size']}\n"
+            f"**Pump social nominations:** {status['pump_profile_nominations']} • "
+            f"financially verified matches {status['pump_profile_verified_matches']}\n"
             f"**Pump-verified candidates:** {pump_verified_text}\n"
             f"**24H discovery refresh:** {discovery_refresh}\n"
             f"**7D verification refresh:** {weekly_refresh}\n"
@@ -1741,6 +1771,15 @@ class SmartMoneyCommands(
             f"{'enabled' if s.paper_allow_pump_source_fallback else 'disabled'}"
             f" • {s.paper_pump_source_fallback_bps}bps adverse penalty"
             " • PAPER only\n"
+            f"**Sniper PAPER lane:** "
+            f"{'enabled' if s.paper_sniper_test_enabled else 'disabled'} • "
+            f"{_money(s.paper_sniper_copy_usd)} launch-stage position • "
+            f"floor {_money(s.paper_sniper_min_liquidity_usd)} liquidity / "
+            f"{s.paper_sniper_min_holders} holders • "
+            f"max {s.paper_sniper_max_entry_drift_percent}% drift / "
+            f"{s.paper_sniper_max_quote_price_impact_percent}% impact • "
+            f"{s.paper_sniper_source_penalty_bps}bps source fallback • "
+            "excluded from live readiness\n"
             f"**Raw entry safety gate:** {raw_entry_gate}\n"
             f"**Quote-shadow PAPER:** "
             f"{'enabled' if s.paper_use_executable_quotes else 'disabled'}\n"

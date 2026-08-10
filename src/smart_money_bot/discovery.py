@@ -516,6 +516,11 @@ def merge_verified_windows(
         week = weekly_by_wallet.get(address)
         if week is None:
             continue
+        # Public-KOL period rows may omit ROI, win rate, trade count, and
+        # closed-token detail. PnL-only rows remain useful nominations, but they
+        # are not enough evidence for an automatically copied wallet.
+        if day.metrics_limited or week.metrics_limited:
+            continue
         score = score_candidate(
             pnl=day.realized_pnl_usd,
             roi_percent=day.roi_percent,
@@ -600,8 +605,14 @@ def _best_window_by_wallet(
     return best
 
 
-def _window_sort_key(candidate: WindowCandidate) -> tuple[Decimal, Decimal, Decimal, int]:
+def _window_sort_key(
+    candidate: WindowCandidate,
+) -> tuple[Decimal, Decimal, Decimal, Decimal, int]:
+    # Prefer complete evidence over a higher-PnL row whose provider response
+    # omitted the fields used by our risk filters. This lets a fully populated
+    # general-leaderboard row verify a wallet also nominated by the KOL feed.
     return (
+        Decimal("0") if candidate.metrics_limited else Decimal("1"),
         candidate.realized_pnl_usd,
         candidate.win_rate_percent,
         candidate.roi_percent,
