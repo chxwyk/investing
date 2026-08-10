@@ -96,7 +96,7 @@ entry spends `DEFAULT_COPY_USD`; repeated buys cannot push one wallet/token lot 
 
 ### Forced PAPER observation
 
-Set `PAPER_FORCE_OBSERVATION_MODE=true` when the goal is to see a complete PAPER outcome for
+`PAPER_FORCE_OBSERVATION_MODE=true` is the v2.17 default for a complete PAPER outcome from
 every valid detected source-wallet swap. This mode records a buy immediately from the source
 transaction price plus `PAPER_OBSERVATION_PENALTY_BPS`; sells use the source price minus the
 same penalty. Normal simulated slippage and fees are then applied. It does not wait for a
@@ -111,6 +111,18 @@ contains no usable token price, fake cash is exhausted, a duplicate signature ar
 sell has no earlier matching PAPER buy. A processed WebSocket trigger reduces delay, but no
 bot can react before the tracked transaction is publicly observed, and a tracked purchase can
 itself move a low-liquidity token before a copy order exists.
+
+### Existing-holding tracking baselines
+
+`PAPER_SEED_TRACKING_BASELINES=true` prevents a newly tracked wallet's first sell from being
+orphaned merely because its corresponding buy happened before monitoring began. The bot uses
+the reconstructed public source inventory, opens a clearly labeled `TRACKING_BASELINE` paper
+lot at the current observed price, and measures only movement after that baseline. It never
+invents the wallet's earlier entry or claims profit from before tracking. Tokens that already
+received any PAPER buy are never baseline-seeded again, so a risk or manual exit cannot
+silently reopen a closed position. `PAPER_BASELINE_MAX_POSITIONS_PER_WALLET` limits existing
+holdings seeded per wallet (default `10`). Baseline trades are excluded from quote-based
+readiness evidence.
 
 For a full-results learning run:
 
@@ -168,12 +180,13 @@ hard stop, take-profit, trailing-profit threshold, or maximum hold. A later sour
 then correctly show `SKIPPED` because the protected paper lot is already closed. Different
 wallets remain separate even when they trade the same token.
 
-Bootstrap history is recorded for scoring but is not purchased retroactively. Therefore a
-sell can also show `SKIPPED` if its matching buy happened before raw mirroring was deployed.
-A new detected buy must occur first. Set `PAPER_MIRROR_RAW_SWAPS=false` to restore the older
-consensus-only paper behavior.
+Bootstrap history is recorded for scoring and reconstructing source holdings, but it is never
+purchased retroactively at an old price. v2.17 instead opens a current-price tracking baseline
+for eligible existing holdings. A sell can still be unmatched when no prior public BUY exists
+inside the scanned history, no current baseline price is available, or the PAPER account lacks
+cash. Set `PAPER_MIRROR_RAW_SWAPS=false` to restore consensus-only paper behavior.
 
-The v2.16.0 discovery, social nomination, observation, sniper, quote, fallback, rotation, and exit controls are
+The v2.17.0 discovery, baseline, social nomination, observation, sniper, quote, fallback, rotation, and exit controls are
 intentionally configurable:
 
 ```text
@@ -181,8 +194,10 @@ PAPER_REQUIRE_CURRENT_PRICE=true
 PAPER_ALLOW_PUMP_SOURCE_FALLBACK=true
 PAPER_PUMP_SOURCE_FALLBACK_BPS=300
 PAPER_RAW_ENTRY_FILTER_ENABLED=true
-PAPER_FORCE_OBSERVATION_MODE=false
+PAPER_FORCE_OBSERVATION_MODE=true
 PAPER_OBSERVATION_PENALTY_BPS=300
+PAPER_SEED_TRACKING_BASELINES=true
+PAPER_BASELINE_MAX_POSITIONS_PER_WALLET=10
 PAPER_SNIPER_TEST_ENABLED=false
 PAPER_SNIPER_COPY_USD=2
 PAPER_SNIPER_MIN_LIQUIDITY_USD=2000

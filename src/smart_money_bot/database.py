@@ -1702,6 +1702,63 @@ class Database:
         )
         return await cursor.fetchone() is not None
 
+    async def paper_tracking_baseline_candidates(
+        self, trader_address: str, *, limit: int = 10
+    ) -> list[dict[str, Any]]:
+        """Return source holdings that predate PAPER tracking for this wallet.
+
+        Bootstrap swaps build ``trader_inventory`` without firing old copy signals.
+        A current-price baseline lets future source sells measure only the movement
+        observed after tracking started.  Any token that already received a PAPER buy
+        is excluded so a risk/manual exit can never be silently reopened.
+        """
+
+        cursor = await self.db.execute(
+            """
+            SELECT
+                inventory.token_mint,
+                inventory.quantity AS source_quantity,
+                inventory.cost_basis_usd AS source_cost_basis_usd,
+                MAX(swaps.block_time) AS last_source_activity_at,
+                (
+                    SELECT priced.token_price_usd
+                    FROM swaps AS priced
+                    WHERE priced.trader_address = inventory.trader_address
+                      AND priced.token_mint = inventory.token_mint
+                      AND priced.token_price_usd IS NOT NULL
+                      AND priced.token_price_usd > 0
+                    ORDER BY priced.block_time DESC, priced.rowid DESC
+                    LIMIT 1
+                ) AS last_source_price_usd
+            FROM trader_inventory AS inventory
+            JOIN swaps
+              ON swaps.trader_address = inventory.trader_address
+             AND swaps.token_mint = inventory.token_mint
+            WHERE inventory.trader_address = ?
+              AND inventory.quantity > 0.000000001
+              AND NOT EXISTS (
+                  SELECT 1 FROM paper_mirror_positions AS position
+                  WHERE position.trader_address = inventory.trader_address
+                    AND position.token_mint = inventory.token_mint
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM paper_trades AS trade
+                  WHERE trade.source_trader = inventory.trader_address
+                    AND trade.token_mint = inventory.token_mint
+                    AND trade.side = 'BUY'
+              )
+            GROUP BY
+                inventory.trader_address,
+                inventory.token_mint,
+                inventory.quantity,
+                inventory.cost_basis_usd
+            ORDER BY last_source_activity_at DESC
+            LIMIT ?
+            """,
+            (trader_address, max(1, min(limit, 50))),
+        )
+        return [dict(row) for row in await cursor.fetchall()]
+
     async def paper_mirror_open_lot_is_sniper(
         self, trader_address: str, token_mint: str
     ) -> bool:

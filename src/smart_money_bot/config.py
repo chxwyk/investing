@@ -110,6 +110,8 @@ class Settings:
     paper_raw_entry_filter_enabled: bool
     paper_force_observation_mode: bool
     paper_observation_penalty_bps: int
+    paper_seed_tracking_baselines: bool
+    paper_baseline_max_positions_per_wallet: int
     paper_sniper_test_enabled: bool
     paper_sniper_copy_usd: Decimal
     paper_sniper_min_liquidity_usd: Decimal
@@ -268,10 +270,16 @@ class Settings:
                 "PAPER_RAW_ENTRY_FILTER_ENABLED", True
             ),
             paper_force_observation_mode=_bool(
-                "PAPER_FORCE_OBSERVATION_MODE", False
+                "PAPER_FORCE_OBSERVATION_MODE", True
             ),
             paper_observation_penalty_bps=_int(
                 "PAPER_OBSERVATION_PENALTY_BPS", 300
+            ),
+            paper_seed_tracking_baselines=_bool(
+                "PAPER_SEED_TRACKING_BASELINES", True
+            ),
+            paper_baseline_max_positions_per_wallet=_int(
+                "PAPER_BASELINE_MAX_POSITIONS_PER_WALLET", 10
             ),
             paper_sniper_test_enabled=_bool("PAPER_SNIPER_TEST_ENABLED", False),
             paper_sniper_copy_usd=_decimal("PAPER_SNIPER_COPY_USD", "2"),
@@ -498,6 +506,10 @@ class Settings:
         if not 0 <= self.paper_observation_penalty_bps <= 10_000:
             raise ValueError(
                 "PAPER_OBSERVATION_PENALTY_BPS must be between 0 and 10000"
+            )
+        if not 1 <= self.paper_baseline_max_positions_per_wallet <= 50:
+            raise ValueError(
+                "PAPER_BASELINE_MAX_POSITIONS_PER_WALLET must be between 1 and 50"
             )
         if self.paper_sniper_copy_usd <= 0:
             raise ValueError("PAPER_SNIPER_COPY_USD must be positive")

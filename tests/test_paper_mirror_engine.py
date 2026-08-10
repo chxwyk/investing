@@ -513,6 +513,86 @@ async def test_unmatched_source_sell_explains_if_buy_never_filled(settings) -> N
 
 
 @pytest.mark.asyncio
+async def test_existing_source_holding_gets_forward_tracking_baseline(settings) -> None:
+    baseline_settings = replace(
+        settings,
+        paper_seed_tracking_baselines=True,
+        paper_force_observation_mode=False,
+    )
+    notifier = CaptureNotifier()
+    engine = SmartMoneyEngine(baseline_settings, notifier=notifier)
+    await engine.initialize()
+    try:
+        trader = TrackedTrader(address="wallet-a", alias="Auto wallet-a")
+        await engine.database.add_trader(trader.address, trader.alias)
+        inserted = await engine.database.record_swap(
+            _swap(Side.BUY, "bootstrap-buy", "1")
+        )
+        assert inserted is True
+
+        engine.market.price = AsyncMock(return_value=Decimal("1.50"))
+        await engine._seed_tracking_baselines(trader)
+
+        positions = await engine.database.paper_mirror_positions()
+        assert len(positions) == 1
+        assert Decimal(str(positions[0]["average_entry_usd"])) > Decimal("1.50")
+        assert notifier.executions[-1].success is True
+        assert "Tracking baseline" in notifier.executions[-1].message
+        trades = await engine.database.paper_recent_trades()
+        assert trades[0]["execution_kind"] == "TRACKING_BASELINE"
+
+        engine.market.price = AsyncMock(return_value=Decimal("2"))
+        await engine._handle_new_swap(_swap(Side.SELL, "future-sell", "2"), trader)
+        assert notifier.executions[-1].success is True
+        assert notifier.executions[-1].side is Side.SELL
+        assert await engine.database.paper_mirror_positions() == []
+
+        # Once the baseline lot has closed, later scans must never reopen it.
+        await engine._seed_tracking_baselines(trader)
+        assert await engine.database.paper_mirror_positions() == []
+    finally:
+        await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_initial_bootstrap_inventory_is_seeded_before_future_sell(settings) -> None:
+    baseline_settings = replace(
+        settings,
+        paper_seed_tracking_baselines=True,
+        paper_force_observation_mode=False,
+    )
+    notifier = CaptureNotifier()
+    engine = SmartMoneyEngine(baseline_settings, notifier=notifier)
+    await engine.initialize()
+    try:
+        trader = TrackedTrader(address="wallet-a", alias="Auto wallet-a")
+        await engine.database.add_trader(trader.address, trader.alias)
+        now = int(time.time())
+        engine.rpc.get_signatures_for_address = AsyncMock(
+            return_value=[
+                {"signature": "bootstrap-history-buy", "blockTime": now, "err": None}
+            ]
+        )
+        engine.rpc.get_transaction = AsyncMock(return_value={"blockTime": now})
+        engine.detector.detect = AsyncMock(
+            return_value=_swap(Side.BUY, "bootstrap-history-buy", "1")
+        )
+        engine.market.price = AsyncMock(return_value=Decimal("1.25"))
+
+        counts = await engine._sync_trader(trader)
+
+        assert counts == {"transactions": 1, "swaps": 1}
+        assert len(await engine.database.paper_mirror_positions()) == 1
+        assert notifier.executions[-1].success is True
+        assert "Tracking baseline" in notifier.executions[-1].message
+        refreshed = await engine.database.list_traders(enabled_only=False)
+        tracked = next(item for item in refreshed if item.address == trader.address)
+        assert tracked.last_signature == "bootstrap-history-buy"
+    finally:
+        await engine.close()
+
+
+@pytest.mark.asyncio
 async def test_raw_paper_hard_stop_closes_source_linked_lot(settings) -> None:
     notifier = CaptureNotifier()
     engine = SmartMoneyEngine(settings, notifier=notifier)

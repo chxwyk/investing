@@ -20,6 +20,7 @@ def settings(monkeypatch: pytest.MonkeyPatch, tmp_path) -> Settings:
         "MIN_ORGANIC_SCORE": "20",
         "MAX_TOP_HOLDERS_PERCENT": "70",
         "PAPER_USE_EXECUTABLE_QUOTES": "false",
+        "PAPER_FORCE_OBSERVATION_MODE": "false",
     }
     for key, value in values.items():
         monkeypatch.setenv(key, value)

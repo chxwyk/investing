@@ -114,11 +114,13 @@ class ExecutionManager:
         pump_source_fallback: bool = False,
         observation_mode: bool = False,
         sniper_mode: bool = False,
+        baseline_mode: bool = False,
     ) -> ExecutionResult:
         if (
             self.settings.paper_use_executable_quotes
             and not pump_source_fallback
             and not observation_mode
+            and not baseline_mode
         ):
             result = await self._execute_quoted_paper_mirror(
                 swap=swap,
@@ -174,19 +176,23 @@ class ExecutionManager:
                 None if observation_mode else self.settings.max_copy_usd
             ),
             execution_kind=(
-                "FORCED_OBSERVATION"
-                if observation_mode
+                "TRACKING_BASELINE"
+                if baseline_mode
                 else (
-                    (
-                        "SNIPER_SOURCE_FALLBACK"
-                        if pump_source_fallback
-                        else "SNIPER_PAPER"
-                    )
-                    if sniper_mode
+                    "FORCED_OBSERVATION"
+                    if observation_mode
                     else (
-                        "PUMP_SOURCE_FALLBACK"
-                        if pump_source_fallback
-                        else "RAW_MIRROR"
+                        (
+                            "SNIPER_SOURCE_FALLBACK"
+                            if pump_source_fallback
+                            else "SNIPER_PAPER"
+                        )
+                        if sniper_mode
+                        else (
+                            "PUMP_SOURCE_FALLBACK"
+                            if pump_source_fallback
+                            else "RAW_MIRROR"
+                        )
                     )
                 )
             ),
@@ -208,6 +214,23 @@ class ExecutionManager:
                 message=message,
             )
         elif swap.side is Side.BUY:
+            if baseline_mode:
+                result = ExecutionResult(
+                    success=True,
+                    mode=ExecutionMode.PAPER,
+                    token_mint=swap.token_mint,
+                    side=swap.side,
+                    size_usd=size_usd,
+                    message=(
+                        f"Tracking baseline for {trader.alias}: opened a "
+                        f"{size_usd:.2f} PAPER lot at ${fill['price']:.8f} because "
+                        "the source wallet already held this token when monitoring "
+                        "started. Only movement after this baseline counts; earlier "
+                        "unobserved profit or loss is not invented."
+                    ),
+                )
+                await self._log(None, result)
+                return result
             observation_note = (
                 " Forced PAPER observation used the source transaction price plus "
                 f"{self.settings.paper_observation_penalty_bps}bps and bypassed "

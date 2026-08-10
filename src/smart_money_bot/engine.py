@@ -577,6 +577,10 @@ class SmartMoneyEngine:
             return totals
 
     async def _sync_trader(self, trader: TrackedTrader) -> dict[str, int]:
+        # Existing databases may already contain bootstrap inventory from before this
+        # release. Seed those holdings before processing the next sell so a legitimate
+        # exit cannot race ahead of its forward-test baseline.
+        await self._seed_tracking_baselines(trader)
         candidates, newest, is_bootstrap = await self._signature_candidates(trader)
         counts = {"transactions": 0, "swaps": 0}
         if not candidates or newest is None:
@@ -609,9 +613,69 @@ class SmartMoneyEngine:
             counts["transactions"] += processed["transactions"]
             counts["swaps"] += processed["swaps"]
 
+        if is_bootstrap:
+            # The first history scan intentionally does not fire old BUY alerts. It does,
+            # however, reconstruct the source wallet's current inventory. Establish a
+            # current-price PAPER baseline now so later sells can be measured from the
+            # moment tracking began rather than being reported as unmatched.
+            await self._seed_tracking_baselines(trader)
+
         if not had_retryable_failure:
             await self.database.update_last_signature(trader.address, newest)
         return counts
+
+    async def _seed_tracking_baselines(self, trader: TrackedTrader) -> None:
+        """Open forward-only PAPER lots for holdings that predate monitoring."""
+
+        if not self.settings.paper_seed_tracking_baselines:
+            return
+        if await self.execution_mode() is not ExecutionMode.PAPER:
+            return
+        if not self.settings.paper_mirror_raw_swaps:
+            return
+        if await self._daily_profit_entries_locked():
+            return
+
+        candidates = await self.database.paper_tracking_baseline_candidates(
+            trader.address,
+            limit=self.settings.paper_baseline_max_positions_per_wallet,
+        )
+        size = min(self.settings.default_copy_usd, self.settings.max_copy_usd)
+        for candidate in candidates:
+            token_mint = str(candidate["token_mint"])
+            source_quantity = Decimal(str(candidate["source_quantity"]))
+            if source_quantity <= 0:
+                continue
+            try:
+                current_price = await self.market.price(token_mint)
+            except JupiterError:
+                current_price = None
+            if current_price is None or current_price <= 0:
+                # A stale historical transaction price would manufacture profit or loss
+                # from before monitoring began, so wait for a real current price.
+                continue
+
+            baseline_swap = DetectedSwap(
+                signature=f"tracking-baseline:{trader.address}:{token_mint}",
+                trader_address=trader.address,
+                block_time=int(time.time()),
+                side=Side.BUY,
+                token_mint=token_mint,
+                token_amount=source_quantity,
+                quote_mint="TRACKING_BASELINE",
+                quote_amount=size,
+                usd_value=size,
+                token_price_usd=current_price,
+            )
+            result = await self.executor.execute_paper_mirror(
+                swap=baseline_swap,
+                trader=trader,
+                market_price_usd=current_price,
+                size_usd=size,
+                baseline_mode=True,
+            )
+            if result.success:
+                await self.notifier.on_execution(result)
 
     async def _process_transaction(
         self,
