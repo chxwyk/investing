@@ -217,7 +217,7 @@ async def test_forced_observation_fills_without_market_or_risk_gates(settings) -
 
 
 @pytest.mark.asyncio
-async def test_forced_observation_allows_repeated_buys_and_source_only_exits(
+async def test_forced_observation_still_enforces_raw_risk_exits(
     settings,
 ) -> None:
     observation = replace(settings, paper_force_observation_mode=True)
@@ -238,7 +238,8 @@ async def test_forced_observation_allows_repeated_buys_and_source_only_exits(
 
         engine.market.prices = AsyncMock(return_value={"mint": Decimal("0.01")})
         await engine._check_position_exits()
-        assert len(await engine.database.paper_mirror_positions()) == 1
+        assert await engine.database.paper_mirror_positions() == []
+        assert "hard stop" in notifier.executions[-1].message
     finally:
         await engine.close()
 
@@ -304,6 +305,7 @@ async def test_daily_profit_lock_liquidates_and_blocks_new_buys(settings) -> Non
         assert await engine.database.paper_mirror_positions() == []
         assert len(notifier.daily_locks) == 1
         assert notifier.daily_locks[0].marked_pnl_usd >= Decimal("100")
+        assert notifier.daily_locks[0].lock_reason == "PROFIT_TARGET"
 
         trades = await engine.database.paper_recent_trades()
         assert trades[0]["execution_kind"] == "DAILY_PROFIT_LOCK_EXIT"
@@ -315,6 +317,48 @@ async def test_daily_profit_lock_liquidates_and_blocks_new_buys(settings) -> Non
         )
         assert await engine.database.paper_mirror_positions() == []
         assert all(item.signature != "blocked-after-target" for item in notifier.swaps)
+    finally:
+        await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_daily_loss_lock_liquidates_and_blocks_new_buys(settings) -> None:
+    guarded = replace(
+        settings,
+        paper_force_observation_mode=True,
+        paper_daily_profit_lock_enabled=True,
+        paper_daily_loss_lock_enabled=True,
+        paper_daily_loss_limit_usd=Decimal("5"),
+    )
+    notifier = CaptureNotifier()
+    engine = SmartMoneyEngine(guarded, notifier=notifier)
+    await engine.initialize()
+    try:
+        trader = TrackedTrader(address="wallet-a", alias="Auto wallet-a")
+        await engine.database.add_trader(trader.address, trader.alias)
+        await engine._handle_new_swap(_swap(Side.BUY, "loss-buy", "1"), trader)
+        assert len(await engine.database.paper_mirror_positions()) == 1
+
+        engine.market.prices = AsyncMock(return_value={"mint": Decimal("1")})
+        armed = await engine.paper_daily_lock_status()
+        assert armed.locked is False
+
+        engine.market.prices = AsyncMock(return_value={"mint": Decimal("0.10")})
+        assert await engine._enforce_daily_profit_lock() is True
+        assert await engine.database.paper_mirror_positions() == []
+        assert len(notifier.daily_locks) == 1
+        assert notifier.daily_locks[0].lock_reason == "LOSS_LIMIT"
+        assert notifier.daily_locks[0].marked_pnl_usd <= Decimal("-5")
+
+        trades = await engine.database.paper_recent_trades()
+        assert trades[0]["execution_kind"] == "DAILY_LOSS_LOCK_EXIT"
+
+        await engine._handle_new_swap(
+            _swap(Side.BUY, "blocked-after-loss", "1", mint="mint-2"),
+            trader,
+        )
+        assert await engine.database.paper_mirror_positions() == []
+        assert all(item.signature != "blocked-after-loss" for item in notifier.swaps)
     finally:
         await engine.close()
 

@@ -41,7 +41,7 @@ async def test_forward_gate_does_not_reject_an_immature_sample(settings) -> None
     engine.database.paper_wallet_performance = AsyncMock(
         return_value={
             source.address: {
-                "closed_sells": 7,
+                "closed_sells": 4,
                 "pnl": Decimal("-50"),
                 "profit_factor": Decimal("0.10"),
             }
@@ -65,12 +65,12 @@ async def test_forward_gate_rejects_mature_loser_and_rewards_mature_winner(
     engine.database.paper_wallet_performance = AsyncMock(
         return_value={
             loser.address: {
-                "closed_sells": 8,
+                "closed_sells": 5,
                 "pnl": Decimal("-20"),
                 "profit_factor": Decimal("0.50"),
             },
             winner.address: {
-                "closed_sells": 8,
+                "closed_sells": 5,
                 "pnl": Decimal("12"),
                 "profit_factor": Decimal("2.00"),
             },
@@ -83,6 +83,6 @@ async def test_forward_gate_rejects_mature_loser_and_rewards_mature_winner(
 
     assert [item.address for item in eligible] == ["winner"]
     assert eligible[0].score == Decimal("82.00")
-    assert "forward PAPER 8 exits" in eligible[0].selection_reason
-    assert "breached -$15.00" in rejected["loser"]
+    assert "forward PAPER 5 exits" in eligible[0].selection_reason
+    assert "breached -$10.00" in rejected["loser"]
     assert evaluated == [loser]

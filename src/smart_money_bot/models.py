@@ -233,12 +233,14 @@ class PaperDailyLockStatus:
     enabled: bool
     day: str
     target_usd: Decimal
+    loss_limit_usd: Decimal
     baseline_equity_usd: Decimal
     current_equity_usd: Decimal
     marked_pnl_usd: Decimal
     locked: bool
     triggered_at: int | None
     open_positions: int
+    lock_reason: str | None
 
 
 @dataclass(frozen=True, slots=True)

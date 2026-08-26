@@ -96,13 +96,15 @@ entry spends `DEFAULT_COPY_USD`; repeated buys cannot push one wallet/token lot 
 
 ### Forced PAPER observation
 
-`PAPER_FORCE_OBSERVATION_MODE=true` is the v2.17 default for a complete PAPER outcome from
-every valid detected source-wallet swap. This mode records a buy immediately from the source
+`PAPER_FORCE_OBSERVATION_MODE=false` is the safe default. Setting it to `true` creates a
+complete PAPER outcome from every valid detected source-wallet swap. This mode records a buy
+immediately from the source
 transaction price plus `PAPER_OBSERVATION_PENALTY_BPS`; sells use the source price minus the
 same penalty. Normal simulated slippage and fees are then applied. It does not wait for a
 Jupiter route and bypasses liquidity, holder, organic-score, entry-drift, price-impact,
-quote-latency, position-count, and per-wallet/token capacity gates. Automatic paper risk exits
-are disabled so the source wallet's later sell controls the linked fake lot.
+quote-latency, position-count, and per-wallet/token capacity gates. The raw hard stop,
+take-profit, trailing lock, maximum hold, and account-level daily loss lock still run in this
+mode; observation pricing must never disable loss controls.
 
 This is deliberately an **observation ledger**, not evidence that a live transaction could
 have landed at that price. Its trades are labeled `FORCED_OBSERVATION`, remain `quote_based=0`,
@@ -114,7 +116,8 @@ itself move a low-liquidity token before a copy order exists.
 
 ### Existing-holding tracking baselines
 
-`PAPER_SEED_TRACKING_BASELINES=true` prevents a newly tracked wallet's first sell from being
+`PAPER_SEED_TRACKING_BASELINES=false` is the safe default. Setting it to `true` prevents a
+newly tracked wallet's first sell from being
 orphaned merely because its corresponding buy happened before monitoring began. The bot uses
 the reconstructed public source inventory, opens a clearly labeled `TRACKING_BASELINE` paper
 lot at the current observed price, and measures only movement after that baseline. It never
@@ -124,7 +127,7 @@ silently reopen a closed position. `PAPER_BASELINE_MAX_POSITIONS_PER_WALLET` lim
 holdings seeded per wallet (default `10`). Baseline trades are excluded from quote-based
 readiness evidence.
 
-For a full-results learning run:
+For a deliberately unfiltered observation run (not the recommended readiness setup):
 
 ```text
 PAPER_FORCE_OBSERVATION_MODE=true
@@ -181,22 +184,23 @@ then correctly show `SKIPPED` because the protected paper lot is already closed.
 wallets remain separate even when they trade the same token.
 
 Bootstrap history is recorded for scoring and reconstructing source holdings, but it is never
-purchased retroactively at an old price. v2.17 instead opens a current-price tracking baseline
-for eligible existing holdings. A sell can still be unmatched when no prior public BUY exists
+purchased retroactively at an old price. Optional baseline seeding can instead open a
+current-price tracking baseline for eligible existing holdings. A sell can still be unmatched
+when no prior public BUY exists
 inside the scanned history, no current baseline price is available, or the PAPER account lacks
 cash. Set `PAPER_MIRROR_RAW_SWAPS=false` to restore consensus-only paper behavior.
 
-The v2.17.0 discovery, baseline, social nomination, observation, sniper, quote, fallback, rotation, and exit controls are
+The v2.18.0 discovery, selective-entry, daily loss/profit locks, social nomination, quote, fallback, rotation, and exit controls are
 intentionally configurable:
 
 ```text
 PAPER_REQUIRE_CURRENT_PRICE=true
-PAPER_ALLOW_PUMP_SOURCE_FALLBACK=true
+PAPER_ALLOW_PUMP_SOURCE_FALLBACK=false
 PAPER_PUMP_SOURCE_FALLBACK_BPS=300
 PAPER_RAW_ENTRY_FILTER_ENABLED=true
-PAPER_FORCE_OBSERVATION_MODE=true
+PAPER_FORCE_OBSERVATION_MODE=false
 PAPER_OBSERVATION_PENALTY_BPS=300
-PAPER_SEED_TRACKING_BASELINES=true
+PAPER_SEED_TRACKING_BASELINES=false
 PAPER_BASELINE_MAX_POSITIONS_PER_WALLET=10
 PAPER_SNIPER_TEST_ENABLED=false
 PAPER_SNIPER_COPY_USD=2
@@ -208,19 +212,21 @@ PAPER_SNIPER_MAX_ENTRY_DRIFT_PERCENT=20
 PAPER_SNIPER_MAX_QUOTE_PRICE_IMPACT_PERCENT=5
 PAPER_DAILY_TARGET_USD=100
 PAPER_DAILY_PROFIT_LOCK_ENABLED=true
+PAPER_DAILY_LOSS_LIMIT_USD=20
+PAPER_DAILY_LOSS_LOCK_ENABLED=true
 PAPER_DAILY_LOCK_TIMEZONE=America/Los_Angeles
 PAPER_DAILY_PROFIT_CHECK_SECONDS=15
 PAPER_USE_EXECUTABLE_QUOTES=true
 PAPER_QUOTE_OUTPUT_BUFFER_BPS=50
-MAX_ADVERSE_ENTRY_DRIFT_PERCENT=8
-MAX_QUOTE_PRICE_IMPACT_PERCENT=2
+MAX_ADVERSE_ENTRY_DRIFT_PERCENT=5
+MAX_QUOTE_PRICE_IMPACT_PERCENT=1.5
 MAX_QUOTE_LATENCY_MS=5000
 MAX_CONSECUTIVE_QUOTE_FAILURES=5
-RAW_MIRROR_STOP_LOSS_PERCENT=8
-RAW_MIRROR_TAKE_PROFIT_PERCENT=20
-RAW_MIRROR_TRAILING_ACTIVATION_PERCENT=8
-RAW_MIRROR_TRAILING_STOP_PERCENT=4
-RAW_MIRROR_MAX_HOLD_SECONDS=7200
+RAW_MIRROR_STOP_LOSS_PERCENT=6
+RAW_MIRROR_TAKE_PROFIT_PERCENT=15
+RAW_MIRROR_TRAILING_ACTIVATION_PERCENT=5
+RAW_MIRROR_TRAILING_STOP_PERCENT=3
+RAW_MIRROR_MAX_HOLD_SECONDS=3600
 DISCOVERY_MAX_WALLETS=25
 DISCOVERY_INCLUDE_KOLS=true
 DISCOVERY_KOL_LIMIT=100
@@ -229,9 +235,9 @@ ROTATION_MAX_IDLE_SECONDS=3600
 ROTATION_MIN_RECENT_SWAPS=1
 ROTATION_MIN_PUMP_SWAPS=1
 ROTATION_REQUIRE_PUMP_ACTIVITY=true
-FORWARD_EVIDENCE_MIN_CLOSED_SELLS=8
-FORWARD_EVIDENCE_MIN_PROFIT_FACTOR=0.65
-FORWARD_EVIDENCE_MAX_LOSS_USD=15
+FORWARD_EVIDENCE_MIN_CLOSED_SELLS=5
+FORWARD_EVIDENCE_MIN_PROFIT_FACTOR=1.0
+FORWARD_EVIDENCE_MAX_LOSS_USD=10
 REALTIME_WALLET_STREAM_ENABLED=true
 REALTIME_STREAM_COMMITMENT=processed
 ```
@@ -327,9 +333,9 @@ ROTATION_PROBE_TRANSACTIONS=6
 ROTATION_MIN_RECENT_SWAPS=1
 ROTATION_MIN_PUMP_SWAPS=1
 ROTATION_REQUIRE_PUMP_ACTIVITY=true
-FORWARD_EVIDENCE_MIN_CLOSED_SELLS=8
-FORWARD_EVIDENCE_MIN_PROFIT_FACTOR=0.65
-FORWARD_EVIDENCE_MAX_LOSS_USD=15
+FORWARD_EVIDENCE_MIN_CLOSED_SELLS=5
+FORWARD_EVIDENCE_MIN_PROFIT_FACTOR=1.0
+FORWARD_EVIDENCE_MAX_LOSS_USD=10
 REALTIME_WALLET_STREAM_ENABLED=true
 ```
 
@@ -484,13 +490,13 @@ fills at a time instead of posting only ten rows or flooding the alert channel.
 When automatic rotation removes a wallet that still has an open source-linked PAPER lot, the
 wallet now remains subscribed in **exit-only** mode. Fresh buys from that wallet are ignored,
 but the matching sell remains monitored until the fake lot closes. `/smartmoney status` shows
-the number of exit-only wallets. No new Railway variables are required for these controls.
+the number of exit-only wallets.
 
-### Daily PAPER profit lock
+### Daily PAPER profit/loss lock
 
 The v2.13.0 daily lock uses the account's **marked** change for the current local day—realized
 P&L plus the current value of open positions relative to the first account mark that day. With
-the defaults, reaching `+$100` immediately records the lock, attempts to sell every priced
+the defaults, reaching `+$100` or `-$20` immediately records the lock, attempts to sell every priced
 PAPER position, blocks every new PAPER buy, and suspends automatic discovery/rotation work for
 the rest of the day. A dedicated account guard re-marks positions every 15 seconds without
 performing another leaderboard refresh. A position whose current price is temporarily
@@ -501,7 +507,8 @@ The lock resets automatically on the next day in `America/Los_Angeles`. It is pe
 SQLite, so a Railway restart cannot silently unlock the account. `/smartmoney paper`,
 `/smartmoney status`, and `/smartmoney limits` show the target and current lock state. Change
 `PAPER_DAILY_TARGET_USD` later to adjust the target, or set
-`PAPER_DAILY_PROFIT_LOCK_ENABLED=false` to disable the feature. The lock is PAPER-only and does
+`PAPER_DAILY_PROFIT_LOCK_ENABLED=false` to disable the upside lock. The downside breaker uses
+`PAPER_DAILY_LOSS_LIMIT_USD=20` and `PAPER_DAILY_LOSS_LOCK_ENABLED=true`. The lock is PAPER-only and does
 not promise an exact $100 realized result: simulated costs and price movement between the mark
 and exit can reduce the final amount.
 

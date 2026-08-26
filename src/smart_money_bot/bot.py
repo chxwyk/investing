@@ -841,18 +841,34 @@ class SmartMoneyBot(commands.Bot):
         await self._send_alert(embed, token_mint=result.token_mint)
 
     async def on_daily_profit_lock(self, status: PaperDailyLockStatus) -> None:
+        loss_lock = status.lock_reason == "LOSS_LIMIT"
         embed = discord.Embed(
-            title="PAPER daily profit lock triggered",
+            title=(
+                "PAPER daily loss lock triggered"
+                if loss_lock
+                else "PAPER daily profit lock triggered"
+            ),
             description=(
-                "The account reached today's marked-profit target. All open PAPER "
+                "The account reached today's marked-loss limit. All open PAPER "
                 "positions are being sold and new PAPER buys are blocked until the "
                 "next local trading day."
+                if loss_lock
+                else "The account reached today's marked-profit target. All open "
+                "PAPER positions are being sold and new PAPER buys are blocked until "
+                "the next local trading day."
             ),
-            color=0x2ECC71,
+            color=0xE74C3C if loss_lock else 0x2ECC71,
             timestamp=discord.utils.utcnow(),
         )
-        embed.add_field(name="Marked profit", value=_money(status.marked_pnl_usd))
-        embed.add_field(name="Target", value=_money(status.target_usd))
+        embed.add_field(name="Marked P&L", value=_money(status.marked_pnl_usd))
+        embed.add_field(
+            name="Triggered limit",
+            value=(
+                f"-{_money(status.loss_limit_usd)} loss"
+                if loss_lock
+                else f"+{_money(status.target_usd)} profit"
+            ),
+        )
         embed.add_field(name="Positions to close", value=str(status.open_positions))
         embed.add_field(
             name="Automatic reset",
@@ -1246,11 +1262,7 @@ class SmartMoneyCommands(
         win_rate = Decimal(summary.wins) / Decimal(closed) * 100 if closed else Decimal("0")
         total_pnl = summary.equity_usd - summary.starting_cash_usd
         total_roi = _return_percent(summary.equity_usd, summary.starting_cash_usd)
-        daily_progress = (
-            daily_lock.marked_pnl_usd
-            / daily_lock.target_usd
-            * Decimal("100")
-        )
+        daily_progress = daily_lock.marked_pnl_usd / daily_lock.target_usd * 100
         profit_factor = (
             f"{summary.profit_factor:.2f}"
             if summary.profit_factor is not None
@@ -1281,11 +1293,12 @@ class SmartMoneyCommands(
             ),
         )
         embed.add_field(
-            name="Today marked / profit lock",
+            name="Today marked / guardrails",
             value=(
-                f"{_money(daily_lock.marked_pnl_usd)} / "
-                f"{_money(daily_lock.target_usd)} "
-                f"({daily_progress:+.1f}%)"
+                f"{_money(daily_lock.marked_pnl_usd)} • "
+                f"profit +{_money(daily_lock.target_usd)} "
+                f"({daily_progress:+.1f}%) • "
+                f"loss -{_money(daily_lock.loss_limit_usd)}"
             ),
             inline=False,
         )
@@ -1294,7 +1307,7 @@ class SmartMoneyCommands(
             value=(
                 "LOCKED — positions liquidating; no more buys today"
                 if daily_lock.locked
-                else "ARMED — trading continues until the target is reached"
+                else "ARMED — selective entries continue inside both daily limits"
             ),
             inline=False,
         )
@@ -1698,10 +1711,11 @@ class SmartMoneyCommands(
             f"**Mode:** {status['mode']}\n"
             f"**Paper auto-copy:** {paper_copy}\n"
             f"**Paper fill policy:** {fill_policy}\n"
-            f"**Daily PAPER profit lock:** "
+            f"**Daily PAPER guard:** "
             f"{'LOCKED' if daily_lock.locked else 'armed'} • "
-            f"{_money(daily_lock.marked_pnl_usd)} / "
-            f"{_money(daily_lock.target_usd)} • "
+            f"{_money(daily_lock.marked_pnl_usd)} • limits "
+            f"+{_money(daily_lock.target_usd)} / "
+            f"-{_money(daily_lock.loss_limit_usd)} • "
             f"{s.paper_daily_lock_timezone} • "
             f"check every {s.paper_daily_profit_check_seconds}s\n"
             f"**Daily-lock open positions:** {daily_lock.open_positions}\n"
@@ -1823,9 +1837,11 @@ class SmartMoneyCommands(
             f"**RPC scanning:** every {s.poll_interval_seconds}s • "
             f"{s.rpc_requests_per_second} requests/second maximum\n"
             f"**Copy size:** {_money(s.default_copy_usd)} (max {_money(s.max_copy_usd)})\n"
-            f"**Daily profit lock:** "
-            f"{'enabled' if s.paper_daily_profit_lock_enabled else 'disabled'} • "
-            f"close all at +{_money(s.paper_daily_target_usd)} marked P&L • "
+            f"**Daily profit/loss lock:** +"
+            f"{_money(s.paper_daily_target_usd)} / "
+            f"-{_money(s.paper_daily_loss_limit_usd)} marked P&L • "
+            f"profit {'on' if s.paper_daily_profit_lock_enabled else 'off'} / "
+            f"loss {'on' if s.paper_daily_loss_lock_enabled else 'off'} • "
             f"check every {s.paper_daily_profit_check_seconds}s • "
             f"reset {s.paper_daily_lock_timezone}\n"
             f"**Daily stop:** -{_money(s.max_daily_loss_usd)}\n"

@@ -60,9 +60,9 @@ def test_public_kol_and_forward_evidence_defaults_are_safe(monkeypatch) -> None:
 
     assert settings.discovery_include_kols is True
     assert settings.discovery_kol_limit == 100
-    assert settings.forward_evidence_min_closed_sells == 8
-    assert settings.forward_evidence_min_profit_factor == Decimal("0.65")
-    assert settings.forward_evidence_max_loss_usd == Decimal("15")
+    assert settings.forward_evidence_min_closed_sells == 5
+    assert settings.forward_evidence_min_profit_factor == Decimal("1.0")
+    assert settings.forward_evidence_max_loss_usd == Decimal("10")
 
 
 def test_rpc_defaults_are_free_tier_friendly(monkeypatch) -> None:
@@ -100,6 +100,7 @@ def test_raw_paper_mirroring_defaults_on_and_can_be_disabled(monkeypatch) -> Non
 def test_v27_paper_risk_guards_default_on(monkeypatch) -> None:
     names = (
         "PAPER_REQUIRE_CURRENT_PRICE",
+        "PAPER_ALLOW_PUMP_SOURCE_FALLBACK",
         "PAPER_RAW_ENTRY_FILTER_ENABLED",
         "RAW_MIRROR_STOP_LOSS_PERCENT",
         "RAW_MIRROR_TAKE_PROFIT_PERCENT",
@@ -111,17 +112,20 @@ def test_v27_paper_risk_guards_default_on(monkeypatch) -> None:
         monkeypatch.delenv(name, raising=False)
     settings = Settings.from_env(require_discord_token=False)
     assert settings.paper_require_current_price is True
+    assert settings.paper_allow_pump_source_fallback is False
     assert settings.paper_raw_entry_filter_enabled is True
-    assert settings.raw_mirror_stop_loss_percent == 8
-    assert settings.raw_mirror_take_profit_percent == 20
-    assert settings.raw_mirror_trailing_activation_percent == 8
-    assert settings.raw_mirror_trailing_stop_percent == 4
-    assert settings.raw_mirror_max_hold_seconds == 7200
+    assert settings.raw_mirror_stop_loss_percent == 6
+    assert settings.raw_mirror_take_profit_percent == 15
+    assert settings.raw_mirror_trailing_activation_percent == 5
+    assert settings.raw_mirror_trailing_stop_percent == 3
+    assert settings.raw_mirror_max_hold_seconds == 3600
 
 
 def test_daily_paper_profit_lock_defaults_to_100_pacific(monkeypatch) -> None:
     monkeypatch.delenv("PAPER_DAILY_TARGET_USD", raising=False)
     monkeypatch.delenv("PAPER_DAILY_PROFIT_LOCK_ENABLED", raising=False)
+    monkeypatch.delenv("PAPER_DAILY_LOSS_LIMIT_USD", raising=False)
+    monkeypatch.delenv("PAPER_DAILY_LOSS_LOCK_ENABLED", raising=False)
     monkeypatch.delenv("PAPER_DAILY_LOCK_TIMEZONE", raising=False)
     monkeypatch.delenv("PAPER_DAILY_PROFIT_CHECK_SECONDS", raising=False)
 
@@ -129,6 +133,9 @@ def test_daily_paper_profit_lock_defaults_to_100_pacific(monkeypatch) -> None:
 
     assert settings.paper_daily_target_usd == Decimal("100")
     assert settings.paper_daily_profit_lock_enabled is True
+    assert settings.paper_daily_loss_limit_usd == Decimal("20")
+    assert settings.paper_daily_loss_lock_enabled is True
+    assert settings.max_daily_loss_usd == Decimal("20")
     assert settings.paper_daily_lock_timezone == "America/Los_Angeles"
     assert settings.paper_daily_profit_check_seconds == 15
 
@@ -149,24 +156,24 @@ def test_v28_quote_shadow_and_readiness_defaults(monkeypatch) -> None:
     settings = Settings.from_env(require_discord_token=False)
     assert settings.paper_use_executable_quotes is True
     assert settings.paper_quote_output_buffer_bps == 50
-    assert settings.max_adverse_entry_drift_percent == 8
-    assert settings.max_quote_price_impact_percent == 2
+    assert settings.max_adverse_entry_drift_percent == 5
+    assert settings.max_quote_price_impact_percent == Decimal("1.5")
     assert settings.max_quote_latency_ms == 5000
     assert settings.max_consecutive_quote_failures == 5
     assert settings.readiness_min_active_days == 14
     assert settings.readiness_min_closed_trades == 100
 
 
-def test_complete_observation_and_tracking_baselines_default_on(monkeypatch) -> None:
+def test_selective_observation_and_tracking_baselines_default_off(monkeypatch) -> None:
     monkeypatch.delenv("PAPER_FORCE_OBSERVATION_MODE", raising=False)
     monkeypatch.delenv("PAPER_OBSERVATION_PENALTY_BPS", raising=False)
     monkeypatch.delenv("PAPER_SEED_TRACKING_BASELINES", raising=False)
     monkeypatch.delenv("PAPER_BASELINE_MAX_POSITIONS_PER_WALLET", raising=False)
     monkeypatch.delenv("REALTIME_STREAM_COMMITMENT", raising=False)
     settings = Settings.from_env(require_discord_token=False)
-    assert settings.paper_force_observation_mode is True
+    assert settings.paper_force_observation_mode is False
     assert settings.paper_observation_penalty_bps == 300
-    assert settings.paper_seed_tracking_baselines is True
+    assert settings.paper_seed_tracking_baselines is False
     assert settings.paper_baseline_max_positions_per_wallet == 10
     assert settings.realtime_stream_commitment == "processed"
 
@@ -195,7 +202,7 @@ def test_v216_public_profile_nominations_default_to_slow_fail_closed_mode(
     assert settings.pump_profile_refresh_seconds == 21600
 
 
-def test_pump_source_price_fallback_defaults_to_conservative_paper_only_mode(
+def test_pump_source_price_fallback_defaults_off_for_executable_trial(
     monkeypatch,
 ) -> None:
     monkeypatch.delenv("PAPER_ALLOW_PUMP_SOURCE_FALLBACK", raising=False)
@@ -203,5 +210,5 @@ def test_pump_source_price_fallback_defaults_to_conservative_paper_only_mode(
 
     settings = Settings.from_env(require_discord_token=False)
 
-    assert settings.paper_allow_pump_source_fallback is True
+    assert settings.paper_allow_pump_source_fallback is False
     assert settings.paper_pump_source_fallback_bps == 300

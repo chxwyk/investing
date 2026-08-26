@@ -122,6 +122,8 @@ class Settings:
     paper_sniper_max_quote_price_impact_percent: Decimal
     paper_daily_target_usd: Decimal
     paper_daily_profit_lock_enabled: bool
+    paper_daily_loss_limit_usd: Decimal
+    paper_daily_loss_lock_enabled: bool
     paper_daily_lock_timezone: str
     paper_daily_profit_check_seconds: int
     paper_use_executable_quotes: bool
@@ -231,13 +233,13 @@ class Settings:
                 "ROTATION_REQUIRE_PUMP_ACTIVITY", True
             ),
             forward_evidence_min_closed_sells=_int(
-                "FORWARD_EVIDENCE_MIN_CLOSED_SELLS", 8
+                "FORWARD_EVIDENCE_MIN_CLOSED_SELLS", 5
             ),
             forward_evidence_min_profit_factor=_decimal(
-                "FORWARD_EVIDENCE_MIN_PROFIT_FACTOR", "0.65"
+                "FORWARD_EVIDENCE_MIN_PROFIT_FACTOR", "1.0"
             ),
             forward_evidence_max_loss_usd=_decimal(
-                "FORWARD_EVIDENCE_MAX_LOSS_USD", "15"
+                "FORWARD_EVIDENCE_MAX_LOSS_USD", "10"
             ),
             realtime_wallet_stream_enabled=_bool(
                 "REALTIME_WALLET_STREAM_ENABLED", True
@@ -261,7 +263,7 @@ class Settings:
             paper_mirror_raw_swaps=_bool("PAPER_MIRROR_RAW_SWAPS", True),
             paper_require_current_price=_bool("PAPER_REQUIRE_CURRENT_PRICE", True),
             paper_allow_pump_source_fallback=_bool(
-                "PAPER_ALLOW_PUMP_SOURCE_FALLBACK", True
+                "PAPER_ALLOW_PUMP_SOURCE_FALLBACK", False
             ),
             paper_pump_source_fallback_bps=_int(
                 "PAPER_PUMP_SOURCE_FALLBACK_BPS", 300
@@ -270,13 +272,13 @@ class Settings:
                 "PAPER_RAW_ENTRY_FILTER_ENABLED", True
             ),
             paper_force_observation_mode=_bool(
-                "PAPER_FORCE_OBSERVATION_MODE", True
+                "PAPER_FORCE_OBSERVATION_MODE", False
             ),
             paper_observation_penalty_bps=_int(
                 "PAPER_OBSERVATION_PENALTY_BPS", 300
             ),
             paper_seed_tracking_baselines=_bool(
-                "PAPER_SEED_TRACKING_BASELINES", True
+                "PAPER_SEED_TRACKING_BASELINES", False
             ),
             paper_baseline_max_positions_per_wallet=_int(
                 "PAPER_BASELINE_MAX_POSITIONS_PER_WALLET", 10
@@ -303,6 +305,12 @@ class Settings:
             paper_daily_profit_lock_enabled=_bool(
                 "PAPER_DAILY_PROFIT_LOCK_ENABLED", True
             ),
+            paper_daily_loss_limit_usd=_decimal(
+                "PAPER_DAILY_LOSS_LIMIT_USD", "20"
+            ),
+            paper_daily_loss_lock_enabled=_bool(
+                "PAPER_DAILY_LOSS_LOCK_ENABLED", True
+            ),
             paper_daily_lock_timezone=os.getenv(
                 "PAPER_DAILY_LOCK_TIMEZONE", "America/Los_Angeles"
             ).strip(),
@@ -316,10 +324,10 @@ class Settings:
                 "PAPER_QUOTE_OUTPUT_BUFFER_BPS", 50
             ),
             max_adverse_entry_drift_percent=_decimal(
-                "MAX_ADVERSE_ENTRY_DRIFT_PERCENT", "8"
+                "MAX_ADVERSE_ENTRY_DRIFT_PERCENT", "5"
             ),
             max_quote_price_impact_percent=_decimal(
-                "MAX_QUOTE_PRICE_IMPACT_PERCENT", "2"
+                "MAX_QUOTE_PRICE_IMPACT_PERCENT", "1.5"
             ),
             max_quote_latency_ms=_int("MAX_QUOTE_LATENCY_MS", 5000),
             max_consecutive_quote_failures=_int(
@@ -339,8 +347,8 @@ class Settings:
                 "READINESS_MIN_QUOTE_SUCCESS_PERCENT", "95"
             ),
             max_copy_usd=_decimal("MAX_COPY_USD", "25"),
-            max_daily_loss_usd=_decimal("MAX_DAILY_LOSS_USD", "30"),
-            max_open_positions=_int("MAX_OPEN_POSITIONS", 6),
+            max_daily_loss_usd=_decimal("MAX_DAILY_LOSS_USD", "20"),
+            max_open_positions=_int("MAX_OPEN_POSITIONS", 4),
             min_token_liquidity_usd=_decimal("MIN_TOKEN_LIQUIDITY_USD", "50000"),
             min_token_holders=_int("MIN_TOKEN_HOLDERS", 100),
             min_organic_score=_decimal("MIN_ORGANIC_SCORE", "20"),
@@ -350,19 +358,19 @@ class Settings:
             take_profit_percent=_decimal("TAKE_PROFIT_PERCENT", "30"),
             max_hold_seconds=_int("MAX_HOLD_SECONDS", 21_600),
             raw_mirror_stop_loss_percent=_decimal(
-                "RAW_MIRROR_STOP_LOSS_PERCENT", "8"
+                "RAW_MIRROR_STOP_LOSS_PERCENT", "6"
             ),
             raw_mirror_take_profit_percent=_decimal(
-                "RAW_MIRROR_TAKE_PROFIT_PERCENT", "20"
+                "RAW_MIRROR_TAKE_PROFIT_PERCENT", "15"
             ),
             raw_mirror_trailing_activation_percent=_decimal(
-                "RAW_MIRROR_TRAILING_ACTIVATION_PERCENT", "8"
+                "RAW_MIRROR_TRAILING_ACTIVATION_PERCENT", "5"
             ),
             raw_mirror_trailing_stop_percent=_decimal(
-                "RAW_MIRROR_TRAILING_STOP_PERCENT", "4"
+                "RAW_MIRROR_TRAILING_STOP_PERCENT", "3"
             ),
             raw_mirror_max_hold_seconds=_int(
-                "RAW_MIRROR_MAX_HOLD_SECONDS", 7_200
+                "RAW_MIRROR_MAX_HOLD_SECONDS", 3_600
             ),
             enable_live_trading=_bool("ENABLE_LIVE_TRADING", False),
             live_trading_ack=os.getenv("LIVE_TRADING_ACK", "").strip(),
@@ -541,6 +549,8 @@ class Settings:
             raise ValueError("MAX_HOLD_SECONDS must be at least 60")
         if self.paper_daily_target_usd <= 0:
             raise ValueError("PAPER_DAILY_TARGET_USD must be positive")
+        if self.paper_daily_loss_limit_usd <= 0:
+            raise ValueError("PAPER_DAILY_LOSS_LIMIT_USD must be positive")
         try:
             ZoneInfo(self.paper_daily_lock_timezone)
         except ZoneInfoNotFoundError as exc:

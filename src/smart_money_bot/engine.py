@@ -179,9 +179,12 @@ class SmartMoneyEngine:
         if self._task and not self._task.done():
             return
         self._task = asyncio.create_task(self._run_loop(), name="smart-money-monitor")
-        if self.settings.paper_daily_profit_lock_enabled:
+        if (
+            self.settings.paper_daily_profit_lock_enabled
+            or self.settings.paper_daily_loss_lock_enabled
+        ):
             self._daily_profit_task = asyncio.create_task(
-                self._run_daily_profit_guard(), name="smart-money-daily-profit-guard"
+                self._run_daily_profit_guard(), name="smart-money-daily-risk-guard"
             )
         if self.stream.enabled:
             self._stream_task = asyncio.create_task(
@@ -257,9 +260,9 @@ class SmartMoneyEngine:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                self.last_error = f"Daily profit lock: {exc}"
-                logger.exception("Daily paper-profit guard failed")
-                await self.notifier.on_error("Daily paper-profit guard", exc)
+                self.last_error = f"Daily paper guard: {exc}"
+                logger.exception("Daily paper profit/loss guard failed")
+                await self.notifier.on_error("Daily paper profit/loss guard", exc)
             await asyncio.sleep(self.settings.paper_daily_profit_check_seconds)
 
     async def refresh_discovery(self, *, force: bool = False) -> DiscoveryRefresh | None:
@@ -1195,8 +1198,10 @@ class SmartMoneyEngine:
         )
         if mode is ExecutionMode.PAPER:
             await self._check_strategy_paper_exits(strategy_positions, prices, now)
-            if not self.settings.paper_force_observation_mode:
-                await self._check_raw_mirror_exits(mirror_positions, prices, now)
+            # Observation mode changes how an entry is priced, not whether losses
+            # may run without bounds. Raw stop, profit, trailing, and time exits
+            # must protect every paper lot in every fill mode.
+            await self._check_raw_mirror_exits(mirror_positions, prices, now)
             await self.database.paper_summary(prices)
             return
 
@@ -1439,7 +1444,10 @@ class SmartMoneyEngine:
         return local_now.date().isoformat(), int(start.timestamp()), int(end.timestamp())
 
     async def _daily_profit_entries_locked(self, *, now: int | None = None) -> bool:
-        if not self.settings.paper_daily_profit_lock_enabled:
+        if not (
+            self.settings.paper_daily_profit_lock_enabled
+            or self.settings.paper_daily_loss_lock_enabled
+        ):
             return False
         timestamp = int(time.time()) if now is None else now
         day, _, _ = self._paper_day_window(timestamp)
@@ -1472,8 +1480,10 @@ class SmartMoneyEngine:
             )
             await self.database.set_setting("paper_daily_lock_triggered", "false")
             await self.database.set_setting("paper_daily_lock_triggered_at", "")
+            await self.database.set_setting("paper_daily_lock_reason", "")
             locked = False
             triggered_at = None
+            lock_reason = None
         else:
             baseline = Decimal(raw_baseline)
             locked = (
@@ -1485,6 +1495,9 @@ class SmartMoneyEngine:
                 "paper_daily_lock_triggered_at", ""
             )
             triggered_at = int(raw_triggered_at) if raw_triggered_at else None
+            lock_reason = await self.database.get_setting(
+                "paper_daily_lock_reason", ""
+            ) or None
 
         positions = [
             item
@@ -1492,15 +1505,20 @@ class SmartMoneyEngine:
             if str(item["token_mint"]) != PAPER_DEMO_MINT
         ]
         return PaperDailyLockStatus(
-            enabled=self.settings.paper_daily_profit_lock_enabled,
+            enabled=(
+                self.settings.paper_daily_profit_lock_enabled
+                or self.settings.paper_daily_loss_lock_enabled
+            ),
             day=day,
             target_usd=self.settings.paper_daily_target_usd,
+            loss_limit_usd=self.settings.paper_daily_loss_limit_usd,
             baseline_equity_usd=baseline,
             current_equity_usd=summary.equity_usd,
             marked_pnl_usd=summary.equity_usd - baseline,
             locked=locked,
             triggered_at=triggered_at,
             open_positions=len(positions),
+            lock_reason=lock_reason,
         )
 
     async def paper_daily_lock_status(self) -> PaperDailyLockStatus:
@@ -1511,7 +1529,10 @@ class SmartMoneyEngine:
             )
 
     async def _enforce_daily_profit_lock(self) -> bool:
-        if not self.settings.paper_daily_profit_lock_enabled:
+        if not (
+            self.settings.paper_daily_profit_lock_enabled
+            or self.settings.paper_daily_loss_lock_enabled
+        ):
             return False
         if await self.execution_mode() is not ExecutionMode.PAPER:
             return False
@@ -1520,12 +1541,34 @@ class SmartMoneyEngine:
             now = int(time.time())
             summary = await self.paper_summary()
             status = await self._paper_daily_lock_status_from_summary(summary, now=now)
-            if not status.locked and status.marked_pnl_usd >= status.target_usd:
+            lock_reason: str | None = None
+            if (
+                not status.locked
+                and self.settings.paper_daily_profit_lock_enabled
+                and status.marked_pnl_usd >= status.target_usd
+            ):
+                lock_reason = "PROFIT_TARGET"
+            elif (
+                not status.locked
+                and self.settings.paper_daily_loss_lock_enabled
+                and status.marked_pnl_usd <= -status.loss_limit_usd
+            ):
+                lock_reason = "LOSS_LIMIT"
+
+            if lock_reason is not None:
                 await self.database.set_setting("paper_daily_lock_triggered", "true")
                 await self.database.set_setting(
                     "paper_daily_lock_triggered_at", str(now)
                 )
-                status = replace(status, locked=True, triggered_at=now)
+                await self.database.set_setting(
+                    "paper_daily_lock_reason", lock_reason
+                )
+                status = replace(
+                    status,
+                    locked=True,
+                    triggered_at=now,
+                    lock_reason=lock_reason,
+                )
                 await self.notifier.on_daily_profit_lock(status)
 
             if status.locked:
@@ -1549,10 +1592,23 @@ class SmartMoneyEngine:
             prices = {}
 
         unavailable = 0
-        reason = (
-            f"daily marked PAPER profit reached ${status.target_usd:.2f}; "
-            f"entry lock for {status.day}"
-        )
+        loss_lock = status.lock_reason == "LOSS_LIMIT"
+        if loss_lock:
+            reason = (
+                f"daily marked PAPER loss reached -${status.loss_limit_usd:.2f}; "
+                f"entry lock for {status.day}"
+            )
+            requested_by = "daily loss lock"
+            execution_kind = "DAILY_LOSS_LOCK_EXIT"
+            message_label = "Daily loss-lock PAPER SELL"
+        else:
+            reason = (
+                f"daily marked PAPER profit reached ${status.target_usd:.2f}; "
+                f"entry lock for {status.day}"
+            )
+            requested_by = "daily profit lock"
+            execution_kind = "DAILY_PROFIT_LOCK_EXIT"
+            message_label = "Daily profit-lock PAPER SELL"
         for position in positions:
             mint = str(position["token_mint"])
             price = prices.get(mint)
@@ -1567,10 +1623,10 @@ class SmartMoneyEngine:
                         "trader_address": str(position["source_trader"]),
                     },
                     market_price_usd=price,
-                    requested_by="daily profit lock",
-                    execution_kind="DAILY_PROFIT_LOCK_EXIT",
+                    requested_by=requested_by,
+                    execution_kind=execution_kind,
                     exit_reason=reason,
-                    message_label="Daily profit-lock PAPER SELL",
+                    message_label=message_label,
                 )
                 if result.success:
                     await self.notifier.on_execution(result)
@@ -1583,9 +1639,9 @@ class SmartMoneyEngine:
                 token_mint=mint,
                 side=Side.SELL,
                 created_at=now,
-                trader_addresses=("DAILY_PROFIT_LOCK",),
+                trader_addresses=(execution_kind,),
                 trader_aliases=(reason,),
-                source_signatures=(f"daily-profit-lock-{mint}-{time.time_ns()}",),
+                source_signatures=(f"daily-lock-{mint}-{time.time_ns()}",),
                 combined_score=Decimal("100"),
                 reference_price_usd=price,
             )
@@ -1599,7 +1655,7 @@ class SmartMoneyEngine:
                 size_usd=cost_basis,
                 fee_bps=self.settings.simulated_fee_bps,
                 slippage_bps=self.settings.simulated_slippage_bps,
-                execution_kind="DAILY_PROFIT_LOCK_EXIT",
+                execution_kind=execution_kind,
                 exit_reason=reason,
             )
             if fill is None:
@@ -1619,7 +1675,7 @@ class SmartMoneyEngine:
                     side=Side.SELL,
                     size_usd=cost_basis,
                     message=(
-                        f"Daily profit-lock PAPER SELL filled at ${fill['price']:.8f}; "
+                        f"{message_label} filled at ${fill['price']:.8f}; "
                         f"fee ${fill['fee']:.4f}; realized P&L "
                         f"${fill['realized_pnl']:.2f}. New entries remain locked "
                         f"for {status.day}."
@@ -1639,10 +1695,10 @@ class SmartMoneyEngine:
 
         if unavailable:
             self.last_error = (
-                f"Daily profit lock: {unavailable} open PAPER position(s) are still "
+                f"Daily paper lock: {unavailable} open PAPER position(s) are still "
                 "waiting for a current exit price; liquidation will retry"
             )
-        elif self.last_error and self.last_error.startswith("Daily profit lock:"):
+        elif self.last_error and self.last_error.startswith("Daily paper lock:"):
             self.last_error = None
 
     async def paper_summary(self) -> PaperSummary:
