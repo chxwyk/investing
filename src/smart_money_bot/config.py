@@ -5,12 +5,15 @@ from dataclasses import dataclass
 from decimal import Decimal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .constants import LIVE_ACK_TEXT, USDC_MINT
+from .constants import LIVE_ACK_TEXT, PUMP_LAUNCH_ACK_TEXT, USDC_MINT
 
 DEFAULT_X_NEWS_RULE = (
-    "(from:realDonaldTrump OR from:elonmusk OR from:WhiteHouse OR "
-    "from:WatcherGuru OR from:CoinDesk OR from:Cointelegraph OR "
-    "from:solana OR from:pumpdotfun) -is:retweet"
+    "(from:realDonaldTrump OR from:elonmusk OR from:WhiteHouse OR from:AP OR "
+    "from:Reuters OR from:BBCBreaking OR from:SportsCenter OR from:espn OR "
+    "from:BleacherReport OR from:TMZ OR from:PopBase OR from:DiscussingFilm OR "
+    "from:IGN OR from:Dexerto OR from:Complex OR from:Rap OR from:NASA OR "
+    "from:Apple OR from:Tesla OR from:WatcherGuru OR from:CoinDesk OR "
+    "from:solana OR from:pumpdotfun) -is:retweet -is:reply"
 )
 
 DEFAULT_NEWS_RSS_FEEDS = "|".join(
@@ -18,6 +21,10 @@ DEFAULT_NEWS_RSS_FEEDS = "|".join(
         "https://www.whitehouse.gov/briefings-statements/feed/",
         "https://www.sec.gov/news/pressreleases.rss",
         "https://feeds.bbci.co.uk/news/world/rss.xml",
+        "https://feeds.bbci.co.uk/news/entertainment_and_arts/rss.xml",
+        "https://feeds.bbci.co.uk/news/technology/rss.xml",
+        "https://feeds.bbci.co.uk/sport/rss.xml",
+        "https://www.espn.com/espn/rss/news",
         "https://www.coindesk.com/arc/outboundfeeds/rss/",
         "https://cointelegraph.com/rss",
     )
@@ -89,11 +96,28 @@ class Settings:
     j7_authorized_feed_url: str | None
     news_poll_seconds: int
     news_min_score: int
+    news_launch_ready_score: int
+    news_x_verify_min_score: int
+    news_x_trend_cache_seconds: int
     news_max_alerts_per_hour: int
     news_dex_match_enabled: bool
     news_dex_match_min_liquidity_usd: Decimal
     news_dex_match_max_age_minutes: int
     news_pair_recheck_seconds: tuple[int, ...]
+
+    pump_one_click_launch_enabled: bool
+    pump_launch_ack: str
+    pump_launch_private_key: str | None
+    pinata_jwt: str | None
+    pump_launch_initial_buy_sol: Decimal
+    pump_launch_min_score: int
+    pump_launch_max_per_day: int
+    pump_launch_max_sol_per_day: Decimal
+    pump_launch_timezone: str
+    pump_launch_cashback: bool
+    pump_launch_mayhem_mode: bool
+    pump_launch_tokenized_agent: bool
+    pump_launch_buyback_bps: int
 
     auto_discovery_enabled: bool
     discovery_refresh_seconds: int
@@ -243,7 +267,10 @@ class Settings:
                 os.getenv("J7_AUTHORIZED_FEED_URL", "").strip() or None
             ),
             news_poll_seconds=_int("NEWS_POLL_SECONDS", 30),
-            news_min_score=_int("NEWS_MIN_SCORE", 20),
+            news_min_score=_int("NEWS_MIN_SCORE", 45),
+            news_launch_ready_score=_int("NEWS_LAUNCH_READY_SCORE", 72),
+            news_x_verify_min_score=_int("NEWS_X_VERIFY_MIN_SCORE", 35),
+            news_x_trend_cache_seconds=_int("NEWS_X_TREND_CACHE_SECONDS", 90),
             news_max_alerts_per_hour=_int("NEWS_MAX_ALERTS_PER_HOUR", 30),
             news_dex_match_enabled=_bool("NEWS_DEX_MATCH_ENABLED", True),
             news_dex_match_min_liquidity_usd=_decimal(
@@ -253,6 +280,23 @@ class Settings:
             news_pair_recheck_seconds=_int_tuple(
                 "NEWS_PAIR_RECHECK_SECONDS", "0,30,90,180"
             ),
+            pump_one_click_launch_enabled=_bool("PUMP_ONE_CLICK_LAUNCH_ENABLED", False),
+            pump_launch_ack=os.getenv("PUMP_LAUNCH_ACK", "").strip(),
+            pump_launch_private_key=(
+                os.getenv("PUMP_LAUNCH_PRIVATE_KEY", "").strip() or None
+            ),
+            pinata_jwt=os.getenv("PINATA_JWT", "").strip() or None,
+            pump_launch_initial_buy_sol=_decimal("PUMP_LAUNCH_INITIAL_BUY_SOL", "0.01"),
+            pump_launch_min_score=_int("PUMP_LAUNCH_MIN_SCORE", 72),
+            pump_launch_max_per_day=_int("PUMP_LAUNCH_MAX_PER_DAY", 3),
+            pump_launch_max_sol_per_day=_decimal("PUMP_LAUNCH_MAX_SOL_PER_DAY", "0.05"),
+            pump_launch_timezone=os.getenv(
+                "PUMP_LAUNCH_TIMEZONE", "America/Los_Angeles"
+            ).strip(),
+            pump_launch_cashback=_bool("PUMP_LAUNCH_CASHBACK", False),
+            pump_launch_mayhem_mode=_bool("PUMP_LAUNCH_MAYHEM_MODE", False),
+            pump_launch_tokenized_agent=_bool("PUMP_LAUNCH_TOKENIZED_AGENT", False),
+            pump_launch_buyback_bps=_int("PUMP_LAUNCH_BUYBACK_BPS", 5000),
             auto_discovery_enabled=_bool("AUTO_DISCOVERY_ENABLED", True),
             discovery_refresh_seconds=_int("DISCOVERY_REFRESH_SECONDS", 1200),
             discovery_7d_refresh_seconds=_int("DISCOVERY_7D_REFRESH_SECONDS", 21600),
@@ -390,6 +434,15 @@ class Settings:
         )
 
     @property
+    def pump_launch_is_unlocked(self) -> bool:
+        return (
+            self.pump_one_click_launch_enabled
+            and self.pump_launch_ack == PUMP_LAUNCH_ACK_TEXT
+            and bool(self.pump_launch_private_key)
+            and bool(self.pinata_jwt)
+        )
+
+    @property
     def discovery_is_configured(self) -> bool:
         return self.auto_discovery_enabled and bool(self.solana_tracker_api_key)
 
@@ -430,6 +483,14 @@ class Settings:
             raise ValueError("NEWS_POLL_SECONDS must be between 15 and 3600")
         if not 0 <= self.news_min_score <= 100:
             raise ValueError("NEWS_MIN_SCORE must be between 0 and 100")
+        if not self.news_min_score <= self.news_launch_ready_score <= 100:
+            raise ValueError(
+                "NEWS_LAUNCH_READY_SCORE must be between NEWS_MIN_SCORE and 100"
+            )
+        if not 0 <= self.news_x_verify_min_score <= 100:
+            raise ValueError("NEWS_X_VERIFY_MIN_SCORE must be between 0 and 100")
+        if not 30 <= self.news_x_trend_cache_seconds <= 3600:
+            raise ValueError("NEWS_X_TREND_CACHE_SECONDS must be between 30 and 3600")
         if not 1 <= self.news_max_alerts_per_hour <= 200:
             raise ValueError("NEWS_MAX_ALERTS_PER_HOUR must be between 1 and 200")
         if self.news_dex_match_min_liquidity_usd < 0:
@@ -438,6 +499,24 @@ class Settings:
             raise ValueError("NEWS_DEX_MATCH_MAX_AGE_MINUTES must be between 1 and 1440")
         if any(item < 0 or item > 900 for item in self.news_pair_recheck_seconds):
             raise ValueError("NEWS_PAIR_RECHECK_SECONDS values must be between 0 and 900")
+        if self.pump_launch_initial_buy_sol <= 0:
+            raise ValueError("PUMP_LAUNCH_INITIAL_BUY_SOL must be positive")
+        if not self.news_launch_ready_score <= self.pump_launch_min_score <= 100:
+            raise ValueError(
+                "PUMP_LAUNCH_MIN_SCORE must be between NEWS_LAUNCH_READY_SCORE and 100"
+            )
+        if not 1 <= self.pump_launch_max_per_day <= 20:
+            raise ValueError("PUMP_LAUNCH_MAX_PER_DAY must be between 1 and 20")
+        if self.pump_launch_max_sol_per_day < self.pump_launch_initial_buy_sol:
+            raise ValueError(
+                "PUMP_LAUNCH_MAX_SOL_PER_DAY cannot be below PUMP_LAUNCH_INITIAL_BUY_SOL"
+            )
+        try:
+            ZoneInfo(self.pump_launch_timezone)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError("PUMP_LAUNCH_TIMEZONE must be a valid IANA timezone") from exc
+        if not 0 <= self.pump_launch_buyback_bps <= 10_000:
+            raise ValueError("PUMP_LAUNCH_BUYBACK_BPS must be between 0 and 10000")
         if not 1 <= self.rpc_requests_per_second <= 100:
             raise ValueError("RPC_REQUESTS_PER_SECOND must be between 1 and 100")
         if not 0 <= self.rpc_max_retries <= 10:

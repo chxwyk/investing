@@ -541,3 +541,42 @@ async def test_verified_candidate_pool_survives_reconnect(tmp_path) -> None:
         assert loaded == [candidate]
     finally:
         await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_pump_launch_reservation_blocks_duplicate_and_counts_daily_limit(tmp_path) -> None:
+    database = Database(str(tmp_path / "pump-launch.db"), Decimal("1000"))
+    await database.connect()
+    try:
+        first = await database.reserve_pump_launch(
+            alert_key="alert-1",
+            source_url="https://example.test/news",
+            headline="Unexpected Sprite event",
+            name="Sprite Event",
+            symbol="SE",
+            score=88,
+            initial_buy_sol=Decimal("0.01"),
+            requested_by="123",
+        )
+        duplicate = await database.reserve_pump_launch(
+            alert_key="alert-1",
+            source_url="https://example.test/news",
+            headline="Unexpected Sprite event",
+            name="Sprite Event",
+            symbol="SE",
+            score=88,
+            initial_buy_sol=Decimal("0.01"),
+            requested_by="123",
+        )
+        now = int(time.time())
+        count, sol = await database.pump_launch_daily_usage(
+            start_at=now - 60,
+            end_at=now + 60,
+        )
+
+        assert first is True
+        assert duplicate is False
+        assert count == 1
+        assert sol == Decimal("0.01")
+    finally:
+        await database.close()

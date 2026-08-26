@@ -194,6 +194,60 @@ class NarrativePairMatch:
 
 
 @dataclass(frozen=True, slots=True)
+class NarrativeCompetition:
+    query: str
+    matching_pairs: int = 0
+    liquid_pairs: int = 0
+    strongest_liquidity_usd: Decimal | None = None
+    strongest_market_cap_usd: Decimal | None = None
+    strongest_mint: str = ""
+    strongest_symbol: str = ""
+    strongest_pair_url: str = ""
+    error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class LaunchOpportunity:
+    alert: NewsAlert
+    score: int
+    verdict: str
+    confidence: str
+    category: str
+    coin_name: str
+    coin_symbol: str
+    primary_narrative: str
+    source_score: int
+    speed_score: int
+    viral_score: int
+    x_score: int
+    confirmation_score: int
+    competition_score: int
+    identity_score: int
+    cross_source_count: int
+    competition: NarrativeCompetition
+    x_evidence: XSocialSnapshot
+    positives: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
+    blockers: tuple[str, ...] = ()
+    generated_at: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class PumpLaunchResult:
+    success: bool
+    status: str
+    message: str
+    alert_key: str
+    name: str
+    symbol: str
+    mint: str = ""
+    signature: str = ""
+    metadata_uri: str = ""
+    explorer_url: str = ""
+    created_at: int = 0
+
+
+@dataclass(frozen=True, slots=True)
 class TokenRiskSnapshot:
     available: bool
     score: Decimal | None = None

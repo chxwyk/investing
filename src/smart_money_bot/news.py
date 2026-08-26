@@ -18,7 +18,7 @@ from urllib.parse import urlparse
 import aiohttp
 from solders.pubkey import Pubkey
 
-from .models import NarrativePairMatch, NewsAlert
+from .models import NarrativeCompetition, NarrativePairMatch, NewsAlert
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +30,9 @@ SOLANA_MINT_RE = re.compile(
 TAG_RE = re.compile(r"[$#]([A-Za-z][A-Za-z0-9_]{2,20})")
 QUOTED_RE = re.compile(r"[\"“]([^\"”]{3,40})[\"”]")
 UPPER_RE = re.compile(r"\b([A-Z][A-Z0-9]{2,19})\b")
+TITLE_PHRASE_RE = re.compile(
+    r"\b([A-Z][A-Za-z0-9'’-]{2,}(?:\s+[A-Z][A-Za-z0-9'’-]{2,}){0,2})\b"
+)
 
 STOP_TERMS = {
     "BREAKING",
@@ -50,6 +53,47 @@ STOP_TERMS = {
     "THEY",
     "ABOUT",
     "PRESIDENT",
+    "LIVE",
+    "REPORT",
+    "REPORTS",
+    "WATCH",
+    "TODAY",
+    "WORLD",
+    "FIRST",
+    "NEW",
+    "SAYS",
+    "SAID",
+}
+
+TITLE_STOP_WORDS = {
+    "A",
+    "An",
+    "And",
+    "As",
+    "At",
+    "Breaking",
+    "By",
+    "Exclusive",
+    "For",
+    "From",
+    "How",
+    "In",
+    "Into",
+    "Live",
+    "New",
+    "News",
+    "Of",
+    "On",
+    "Report",
+    "Reports",
+    "Says",
+    "The",
+    "This",
+    "To",
+    "Update",
+    "Watch",
+    "Why",
+    "With",
 }
 
 HIGH_IMPACT_WORDS = {
@@ -74,6 +118,70 @@ HIGH_IMPACT_WORDS = {
     "emergency",
     "war",
     "ceasefire",
+    "dies",
+    "died",
+    "death",
+    "wins",
+    "winner",
+    "record",
+    "upset",
+    "trade",
+    "fired",
+    "suspended",
+    "injured",
+    "viral",
+    "recall",
+    "reveal",
+    "unveil",
+    "release",
+    "cancel",
+    "scores",
+    "breaks",
+    "shatters",
+    "beats",
+    "marries",
+    "divorce",
+    "pregnant",
+    "feud",
+    "fight",
+    "collapse",
+    "crash",
+    "fires",
+    "hired",
+    "signs",
+    "sues",
+    "sued",
+    "boycott",
+    "challenge",
+    "trend",
+}
+
+COIN_INTENT_PHRASES = {
+    "coin",
+    "token",
+    "memecoin",
+    "meme coin",
+    "contract address",
+    "ticker",
+    "launch",
+    "listing",
+}
+
+TECHNICAL_NEWS_PHRASES = {
+    "taxable",
+    "tax reporting",
+    "reporting framework",
+    "regulatory reporting",
+    "compliance framework",
+    "accounting standard",
+}
+
+VIRAL_SOURCE_ACCOUNTS = {
+    "@realdonaldtrump",
+    "@elonmusk",
+    "@whitehouse",
+    "@pumpdotfun",
+    "@solana",
 }
 
 # Named narratives that routinely seed fast copycat tokens. This is intentionally
@@ -101,6 +209,22 @@ NAMED_NARRATIVES = (
     "Ukraine",
     "NATO",
     "Greenland",
+    "Sprite",
+    "Coca-Cola",
+    "Pepsi",
+    "Nike",
+    "Apple",
+    "Disney",
+    "Netflix",
+    "Fortnite",
+    "Roblox",
+    "MrBeast",
+    "Taylor Swift",
+    "Drake",
+    "NBA",
+    "NFL",
+    "MLB",
+    "FIFA",
 )
 
 
@@ -126,6 +250,12 @@ def extract_narrative_terms(text: str) -> tuple[str, ...]:
         for term in NAMED_NARRATIVES
         if re.search(rf"\b{re.escape(term)}\b", text, flags=re.IGNORECASE)
     )
+    candidates.extend(
+        phrase
+        for phrase in TITLE_PHRASE_RE.findall(text)
+        if phrase not in TITLE_STOP_WORDS
+        and not all(word in TITLE_STOP_WORDS for word in phrase.split())
+    )
     terms: list[str] = []
     for raw in candidates:
         cleaned = re.sub(r"\s+", " ", raw).strip(" .,:;!?-_/@")
@@ -137,7 +267,7 @@ def extract_narrative_terms(text: str) -> tuple[str, ...]:
         if any(item.casefold() == key for item in terms):
             continue
         terms.append(cleaned)
-    return tuple(terms[:5])
+    return tuple(terms[:8])
 
 
 def score_news(
@@ -170,6 +300,28 @@ def score_news(
     score = max(0, min(100, score))
     urgency = "HIGH" if score >= 55 else "MEDIUM" if score >= 30 else "LOW"
     return score, urgency
+
+
+def is_coin_actionable_news(alert: NewsAlert) -> bool:
+    """Broad prefilter for events that could plausibly become a meme narrative."""
+
+    if alert.token_mints:
+        return True
+    if not alert.narrative_terms:
+        return False
+
+    text = f"{alert.headline}\n{alert.summary}".casefold()
+    high_impact_hits = sum(1 for word in HIGH_IMPACT_WORDS if word in text)
+    has_coin_intent = any(phrase in text for phrase in COIN_INTENT_PHRASES)
+    has_social_identity = bool(TAG_RE.search(f"{alert.headline}\n{alert.summary}"))
+    viral_source = alert.author.casefold() in VIRAL_SOURCE_ACCOUNTS
+    technical_only = any(phrase in text for phrase in TECHNICAL_NEWS_PHRASES)
+
+    if technical_only and not has_coin_intent and high_impact_hits == 0:
+        return False
+    if has_coin_intent or has_social_identity or high_impact_hits or viral_source:
+        return True
+    return bool(alert.narrative_terms) and (alert.score >= 30 or alert.author_verified)
 
 
 def _parse_iso_time(value: Any) -> int:
@@ -263,7 +415,7 @@ class XFilteredNewsStream:
                 timeout=aiohttp.ClientTimeout(total=None, sock_connect=15, sock_read=90),
                 headers={
                     "Authorization": f"Bearer {self.bearer_token}",
-                    "User-Agent": "SmartMoneyCopyBot/2.20 news-radar",
+                    "User-Agent": "SmartMoneyCopyBot/2.22 news-radar",
                 },
             )
         return self._session
@@ -460,7 +612,7 @@ class RssNewsPoller:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=15),
-                headers={"User-Agent": "SmartMoneyCopyBot/2.20 news-radar"},
+                headers={"User-Agent": "SmartMoneyCopyBot/2.22 news-radar"},
             )
         return self._session
 
@@ -538,7 +690,7 @@ class DexNarrativeMatcher:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=12),
-                headers={"User-Agent": "SmartMoneyCopyBot/2.20 narrative-match"},
+                headers={"User-Agent": "SmartMoneyCopyBot/2.22 narrative-match"},
             )
         return self._session
 
@@ -550,18 +702,9 @@ class DexNarrativeMatcher:
         query = narrative.strip()
         if not query:
             return None
-        session = await self._get_session()
-        try:
-            async with session.get(
-                f"{self.BASE_URL}/latest/dex/search",
-                params={"q": query},
-            ) as response:
-                if response.status >= 400:
-                    return None
-                payload = await response.json(content_type=None)
-        except (TimeoutError, aiohttp.ClientError, ValueError):
+        pairs = await self._search_pairs(query)
+        if pairs is None:
             return None
-        pairs = payload.get("pairs") or [] if isinstance(payload, dict) else []
         matches: list[NarrativePairMatch] = []
         wanted = _normalize_term(query)
         now_ms = int(time.time() * 1000)
@@ -609,6 +752,68 @@ class DexNarrativeMatcher:
             ),
             default=None,
         )
+
+    async def competition(self, narrative: str) -> NarrativeCompetition:
+        query = narrative.strip()
+        if not query:
+            return NarrativeCompetition(query=query, error="empty narrative")
+        pairs = await self._search_pairs(query)
+        if pairs is None:
+            return NarrativeCompetition(query=query, error="DEX search unavailable")
+
+        wanted = _normalize_term(query)
+        matches: list[dict[str, Any]] = []
+        for pair in pairs:
+            if not isinstance(pair, dict) or str(pair.get("chainId") or "").lower() != "solana":
+                continue
+            token = pair.get("baseToken") or {}
+            identities = {
+                _normalize_term(str(token.get("symbol") or "")),
+                _normalize_term(str(token.get("name") or "")),
+            }
+            if wanted not in identities and not any(
+                wanted and (wanted in item or item in wanted) for item in identities if item
+            ):
+                continue
+            matches.append(pair)
+
+        def liquidity(pair: dict[str, Any]) -> Decimal:
+            return _decimal_or_none((pair.get("liquidity") or {}).get("usd")) or Decimal("0")
+
+        strongest = max(matches, key=liquidity, default=None)
+        strongest_token = (strongest or {}).get("baseToken") or {}
+        strongest_liquidity = liquidity(strongest) if strongest else None
+        return NarrativeCompetition(
+            query=query,
+            matching_pairs=len(matches),
+            liquid_pairs=sum(1 for pair in matches if liquidity(pair) >= self.min_liquidity_usd),
+            strongest_liquidity_usd=strongest_liquidity,
+            strongest_market_cap_usd=(
+                _decimal_or_none((strongest or {}).get("marketCap") or (strongest or {}).get("fdv"))
+                if strongest
+                else None
+            ),
+            strongest_mint=str(strongest_token.get("address") or ""),
+            strongest_symbol=str(strongest_token.get("symbol") or ""),
+            strongest_pair_url=str((strongest or {}).get("url") or ""),
+        )
+
+    async def _search_pairs(self, query: str) -> list[Any] | None:
+        session = await self._get_session()
+        try:
+            async with session.get(
+                f"{self.BASE_URL}/latest/dex/search",
+                params={"q": query},
+            ) as response:
+                if response.status >= 400:
+                    return None
+                payload = await response.json(content_type=None)
+        except (TimeoutError, aiohttp.ClientError, ValueError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        pairs = payload.get("pairs") or []
+        return pairs if isinstance(pairs, list) else None
 
 
 def _normalize_term(value: str) -> str:

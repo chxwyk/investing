@@ -8,3 +8,7 @@ class JupiterError(RuntimeError):
 
 class DiscoveryError(RuntimeError):
     pass
+
+
+class PumpLaunchError(RuntimeError):
+    pass

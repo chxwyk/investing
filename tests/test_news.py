@@ -1,8 +1,10 @@
 from datetime import UTC, datetime
 
+from smart_money_bot.models import NewsAlert
 from smart_money_bot.news import (
     extract_narrative_terms,
     extract_solana_mints,
+    is_coin_actionable_news,
     parse_feed,
     parse_x_news_payload,
 )
@@ -26,6 +28,41 @@ def test_extracts_named_news_narratives_without_all_caps() -> None:
     terms = extract_narrative_terms("Trump announces a new federal initiative")
 
     assert "Trump" in terms
+
+
+def test_technical_crypto_publisher_story_is_not_coin_actionable() -> None:
+    alert = NewsAlert(
+        source="X filtered stream",
+        headline=(
+            "Chainalysis estimates global taxable onchain crypto activity reached at least "
+            "$457 billion, while the OECD's CARF reporting framework covers only 14%"
+        ),
+        summary="",
+        url="https://x.com/Cointelegraph/status/1",
+        author="@Cointelegraph",
+        author_followers=2_936_642,
+        author_verified=True,
+        score=53,
+        urgency="MEDIUM",
+        narrative_terms=("OECD", "CARF"),
+    )
+
+    assert is_coin_actionable_news(alert) is False
+
+
+def test_named_breaking_event_is_coin_actionable_before_contract_exists() -> None:
+    alert = NewsAlert(
+        source="X filtered stream",
+        headline="BREAKING: Trump announces Project Kitchen",
+        summary="",
+        url="https://x.com/newsdesk/status/2",
+        author="@newsdesk",
+        score=55,
+        urgency="HIGH",
+        narrative_terms=("Trump", "Kitchen"),
+    )
+
+    assert is_coin_actionable_news(alert) is True
 
 
 def test_x_stream_payload_becomes_fast_news_alert() -> None:

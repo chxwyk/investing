@@ -3,7 +3,7 @@ from __future__ import annotations
 from decimal import Decimal
 
 from smart_money_bot.config import Settings
-from smart_money_bot.constants import LIVE_ACK_TEXT
+from smart_money_bot.constants import LIVE_ACK_TEXT, PUMP_LAUNCH_ACK_TEXT
 
 
 def test_live_mode_requires_every_lock(monkeypatch) -> None:
@@ -21,6 +21,18 @@ def test_live_mode_stays_locked_without_ack(monkeypatch) -> None:
     monkeypatch.setenv("JUPITER_API_KEY", "jup_test")
     settings = Settings.from_env(require_discord_token=False)
     assert settings.live_is_unlocked is False
+
+
+def test_pump_launch_requires_separate_ack_wallet_and_pinata(monkeypatch) -> None:
+    monkeypatch.setenv("PUMP_ONE_CLICK_LAUNCH_ENABLED", "true")
+    monkeypatch.setenv("PUMP_LAUNCH_ACK", PUMP_LAUNCH_ACK_TEXT)
+    monkeypatch.setenv("PUMP_LAUNCH_PRIVATE_KEY", "dedicated-secret-present")
+    monkeypatch.setenv("PINATA_JWT", "pinata-secret-present")
+
+    settings = Settings.from_env(require_discord_token=False)
+
+    assert settings.pump_launch_is_unlocked is True
+    assert settings.enable_live_trading is False
 
 
 def test_discovery_requires_api_key(monkeypatch) -> None:
@@ -223,10 +235,17 @@ def test_news_radar_defaults_to_fast_but_cost_bounded_sources(monkeypatch) -> No
         "J7_AUTHORIZED_FEED_URL",
         "NEWS_POLL_SECONDS",
         "NEWS_MIN_SCORE",
+        "NEWS_LAUNCH_READY_SCORE",
+        "NEWS_X_VERIFY_MIN_SCORE",
+        "NEWS_X_TREND_CACHE_SECONDS",
         "NEWS_MAX_ALERTS_PER_HOUR",
         "NEWS_DEX_MATCH_ENABLED",
         "NEWS_PAIR_RECHECK_SECONDS",
         "X_SEARCH_MAX_RESULTS",
+        "PUMP_ONE_CLICK_LAUNCH_ENABLED",
+        "PUMP_LAUNCH_ACK",
+        "PUMP_LAUNCH_PRIVATE_KEY",
+        "PINATA_JWT",
     )
     for name in names:
         monkeypatch.delenv(name, raising=False)
@@ -239,8 +258,12 @@ def test_news_radar_defaults_to_fast_but_cost_bounded_sources(monkeypatch) -> No
     assert settings.news_rss_feeds
     assert settings.j7_authorized_feed_url is None
     assert settings.news_poll_seconds == 30
-    assert settings.news_min_score == 20
+    assert settings.news_min_score == 45
+    assert settings.news_launch_ready_score == 72
+    assert settings.news_x_verify_min_score == 35
     assert settings.news_max_alerts_per_hour == 30
     assert settings.news_dex_match_enabled is True
+    assert settings.pump_one_click_launch_enabled is False
+    assert settings.pump_launch_is_unlocked is False
     assert settings.news_pair_recheck_seconds == (0, 30, 90, 180)
     assert settings.x_search_max_results == 10

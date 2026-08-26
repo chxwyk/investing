@@ -298,7 +298,7 @@ def _decimal_or_none(value: Any) -> Decimal | None:
     return Decimal(str(value)) if value is not None else None
 
 
-def load_keypair(secret: str) -> Keypair:
+def load_keypair(secret: str, *, variable_name: str = "TRADING_PRIVATE_KEY") -> Keypair:
     secret = secret.strip()
     try:
         if secret.startswith("["):
@@ -310,21 +310,30 @@ def load_keypair(secret: str) -> Keypair:
         else:
             return Keypair.from_base58_string(secret)
     except (ValueError, json.JSONDecodeError) as exc:
-        raise ValueError("TRADING_PRIVATE_KEY must be base58 or a 64-byte JSON array") from exc
+        raise ValueError(
+            f"{variable_name} must be base58 or a 64-byte JSON array"
+        ) from exc
 
 
-def sign_versioned_transaction(encoded: str, keypair: Keypair) -> str:
+def sign_versioned_transaction(
+    encoded: str,
+    keypair: Keypair,
+    *,
+    provider: str = "Jupiter",
+) -> str:
     try:
         transaction = VersionedTransaction.from_bytes(base64.b64decode(encoded))
     except Exception as exc:  # solders raises several low-level decode errors
-        raise JupiterError("Jupiter returned an invalid versioned transaction") from exc
+        raise JupiterError(f"{provider} returned an invalid versioned transaction") from exc
 
     required = transaction.message.header.num_required_signatures
     signer_keys = list(transaction.message.account_keys)[:required]
     try:
         signer_index = signer_keys.index(keypair.pubkey())
     except ValueError as exc:
-        raise JupiterError("Trading key is not a required signer on the Jupiter order") from exc
+        raise JupiterError(
+            f"Configured signing key is not a required signer on the {provider} transaction"
+        ) from exc
 
     signatures = list(transaction.signatures)
     signatures[signer_index] = keypair.sign_message(to_bytes_versioned(transaction.message))

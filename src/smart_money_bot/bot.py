@@ -4,6 +4,7 @@ import csv
 import io
 import logging
 import time
+from contextlib import suppress
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Literal
@@ -25,9 +26,11 @@ from .models import (
     DiscoveryRefresh,
     ExecutionMode,
     ExecutionResult,
+    LaunchOpportunity,
     NarrativePairMatch,
     NewsAlert,
     PaperDailyLockStatus,
+    PumpLaunchResult,
     RiskDecision,
     Side,
     Signal,
@@ -36,6 +39,15 @@ from .models import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _member_is_admin(user: discord.abc.User, settings: Settings) -> bool:
+    if not isinstance(user, discord.Member):
+        return False
+    if user.guild_permissions.administrator:
+        return True
+    role_ids = {role.id for role in user.roles}
+    return bool(role_ids & settings.discord_admin_role_ids)
 
 
 def _money(value: Decimal | None) -> str:
@@ -95,7 +107,7 @@ def _token_view(mint: str, fomo_referral_code: str | None = None) -> discord.ui.
     )
     view.add_item(
         discord.ui.Button(
-        label="Buy on Jupiter",
+            label="Buy on Jupiter",
             style=discord.ButtonStyle.link,
             url=f"https://jup.ag/swap/SOL-{mint}",
             row=0,
@@ -118,6 +130,147 @@ def _token_view(mint: str, fomo_referral_code: str | None = None) -> discord.ui.
         )
     )
     return view
+
+
+def _news_lead_view(alert: NewsAlert) -> discord.ui.View:
+    query = " ".join(alert.narrative_terms[:3]) or alert.headline[:100]
+    view = discord.ui.View(timeout=None)
+    view.add_item(
+        discord.ui.Button(
+            label="Search Matching Coins",
+            style=discord.ButtonStyle.link,
+            url=f"https://dexscreener.com/search?{urlencode({'q': query})}",
+            row=0,
+        )
+    )
+    view.add_item(
+        discord.ui.Button(
+            label="Explore Pump.fun",
+            style=discord.ButtonStyle.link,
+            url="https://pump.fun/coins",
+            row=0,
+        )
+    )
+    view.add_item(
+        discord.ui.Button(
+            label="Create on Pump.fun",
+            style=discord.ButtonStyle.link,
+            url="https://pump.fun/create",
+            row=0,
+        )
+    )
+    view.add_item(
+        discord.ui.Button(
+            label="Search X Live",
+            style=discord.ButtonStyle.link,
+            url=f"https://x.com/search?{urlencode({'q': query, 'f': 'live'})}",
+            row=1,
+        )
+    )
+    if alert.url:
+        view.add_item(
+            discord.ui.Button(
+                label="Original News",
+                style=discord.ButtonStyle.link,
+                url=alert.url,
+                row=1,
+            )
+        )
+    return view
+
+
+class NewsOpportunityView(discord.ui.View):
+    def __init__(self, bot: SmartMoneyBot, opportunity: LaunchOpportunity) -> None:
+        super().__init__(timeout=900)
+        self.bot = bot
+        self.opportunity = opportunity
+        alert = opportunity.alert
+        query = " ".join(alert.narrative_terms[:3]) or alert.headline[:100]
+        self.add_item(
+            discord.ui.Button(
+                label="Search Matching Coins",
+                style=discord.ButtonStyle.link,
+                url=f"https://dexscreener.com/search?{urlencode({'q': query})}",
+                row=0,
+            )
+        )
+        self.add_item(
+            discord.ui.Button(
+                label="Explore Pump.fun",
+                style=discord.ButtonStyle.link,
+                url="https://pump.fun/coins",
+                row=0,
+            )
+        )
+        self.add_item(
+            discord.ui.Button(
+                label="Search X Live",
+                style=discord.ButtonStyle.link,
+                url=f"https://x.com/search?{urlencode({'q': query, 'f': 'live'})}",
+                row=1,
+            )
+        )
+        if alert.url:
+            self.add_item(
+                discord.ui.Button(
+                    label="Original News",
+                    style=discord.ButtonStyle.link,
+                    url=alert.url,
+                    row=1,
+                )
+            )
+        self.launch_button.disabled = (
+            opportunity.verdict != "LAUNCH READY" or not bot.engine.pump_launcher.configured
+        )
+        if opportunity.verdict != "LAUNCH READY":
+            self.launch_button.label = "Launch unavailable — WATCH"
+        elif not bot.engine.pump_launcher.configured:
+            self.launch_button.label = "One-click launch locked"
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if _member_is_admin(interaction.user, self.bot.settings):
+            return True
+        await interaction.response.send_message(
+            "Only a configured bot administrator can launch from an alert.",
+            ephemeral=True,
+        )
+        return False
+
+    @discord.ui.button(
+        label="Launch on Pump.fun",
+        style=discord.ButtonStyle.danger,
+        row=2,
+        custom_id="smartmoney:launch-news-coin:v1",
+    )
+    async def launch_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        button.disabled = True
+        button.label = "Launch submitted…"
+        if interaction.message:
+            with suppress(discord.HTTPException):
+                await interaction.message.edit(view=self)
+        result = await self.bot.engine.launch_news_opportunity(
+            self.opportunity,
+            requested_by=str(interaction.user.id),
+        )
+        result_embed = _pump_launch_result_embed(result)
+        await interaction.followup.send(embed=result_embed, ephemeral=True)
+        if result.success:
+            await self.bot._send_alert(
+                result_embed,
+                token_mint=result.mint,
+                ping_user=True,
+            )
+            button.label = "Launched"
+        else:
+            button.label = f"Launch {result.status.lower()}"[:80]
+        if interaction.message:
+            with suppress(discord.HTTPException):
+                await interaction.message.edit(view=self)
 
 
 def _discovery_lines(candidates: tuple[DiscoveryCandidate, ...] | list[DiscoveryCandidate]) -> str:
@@ -253,26 +406,52 @@ def _coin_callout_embed(callout: CoinCallout) -> discord.Embed:
     return embed
 
 
-def _news_alert_embed(alert: NewsAlert) -> discord.Embed:
-    color = (
-        0xE74C3C
-        if alert.urgency == "HIGH"
-        else 0xF1C40F
-        if alert.urgency == "MEDIUM"
-        else 0x3498DB
-    )
+def _news_alert_embed(
+    alert: NewsAlert,
+    opportunity: LaunchOpportunity,
+) -> discord.Embed:
+    colors = {
+        "COIN FOUND": 0x3498DB,
+        "LAUNCH READY": 0xE74C3C,
+        "WATCH": 0xF1C40F,
+        "SKIP": 0x95A5A6,
+    }
     source = alert.author or alert.source
     delay = max(0, alert.received_at - alert.created_at) if alert.created_at else None
     timing = f" • received `{delay}s` after publication" if delay is not None else ""
     embed = discord.Embed(
-        title=f"NEWS RADAR • {alert.urgency} • {source}"[:256],
-        description=f"**{alert.headline[:700]}**",
-        color=color,
+        title=f"NEWS RADAR • {opportunity.verdict} • {opportunity.category} • {source}"[:256],
+        description=(
+            f"**{alert.headline[:700]}**\n\n"
+            + (
+                "A Solana contract is already in the source. Use the direct research/buy "
+                "links; this alert cannot launch a duplicate coin."
+                if alert.token_mints
+                else "No source contract was found. `LAUNCH READY` means the event passed "
+                "the cultural-opportunity threshold; `WATCH` means evidence is still short."
+            )
+        ),
+        color=colors.get(opportunity.verdict, 0x95A5A6),
         timestamp=datetime.fromtimestamp(alert.received_at or int(time.time()), tz=UTC),
     )
     embed.add_field(
-        name="Signal",
-        value=f"Narrative score `{alert.score}/100`{timing}",
+        name="Launch-opportunity score",
+        value=(
+            f"**{opportunity.score}/100** • confidence **{opportunity.confidence}**{timing}\n"
+            f"Proposed identity: **{opportunity.coin_name}** (`${opportunity.coin_symbol}`)"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Why it scored this way",
+        value=(
+            f"Source `{opportunity.source_score}/15` • speed `{opportunity.speed_score}/15` • "
+            f"meme potential `{opportunity.viral_score}/25`\n"
+            f"X traction `{opportunity.x_score}/15` • independent confirmation "
+            f"`{opportunity.confirmation_score}/10` • open coin space "
+            f"`{opportunity.competition_score}/10` • identity "
+            f"`{opportunity.identity_score}/10`"
+        ),
         inline=False,
     )
     if alert.author:
@@ -290,6 +469,31 @@ def _news_alert_embed(alert: NewsAlert) -> discord.Embed:
             value=" • ".join(f"`{item}`" for item in alert.narrative_terms)[:1024],
             inline=False,
         )
+    if opportunity.x_evidence.available:
+        x = opportunity.x_evidence
+        embed.add_field(
+            name="Wider X evidence",
+            value=(
+                f"Posts `{x.posts}` • authors `{x.unique_authors}` • established "
+                f"`{x.established_authors}` • influential `{x.influential_authors}`\n"
+                f"Velocity `{x.posts_per_minute}/min` • engagements `{x.engagements}` • "
+                f"duplicate text `{x.duplicate_percent}%`"
+            ),
+            inline=False,
+        )
+    if opportunity.positives:
+        embed.add_field(
+            name="Positive evidence",
+            value="\n".join(f"• {item}" for item in opportunity.positives)[:1024],
+            inline=False,
+        )
+    risks = opportunity.blockers + opportunity.warnings
+    if risks:
+        embed.add_field(
+            name="Blocks / missing proof",
+            value="\n".join(f"• {item}" for item in risks)[:1024],
+            inline=False,
+        )
     if alert.token_mints:
         embed.add_field(
             name="Contracts found in the source",
@@ -299,8 +503,41 @@ def _news_alert_embed(alert: NewsAlert) -> discord.Embed:
     if alert.url:
         embed.add_field(name="Original source", value=f"[Open source]({alert.url})", inline=False)
     embed.set_footer(
-        text="News lead only • narrative pairs are cross-checked • never an automatic live buy"
+        text=(
+            "COIN FOUND • direct links below • token-risk callout follows"
+            if alert.token_mints
+            else "No coin yet • DEX matcher keeps checking • launch button is admin-only"
+        )
     )
+    return embed
+
+
+def _pump_launch_result_embed(result: PumpLaunchResult) -> discord.Embed:
+    embed = discord.Embed(
+        title=(
+            f"PUMP LAUNCH • {result.status} • ${result.symbol}"
+            if result.success
+            else f"PUMP LAUNCH • {result.status}"
+        ),
+        description=result.message,
+        color=0x2ECC71 if result.success else 0xE74C3C,
+        timestamp=datetime.fromtimestamp(result.created_at or int(time.time()), tz=UTC),
+    )
+    embed.add_field(name="Name", value=result.name or "unknown")
+    embed.add_field(name="Symbol", value=f"`${result.symbol}`" if result.symbol else "unknown")
+    if result.mint:
+        embed.add_field(name="Mint", value=f"`{result.mint}`", inline=False)
+        embed.add_field(
+            name="Pump.fun",
+            value=f"[Open coin](https://pump.fun/coin/{result.mint})",
+        )
+    if result.signature:
+        embed.add_field(
+            name="Transaction",
+            value=f"[View on Solscan](https://solscan.io/tx/{result.signature})",
+            inline=False,
+        )
+    embed.set_footer(text="Dedicated launch wallet • duplicate lock • daily count/SOL limits")
     return embed
 
 
@@ -861,6 +1098,7 @@ class SmartMoneyBot(commands.Bot):
         *,
         token_mint: str | None = None,
         ping_user: bool = False,
+        view: discord.ui.View | None = None,
     ) -> None:
         channel = await self._alert_channel()
         if channel is None:
@@ -878,7 +1116,9 @@ class SmartMoneyBot(commands.Bot):
                 content=content,
                 embed=embed,
                 view=(
-                    _token_view(token_mint, self.settings.fomo_referral_code)
+                    view
+                    if view is not None
+                    else _token_view(token_mint, self.settings.fomo_referral_code)
                     if token_mint
                     else None
                 ),
@@ -1020,11 +1260,17 @@ class SmartMoneyBot(commands.Bot):
             ping_user=callout.verdict in {"STRONG WATCH", "WATCH"},
         )
 
-    async def on_news_alert(self, alert: NewsAlert) -> None:
+    async def on_news_alert(
+        self,
+        alert: NewsAlert,
+        opportunity: LaunchOpportunity,
+    ) -> None:
+        mint = alert.token_mints[0] if alert.token_mints else None
         await self._send_alert(
-            _news_alert_embed(alert),
-            token_mint=alert.token_mints[0] if alert.token_mints else None,
-            ping_user=alert.urgency in {"HIGH", "MEDIUM"},
+            _news_alert_embed(alert, opportunity),
+            token_mint=mint,
+            ping_user=opportunity.verdict in {"COIN FOUND", "LAUNCH READY"},
+            view=None if mint else NewsOpportunityView(self, opportunity),
         )
 
     async def on_narrative_match(
@@ -1089,12 +1335,7 @@ class SmartMoneyCommands(
         self.bot = bot
 
     def _is_admin(self, user: discord.abc.User) -> bool:
-        if not isinstance(user, discord.Member):
-            return False
-        if user.guild_permissions.administrator:
-            return True
-        role_ids = {role.id for role in user.roles}
-        return bool(role_ids & self.bot.settings.discord_admin_role_ids)
+        return _member_is_admin(user, self.bot.settings)
 
     async def _require_admin(self, interaction: discord.Interaction) -> bool:
         if self._is_admin(interaction.user):
@@ -1420,9 +1661,12 @@ class SmartMoneyCommands(
             f"**X/Twitter coin intelligence:** {x_status}"
             " • contract + DEX-listed name/ticker • author-quality and duplicate-text checks\n"
             f"**X near-realtime news stream:** {news_stream_status} • configured account/news "
-            "rule • narrative extraction\n"
+            "rule • cross-category cultural-event scoring • narrative extraction\n"
             f"**RSS/news radar:** {'ready' if status['news_rss_ready'] else 'starting'} • "
-            "White House, SEC, world news, and crypto sources\n"
+            "government, world, sports, entertainment, technology, market, and crypto\n"
+            f"**One-click Pump.fun launch:** "
+            f"{'unlocked' if status['pump_launch_unlocked'] else 'locked'} • "
+            "admin-only • separate capped wallet • public IPFS metadata\n"
             f"**J7 Tracker:** "
             + (
                 f"authorized feed {status['j7_feed_health']}\n"
@@ -2003,7 +2247,16 @@ class SmartMoneyCommands(
             f"X {x_callout_health} • "
             f"minimum alert score {s.coin_callout_min_alert_score}/100\n"
             f"**News radar:** {'enabled' if status['news_radar_enabled'] else 'disabled'} • "
+            "politics/sports/celebrity/products/internet/gaming/world/crypto • "
             f"X stream {x_news_health} • RSS {rss_health}\n"
+            f"**Cultural launch score:** WATCH {s.news_min_score}+ • LAUNCH READY "
+            f"{s.news_launch_ready_score}+ • source/speed/meme/X/confirmation/"
+            "competition/identity\n"
+            f"**One-click Pump launch:** "
+            f"{'unlocked' if status['pump_launch_unlocked'] else 'locked'} • "
+            f"{s.pump_launch_initial_buy_sol} SOL initial buy • max "
+            f"{s.pump_launch_max_per_day}/day and "
+            f"{s.pump_launch_max_sol_per_day} SOL/day\n"
             f"**Narrative pair matching:** "
             f"{'enabled' if s.news_dex_match_enabled else 'disabled'} • minimum "
             f"{_money(s.news_dex_match_min_liquidity_usd)} liquidity • maximum "

@@ -30,6 +30,7 @@ from .discovery import (
 )
 from .errors import DiscoveryError, JupiterError, RpcError
 from .executor import ExecutionManager
+from .launch import PumpLaunchClient, alert_key, score_launch_opportunity
 from .market import JupiterClient
 from .models import (
     CoinCallout,
@@ -38,11 +39,13 @@ from .models import (
     DiscoveryRefresh,
     ExecutionMode,
     ExecutionResult,
+    LaunchOpportunity,
     NarrativePairMatch,
     NewsAlert,
     PaperDailyLockStatus,
     PaperReadiness,
     PaperSummary,
+    PumpLaunchResult,
     RiskDecision,
     ScoredTrader,
     Side,
@@ -51,7 +54,12 @@ from .models import (
     TrackedTrader,
     TraderMetrics,
 )
-from .news import DexNarrativeMatcher, RssNewsPoller, XFilteredNewsStream
+from .news import (
+    DexNarrativeMatcher,
+    RssNewsPoller,
+    XFilteredNewsStream,
+    is_coin_actionable_news,
+)
 from .risk import RiskEngine
 from .rotation import CandidateRotator, RotationResult, is_pump_mint
 from .rpc import SolanaRPC
@@ -80,7 +88,11 @@ class Notifier(Protocol):
 
     async def on_coin_callout(self, callout: CoinCallout) -> None: ...
 
-    async def on_news_alert(self, alert: NewsAlert) -> None: ...
+    async def on_news_alert(
+        self,
+        alert: NewsAlert,
+        opportunity: LaunchOpportunity,
+    ) -> None: ...
 
     async def on_narrative_match(
         self, alert: NewsAlert, match: NarrativePairMatch
@@ -109,7 +121,11 @@ class NullNotifier:
     async def on_coin_callout(self, callout: CoinCallout) -> None:
         return None
 
-    async def on_news_alert(self, alert: NewsAlert) -> None:
+    async def on_news_alert(
+        self,
+        alert: NewsAlert,
+        opportunity: LaunchOpportunity,
+    ) -> None:
         return None
 
     async def on_narrative_match(
@@ -139,6 +155,7 @@ class SmartMoneyEngine:
         self.x_social = XRecentSearchClient(
             settings.x_api_bearer_token,
             max_results=settings.x_search_max_results,
+            cache_seconds=settings.news_x_trend_cache_seconds,
         )
         self.tracker_token_risk = SolanaTrackerTokenRiskClient(settings.solana_tracker_api_key)
         self.callout_analyzer = CoinCalloutAnalyzer(
@@ -161,6 +178,7 @@ class SmartMoneyEngine:
             min_liquidity_usd=settings.news_dex_match_min_liquidity_usd,
             max_age_minutes=settings.news_dex_match_max_age_minutes,
         )
+        self.pump_launcher = PumpLaunchClient(settings, self.rpc)
         self.discovery = (
             SolanaTrackerClient(settings.solana_tracker_api_key)
             if settings.solana_tracker_api_key
@@ -197,6 +215,7 @@ class SmartMoneyEngine:
         self._news_rss_task: asyncio.Task[None] | None = None
         self._news_match_tasks: set[asyncio.Task[None]] = set()
         self._news_alert_times: deque[int] = deque()
+        self._recent_news_events: deque[tuple[int, str, frozenset[str]]] = deque()
         self._narrative_matches_seen: set[str] = set()
         self._last_callout_state: dict[str, tuple[int, int]] = {}
         self._scan_lock = asyncio.Lock()
@@ -316,6 +335,7 @@ class SmartMoneyEngine:
         await self.x_news_stream.close()
         await self.news_poller.close()
         await self.news_matcher.close()
+        await self.pump_launcher.close()
         if self.discovery:
             await self.discovery.close()
         if self.profile_discovery:
@@ -907,12 +927,59 @@ class SmartMoneyEngine:
         now = int(time.time())
         while self._news_alert_times and now - self._news_alert_times[0] >= 3600:
             self._news_alert_times.popleft()
-        if alert.score < self.settings.news_min_score:
+        if not is_coin_actionable_news(alert):
+            return
+        preliminary = score_launch_opportunity(
+            alert,
+            now=now,
+            watch_score=self.settings.news_min_score,
+            launch_ready_score=self.settings.news_launch_ready_score,
+        )
+        if (
+            preliminary.score < self.settings.news_x_verify_min_score
+            and not alert.token_mints
+        ):
+            return
+
+        x_task = (
+            self.x_social.narrative_snapshot(preliminary.primary_narrative)
+            if self.x_social.configured
+            else None
+        )
+        competition_task = (
+            self.news_matcher.competition(preliminary.primary_narrative)
+            if self.settings.news_dex_match_enabled
+            else None
+        )
+        if x_task is not None and competition_task is not None:
+            x_evidence, competition = await asyncio.gather(x_task, competition_task)
+        elif x_task is not None:
+            x_evidence = await x_task
+            competition = preliminary.competition
+        elif competition_task is not None:
+            x_evidence = preliminary.x_evidence
+            competition = await competition_task
+        else:
+            x_evidence = preliminary.x_evidence
+            competition = preliminary.competition
+
+        cross_sources = self._cross_source_count(alert, now=now)
+        opportunity = score_launch_opportunity(
+            alert,
+            x_evidence=x_evidence,
+            competition=competition,
+            cross_source_count=cross_sources,
+            now=now,
+            watch_score=self.settings.news_min_score,
+            launch_ready_score=self.settings.news_launch_ready_score,
+        )
+        self._remember_news_event(alert, now=now)
+        if opportunity.verdict == "SKIP" or opportunity.score < self.settings.news_min_score:
             return
         if len(self._news_alert_times) >= self.settings.news_max_alerts_per_hour:
             return
         self._news_alert_times.append(now)
-        await self.notifier.on_news_alert(alert)
+        await self.notifier.on_news_alert(opportunity.alert, opportunity)
         for mint in alert.token_mints:
             self._queue_coin_callout(mint)
         if (
@@ -926,6 +993,118 @@ class SmartMoneyEngine:
             )
             self._news_match_tasks.add(task)
             task.add_done_callback(self._news_match_tasks.discard)
+
+    def _cross_source_count(self, alert: NewsAlert, *, now: int) -> int:
+        while self._recent_news_events and now - self._recent_news_events[0][0] > 600:
+            self._recent_news_events.popleft()
+        terms = {item.casefold() for item in alert.narrative_terms}
+        if not terms:
+            return 0
+        current_source = (alert.author or alert.source).casefold()
+        sources = {
+            source
+            for _, source, previous_terms in self._recent_news_events
+            if source != current_source and terms.intersection(previous_terms)
+        }
+        return len(sources)
+
+    def _remember_news_event(self, alert: NewsAlert, *, now: int) -> None:
+        terms = frozenset(item.casefold() for item in alert.narrative_terms)
+        if terms:
+            self._recent_news_events.append(
+                (now, (alert.author or alert.source).casefold(), terms)
+            )
+
+    async def launch_news_opportunity(
+        self,
+        opportunity: LaunchOpportunity,
+        *,
+        requested_by: str,
+    ) -> PumpLaunchResult:
+        now = int(time.time())
+        key = alert_key(opportunity.alert)
+        if not self.pump_launcher.configured:
+            return PumpLaunchResult(
+                success=False,
+                status="LOCKED",
+                message="One-click launch is locked or missing its dedicated wallet/Pinata setup.",
+                alert_key=key,
+                name=opportunity.coin_name,
+                symbol=opportunity.coin_symbol,
+                created_at=now,
+            )
+
+        timezone = ZoneInfo(self.settings.pump_launch_timezone)
+        local_now = datetime.now(timezone)
+        day_start = datetime.combine(local_now.date(), datetime_time.min, tzinfo=timezone)
+        day_end = day_start + timedelta(days=1)
+        launches, spent_sol = await self.database.pump_launch_daily_usage(
+            start_at=int(day_start.timestamp()),
+            end_at=int(day_end.timestamp()),
+        )
+        next_spend = spent_sol + self.settings.pump_launch_initial_buy_sol
+        if launches >= self.settings.pump_launch_max_per_day:
+            return PumpLaunchResult(
+                success=False,
+                status="DAILY_LIMIT",
+                message="Daily Pump launch-count limit reached.",
+                alert_key=key,
+                name=opportunity.coin_name,
+                symbol=opportunity.coin_symbol,
+                created_at=now,
+            )
+        if next_spend > self.settings.pump_launch_max_sol_per_day:
+            return PumpLaunchResult(
+                success=False,
+                status="DAILY_LIMIT",
+                message="Daily Pump initial-buy SOL limit reached.",
+                alert_key=key,
+                name=opportunity.coin_name,
+                symbol=opportunity.coin_symbol,
+                created_at=now,
+            )
+
+        reserved = await self.database.reserve_pump_launch(
+            alert_key=key,
+            source_url=opportunity.alert.url,
+            headline=opportunity.alert.headline,
+            name=opportunity.coin_name,
+            symbol=opportunity.coin_symbol,
+            score=opportunity.score,
+            initial_buy_sol=self.settings.pump_launch_initial_buy_sol,
+            requested_by=requested_by,
+        )
+        if not reserved:
+            return PumpLaunchResult(
+                success=False,
+                status="DUPLICATE",
+                message="This alert already has a launch record; a second coin was blocked.",
+                alert_key=key,
+                name=opportunity.coin_name,
+                symbol=opportunity.coin_symbol,
+                created_at=now,
+            )
+        try:
+            result = await self.pump_launcher.launch(opportunity)
+            await self.database.complete_pump_launch(
+                alert_key=key,
+                status=result.status,
+                mint=result.mint,
+                signature=result.signature,
+                metadata_uri=result.metadata_uri,
+            )
+            return result
+        except Exception as exc:
+            await self.database.fail_pump_launch(key, str(exc))
+            return PumpLaunchResult(
+                success=False,
+                status="FAILED",
+                message=str(exc)[:500],
+                alert_key=key,
+                name=opportunity.coin_name,
+                symbol=opportunity.coin_symbol,
+                created_at=now,
+            )
 
     async def _run_narrative_match(self, alert: NewsAlert) -> None:
         elapsed = 0
@@ -2059,4 +2238,7 @@ class SmartMoneyEngine:
                 if self.settings.j7_authorized_feed_url
                 else "not configured"
             ),
+            "pump_one_click_launch_enabled": self.settings.pump_one_click_launch_enabled,
+            "pump_launch_unlocked": self.pump_launcher.configured,
+            "pump_launch_wallet": self.pump_launcher.wallet_address,
         }

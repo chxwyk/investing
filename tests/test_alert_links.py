@@ -4,7 +4,8 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
-from smart_money_bot.bot import _token_view
+from smart_money_bot.bot import _news_lead_view, _token_view
+from smart_money_bot.models import NewsAlert
 
 
 @pytest.mark.asyncio
@@ -33,6 +34,26 @@ async def test_token_view_builds_exact_solana_coin_links() -> None:
     assert buttons["Buy on Jupiter"].row == 0
     assert buttons["Chart"].row == 1
     assert buttons["Solscan"].row == 1
+
+
+def test_news_without_contract_has_search_and_creation_links() -> None:
+    alert = NewsAlert(
+        source="X filtered stream",
+        headline="BREAKING: Trump announces Project Kitchen",
+        summary="",
+        score=60,
+        urgency="HIGH",
+        narrative_terms=("Trump", "Kitchen"),
+        url="https://x.com/example/status/1",
+    )
+    buttons = {item.label: item for item in _news_lead_view(alert).children}
+
+    assert buttons["Create on Pump.fun"].url == "https://pump.fun/create"
+    assert buttons["Explore Pump.fun"].url == "https://pump.fun/coins"
+    assert parse_qs(urlparse(buttons["Search Matching Coins"].url).query) == {
+        "q": ["Trump Kitchen"]
+    }
+    assert buttons["Original News"].url == alert.url
 
 
 @pytest.mark.asyncio

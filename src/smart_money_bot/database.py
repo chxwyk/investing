@@ -286,6 +286,28 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_paper_equity_samples_time
                 ON paper_equity_samples(created_at);
 
+            CREATE TABLE IF NOT EXISTS pump_launches (
+                alert_key TEXT PRIMARY KEY,
+                source_url TEXT NOT NULL,
+                headline TEXT NOT NULL,
+                name TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                score INTEGER NOT NULL,
+                initial_buy_sol REAL NOT NULL,
+                requested_by TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (
+                    status IN ('RESERVED', 'SUBMITTED', 'CONFIRMED', 'FAILED')
+                ),
+                mint TEXT,
+                signature TEXT,
+                metadata_uri TEXT,
+                error TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_pump_launches_time
+                ON pump_launches(created_at DESC);
+
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -2333,6 +2355,107 @@ class Database:
             ),
         )
         await self.db.commit()
+
+    async def reserve_pump_launch(
+        self,
+        *,
+        alert_key: str,
+        source_url: str,
+        headline: str,
+        name: str,
+        symbol: str,
+        score: int,
+        initial_buy_sol: Decimal,
+        requested_by: str,
+    ) -> bool:
+        """Atomically reserve one news item so double clicks cannot launch twice."""
+
+        now = int(time.time())
+        async with self._write_lock:
+            cursor = await self.db.execute(
+                """
+                INSERT OR IGNORE INTO pump_launches(
+                    alert_key, source_url, headline, name, symbol, score,
+                    initial_buy_sol, requested_by, status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'RESERVED', ?, ?)
+                """,
+                (
+                    alert_key,
+                    source_url[:1000],
+                    headline[:1000],
+                    name[:64],
+                    symbol[:16],
+                    score,
+                    float(initial_buy_sol),
+                    requested_by[:64],
+                    now,
+                    now,
+                ),
+            )
+            await self.db.commit()
+            return cursor.rowcount > 0
+
+    async def complete_pump_launch(
+        self,
+        *,
+        alert_key: str,
+        status: str,
+        mint: str,
+        signature: str,
+        metadata_uri: str,
+    ) -> None:
+        await self.db.execute(
+            """
+            UPDATE pump_launches SET
+                status = ?, mint = ?, signature = ?, metadata_uri = ?,
+                error = NULL, updated_at = ?
+            WHERE alert_key = ?
+            """,
+            (
+                status,
+                mint,
+                signature,
+                metadata_uri,
+                int(time.time()),
+                alert_key,
+            ),
+        )
+        await self.db.commit()
+
+    async def fail_pump_launch(self, alert_key: str, error: str) -> None:
+        await self.db.execute(
+            """
+            UPDATE pump_launches SET status = 'FAILED', error = ?, updated_at = ?
+            WHERE alert_key = ?
+            """,
+            (error[:1000], int(time.time()), alert_key),
+        )
+        await self.db.commit()
+
+    async def pump_launch_daily_usage(
+        self,
+        *,
+        start_at: int,
+        end_at: int,
+    ) -> tuple[int, Decimal]:
+        cursor = await self.db.execute(
+            """
+            SELECT COUNT(*) AS launches, COALESCE(SUM(initial_buy_sol), 0) AS sol
+            FROM pump_launches
+            WHERE created_at >= ? AND created_at < ?
+              AND status IN ('RESERVED', 'SUBMITTED', 'CONFIRMED')
+            """,
+            (start_at, end_at),
+        )
+        row = await cursor.fetchone()
+        return int(row["launches"] or 0), _d(row["sol"])
+
+    async def recent_pump_launches(self, *, limit: int = 10) -> list[dict[str, Any]]:
+        cursor = await self.db.execute(
+            "SELECT * FROM pump_launches ORDER BY created_at DESC LIMIT ?",
+            (max(1, min(50, limit)),),
+        )
+        return [dict(row) for row in await cursor.fetchall()]
 
     async def get_setting(self, key: str, default: str | None = None) -> str | None:
         cursor = await self.db.execute("SELECT value FROM settings WHERE key = ?", (key,))

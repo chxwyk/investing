@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "smart-money-copy-bot"
-version = "2.20.0"
+version = "2.22.0"
 description = "Discord bot for automatically discovering and paper-copying public Solana wallets."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -12,6 +12,7 @@ dependencies = [
   "aiohttp>=3.11,<4",
   "aiosqlite>=0.21,<1",
   "discord.py>=2.5,<3",
+  "pillow>=11,<13",
   "solders>=0.26,<1",
 ]
 

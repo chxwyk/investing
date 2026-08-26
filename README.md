@@ -7,7 +7,27 @@ transactions, and mirrors every newly detected hot-wallet swap in PAPER mode. PA
 as either a forced source-price observation ledger or an executable Jupiter quote-shadow
 trial; the two answer different questions and are labeled separately.
 
-Version 2.20 adds a fast, research-only news radar in front of the existing coin-intelligence
+Version 2.22 replaces the crypto-news gate with a cultural launch-opportunity score. Politics,
+sports, celebrities, brands/products, internet culture, gaming/technology, world events, and
+crypto are evaluated by the same 100-point model: source credibility (15), speed (15), viral
+meme clarity (25), wider X activity (15), independent confirmation (10), existing-coin
+competition (10), and coin-name/ticker clarity (10). Results are labeled `LAUNCH READY`,
+`WATCH`, `COIN FOUND`, or suppressed as `SKIP`; a non-crypto event is never rejected merely
+for being non-crypto.
+
+For `LAUNCH READY` alerts, v2.22 can expose one admin-only Discord button that uploads a
+generated community-meme image and metadata to public IPFS, asks Pump.fun's official build API
+for a create + initial-buy transaction, signs with a separate low-balance launch wallet, and
+submits it through the configured Solana RPC. There is no second confirmation modal. The path
+is locked by default and requires a one-time environment acknowledgement, separate wallet,
+Pinata JWT, minimum score, duplicate lock, and daily launch-count/SOL caps. Existing contracts
+never receive a launch button; they route to research/buy links instead.
+
+Version 2.21 made each news lead actionable and removed capitalized-acronym spam. Leads without
+a contract gained matching-coin, Pump.fun, X, and original-source links; contract and newly
+matched-pair alerts gained direct Fomo, Pump.fun, Jupiter, DEX chart, and Solscan controls.
+
+Version 2.20 added a fast, research-only news radar in front of the existing coin-intelligence
 pipeline. It consumes X's official filtered stream plus selected official RSS/Atom feeds,
 alerts on scored breaking narratives, extracts any Solana contract address already present,
 and rechecks DEX Screener for a newly created Solana pair matching the narrative. A detected
@@ -75,7 +95,12 @@ unless four separate controls are deliberately configured.
 - Posts raw wallet activity and the matching paper fills to Discord.
 - Adds one-tap Fomo, Pump.fun, Jupiter, DexScreener, and Solscan buttons to every token alert.
 - Posts breaking-news radar alerts from the official X filtered stream and selected RSS/Atom
-  feeds, then watches for a newly created matching Solana pair.
+  feeds across politics, sports, entertainment, products, internet culture, technology, world
+  events, and crypto, then watches for a newly created matching Solana pair.
+- Scores each event with visible source, speed, meme, X, confirmation, competition, and
+  identity components instead of requiring crypto relevance.
+- Optionally launches a `LAUNCH READY` community coin with one admin-only Discord click using
+  a separate capped Pump wallet; it does not reuse the Jupiter trading wallet.
 - Searches X coin evidence by exact mint plus DEX-listed token name/symbol identity, while
   discounting identity-only matches so ticker collisions cannot masquerade as contract proof.
 - Suppresses automatic low-score blocked reports that used to flood the channel; every token
@@ -219,8 +244,8 @@ when no prior public BUY exists
 inside the scanned history, no current baseline price is available, or the PAPER account lacks
 cash. Set `PAPER_MIRROR_RAW_SWAPS=false` to restore consensus-only paper behavior.
 
-The v2.20.0 discovery, news-radar, callout, selective-entry, daily loss/profit locks, social nomination,
-quote, fallback, rotation, and exit controls are
+The v2.22.0 discovery, cultural launch-radar, callout, selective-entry, daily loss/profit
+locks, social nomination, quote, fallback, rotation, and exit controls are
 intentionally configurable:
 
 ```text
@@ -273,7 +298,10 @@ REALTIME_STREAM_COMMITMENT=processed
 NEWS_RADAR_ENABLED=true
 X_NEWS_STREAM_ENABLED=true
 NEWS_POLL_SECONDS=30
-NEWS_MIN_SCORE=20
+NEWS_MIN_SCORE=45
+NEWS_LAUNCH_READY_SCORE=72
+NEWS_X_VERIFY_MIN_SCORE=35
+NEWS_X_TREND_CACHE_SECONDS=90
 NEWS_MAX_ALERTS_PER_HOUR=30
 NEWS_DEX_MATCH_ENABLED=true
 NEWS_DEX_MATCH_MIN_LIQUIDITY_USD=2000
@@ -285,25 +313,59 @@ These values are hypotheses to validate in PAPER mode, not optimized or guarante
 settings. Use `/smartmoney paper`, `/smartmoney positions`, `/smartmoney paper-trades`, and
 `/smartmoney readiness` to evaluate them before changing size.
 
-## Fast news radar
+## Cultural news and launch radar
 
 The radar has two independent inputs. X uses the official filtered-stream endpoint, so a
-matching public post arrives without repeatedly running recent-search. RSS/Atom polls selected
-official government, market, and crypto-news feeds every 30 seconds. Each item is deduplicated,
-time-decayed, source-scored, and checked for a Solana mint. If no mint exists yet, the bot
-extracts a few narrative terms and asks DEX Screener for a new Solana pair immediately and at
-30, 90, and 180 seconds. A match requires an exact normalized name/symbol term, a recent pair,
-and at least the configured liquidity before the normal coin-risk report runs.
+matching public post arrives without polling. RSS/Atom polls selected official government,
+world, sports, entertainment, technology, market, and crypto feeds every 30 seconds. Each item
+is deduplicated, time-decayed, source-scored, and checked for a Solana mint. The topic does not
+need to be crypto-related. The score instead asks whether the event is credible, fresh,
+recognizable, socially active, independently confirmed, not already crowded by competing
+coins, and easy to express as a short coin identity.
+
+Scores from 45 through 71 are `WATCH`. A score of 72 or more can be `LAUNCH READY`, but only if
+the source, speed, viral clarity, identity, and competition sub-gates also pass and the story is
+not framed as an unconfirmed rumor. If a source already includes a contract, the result is
+`COIN FOUND` and duplicate creation is blocked. If no mint exists yet, DEX Screener is checked
+immediately and again after 30, 90, and 180 seconds; a new matching pair still receives the
+normal token-risk report.
 
 The default X rule follows a deliberately small set of high-signal official/news accounts to
 limit paid X reads. Customize `X_NEWS_STREAM_RULE` using valid X filtered-stream syntax instead
 of broad keywords that can consume credits quickly. `X_SEARCH_MAX_RESULTS=10` similarly caps
 each on-demand coin-evidence search. `/smartmoney sources` and `/smartmoney status` show the
-last X search error, stream state, RSS state, J7 feed state, and narrative matcher state.
+last X search error, stream state, RSS state, J7 feed state, narrative matcher state, scoring
+thresholds, and one-click launch lock.
 
 J7's public site does not document an integration API in this release. If J7 support gives you
 an official RSS/Atom URL, store only that URL as `J7_AUTHORIZED_FEED_URL`. Never place a J7
 password, browser cookie, session token, or copied private endpoint in Railway.
+
+### One-click Pump.fun launch setup
+
+This feature spends real SOL even while the copy-trading engine remains in PAPER mode. Create a
+separate burner-style Solana wallet, keep only the amount you accept losing in it, and store its
+private key only in Railway Variables. Create a Pinata JWT for public file uploads and store it
+there too. Never reuse `TRADING_PRIVATE_KEY`.
+
+```text
+PUMP_ONE_CLICK_LAUNCH_ENABLED=true
+PUMP_LAUNCH_ACK=I_UNDERSTAND_PUMP_LAUNCHES_SPEND_REAL_SOL
+PUMP_LAUNCH_PRIVATE_KEY=<dedicated launch wallet secret>
+PINATA_JWT=<server-side Pinata JWT>
+PUMP_LAUNCH_INITIAL_BUY_SOL=0.01
+PUMP_LAUNCH_MIN_SCORE=72
+PUMP_LAUNCH_MAX_PER_DAY=3
+PUMP_LAUNCH_MAX_SOL_PER_DAY=0.05
+PUMP_LAUNCH_TIMEZONE=America/Los_Angeles
+```
+
+The launch button is shown only on `LAUNCH READY` alerts and only Discord administrators or
+configured `DISCORD_ADMIN_ROLE_IDS` can press it. One click creates and submits the transaction;
+there is no per-launch confirmation dialog. SQLite reserves the source alert before any upload
+or signature so double clicks and restarts cannot produce a second coin from the same alert.
+Pump metadata labels the asset as a community meme and explicitly says it is not official or
+affiliated with the people, brands, publisher, or event in the source.
 
 ## Official PAPER readiness trial
 

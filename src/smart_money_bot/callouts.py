@@ -49,7 +49,7 @@ class DexScreenerClient:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
                 timeout=self.timeout,
-                headers={"User-Agent": "SmartMoneyCopyBot/2.20 coin-intelligence"},
+                headers={"User-Agent": "SmartMoneyCopyBot/2.22 coin-intelligence"},
             )
         return self._session
 
@@ -157,9 +157,11 @@ class XRecentSearchClient:
         *,
         timeout_seconds: int = 15,
         max_results: int = 10,
+        cache_seconds: int = 60,
     ) -> None:
         self.bearer_token = bearer_token
         self.max_results = max(10, min(100, max_results))
+        self.cache_seconds = max(30, cache_seconds)
         self.timeout = aiohttp.ClientTimeout(total=timeout_seconds)
         self._session: aiohttp.ClientSession | None = None
         self._cache: dict[str, tuple[float, XSocialSnapshot]] = {}
@@ -192,7 +194,7 @@ class XRecentSearchClient:
         query = build_x_query(mint, symbol=symbol, name=name)
         cached = self._cache.get(query)
         now = time.monotonic()
-        if cached and now - cached[0] <= 60:
+        if cached and now - cached[0] <= self.cache_seconds:
             return cached[1]
         session = await self._get_session()
         params = {
@@ -223,6 +225,59 @@ class XRecentSearchClient:
             self.last_error = f"request failed: {str(exc)[:120]}"
             return XSocialSnapshot(available=False, query=query, error=self.last_error)
         snapshot = parse_x_snapshot(body, query=query, contract=mint)
+        self.last_status_code = 200
+        self.last_error = None
+        self.last_success_at = int(time.time())
+        self._cache[query] = (now, snapshot)
+        return snapshot
+
+    async def narrative_snapshot(self, narrative: str) -> XSocialSnapshot:
+        """Measure public X activity for one narrative using the official recent-search API."""
+
+        cleaned = re.sub(r"[\"\\]", "", narrative).strip()
+        if not cleaned:
+            return XSocialSnapshot(available=False, error="empty narrative")
+        if not self.bearer_token:
+            return XSocialSnapshot(
+                available=False,
+                error="X_API_BEARER_TOKEN not configured",
+            )
+        query = f'"{cleaned[:80]}" -is:retweet'
+        cached = self._cache.get(query)
+        now = time.monotonic()
+        if cached and now - cached[0] <= self.cache_seconds:
+            return cached[1]
+
+        session = await self._get_session()
+        params = {
+            "query": query,
+            "max_results": str(self.max_results),
+            "tweet.fields": "author_id,created_at,public_metrics,text",
+            "expansions": "author_id",
+            "user.fields": "created_at,public_metrics,verified,verified_type",
+        }
+        try:
+            async with session.get(
+                f"{self.BASE_URL}/2/tweets/search/recent",
+                params=params,
+                headers={"Authorization": f"Bearer {self.bearer_token}"},
+            ) as response:
+                body = await response.json(content_type=None)
+                if response.status >= 400:
+                    detail = str(body.get("detail") or body.get("title") or response.status)
+                    self.last_status_code = response.status
+                    self.last_error = f"HTTP {response.status}: {detail[:120]}"
+                    return XSocialSnapshot(
+                        available=False,
+                        query=query,
+                        error=self.last_error,
+                    )
+        except (TimeoutError, aiohttp.ClientError, ValueError) as exc:
+            self.last_status_code = None
+            self.last_error = f"request failed: {str(exc)[:120]}"
+            return XSocialSnapshot(available=False, query=query, error=self.last_error)
+
+        snapshot = parse_x_snapshot(body, query=query)
         self.last_status_code = 200
         self.last_error = None
         self.last_success_at = int(time.time())
