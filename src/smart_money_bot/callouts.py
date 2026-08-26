@@ -6,6 +6,7 @@ import time
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
+from urllib.parse import urlparse
 
 import aiohttp
 
@@ -48,7 +49,7 @@ class DexScreenerClient:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
                 timeout=self.timeout,
-                headers={"User-Agent": "SmartMoneyCopyBot/2.19 coin-intelligence"},
+                headers={"User-Agent": "SmartMoneyCopyBot/2.20 coin-intelligence"},
             )
         return self._session
 
@@ -97,6 +98,24 @@ def parse_dex_snapshot(payload: Any, *, mint: str) -> DexSnapshot:
     info = pair.get("info") or {}
     websites = info.get("websites") or []
     socials = info.get("socials") or []
+    website_url = next(
+        (
+            str(item.get("url") or "")
+            for item in websites
+            if isinstance(item, dict) and item.get("url")
+        ),
+        "",
+    )
+    x_url = next(
+        (
+            str(item.get("url") or "")
+            for item in socials
+            if isinstance(item, dict)
+            and str(item.get("type") or "").lower() in {"twitter", "x"}
+        ),
+        "",
+    )
+    x_path = urlparse(x_url).path.strip("/").split("/")[0] if x_url else ""
     created_ms = _integer(pair.get("pairCreatedAt"))
     age_minutes = (
         max(0, int((time.time() * 1000 - created_ms) / 60_000)) if created_ms > 0 else None
@@ -121,6 +140,8 @@ def parse_dex_snapshot(payload: Any, *, mint: str) -> DexSnapshot:
             for item in socials
             if isinstance(item, dict)
         ),
+        website_url=website_url,
+        x_handle=x_path.lstrip("@"),
         pair_url=str(pair.get("url") or ""),
     )
 
@@ -130,11 +151,21 @@ class XRecentSearchClient:
 
     BASE_URL = "https://api.x.com"
 
-    def __init__(self, bearer_token: str | None, *, timeout_seconds: int = 15) -> None:
+    def __init__(
+        self,
+        bearer_token: str | None,
+        *,
+        timeout_seconds: int = 15,
+        max_results: int = 10,
+    ) -> None:
         self.bearer_token = bearer_token
+        self.max_results = max(10, min(100, max_results))
         self.timeout = aiohttp.ClientTimeout(total=timeout_seconds)
         self._session: aiohttp.ClientSession | None = None
         self._cache: dict[str, tuple[float, XSocialSnapshot]] = {}
+        self.last_success_at: int | None = None
+        self.last_error: str | None = None
+        self.last_status_code: int | None = None
 
     @property
     def configured(self) -> bool:
@@ -149,18 +180,24 @@ class XRecentSearchClient:
         if self._session and not self._session.closed:
             await self._session.close()
 
-    async def snapshot(self, mint: str) -> XSocialSnapshot:
+    async def snapshot(
+        self,
+        mint: str,
+        *,
+        symbol: str | None = None,
+        name: str | None = None,
+    ) -> XSocialSnapshot:
         if not self.bearer_token:
             return XSocialSnapshot(available=False, error="X_API_BEARER_TOKEN not configured")
-        cached = self._cache.get(mint)
+        query = build_x_query(mint, symbol=symbol, name=name)
+        cached = self._cache.get(query)
         now = time.monotonic()
         if cached and now - cached[0] <= 60:
             return cached[1]
-        query = f'"{mint}" -is:retweet'
         session = await self._get_session()
         params = {
             "query": query,
-            "max_results": "100",
+            "max_results": str(self.max_results),
             "tweet.fields": "author_id,created_at,public_metrics,text",
             "expansions": "author_id",
             "user.fields": "created_at,public_metrics,verified,verified_type",
@@ -174,12 +211,41 @@ class XRecentSearchClient:
                 body = await response.json(content_type=None)
                 if response.status >= 400:
                     detail = str(body.get("detail") or body.get("title") or response.status)
-                    return XSocialSnapshot(available=False, query=query, error=detail[:160])
+                    self.last_status_code = response.status
+                    self.last_error = f"HTTP {response.status}: {detail[:120]}"
+                    return XSocialSnapshot(
+                        available=False,
+                        query=query,
+                        error=self.last_error,
+                    )
         except (TimeoutError, aiohttp.ClientError, ValueError) as exc:
-            return XSocialSnapshot(available=False, query=query, error=str(exc)[:160])
-        snapshot = parse_x_snapshot(body, query=query)
-        self._cache[mint] = (now, snapshot)
+            self.last_status_code = None
+            self.last_error = f"request failed: {str(exc)[:120]}"
+            return XSocialSnapshot(available=False, query=query, error=self.last_error)
+        snapshot = parse_x_snapshot(body, query=query, contract=mint)
+        self.last_status_code = 200
+        self.last_error = None
+        self.last_success_at = int(time.time())
+        self._cache[query] = (now, snapshot)
         return snapshot
+
+
+def build_x_query(mint: str, *, symbol: str | None = None, name: str | None = None) -> str:
+    """Build one cost-controlled query covering the contract and verified identity."""
+
+    terms = [f'"{mint}"']
+    cleaned_symbol = re.sub(r"[^A-Za-z0-9_]", "", symbol or "")
+    if 3 <= len(cleaned_symbol) <= 15:
+        terms.append(f'"${cleaned_symbol}"')
+    cleaned_name = re.sub(r"[\"\\]", "", (name or "").strip())
+    if 4 <= len(cleaned_name) <= 40 and cleaned_name.lower() not in {
+        "token",
+        "coin",
+        "solana",
+        "official",
+    }:
+        terms.append(f'"{cleaned_name}"')
+    return f"({' OR '.join(dict.fromkeys(terms))}) -is:retweet"
 
 
 class SolanaTrackerTokenRiskClient:
@@ -256,7 +322,12 @@ def parse_tracker_risk(payload: Any) -> TokenRiskSnapshot:
     )
 
 
-def parse_x_snapshot(payload: Any, *, query: str = "") -> XSocialSnapshot:
+def parse_x_snapshot(
+    payload: Any,
+    *,
+    query: str = "",
+    contract: str = "",
+) -> XSocialSnapshot:
     if not isinstance(payload, dict):
         return XSocialSnapshot(available=False, query=query, error="invalid X response")
     posts = payload.get("data") or []
@@ -270,6 +341,7 @@ def parse_x_snapshot(payload: Any, *, query: str = "") -> XSocialSnapshot:
     suspicious: set[str] = set()
     engagements = 0
     normalized_texts: list[str] = []
+    contract_posts = 0
     timestamps: list[datetime] = []
     now = datetime.now(UTC)
     for post in posts:
@@ -284,6 +356,8 @@ def parse_x_snapshot(payload: Any, *, query: str = "") -> XSocialSnapshot:
             for key in ("like_count", "retweet_count", "reply_count", "quote_count")
         )
         normalized = normalize_post_text(str(post.get("text") or ""))
+        if contract and contract.lower() in str(post.get("text") or "").lower():
+            contract_posts += 1
         if normalized:
             normalized_texts.append(normalized)
         created = _parse_time(post.get("created_at"))
@@ -320,6 +394,8 @@ def parse_x_snapshot(payload: Any, *, query: str = "") -> XSocialSnapshot:
     return XSocialSnapshot(
         available=True,
         posts=len(posts),
+        contract_posts=contract_posts,
+        identity_posts=max(0, len(posts) - contract_posts),
         unique_authors=len(author_ids),
         established_authors=len(established),
         influential_authors=len(influential),
@@ -368,7 +444,11 @@ class CoinCalloutAnalyzer:
     ) -> CoinCallout:
         dex, social, tracker_risk = await asyncio.gather(
             self.dex.snapshot(mint),
-            self.social.snapshot(mint),
+            self.social.snapshot(
+                mint,
+                symbol=token_info.symbol if token_info else None,
+                name=token_info.name if token_info else None,
+            ),
             self.tracker_risk.snapshot(mint),
         )
         return score_callout(
@@ -539,17 +619,23 @@ def score_callout(
         warnings.append("DEX pair activity is unavailable")
 
     if social.available:
-        score += Decimal(min(8, social.unique_authors // 2))
-        score += Decimal(min(5, social.established_authors))
-        score += Decimal(min(4, social.influential_authors * 2))
+        social_points = Decimal(min(8, social.unique_authors // 2))
+        social_points += Decimal(min(5, social.established_authors))
+        social_points += Decimal(min(4, social.influential_authors * 2))
         if social.posts_per_minute >= Decimal("1"):
-            score += 4
+            social_points += 4
         elif social.posts_per_minute >= Decimal("0.25"):
-            score += 2
+            social_points += 2
         if social.engagements >= 250:
-            score += 4
+            social_points += 4
         elif social.engagements >= 50:
-            score += 2
+            social_points += 2
+        if social.posts and social.contract_posts == 0:
+            social_points = (social_points * Decimal("0.50")).quantize(Decimal("0.01"))
+            warnings.append(
+                "X activity matched the verified name/ticker but not the contract address"
+            )
+        score += social_points
         if social.unique_authors >= 10:
             positives.append(f"{social.unique_authors} unique X authors mention the contract")
         if social.duplicate_percent >= 50:

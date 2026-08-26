@@ -2,6 +2,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from smart_money_bot.callouts import (
+    build_x_query,
     parse_dex_snapshot,
     parse_tracker_risk,
     parse_x_snapshot,
@@ -82,13 +83,24 @@ def test_x_parser_counts_unique_quality_and_duplicate_authors() -> None:
         },
     }
 
-    item = parse_x_snapshot(payload, query=MINT)
+    item = parse_x_snapshot(payload, query=MINT, contract=MINT)
 
     assert item.available
     assert item.unique_authors == 2
     assert item.established_authors == 2
     assert item.influential_authors == 1
     assert item.duplicate_percent == Decimal("50.00")
+    assert item.contract_posts == 2
+    assert item.identity_posts == 0
+
+
+def test_x_query_adds_verified_identity_without_dropping_contract() -> None:
+    query = build_x_query(MINT, symbol="PATS", name="Patriots")
+
+    assert f'"{MINT}"' in query
+    assert '"$PATS"' in query
+    assert '"Patriots"' in query
+    assert query.endswith("-is:retweet")
 
 
 def test_tracker_risk_parser_preserves_launch_manipulation_evidence() -> None:
@@ -138,6 +150,7 @@ def test_callout_never_overrides_hard_token_risk() -> None:
         social=XSocialSnapshot(
             available=True,
             posts=100,
+            contract_posts=100,
             unique_authors=50,
             established_authors=20,
             influential_authors=10,
@@ -177,6 +190,7 @@ def test_strong_watch_requires_cross_source_confirmation() -> None:
         social=XSocialSnapshot(
             available=True,
             posts=40,
+            contract_posts=40,
             unique_authors=20,
             established_authors=8,
             influential_authors=3,

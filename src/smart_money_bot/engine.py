@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import deque
 from contextlib import suppress
 from dataclasses import replace
 from datetime import datetime, timedelta
@@ -37,6 +38,8 @@ from .models import (
     DiscoveryRefresh,
     ExecutionMode,
     ExecutionResult,
+    NarrativePairMatch,
+    NewsAlert,
     PaperDailyLockStatus,
     PaperReadiness,
     PaperSummary,
@@ -48,6 +51,7 @@ from .models import (
     TrackedTrader,
     TraderMetrics,
 )
+from .news import DexNarrativeMatcher, RssNewsPoller, XFilteredNewsStream
 from .risk import RiskEngine
 from .rotation import CandidateRotator, RotationResult, is_pump_mint
 from .rpc import SolanaRPC
@@ -76,6 +80,12 @@ class Notifier(Protocol):
 
     async def on_coin_callout(self, callout: CoinCallout) -> None: ...
 
+    async def on_news_alert(self, alert: NewsAlert) -> None: ...
+
+    async def on_narrative_match(
+        self, alert: NewsAlert, match: NarrativePairMatch
+    ) -> None: ...
+
     async def on_daily_profit_lock(self, status: PaperDailyLockStatus) -> None: ...
 
     async def on_error(self, context: str, error: Exception) -> None: ...
@@ -99,6 +109,14 @@ class NullNotifier:
     async def on_coin_callout(self, callout: CoinCallout) -> None:
         return None
 
+    async def on_news_alert(self, alert: NewsAlert) -> None:
+        return None
+
+    async def on_narrative_match(
+        self, alert: NewsAlert, match: NarrativePairMatch
+    ) -> None:
+        return None
+
     async def on_daily_profit_lock(self, status: PaperDailyLockStatus) -> None:
         return None
 
@@ -118,12 +136,30 @@ class SmartMoneyEngine:
         )
         self.market = JupiterClient(settings.jupiter_api_key)
         self.dex_screener = DexScreenerClient()
-        self.x_social = XRecentSearchClient(settings.x_api_bearer_token)
+        self.x_social = XRecentSearchClient(
+            settings.x_api_bearer_token,
+            max_results=settings.x_search_max_results,
+        )
         self.tracker_token_risk = SolanaTrackerTokenRiskClient(settings.solana_tracker_api_key)
         self.callout_analyzer = CoinCalloutAnalyzer(
             self.dex_screener,
             self.x_social,
             self.tracker_token_risk,
+        )
+        self.x_news_stream = XFilteredNewsStream(
+            settings.x_api_bearer_token,
+            settings.x_news_stream_rule,
+        )
+        news_feeds = settings.news_rss_feeds + (
+            (settings.j7_authorized_feed_url,) if settings.j7_authorized_feed_url else ()
+        )
+        self.news_poller = RssNewsPoller(
+            news_feeds,
+            poll_seconds=settings.news_poll_seconds,
+        )
+        self.news_matcher = DexNarrativeMatcher(
+            min_liquidity_usd=settings.news_dex_match_min_liquidity_usd,
+            max_age_minutes=settings.news_dex_match_max_age_minutes,
         )
         self.discovery = (
             SolanaTrackerClient(settings.solana_tracker_api_key)
@@ -157,6 +193,11 @@ class SmartMoneyEngine:
         self._stream_consumer_task: asyncio.Task[None] | None = None
         self._daily_profit_task: asyncio.Task[None] | None = None
         self._callout_tasks: set[asyncio.Task[None]] = set()
+        self._news_stream_task: asyncio.Task[None] | None = None
+        self._news_rss_task: asyncio.Task[None] | None = None
+        self._news_match_tasks: set[asyncio.Task[None]] = set()
+        self._news_alert_times: deque[int] = deque()
+        self._narrative_matches_seen: set[str] = set()
         self._last_callout_state: dict[str, tuple[int, int]] = {}
         self._scan_lock = asyncio.Lock()
         self._discovery_lock = asyncio.Lock()
@@ -215,8 +256,33 @@ class SmartMoneyEngine:
             self._stream_consumer_task = asyncio.create_task(
                 self._consume_stream_events(), name="smart-money-stream-consumer"
             )
+        if self.settings.news_radar_enabled:
+            if self.settings.x_news_stream_enabled and self.x_news_stream.configured:
+                self._news_stream_task = asyncio.create_task(
+                    self.x_news_stream.run(self._handle_news_alert),
+                    name="smart-money-x-news-stream",
+                )
+            if self.news_poller.configured:
+                self._news_rss_task = asyncio.create_task(
+                    self.news_poller.run(self._handle_news_alert),
+                    name="smart-money-news-rss",
+                )
 
     async def close(self) -> None:
+        for task in self._news_match_tasks:
+            task.cancel()
+        if self._news_match_tasks:
+            await asyncio.gather(*self._news_match_tasks, return_exceptions=True)
+        self._news_match_tasks.clear()
+        for task in (self._news_stream_task, self._news_rss_task):
+            if task:
+                task.cancel()
+        for task in (self._news_stream_task, self._news_rss_task):
+            if task:
+                with suppress(asyncio.CancelledError):
+                    await task
+        self._news_stream_task = None
+        self._news_rss_task = None
         for task in self._callout_tasks:
             task.cancel()
         if self._callout_tasks:
@@ -247,6 +313,9 @@ class SmartMoneyEngine:
         await self.dex_screener.close()
         await self.x_social.close()
         await self.tracker_token_risk.close()
+        await self.x_news_stream.close()
+        await self.news_poller.close()
+        await self.news_matcher.close()
         if self.discovery:
             await self.discovery.close()
         if self.profile_discovery:
@@ -834,6 +903,46 @@ class SmartMoneyEngine:
         self._callout_tasks.add(task)
         task.add_done_callback(self._callout_tasks.discard)
 
+    async def _handle_news_alert(self, alert: NewsAlert) -> None:
+        now = int(time.time())
+        while self._news_alert_times and now - self._news_alert_times[0] >= 3600:
+            self._news_alert_times.popleft()
+        if alert.score < self.settings.news_min_score:
+            return
+        if len(self._news_alert_times) >= self.settings.news_max_alerts_per_hour:
+            return
+        self._news_alert_times.append(now)
+        await self.notifier.on_news_alert(alert)
+        for mint in alert.token_mints:
+            self._queue_coin_callout(mint)
+        if (
+            self.settings.news_dex_match_enabled
+            and not alert.token_mints
+            and alert.narrative_terms
+        ):
+            task = asyncio.create_task(
+                self._run_narrative_match(alert),
+                name=f"news-narrative-match-{now}",
+            )
+            self._news_match_tasks.add(task)
+            task.add_done_callback(self._news_match_tasks.discard)
+
+    async def _run_narrative_match(self, alert: NewsAlert) -> None:
+        elapsed = 0
+        for target in sorted(set(self.settings.news_pair_recheck_seconds)):
+            delay = max(0, target - elapsed)
+            if delay:
+                await asyncio.sleep(delay)
+            elapsed = target
+            for narrative in alert.narrative_terms[:3]:
+                match = await self.news_matcher.search(narrative)
+                if match is None or match.mint in self._narrative_matches_seen:
+                    continue
+                self._narrative_matches_seen.add(match.mint)
+                await self.notifier.on_narrative_match(alert, match)
+                self._queue_coin_callout(match.mint)
+                return
+
     async def _run_coin_callout(self, mint: str) -> None:
         try:
             buyers = await self.database.recent_verified_token_buyers(
@@ -851,7 +960,10 @@ class SmartMoneyEngine:
                 return
             callout = await self.analyze_coin(mint, buyers=buyers)
             self._last_callout_state[mint] = (now, buyer_count)
-            if callout.score >= self.settings.coin_callout_min_alert_score or callout.hard_blockers:
+            # Automatic alerts are for evidence-rich leads. Very weak blocked rows remain
+            # available through /smartmoney coin, but no longer flood the channel merely
+            # because a missing-data or safety blocker exists.
+            if callout.score >= self.settings.coin_callout_min_alert_score:
                 await self.notifier.on_coin_callout(callout)
         except Exception as exc:
             await self.notifier.on_error("Analyzing coin callout", exc)
@@ -1927,4 +2039,24 @@ class SmartMoneyEngine:
             "consecutive_quote_failures": self.executor.consecutive_quote_failures,
             "coin_callouts_enabled": self.settings.coin_callouts_enabled,
             "x_social_configured": self.x_social.configured,
+            "x_social_last_success": self.x_social.last_success_at,
+            "x_social_last_error": self.x_social.last_error,
+            "news_radar_enabled": self.settings.news_radar_enabled,
+            "x_news_stream_configured": self.x_news_stream.configured,
+            "x_news_stream_connected": self.x_news_stream.connected,
+            "x_news_stream_rule_active": self.x_news_stream.rule_active,
+            "x_news_stream_last_event": self.x_news_stream.last_event_at,
+            "x_news_stream_last_error": self.x_news_stream.last_error,
+            "news_rss_ready": self.news_poller.ready,
+            "news_rss_last_refresh": self.news_poller.last_refresh_at,
+            "news_rss_last_error": self.news_poller.last_error,
+            "j7_feed_configured": bool(self.settings.j7_authorized_feed_url),
+            "j7_feed_health": (
+                self.news_poller.feed_health.get(
+                    self.settings.j7_authorized_feed_url,
+                    "waiting for first refresh",
+                )
+                if self.settings.j7_authorized_feed_url
+                else "not configured"
+            ),
         }

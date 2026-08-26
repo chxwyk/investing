@@ -7,6 +7,22 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .constants import LIVE_ACK_TEXT, USDC_MINT
 
+DEFAULT_X_NEWS_RULE = (
+    "(from:realDonaldTrump OR from:elonmusk OR from:WhiteHouse OR "
+    "from:WatcherGuru OR from:CoinDesk OR from:Cointelegraph OR "
+    "from:solana OR from:pumpdotfun) -is:retweet"
+)
+
+DEFAULT_NEWS_RSS_FEEDS = "|".join(
+    (
+        "https://www.whitehouse.gov/briefings-statements/feed/",
+        "https://www.sec.gov/news/pressreleases.rss",
+        "https://feeds.bbci.co.uk/news/world/rss.xml",
+        "https://www.coindesk.com/arc/outboundfeeds/rss/",
+        "https://cointelegraph.com/rss",
+    )
+)
+
 
 def _bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -33,6 +49,16 @@ def _int_set(name: str) -> frozenset[int]:
     return frozenset(int(item.strip()) for item in raw.split(",") if item.strip())
 
 
+def _str_tuple(name: str, default: str = "") -> tuple[str, ...]:
+    raw = os.getenv(name, default)
+    return tuple(item.strip() for item in raw.split("|") if item.strip())
+
+
+def _int_tuple(name: str, default: str = "") -> tuple[int, ...]:
+    raw = os.getenv(name, default)
+    return tuple(int(item.strip()) for item in raw.split(",") if item.strip())
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     discord_token: str
@@ -54,6 +80,20 @@ class Settings:
     coin_callout_window_seconds: int
     coin_callout_cooldown_seconds: int
     coin_callout_min_alert_score: Decimal
+    x_search_max_results: int
+
+    news_radar_enabled: bool
+    x_news_stream_enabled: bool
+    x_news_stream_rule: str
+    news_rss_feeds: tuple[str, ...]
+    j7_authorized_feed_url: str | None
+    news_poll_seconds: int
+    news_min_score: int
+    news_max_alerts_per_hour: int
+    news_dex_match_enabled: bool
+    news_dex_match_min_liquidity_usd: Decimal
+    news_dex_match_max_age_minutes: int
+    news_pair_recheck_seconds: tuple[int, ...]
 
     auto_discovery_enabled: bool
     discovery_refresh_seconds: int
@@ -194,6 +234,25 @@ class Settings:
             coin_callout_window_seconds=_int("COIN_CALLOUT_WINDOW_SECONDS", 300),
             coin_callout_cooldown_seconds=_int("COIN_CALLOUT_COOLDOWN_SECONDS", 300),
             coin_callout_min_alert_score=_decimal("COIN_CALLOUT_MIN_ALERT_SCORE", "45"),
+            x_search_max_results=_int("X_SEARCH_MAX_RESULTS", 10),
+            news_radar_enabled=_bool("NEWS_RADAR_ENABLED", True),
+            x_news_stream_enabled=_bool("X_NEWS_STREAM_ENABLED", True),
+            x_news_stream_rule=os.getenv("X_NEWS_STREAM_RULE", DEFAULT_X_NEWS_RULE).strip(),
+            news_rss_feeds=_str_tuple("NEWS_RSS_FEEDS", DEFAULT_NEWS_RSS_FEEDS),
+            j7_authorized_feed_url=(
+                os.getenv("J7_AUTHORIZED_FEED_URL", "").strip() or None
+            ),
+            news_poll_seconds=_int("NEWS_POLL_SECONDS", 30),
+            news_min_score=_int("NEWS_MIN_SCORE", 20),
+            news_max_alerts_per_hour=_int("NEWS_MAX_ALERTS_PER_HOUR", 30),
+            news_dex_match_enabled=_bool("NEWS_DEX_MATCH_ENABLED", True),
+            news_dex_match_min_liquidity_usd=_decimal(
+                "NEWS_DEX_MATCH_MIN_LIQUIDITY_USD", "2000"
+            ),
+            news_dex_match_max_age_minutes=_int("NEWS_DEX_MATCH_MAX_AGE_MINUTES", 60),
+            news_pair_recheck_seconds=_int_tuple(
+                "NEWS_PAIR_RECHECK_SECONDS", "0,30,90,180"
+            ),
             auto_discovery_enabled=_bool("AUTO_DISCOVERY_ENABLED", True),
             discovery_refresh_seconds=_int("DISCOVERY_REFRESH_SECONDS", 1200),
             discovery_7d_refresh_seconds=_int("DISCOVERY_7D_REFRESH_SECONDS", 21600),
@@ -363,6 +422,22 @@ class Settings:
             raise ValueError("COIN_CALLOUT_COOLDOWN_SECONDS must be between 30 and 3600")
         if not 0 <= self.coin_callout_min_alert_score <= 100:
             raise ValueError("COIN_CALLOUT_MIN_ALERT_SCORE must be between 0 and 100")
+        if not 10 <= self.x_search_max_results <= 100:
+            raise ValueError("X_SEARCH_MAX_RESULTS must be between 10 and 100")
+        if len(self.x_news_stream_rule) > 1024:
+            raise ValueError("X_NEWS_STREAM_RULE cannot exceed 1024 characters")
+        if not 15 <= self.news_poll_seconds <= 3600:
+            raise ValueError("NEWS_POLL_SECONDS must be between 15 and 3600")
+        if not 0 <= self.news_min_score <= 100:
+            raise ValueError("NEWS_MIN_SCORE must be between 0 and 100")
+        if not 1 <= self.news_max_alerts_per_hour <= 200:
+            raise ValueError("NEWS_MAX_ALERTS_PER_HOUR must be between 1 and 200")
+        if self.news_dex_match_min_liquidity_usd < 0:
+            raise ValueError("NEWS_DEX_MATCH_MIN_LIQUIDITY_USD cannot be negative")
+        if not 1 <= self.news_dex_match_max_age_minutes <= 1440:
+            raise ValueError("NEWS_DEX_MATCH_MAX_AGE_MINUTES must be between 1 and 1440")
+        if any(item < 0 or item > 900 for item in self.news_pair_recheck_seconds):
+            raise ValueError("NEWS_PAIR_RECHECK_SECONDS values must be between 0 and 900")
         if not 1 <= self.rpc_requests_per_second <= 100:
             raise ValueError("RPC_REQUESTS_PER_SECOND must be between 1 and 100")
         if not 0 <= self.rpc_max_retries <= 10:

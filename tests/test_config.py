@@ -212,3 +212,35 @@ def test_pump_source_price_fallback_defaults_off_for_executable_trial(
 
     assert settings.paper_allow_pump_source_fallback is False
     assert settings.paper_pump_source_fallback_bps == 300
+
+
+def test_news_radar_defaults_to_fast_but_cost_bounded_sources(monkeypatch) -> None:
+    names = (
+        "NEWS_RADAR_ENABLED",
+        "X_NEWS_STREAM_ENABLED",
+        "X_NEWS_STREAM_RULE",
+        "NEWS_RSS_FEEDS",
+        "J7_AUTHORIZED_FEED_URL",
+        "NEWS_POLL_SECONDS",
+        "NEWS_MIN_SCORE",
+        "NEWS_MAX_ALERTS_PER_HOUR",
+        "NEWS_DEX_MATCH_ENABLED",
+        "NEWS_PAIR_RECHECK_SECONDS",
+        "X_SEARCH_MAX_RESULTS",
+    )
+    for name in names:
+        monkeypatch.delenv(name, raising=False)
+
+    settings = Settings.from_env(require_discord_token=False)
+
+    assert settings.news_radar_enabled is True
+    assert settings.x_news_stream_enabled is True
+    assert "from:elonmusk" in settings.x_news_stream_rule
+    assert settings.news_rss_feeds
+    assert settings.j7_authorized_feed_url is None
+    assert settings.news_poll_seconds == 30
+    assert settings.news_min_score == 20
+    assert settings.news_max_alerts_per_hour == 30
+    assert settings.news_dex_match_enabled is True
+    assert settings.news_pair_recheck_seconds == (0, 30, 90, 180)
+    assert settings.x_search_max_results == 10

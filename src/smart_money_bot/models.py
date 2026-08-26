@@ -138,6 +138,8 @@ class DexSnapshot:
     active_boosts: int = 0
     has_website: bool = False
     has_x_profile: bool = False
+    website_url: str = ""
+    x_handle: str = ""
     pair_url: str = ""
 
 
@@ -145,6 +147,8 @@ class DexSnapshot:
 class XSocialSnapshot:
     available: bool
     posts: int = 0
+    contract_posts: int = 0
+    identity_posts: int = 0
     unique_authors: int = 0
     established_authors: int = 0
     influential_authors: int = 0
@@ -154,6 +158,39 @@ class XSocialSnapshot:
     posts_per_minute: Decimal = Decimal("0")
     query: str = ""
     error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class NewsAlert:
+    source: str
+    headline: str
+    summary: str
+    url: str
+    author: str = ""
+    author_followers: int = 0
+    author_verified: bool = False
+    score: int = 0
+    urgency: str = "LOW"
+    matched_rule: str = ""
+    narrative_terms: tuple[str, ...] = ()
+    token_mints: tuple[str, ...] = ()
+    created_at: int = 0
+    received_at: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class NarrativePairMatch:
+    narrative: str
+    mint: str
+    symbol: str
+    name: str
+    liquidity_usd: Decimal | None
+    market_cap_usd: Decimal | None
+    pair_age_minutes: int | None
+    buys_5m: int
+    sells_5m: int
+    volume_5m_usd: Decimal
+    pair_url: str
 
 
 @dataclass(frozen=True, slots=True)

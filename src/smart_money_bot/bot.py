@@ -25,6 +25,8 @@ from .models import (
     DiscoveryRefresh,
     ExecutionMode,
     ExecutionResult,
+    NarrativePairMatch,
+    NewsAlert,
     PaperDailyLockStatus,
     RiskDecision,
     Side,
@@ -93,7 +95,7 @@ def _token_view(mint: str, fomo_referral_code: str | None = None) -> discord.ui.
     )
     view.add_item(
         discord.ui.Button(
-            label="Buy on Jupiter",
+        label="Buy on Jupiter",
             style=discord.ButtonStyle.link,
             url=f"https://jup.ag/swap/SOL-{mint}",
             row=0,
@@ -192,7 +194,9 @@ def _coin_callout_embed(callout: CoinCallout) -> discord.Embed:
         embed.add_field(
             name="X/Twitter evidence",
             value=(
-                f"Posts `{social.posts}` • unique authors `{social.unique_authors}` • "
+                f"Posts `{social.posts}` • contract `{social.contract_posts}` • "
+                f"identity `{social.identity_posts}`\n"
+                f"Unique authors `{social.unique_authors}` • "
                 f"established `{social.established_authors}` • "
                 f"influential `{social.influential_authors}`\n"
                 f"Velocity `{social.posts_per_minute}/min` • engagements `{social.engagements}` • "
@@ -201,9 +205,10 @@ def _coin_callout_embed(callout: CoinCallout) -> discord.Embed:
             inline=False,
         )
     else:
+        error = social.error or "not configured or no response"
         embed.add_field(
             name="X/Twitter evidence",
-            value="Not scored—official X API access is not configured or did not respond.",
+            value=f"Not scored—`{error[:180]}`",
             inline=False,
         )
     tracker = callout.tracker_risk
@@ -222,9 +227,10 @@ def _coin_callout_embed(callout: CoinCallout) -> discord.Embed:
             inline=False,
         )
     else:
+        risk_error = tracker.error or "token-risk evidence unavailable"
         embed.add_field(
             name="Rug / launch manipulation",
-            value="Solana Tracker token-risk evidence unavailable.",
+            value=f"Solana Tracker `{risk_error[:180]}`.",
             inline=False,
         )
     if callout.positives:
@@ -242,8 +248,89 @@ def _coin_callout_embed(callout: CoinCallout) -> discord.Embed:
         )
     embed.add_field(name="Contract", value=f"`{callout.mint}`", inline=False)
     embed.set_footer(
-        text="Contract-address X search • duplicate/bot penalty • DEX/on-chain cross-check"
+        text="Contract + DEX-listed identity X search • duplicate/bot penalty • DEX/on-chain check"
     )
+    return embed
+
+
+def _news_alert_embed(alert: NewsAlert) -> discord.Embed:
+    color = (
+        0xE74C3C
+        if alert.urgency == "HIGH"
+        else 0xF1C40F
+        if alert.urgency == "MEDIUM"
+        else 0x3498DB
+    )
+    source = alert.author or alert.source
+    delay = max(0, alert.received_at - alert.created_at) if alert.created_at else None
+    timing = f" • received `{delay}s` after publication" if delay is not None else ""
+    embed = discord.Embed(
+        title=f"NEWS RADAR • {alert.urgency} • {source}"[:256],
+        description=f"**{alert.headline[:700]}**",
+        color=color,
+        timestamp=datetime.fromtimestamp(alert.received_at or int(time.time()), tz=UTC),
+    )
+    embed.add_field(
+        name="Signal",
+        value=f"Narrative score `{alert.score}/100`{timing}",
+        inline=False,
+    )
+    if alert.author:
+        embed.add_field(
+            name="Account proof",
+            value=(
+                f"Followers `{alert.author_followers:,}` • "
+                f"verified `{'yes' if alert.author_verified else 'no'}`"
+            ),
+            inline=False,
+        )
+    if alert.narrative_terms:
+        embed.add_field(
+            name="Narratives being watched",
+            value=" • ".join(f"`{item}`" for item in alert.narrative_terms)[:1024],
+            inline=False,
+        )
+    if alert.token_mints:
+        embed.add_field(
+            name="Contracts found in the source",
+            value="\n".join(f"`{item}`" for item in alert.token_mints)[:1024],
+            inline=False,
+        )
+    if alert.url:
+        embed.add_field(name="Original source", value=f"[Open source]({alert.url})", inline=False)
+    embed.set_footer(
+        text="News lead only • narrative pairs are cross-checked • never an automatic live buy"
+    )
+    return embed
+
+
+def _narrative_match_embed(alert: NewsAlert, match: NarrativePairMatch) -> discord.Embed:
+    embed = discord.Embed(
+        title=f"NEWS → NEW COIN MATCH • {match.symbol or _short(match.mint)}"[:256],
+        description=(
+            f"A new Solana pair matches the `{match.narrative}` narrative from "
+            f"**{alert.author or alert.source}**. Name matching is an early lead, not proof "
+            "that the source created or endorsed this token."
+        ),
+        color=0xF39C12,
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(name="Token", value=f"**{match.name or 'unknown'}** (`{match.symbol or '?'}`)")
+    embed.add_field(name="Pair age", value=f"`{match.pair_age_minutes} min`")
+    embed.add_field(name="Liquidity", value=_money(match.liquidity_usd))
+    embed.add_field(name="Market cap", value=_money(match.market_cap_usd))
+    embed.add_field(
+        name="5m flow",
+        value=(
+            f"buys/sells `{match.buys_5m}/{match.sells_5m}` • "
+            f"volume `{_money(match.volume_5m_usd)}`"
+        ),
+        inline=False,
+    )
+    embed.add_field(name="Contract", value=f"`{match.mint}`", inline=False)
+    if alert.url:
+        embed.add_field(name="Triggering news", value=f"[Open source]({alert.url})", inline=False)
+    embed.set_footer(text="Automatic coin-risk callout follows • PAPER/research only")
     return embed
 
 
@@ -724,6 +811,7 @@ class SmartMoneyBot(commands.Bot):
         self.settings = settings
         self.engine = SmartMoneyEngine(settings, notifier=self)
         self._engine_started = False
+        self._last_unmatched_sell_alert: dict[str, int] = {}
 
     async def setup_hook(self) -> None:
         await self.engine.initialize()
@@ -895,6 +983,17 @@ class SmartMoneyBot(commands.Bot):
         await self._send_alert(embed, token_mint=signal.token_mint)
 
     async def on_execution(self, result: ExecutionResult) -> None:
+        unmatched_sell = (
+            result.side is Side.SELL
+            and not result.success
+            and "no open paper lot" in result.message.lower()
+        )
+        if unmatched_sell:
+            now = int(time.time())
+            previous = self._last_unmatched_sell_alert.get(result.token_mint)
+            if previous and now - previous < 300:
+                return
+            self._last_unmatched_sell_alert[result.token_mint] = now
         skipped = not result.success and result.message.startswith("Skipped:")
         status = "FILLED" if result.success else ("SKIPPED" if skipped else "FAILED")
         color = 0x3498DB if result.success else (0xF1C40F if skipped else 0xE74C3C)
@@ -919,6 +1018,22 @@ class SmartMoneyBot(commands.Bot):
             _coin_callout_embed(callout),
             token_mint=callout.mint,
             ping_user=callout.verdict in {"STRONG WATCH", "WATCH"},
+        )
+
+    async def on_news_alert(self, alert: NewsAlert) -> None:
+        await self._send_alert(
+            _news_alert_embed(alert),
+            token_mint=alert.token_mints[0] if alert.token_mints else None,
+            ping_user=alert.urgency in {"HIGH", "MEDIUM"},
+        )
+
+    async def on_narrative_match(
+        self, alert: NewsAlert, match: NarrativePairMatch
+    ) -> None:
+        await self._send_alert(
+            _narrative_match_embed(alert, match),
+            token_mint=match.mint,
+            ping_user=True,
         )
 
     async def on_daily_profit_lock(self, status: PaperDailyLockStatus) -> None:
@@ -1263,9 +1378,26 @@ class SmartMoneyCommands(
             else "polling fallback"
         )
         x_status = (
-            "official recent-search connected"
-            if status["x_social_configured"]
-            else "API key needed"
+            f"working (last success <t:{status['x_social_last_success']}:R>)"
+            if status["x_social_last_success"]
+            else (
+                f"configured but failing: {status['x_social_last_error']}"
+                if status["x_social_last_error"]
+                else "key configured; waiting for first search"
+                if status["x_social_configured"]
+                else "API key needed"
+            )
+        )
+        news_stream_status = (
+            "connected"
+            if status["x_news_stream_connected"]
+            else (
+                f"error: {status['x_news_stream_last_error']}"
+                if status["x_news_stream_last_error"]
+                else "starting"
+                if status["x_news_stream_configured"]
+                else "not configured"
+            )
         )
         text = (
             "**Solana Tracker:** connected for strict 24H + 7D general-trader screening\n"
@@ -1286,7 +1418,18 @@ class SmartMoneyCommands(
             "**DEX Screener coin intelligence:** enabled for live pair liquidity, flow, "
             "volume, profiles, and paid-boost labeling\n"
             f"**X/Twitter coin intelligence:** {x_status}"
-            " • contract-address search • author-quality and duplicate-text checks\n"
+            " • contract + DEX-listed name/ticker • author-quality and duplicate-text checks\n"
+            f"**X near-realtime news stream:** {news_stream_status} • configured account/news "
+            "rule • narrative extraction\n"
+            f"**RSS/news radar:** {'ready' if status['news_rss_ready'] else 'starting'} • "
+            "White House, SEC, world news, and crypto sources\n"
+            f"**J7 Tracker:** "
+            + (
+                f"authorized feed {status['j7_feed_health']}\n"
+                if status["j7_feed_configured"]
+                else "optional authorized RSS/Atom adapter ready; no public API documented\n"
+            )
+            +
             "**Fomo:** the official app exposes leaderboards, profiles, follows, and alerts, "
             "but no documented public API/webhook was found. The bot will not claim a "
             "private endpoint is authorized; Fomo candidates require an official feed or a "
@@ -1757,6 +1900,37 @@ class SmartMoneyCommands(
             if status["rotation_last_refresh"]
             else "not completed yet"
         )
+        x_callout_health = (
+            f"working • last success <t:{status['x_social_last_success']}:R>"
+            if status["x_social_last_success"]
+            else (
+                f"ERROR • {status['x_social_last_error']}"
+                if status["x_social_last_error"]
+                else "key configured • awaiting first request"
+                if status["x_social_configured"]
+                else "key needed"
+            )
+        )
+        x_news_health = (
+            "connected"
+            if status["x_news_stream_connected"]
+            else (
+                f"error • {status['x_news_stream_last_error']}"
+                if status["x_news_stream_last_error"]
+                else "starting"
+                if status["x_news_stream_configured"]
+                else "not configured"
+            )
+        )
+        rss_health = (
+            f"ready • last refresh <t:{status['news_rss_last_refresh']}:R>"
+            if status["news_rss_last_refresh"]
+            else (
+                f"error • {status['news_rss_last_error']}"
+                if status["news_rss_last_error"]
+                else "starting"
+            )
+        )
         stream_status = (
             f"connected • {status['stream_subscriptions']} wallet subscriptions"
             if status["stream_connected"]
@@ -1826,8 +2000,14 @@ class SmartMoneyCommands(
             f"**Coin callouts:** "
             f"{'enabled' if status['coin_callouts_enabled'] else 'disabled'} • "
             "DEX/on-chain cross-check • "
-            f"X {'connected' if status['x_social_configured'] else 'key needed'} • "
+            f"X {x_callout_health} • "
             f"minimum alert score {s.coin_callout_min_alert_score}/100\n"
+            f"**News radar:** {'enabled' if status['news_radar_enabled'] else 'disabled'} • "
+            f"X stream {x_news_health} • RSS {rss_health}\n"
+            f"**Narrative pair matching:** "
+            f"{'enabled' if s.news_dex_match_enabled else 'disabled'} • minimum "
+            f"{_money(s.news_dex_match_min_liquidity_usd)} liquidity • maximum "
+            f"{s.news_dex_match_max_age_minutes}m old\n"
             f"**Paused:** {status['paused']}\n"
             f"**Tracked wallets:** {status['wallets']}\n"
             f"**Exit-only wallets:** {status['exit_only_wallets']} "

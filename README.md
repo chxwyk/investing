@@ -7,7 +7,16 @@ transactions, and mirrors every newly detected hot-wallet swap in PAPER mode. PA
 as either a forced source-price observation ledger or an executable Jupiter quote-shadow
 trial; the two answer different questions and are labeled separately.
 
-Version 2.19 adds asynchronous coin-intelligence callouts. A detected BUY keeps the fast
+Version 2.20 adds a fast, research-only news radar in front of the existing coin-intelligence
+pipeline. It consumes X's official filtered stream plus selected official RSS/Atom feeds,
+alerts on scored breaking narratives, extracts any Solana contract address already present,
+and rechecks DEX Screener for a newly created Solana pair matching the narrative. A detected
+pair still passes the normal DEX, token-safety, verified-wallet, and X evidence checks; a
+headline never becomes an automatic live buy. An optional `J7_AUTHORIZED_FEED_URL` accepts a
+legitimately provided J7 RSS/Atom feed, but the bot does not scrape J7's authenticated product
+or store J7 login credentials.
+
+Version 2.19 added asynchronous coin-intelligence callouts. A detected BUY keeps the fast
 quote/PAPER path; a separate task cross-checks the mint against DEX Screener pair flow,
 existing Jupiter token safety metadata, independently verified smart-wallet buyers, and—when
 `X_API_BEARER_TOKEN` is configured—the official X recent-search API. X evidence is searched
@@ -65,6 +74,12 @@ unless four separate controls are deliberately configured.
 - Uses independent-wallet consensus and risk gates for alert/live strategy execution.
 - Posts raw wallet activity and the matching paper fills to Discord.
 - Adds one-tap Fomo, Pump.fun, Jupiter, DexScreener, and Solscan buttons to every token alert.
+- Posts breaking-news radar alerts from the official X filtered stream and selected RSS/Atom
+  feeds, then watches for a newly created matching Solana pair.
+- Searches X coin evidence by exact mint plus DEX-listed token name/symbol identity, while
+  discounting identity-only matches so ticker collisions cannot masquerade as contract proof.
+- Suppresses automatic low-score blocked reports that used to flood the channel; every token
+  remains inspectable on demand with `/smartmoney coin`.
 - Posts scored coin callouts without delaying the copy path; a second independent verified
   wallet buying the same mint forces a fresh callout even inside the normal cooldown.
 - Provides `/smartmoney coin` for an on-demand contract-address report covering smart money,
@@ -87,7 +102,7 @@ unless four separate controls are deliberately configured.
 
 ## What it deliberately does not do
 
-- It does not log into, scrape, reverse-engineer, or control a Fomo account.
+- It does not log into, scrape, reverse-engineer, or control a Fomo or J7 Tracker account.
 - It does not scrape or automate KOLScan. Only documented provider APIs and public on-chain
   activity are used for automatic candidate discovery.
 - It does not map Fomo usernames to wallets or copy Fomo's leaderboard. Fomo does not expose
@@ -204,7 +219,7 @@ when no prior public BUY exists
 inside the scanned history, no current baseline price is available, or the PAPER account lacks
 cash. Set `PAPER_MIRROR_RAW_SWAPS=false` to restore consensus-only paper behavior.
 
-The v2.19.0 discovery, callout, selective-entry, daily loss/profit locks, social nomination,
+The v2.20.0 discovery, news-radar, callout, selective-entry, daily loss/profit locks, social nomination,
 quote, fallback, rotation, and exit controls are
 intentionally configurable:
 
@@ -255,11 +270,40 @@ FORWARD_EVIDENCE_MIN_PROFIT_FACTOR=1.0
 FORWARD_EVIDENCE_MAX_LOSS_USD=10
 REALTIME_WALLET_STREAM_ENABLED=true
 REALTIME_STREAM_COMMITMENT=processed
+NEWS_RADAR_ENABLED=true
+X_NEWS_STREAM_ENABLED=true
+NEWS_POLL_SECONDS=30
+NEWS_MIN_SCORE=20
+NEWS_MAX_ALERTS_PER_HOUR=30
+NEWS_DEX_MATCH_ENABLED=true
+NEWS_DEX_MATCH_MIN_LIQUIDITY_USD=2000
+NEWS_DEX_MATCH_MAX_AGE_MINUTES=60
+NEWS_PAIR_RECHECK_SECONDS=0,30,90,180
 ```
 
 These values are hypotheses to validate in PAPER mode, not optimized or guaranteed-profit
 settings. Use `/smartmoney paper`, `/smartmoney positions`, `/smartmoney paper-trades`, and
 `/smartmoney readiness` to evaluate them before changing size.
+
+## Fast news radar
+
+The radar has two independent inputs. X uses the official filtered-stream endpoint, so a
+matching public post arrives without repeatedly running recent-search. RSS/Atom polls selected
+official government, market, and crypto-news feeds every 30 seconds. Each item is deduplicated,
+time-decayed, source-scored, and checked for a Solana mint. If no mint exists yet, the bot
+extracts a few narrative terms and asks DEX Screener for a new Solana pair immediately and at
+30, 90, and 180 seconds. A match requires an exact normalized name/symbol term, a recent pair,
+and at least the configured liquidity before the normal coin-risk report runs.
+
+The default X rule follows a deliberately small set of high-signal official/news accounts to
+limit paid X reads. Customize `X_NEWS_STREAM_RULE` using valid X filtered-stream syntax instead
+of broad keywords that can consume credits quickly. `X_SEARCH_MAX_RESULTS=10` similarly caps
+each on-demand coin-evidence search. `/smartmoney sources` and `/smartmoney status` show the
+last X search error, stream state, RSS state, J7 feed state, and narrative matcher state.
+
+J7's public site does not document an integration API in this release. If J7 support gives you
+an official RSS/Atom URL, store only that URL as `J7_AUTHORIZED_FEED_URL`. Never place a J7
+password, browser cookie, session token, or copied private endpoint in Railway.
 
 ## Official PAPER readiness trial
 
