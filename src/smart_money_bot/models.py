@@ -122,6 +122,75 @@ class TokenInfo:
 
 
 @dataclass(frozen=True, slots=True)
+class DexSnapshot:
+    available: bool
+    liquidity_usd: Decimal | None = None
+    market_cap_usd: Decimal | None = None
+    pair_age_minutes: int | None = None
+    buys_5m: int = 0
+    sells_5m: int = 0
+    buys_1h: int = 0
+    sells_1h: int = 0
+    volume_5m_usd: Decimal = Decimal("0")
+    volume_1h_usd: Decimal = Decimal("0")
+    price_change_5m_percent: Decimal | None = None
+    price_change_1h_percent: Decimal | None = None
+    active_boosts: int = 0
+    has_website: bool = False
+    has_x_profile: bool = False
+    pair_url: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class XSocialSnapshot:
+    available: bool
+    posts: int = 0
+    unique_authors: int = 0
+    established_authors: int = 0
+    influential_authors: int = 0
+    suspicious_authors: int = 0
+    engagements: int = 0
+    duplicate_percent: Decimal = Decimal("0")
+    posts_per_minute: Decimal = Decimal("0")
+    query: str = ""
+    error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TokenRiskSnapshot:
+    available: bool
+    score: Decimal | None = None
+    rugged: bool = False
+    snipers_percent: Decimal | None = None
+    insiders_percent: Decimal | None = None
+    bundlers_percent: Decimal | None = None
+    top10_percent: Decimal | None = None
+    dev_percent: Decimal | None = None
+    danger_flags: tuple[str, ...] = ()
+    jupiter_verified: bool | None = None
+    error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CoinCallout:
+    mint: str
+    symbol: str | None
+    name: str | None
+    score: Decimal
+    verdict: str
+    confidence: str
+    smart_wallets: tuple[str, ...]
+    token_info: TokenInfo | None
+    dex: DexSnapshot
+    social: XSocialSnapshot
+    tracker_risk: TokenRiskSnapshot
+    positives: tuple[str, ...]
+    warnings: tuple[str, ...]
+    hard_blockers: tuple[str, ...]
+    generated_at: int
+
+
+@dataclass(frozen=True, slots=True)
 class SwapQuote:
     """A quote-only Jupiter Swap V2 order normalized for paper execution."""
 

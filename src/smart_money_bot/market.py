@@ -183,9 +183,7 @@ class JupiterClient:
         """Return a quote-only Swap V2 order without asking for a transaction."""
 
         if not self.api_key:
-            raise JupiterError(
-                "JUPITER_API_KEY is required for executable PAPER order quotes"
-            )
+            raise JupiterError("JUPITER_API_KEY is required for executable PAPER order quotes")
         if amount_raw <= 0:
             raise ValueError("amount_raw must be positive")
         if input_decimals < 0 or output_decimals < 0:
@@ -206,8 +204,7 @@ class JupiterClient:
             raise JupiterError("Jupiter returned an invalid order quote")
         if data.get("error") or data.get("errorMessage"):
             raise JupiterError(
-                f"Jupiter order quote failed: "
-                f"{data.get('errorMessage') or data.get('error')}"
+                f"Jupiter order quote failed: {data.get('errorMessage') or data.get('error')}"
             )
         if data.get("inputMint") != input_mint or data.get("outputMint") != output_mint:
             raise JupiterError("Jupiter order quote returned the wrong token pair")
@@ -234,9 +231,7 @@ class JupiterClient:
         else:
             deprecated_ratio = _decimal_or_none(data.get("priceImpactPct"))
             price_impact = (
-                abs(deprecated_ratio * Decimal("100"))
-                if deprecated_ratio
-                else Decimal("0")
+                abs(deprecated_ratio * Decimal("100")) if deprecated_ratio else Decimal("0")
             )
 
         return SwapQuote(

@@ -292,27 +292,15 @@ class Database:
             );
             """
         )
-        await self._ensure_column(
-            "tracked_traders", "source", "TEXT NOT NULL DEFAULT 'manual'"
-        )
-        await self._ensure_column(
-            "discovery_wallets", "realized_pnl_7d", "REAL NOT NULL DEFAULT 0"
-        )
-        await self._ensure_column(
-            "discovery_wallets", "roi_7d_percent", "REAL NOT NULL DEFAULT 0"
-        )
+        await self._ensure_column("tracked_traders", "source", "TEXT NOT NULL DEFAULT 'manual'")
+        await self._ensure_column("discovery_wallets", "realized_pnl_7d", "REAL NOT NULL DEFAULT 0")
+        await self._ensure_column("discovery_wallets", "roi_7d_percent", "REAL NOT NULL DEFAULT 0")
         await self._ensure_column(
             "discovery_wallets", "win_rate_7d_percent", "REAL NOT NULL DEFAULT 0"
         )
-        await self._ensure_column(
-            "discovery_wallets", "trades_7d", "INTEGER NOT NULL DEFAULT 0"
-        )
-        await self._ensure_column(
-            "discovery_wallets", "recent_swaps", "INTEGER NOT NULL DEFAULT 0"
-        )
-        await self._ensure_column(
-            "discovery_wallets", "pump_swaps", "INTEGER NOT NULL DEFAULT 0"
-        )
+        await self._ensure_column("discovery_wallets", "trades_7d", "INTEGER NOT NULL DEFAULT 0")
+        await self._ensure_column("discovery_wallets", "recent_swaps", "INTEGER NOT NULL DEFAULT 0")
+        await self._ensure_column("discovery_wallets", "pump_swaps", "INTEGER NOT NULL DEFAULT 0")
         await self._ensure_column("discovery_wallets", "last_activity_at", "INTEGER")
         await self._ensure_column(
             "discovery_wallets", "selection_reason", "TEXT NOT NULL DEFAULT ''"
@@ -338,9 +326,7 @@ class Database:
         await self._ensure_column("paper_trades", "quote_router", "TEXT")
         await self._ensure_column("paper_trades", "quote_latency_ms", "INTEGER")
         await self._ensure_column("paper_trades", "quote_fee_bps", "INTEGER")
-        await self._ensure_column(
-            "paper_trades", "quote_based", "INTEGER NOT NULL DEFAULT 0"
-        )
+        await self._ensure_column("paper_trades", "quote_based", "INTEGER NOT NULL DEFAULT 0")
         await self.db.execute(
             """
             CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_trades_source_signature
@@ -514,9 +500,7 @@ class Database:
                 enabled_cursor = await self.db.execute(
                     "SELECT address FROM tracked_traders WHERE enabled = 1"
                 )
-                previously_enabled = {
-                    row["address"] for row in await enabled_cursor.fetchall()
-                }
+                previously_enabled = {row["address"] for row in await enabled_cursor.fetchall()}
                 auto_cursor = await self.db.execute(
                     "SELECT address FROM tracked_traders WHERE source = 'auto' AND enabled = 1"
                 )
@@ -530,12 +514,8 @@ class Database:
                         (candidate.address,),
                     )
                     previous_row = await previous_cursor.fetchone()
-                    previous_pnl = (
-                        _d(previous_row["realized_pnl_24h"]) if previous_row else None
-                    )
-                    hydrated_candidate = replace(
-                        candidate, previous_pnl_24h=previous_pnl
-                    )
+                    previous_pnl = _d(previous_row["realized_pnl_24h"]) if previous_row else None
+                    hydrated_candidate = replace(candidate, previous_pnl_24h=previous_pnl)
                     hydrated.append(hydrated_candidate)
                     selected_addresses.append(candidate.address)
                     continuing = candidate.address in previously_auto
@@ -698,9 +678,7 @@ class Database:
                     score = current.score if current is not None else _d(row["score"])
                     baseline_24h = _d(row["baseline_pnl_24h"])
                     baseline_7d = _d(row["baseline_pnl_7d"])
-                    tracking_started_at = int(
-                        row["tracking_started_at"] or row["first_seen_at"]
-                    )
+                    tracking_started_at = int(row["tracking_started_at"] or row["first_seen_at"])
                     reason = reasons.get(
                         address, "rotated out by a higher-ranked active Pump wallet"
                     )
@@ -865,9 +843,7 @@ class Database:
                 alias=row["alias"],
                 realized_pnl_24h=_d(row["realized_pnl_24h"]),
                 previous_pnl_24h=(
-                    _d(row["previous_pnl_24h"])
-                    if row["previous_pnl_24h"] is not None
-                    else None
+                    _d(row["previous_pnl_24h"]) if row["previous_pnl_24h"] is not None else None
                 ),
                 roi_24h_percent=_d(row["roi_24h_percent"]),
                 win_rate_percent=_d(row["win_rate_percent"]),
@@ -878,9 +854,7 @@ class Database:
                 invested_24h_usd=_d(row["invested_24h_usd"]),
                 volume_24h_usd=_d(row["volume_24h_usd"]),
                 last_trade_ms=(
-                    int(row["last_trade_ms"])
-                    if row["last_trade_ms"] is not None
-                    else None
+                    int(row["last_trade_ms"]) if row["last_trade_ms"] is not None else None
                 ),
                 score=_d(row["score"]),
                 rank=int(row["rank"]),
@@ -891,9 +865,7 @@ class Database:
                 recent_swaps=int(row["recent_swaps"]),
                 pump_swaps=int(row["pump_swaps"]),
                 last_activity_at=(
-                    int(row["last_activity_at"])
-                    if row["last_activity_at"] is not None
-                    else None
+                    int(row["last_activity_at"]) if row["last_activity_at"] is not None else None
                 ),
                 selection_reason=str(row["selection_reason"] or ""),
             )
@@ -963,7 +935,9 @@ class Database:
             profit_factor = (
                 gross_profit / gross_loss
                 if gross_loss > 0
-                else Decimal("999") if gross_profit > 0 else Decimal("0")
+                else Decimal("999")
+                if gross_profit > 0
+                else Decimal("0")
             )
             reports.append(
                 {
@@ -985,9 +959,7 @@ class Database:
                     "observed_swaps": int(source["swaps"] if source else 0),
                     "observed_source_pnl": _d(source["pnl"] if source else 0),
                     "paper_fills": int(paper["fills"] if paper else 0),
-                    "paper_closed_sells": int(
-                        (paper["closed_sells"] if paper else 0) or 0
-                    ),
+                    "paper_closed_sells": int((paper["closed_sells"] if paper else 0) or 0),
                     "paper_pnl": _d(paper["pnl"] if paper else 0),
                     "paper_profit_factor": profit_factor,
                     "selection_reason": str(row["selection_reason"] or ""),
@@ -1027,7 +999,9 @@ class Database:
             profit_factor = (
                 gross_profit / gross_loss
                 if gross_loss > 0
-                else Decimal("999") if gross_profit > 0 else Decimal("0")
+                else Decimal("999")
+                if gross_profit > 0
+                else Decimal("0")
             )
             performance[str(row["source_trader"])] = {
                 "closed_sells": int(row["closed_sells"]),
@@ -1094,9 +1068,7 @@ class Database:
                         swap.quote_mint,
                         float(swap.quote_amount),
                         float(swap.usd_value) if swap.usd_value is not None else None,
-                        float(swap.token_price_usd)
-                        if swap.token_price_usd is not None
-                        else None,
+                        float(swap.token_price_usd) if swap.token_price_usd is not None else None,
                         float(realized_pnl),
                         float(matched_cost),
                         int(time.time()),
@@ -1266,9 +1238,7 @@ class Database:
         await self.db.commit()
         return int(cursor.lastrowid)
 
-    async def recent_signal_exists(
-        self, token_mint: str, side: Side, cutoff: int
-    ) -> bool:
+    async def recent_signal_exists(self, token_mint: str, side: Side, cutoff: int) -> bool:
         cursor = await self.db.execute(
             """
             SELECT 1 FROM signals
@@ -1277,6 +1247,27 @@ class Database:
             (token_mint, side.value, cutoff),
         )
         return await cursor.fetchone() is not None
+
+    async def recent_verified_token_buyers(
+        self, token_mint: str, cutoff: int
+    ) -> list[tuple[str, str]]:
+        """Return distinct financially verified wallets buying a mint since cutoff."""
+
+        cursor = await self.db.execute(
+            """
+            SELECT s.trader_address, t.alias, MAX(s.block_time) AS latest_buy
+            FROM swaps AS s
+            JOIN tracked_traders AS t ON t.address = s.trader_address
+            JOIN discovery_wallets AS d ON d.address = s.trader_address
+            WHERE s.token_mint = ? AND s.side = 'BUY' AND s.block_time >= ?
+              AND t.enabled = 1 AND d.qualified = 1
+            GROUP BY s.trader_address, t.alias
+            ORDER BY latest_buy DESC
+            """,
+            (token_mint, cutoff),
+        )
+        rows = await cursor.fetchall()
+        return [(str(row["trader_address"]), str(row["alias"])) for row in rows]
 
     async def paper_execute(
         self,
@@ -1297,9 +1288,7 @@ class Database:
         async with self._write_lock:
             await self.db.execute("BEGIN IMMEDIATE")
             try:
-                account_cursor = await self.db.execute(
-                    "SELECT * FROM paper_account WHERE id = 1"
-                )
+                account_cursor = await self.db.execute("SELECT * FROM paper_account WHERE id = 1")
                 account = await account_cursor.fetchone()
                 cash = _d(account["cash_usd"])
                 realized_total = _d(account["realized_pnl_usd"])
@@ -1449,9 +1438,7 @@ class Database:
                 if await duplicate_cursor.fetchone():
                     await self.db.rollback()
                     return None
-                account_cursor = await self.db.execute(
-                    "SELECT * FROM paper_account WHERE id = 1"
-                )
+                account_cursor = await self.db.execute("SELECT * FROM paper_account WHERE id = 1")
                 account = await account_cursor.fetchone()
                 cash = _d(account["cash_usd"])
                 realized_total = _d(account["realized_pnl_usd"])
@@ -1576,16 +1563,14 @@ class Database:
                     realized = net - matched_cost
                     cash += net
                     realized_total += realized
-                    remaining_source_quantity = (
-                        observed_source_quantity
-                        - min(source_token_amount, observed_source_quantity)
+                    remaining_source_quantity = observed_source_quantity - min(
+                        source_token_amount, observed_source_quantity
                     )
                     remaining_quantity = held_paper_quantity - paper_quantity
                     remaining_cost = held_cost - matched_cost
-                    if (
-                        remaining_source_quantity <= Decimal("0.000000001")
-                        or remaining_quantity <= Decimal("0.000000001")
-                    ):
+                    if remaining_source_quantity <= Decimal(
+                        "0.000000001"
+                    ) or remaining_quantity <= Decimal("0.000000001"):
                         await self.db.execute(
                             """
                             DELETE FROM paper_mirror_positions
@@ -1650,16 +1635,8 @@ class Database:
                         exit_reason,
                         float(source_price_usd) if source_price_usd is not None else None,
                         float(quote_price_usd) if quote_price_usd is not None else None,
-                        (
-                            float(price_drift_percent)
-                            if price_drift_percent is not None
-                            else None
-                        ),
-                        (
-                            float(price_impact_percent)
-                            if price_impact_percent is not None
-                            else None
-                        ),
+                        (float(price_drift_percent) if price_drift_percent is not None else None),
+                        (float(price_impact_percent) if price_impact_percent is not None else None),
                         quote_router,
                         quote_latency_ms,
                         effective_fee_bps if quote_based else None,
@@ -1690,9 +1667,7 @@ class Database:
         )
         return await cursor.fetchone() is not None
 
-    async def has_paper_mirror_position(
-        self, trader_address: str, token_mint: str
-    ) -> bool:
+    async def has_paper_mirror_position(self, trader_address: str, token_mint: str) -> bool:
         cursor = await self.db.execute(
             """
             SELECT 1 FROM paper_mirror_positions
@@ -1759,9 +1734,7 @@ class Database:
         )
         return [dict(row) for row in await cursor.fetchall()]
 
-    async def paper_mirror_open_lot_is_sniper(
-        self, trader_address: str, token_mint: str
-    ) -> bool:
+    async def paper_mirror_open_lot_is_sniper(self, trader_address: str, token_mint: str) -> bool:
         """Return whether the newest buy contributing to an open lot used sniper PAPER."""
 
         if not await self.has_paper_mirror_position(trader_address, token_mint):
@@ -1801,9 +1774,7 @@ class Database:
         requested_usd: Decimal,
         max_position_usd: Decimal,
     ) -> Decimal:
-        account_cursor = await self.db.execute(
-            "SELECT cash_usd FROM paper_account WHERE id = 1"
-        )
+        account_cursor = await self.db.execute("SELECT cash_usd FROM paper_account WHERE id = 1")
         account = await account_cursor.fetchone()
         position_cursor = await self.db.execute(
             """
@@ -1878,11 +1849,7 @@ class Database:
                 1 if accepted else 0,
                 reason,
                 latency_ms,
-                (
-                    float(price_impact_percent)
-                    if price_impact_percent is not None
-                    else None
-                ),
+                (float(price_impact_percent) if price_impact_percent is not None else None),
                 float(price_drift_percent) if price_drift_percent is not None else None,
                 int(time.time()),
             ),
@@ -1924,15 +1891,11 @@ class Database:
             return peak
 
     async def paper_positions(self) -> list[dict[str, Any]]:
-        cursor = await self.db.execute(
-            "SELECT * FROM paper_positions ORDER BY opened_at"
-        )
+        cursor = await self.db.execute("SELECT * FROM paper_positions ORDER BY opened_at")
         return [dict(row) for row in await cursor.fetchall()]
 
     async def paper_mirror_positions(self) -> list[dict[str, Any]]:
-        cursor = await self.db.execute(
-            "SELECT * FROM paper_mirror_positions ORDER BY opened_at"
-        )
+        cursor = await self.db.execute("SELECT * FROM paper_mirror_positions ORDER BY opened_at")
         return [dict(row) for row in await cursor.fetchall()]
 
     async def paper_recent_trades(self, limit: int = 15) -> list[dict[str, Any]]:
@@ -1951,9 +1914,7 @@ class Database:
         row = await cursor.fetchone()
         return int(row["count"] or 0)
 
-    async def paper_trades_page(
-        self, *, limit: int = 5, offset: int = 0
-    ) -> list[dict[str, Any]]:
+    async def paper_trades_page(self, *, limit: int = 5, offset: int = 0) -> list[dict[str, Any]]:
         cursor = await self.db.execute(
             """
             SELECT * FROM paper_trades
@@ -1993,9 +1954,7 @@ class Database:
         return sorted(combined, key=lambda item: int(item["opened_at"]))
 
     async def paper_position_count(self) -> int:
-        standard_cursor = await self.db.execute(
-            "SELECT COUNT(*) AS count FROM paper_positions"
-        )
+        standard_cursor = await self.db.execute("SELECT COUNT(*) AS count FROM paper_positions")
         mirror_cursor = await self.db.execute(
             "SELECT COUNT(*) AS count FROM paper_mirror_positions"
         )
@@ -2088,17 +2047,13 @@ class Database:
             wins=int(trade_row["wins"] or 0),
             losses=int(trade_row["losses"] or 0),
             max_drawdown_usd=_d(account["max_drawdown_usd"]),
-            current_drawdown_usd=max(
-                Decimal("0"), _d(account["high_watermark_usd"]) - equity
-            ),
+            current_drawdown_usd=max(Decimal("0"), _d(account["high_watermark_usd"]) - equity),
             realized_pnl_24h_usd=await self.paper_daily_realized_pnl(),
             gross_profit_usd=gross_profit,
             gross_loss_usd=gross_loss,
             average_win_usd=_d(trade_row["average_win"]),
             average_loss_usd=_d(trade_row["average_loss"]),
-            expectancy_usd=(
-                net_closed / Decimal(trade_count) if trade_count else Decimal("0")
-            ),
+            expectancy_usd=(net_closed / Decimal(trade_count) if trade_count else Decimal("0")),
             profit_factor=(gross_profit / gross_loss if gross_loss > 0 else None),
         )
 
@@ -2172,9 +2127,7 @@ class Database:
         gross_profit = _d(trade_row["gross_profit"])
         gross_loss = _d(trade_row["gross_loss"])
         net_pnl = _d(trade_row["net_pnl"])
-        expectancy = (
-            net_pnl / Decimal(closed_trades) if closed_trades else Decimal("0")
-        )
+        expectancy = net_pnl / Decimal(closed_trades) if closed_trades else Decimal("0")
         profit_factor = gross_profit / gross_loss if gross_loss > 0 else None
 
         samples_cursor = await self.db.execute(
@@ -2210,9 +2163,7 @@ class Database:
         if expectancy <= 0:
             blockers.append("expectancy is not positive")
         if max_drawdown_pct > max_drawdown_percent:
-            blockers.append(
-                f"drawdown {max_drawdown_pct:.2f}% exceeds {max_drawdown_percent:.2f}%"
-            )
+            blockers.append(f"drawdown {max_drawdown_pct:.2f}% exceeds {max_drawdown_percent:.2f}%")
         if quote_success_percent < min_quote_success_percent:
             blockers.append(
                 f"quote success {quote_success_percent:.1f}% is below "
@@ -2398,9 +2349,7 @@ class Database:
         )
         await self.db.commit()
 
-    async def cache_discovery_candidates(
-        self, candidates: list[DiscoveryCandidate]
-    ) -> None:
+    async def cache_discovery_candidates(self, candidates: list[DiscoveryCandidate]) -> None:
         """Persist the verified pre-rotation pool across Railway redeploys."""
 
         payload = [asdict(candidate) for candidate in candidates]

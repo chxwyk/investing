@@ -54,4 +54,3 @@ def test_score_is_bounded() -> None:
     )
     score = score_trader(metrics, metrics)
     assert Decimal("0") <= score <= Decimal("100")
-

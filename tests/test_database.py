@@ -96,9 +96,7 @@ async def test_existing_paper_database_migrates_raw_mirror_columns(tmp_path) -> 
             "quote_fee_bps",
             "quote_based",
         } <= columns
-        mirror_cursor = await database.db.execute(
-            "PRAGMA table_info(paper_mirror_positions)"
-        )
+        mirror_cursor = await database.db.execute("PRAGMA table_info(paper_mirror_positions)")
         mirror_columns = {row["name"] for row in await mirror_cursor.fetchall()}
         assert {"peak_price_usd", "token_decimals"} <= mirror_columns
         assert await database.paper_mirror_positions() == []

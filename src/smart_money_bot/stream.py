@@ -106,9 +106,7 @@ class RealtimeWalletStream:
                     current = tuple(
                         sorted(
                             trader.address
-                            for trader in await self.database.list_traders(
-                                enabled_only=True
-                            )
+                            for trader in await self.database.list_traders(enabled_only=True)
                         )
                     )
                     if current != fingerprint:
@@ -129,9 +127,7 @@ class RealtimeWalletStream:
                 request_id = payload.get("id")
                 if request_id in pending:
                     if payload.get("error") is not None:
-                        raise ConnectionError(
-                            f"wallet subscription rejected: {payload['error']}"
-                        )
+                        raise ConnectionError(f"wallet subscription rejected: {payload['error']}")
                     subscription_id = payload.get("result")
                     if isinstance(subscription_id, int):
                         subscriptions[subscription_id] = pending.pop(request_id)
@@ -161,9 +157,7 @@ def derive_ws_url(rpc_url: str) -> str | None:
         parts = urlsplit(rpc_url)
     except ValueError:
         return None
-    scheme = {"https": "wss", "http": "ws", "wss": "wss", "ws": "ws"}.get(
-        parts.scheme.lower()
-    )
+    scheme = {"https": "wss", "http": "ws", "wss": "wss", "ws": "ws"}.get(parts.scheme.lower())
     if scheme is None or not parts.netloc:
         return None
     return urlunsplit((scheme, parts.netloc, parts.path, parts.query, parts.fragment))

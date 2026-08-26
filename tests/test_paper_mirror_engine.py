@@ -129,9 +129,7 @@ async def test_new_raw_swaps_immediately_buy_and_sell_in_paper_mode(settings) ->
     engine = SmartMoneyEngine(settings, notifier=notifier)
     await engine.initialize()
     try:
-        engine.market.price = AsyncMock(
-            side_effect=(Decimal("1"), Decimal("1.2"))
-        )
+        engine.market.price = AsyncMock(side_effect=(Decimal("1"), Decimal("1.2")))
         trader = TrackedTrader(address="wallet-a", alias="Auto wallet-a")
         await engine.database.add_trader(trader.address, trader.alias)
 
@@ -228,9 +226,7 @@ async def test_forced_observation_still_enforces_raw_risk_exits(
         trader = TrackedTrader(address="wallet-a", alias="Auto wallet-a")
         await engine.database.add_trader(trader.address, trader.alias)
         for index in range(3):
-            await engine._handle_new_swap(
-                _swap(Side.BUY, f"observe-buy-{index}", "1"), trader
-            )
+            await engine._handle_new_swap(_swap(Side.BUY, f"observe-buy-{index}", "1"), trader)
 
         positions = await engine.database.paper_mirror_positions()
         assert len(positions) == 1
@@ -404,9 +400,7 @@ async def test_unrouted_pump_swap_uses_guarded_source_price_paper_fallback(
 
         trades = await engine.database.paper_recent_trades()
         assert len(trades) == 2
-        assert {item["execution_kind"] for item in trades} == {
-            "PUMP_SOURCE_FALLBACK"
-        }
+        assert {item["execution_kind"] for item in trades} == {"PUMP_SOURCE_FALLBACK"}
         assert all(item["quote_based"] == 0 for item in trades)
         assert Decimal(str(trades[0]["realized_pnl_usd"])) > 0
     finally:
@@ -444,9 +438,7 @@ async def test_raw_paper_entry_filter_blocks_suspicious_token(settings) -> None:
     await engine.initialize()
     try:
         engine.market.price = AsyncMock(return_value=Decimal("1"))
-        engine.market.token_info = AsyncMock(
-            return_value=TokenInfo(mint="mint", suspicious=True)
-        )
+        engine.market.token_info = AsyncMock(return_value=TokenInfo(mint="mint", suspicious=True))
         trader = TrackedTrader(address="wallet-a", alias="Auto wallet-a")
         await engine.database.add_trader(trader.address, trader.alias)
 
@@ -488,9 +480,7 @@ async def test_sniper_paper_lane_takes_small_low_liquidity_pump_position(
         trader = TrackedTrader(address="wallet-a", alias="Auto wallet-a")
         await engine.database.add_trader(trader.address, trader.alias)
 
-        await engine._handle_new_swap(
-            _swap(Side.BUY, "sniper-buy", "1", mint=pump_mint), trader
-        )
+        await engine._handle_new_swap(_swap(Side.BUY, "sniper-buy", "1", mint=pump_mint), trader)
 
         assert notifier.executions[-1].success is True
         assert "Sniper PAPER" in notifier.executions[-1].message
@@ -526,9 +516,7 @@ async def test_sniper_paper_lane_keeps_absolute_floor_and_ownership_checks(
         trader = TrackedTrader(address="wallet-a", alias="Auto wallet-a")
         await engine.database.add_trader(trader.address, trader.alias)
 
-        await engine._handle_new_swap(
-            _swap(Side.BUY, "sniper-reject", "1", mint=pump_mint), trader
-        )
+        await engine._handle_new_swap(_swap(Side.BUY, "sniper-reject", "1", mint=pump_mint), trader)
 
         assert notifier.executions[-1].success is False
         assert "sniper lane rejected" in notifier.executions[-1].message
@@ -569,9 +557,7 @@ async def test_existing_source_holding_gets_forward_tracking_baseline(settings) 
     try:
         trader = TrackedTrader(address="wallet-a", alias="Auto wallet-a")
         await engine.database.add_trader(trader.address, trader.alias)
-        inserted = await engine.database.record_swap(
-            _swap(Side.BUY, "bootstrap-buy", "1")
-        )
+        inserted = await engine.database.record_swap(_swap(Side.BUY, "bootstrap-buy", "1"))
         assert inserted is True
 
         engine.market.price = AsyncMock(return_value=Decimal("1.50"))
@@ -613,9 +599,7 @@ async def test_initial_bootstrap_inventory_is_seeded_before_future_sell(settings
         await engine.database.add_trader(trader.address, trader.alias)
         now = int(time.time())
         engine.rpc.get_signatures_for_address = AsyncMock(
-            return_value=[
-                {"signature": "bootstrap-history-buy", "blockTime": now, "err": None}
-            ]
+            return_value=[{"signature": "bootstrap-history-buy", "blockTime": now, "err": None}]
         )
         engine.rpc.get_transaction = AsyncMock(return_value={"blockTime": now})
         engine.detector.detect = AsyncMock(
@@ -815,9 +799,7 @@ async def test_quote_shadow_blocks_25_percent_entry_chase(settings) -> None:
     await engine.initialize()
     try:
         engine.market.price = AsyncMock(return_value=Decimal("1"))
-        engine.market.token_info = AsyncMock(
-            return_value=TokenInfo(mint="mint", decimals=6)
-        )
+        engine.market.token_info = AsyncMock(return_value=TokenInfo(mint="mint", decimals=6))
         engine.market.quote_order = AsyncMock(return_value=_quote(output="8"))
         trader = TrackedTrader(address="wallet-a", alias="Auto wallet-a")
         await engine.database.add_trader(trader.address, trader.alias)
@@ -844,9 +826,7 @@ async def test_quote_shadow_records_buffered_buy_and_quoted_sell(settings) -> No
     await engine.initialize()
     try:
         engine.market.price = AsyncMock(return_value=Decimal("1"))
-        engine.market.token_info = AsyncMock(
-            return_value=TokenInfo(mint="mint", decimals=6)
-        )
+        engine.market.token_info = AsyncMock(return_value=TokenInfo(mint="mint", decimals=6))
         buy_quote = _quote(output="10")
         sell_quote = replace(
             _quote(output="12"),
@@ -894,9 +874,7 @@ async def test_manual_quoted_exit_is_excluded_from_readiness(settings) -> None:
         engine.market.price = AsyncMock(
             side_effect=(Decimal("1"), Decimal("1"), Decimal("1.2"), Decimal("1"))
         )
-        engine.market.token_info = AsyncMock(
-            return_value=TokenInfo(mint="mint", decimals=6)
-        )
+        engine.market.token_info = AsyncMock(return_value=TokenInfo(mint="mint", decimals=6))
         buy_quote = _quote(output="10")
         sell_quote = replace(
             _quote(output="12"),
@@ -944,12 +922,8 @@ async def test_quote_shadow_blocks_high_entry_price_impact(settings) -> None:
     await engine.initialize()
     try:
         engine.market.price = AsyncMock(return_value=Decimal("1"))
-        engine.market.token_info = AsyncMock(
-            return_value=TokenInfo(mint="mint", decimals=6)
-        )
-        engine.market.quote_order = AsyncMock(
-            return_value=_quote(output="10", impact="3")
-        )
+        engine.market.token_info = AsyncMock(return_value=TokenInfo(mint="mint", decimals=6))
+        engine.market.quote_order = AsyncMock(return_value=_quote(output="10", impact="3"))
         trader = TrackedTrader(address="wallet-a", alias="Auto wallet-a")
         await engine.database.add_trader(trader.address, trader.alias)
 

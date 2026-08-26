@@ -22,9 +22,7 @@ def score_trader(metrics_24h: TraderMetrics, metrics_7d: TraderMetrics) -> Decim
     win_component = metrics_24h.win_rate * Decimal("30")
 
     # 25% realized ROI fills this component; losses can reduce it to zero.
-    roi_scaled = _clamp(
-        metrics_24h.realized_roi / Decimal("0.25"), Decimal("-1"), Decimal("1")
-    )
+    roi_scaled = _clamp(metrics_24h.realized_roi / Decimal("0.25"), Decimal("-1"), Decimal("1"))
     roi_component = max(Decimal("0"), roi_scaled) * Decimal("25")
 
     consistency_component = Decimal("0")
@@ -36,9 +34,7 @@ def score_trader(metrics_24h: TraderMetrics, metrics_7d: TraderMetrics) -> Decim
         consistency_component += Decimal("7")
 
     pnl_scale = abs(metrics_7d.realized_pnl_usd) + Decimal("10")
-    drawdown_ratio = _clamp(
-        metrics_7d.max_drawdown_usd / pnl_scale, Decimal("0"), Decimal("1")
-    )
+    drawdown_ratio = _clamp(metrics_7d.max_drawdown_usd / pnl_scale, Decimal("0"), Decimal("1"))
     drawdown_component = (Decimal("1") - drawdown_ratio) * Decimal("10")
     activity_component = activity * Decimal("10")
 
@@ -50,9 +46,7 @@ def score_trader(metrics_24h: TraderMetrics, metrics_7d: TraderMetrics) -> Decim
         + activity_component
     )
     reliability = Decimal("0.35") + (closure_reliability * Decimal("0.65"))
-    return _clamp(raw * reliability, Decimal("0"), Decimal("100")).quantize(
-        Decimal("0.01")
-    )
+    return _clamp(raw * reliability, Decimal("0"), Decimal("100")).quantize(Decimal("0.01"))
 
 
 def rank_traders(
@@ -76,4 +70,3 @@ def rank_traders(
         ),
         reverse=True,
     )
-

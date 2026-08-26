@@ -71,7 +71,7 @@ class PumpProfileDiscovery:
                 timeout=self.timeout,
                 headers={
                     "User-Agent": (
-                        "SmartMoneyCopyBot/2.18 (+public profile verification; "
+                        "SmartMoneyCopyBot/2.19 (+public profile verification; "
                         "contact via deployed Discord bot)"
                     )
                 },
@@ -102,9 +102,7 @@ class PumpProfileDiscovery:
                 if previous is None or item.followers > previous.followers:
                     summaries[item.slug] = item
 
-        ordered = sorted(
-            summaries.values(), key=lambda item: item.followers, reverse=True
-        )[:limit]
+        ordered = sorted(summaries.values(), key=lambda item: item.followers, reverse=True)[:limit]
         semaphore = asyncio.Semaphore(4)
 
         async def resolve(item: PumpProfileSummary) -> SocialNomination | None:
@@ -141,9 +139,7 @@ class PumpProfileDiscovery:
                 by_wallet[item.wallet] = item
         return sorted(by_wallet.values(), key=lambda item: item.followers, reverse=True)
 
-    async def _request_html(
-        self, path: str, *, params: dict[str, str] | None
-    ) -> str:
+    async def _request_html(self, path: str, *, params: dict[str, str] | None) -> str:
         session = await self._get_session()
         async with session.get(f"{self.BASE_URL}{path}", params=params) as response:
             body = await response.text()
@@ -210,9 +206,7 @@ def annotate_social_nominations(
             annotated.append(candidate)
             continue
         matched += 1
-        social_note = (
-            f"; Pump public profile nomination ({nomination.followers:,} followers)"
-        )
+        social_note = f"; Pump public profile nomination ({nomination.followers:,} followers)"
         annotated.append(
             replace(
                 candidate,
@@ -244,6 +238,4 @@ def verified_social_share(
         return Decimal("0")
     nominated = {item.wallet for item in nominations}
     matched = sum(candidate.address in nominated for candidate in candidates)
-    return (Decimal(matched) / Decimal(len(candidates)) * Decimal("100")).quantize(
-        Decimal("0.01")
-    )
+    return (Decimal(matched) / Decimal(len(candidates)) * Decimal("100")).quantize(Decimal("0.01"))

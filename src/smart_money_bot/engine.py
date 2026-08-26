@@ -11,6 +11,12 @@ from decimal import Decimal
 from typing import Protocol
 from zoneinfo import ZoneInfo
 
+from .callouts import (
+    CoinCalloutAnalyzer,
+    DexScreenerClient,
+    SolanaTrackerTokenRiskClient,
+    XRecentSearchClient,
+)
 from .config import Settings
 from .constants import PAPER_DEMO_ENTRY_PRICE_USD, PAPER_DEMO_MINT
 from .database import Database
@@ -25,6 +31,7 @@ from .errors import DiscoveryError, JupiterError, RpcError
 from .executor import ExecutionManager
 from .market import JupiterClient
 from .models import (
+    CoinCallout,
     DetectedSwap,
     DiscoveryCandidate,
     DiscoveryRefresh,
@@ -67,6 +74,8 @@ class Notifier(Protocol):
 
     async def on_execution(self, result: ExecutionResult) -> None: ...
 
+    async def on_coin_callout(self, callout: CoinCallout) -> None: ...
+
     async def on_daily_profit_lock(self, status: PaperDailyLockStatus) -> None: ...
 
     async def on_error(self, context: str, error: Exception) -> None: ...
@@ -87,6 +96,9 @@ class NullNotifier:
     async def on_execution(self, result: ExecutionResult) -> None:
         return None
 
+    async def on_coin_callout(self, callout: CoinCallout) -> None:
+        return None
+
     async def on_daily_profit_lock(self, status: PaperDailyLockStatus) -> None:
         return None
 
@@ -105,6 +117,14 @@ class SmartMoneyEngine:
             max_retries=settings.rpc_max_retries,
         )
         self.market = JupiterClient(settings.jupiter_api_key)
+        self.dex_screener = DexScreenerClient()
+        self.x_social = XRecentSearchClient(settings.x_api_bearer_token)
+        self.tracker_token_risk = SolanaTrackerTokenRiskClient(settings.solana_tracker_api_key)
+        self.callout_analyzer = CoinCalloutAnalyzer(
+            self.dex_screener,
+            self.x_social,
+            self.tracker_token_risk,
+        )
         self.discovery = (
             SolanaTrackerClient(settings.solana_tracker_api_key)
             if settings.solana_tracker_api_key
@@ -136,6 +156,8 @@ class SmartMoneyEngine:
         self._stream_task: asyncio.Task[None] | None = None
         self._stream_consumer_task: asyncio.Task[None] | None = None
         self._daily_profit_task: asyncio.Task[None] | None = None
+        self._callout_tasks: set[asyncio.Task[None]] = set()
+        self._last_callout_state: dict[str, tuple[int, int]] = {}
         self._scan_lock = asyncio.Lock()
         self._discovery_lock = asyncio.Lock()
         self._daily_profit_lock = asyncio.Lock()
@@ -195,6 +217,11 @@ class SmartMoneyEngine:
             )
 
     async def close(self) -> None:
+        for task in self._callout_tasks:
+            task.cancel()
+        if self._callout_tasks:
+            await asyncio.gather(*self._callout_tasks, return_exceptions=True)
+        self._callout_tasks.clear()
         if self._daily_profit_task:
             self._daily_profit_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -217,6 +244,9 @@ class SmartMoneyEngine:
         await self.stream.close()
         await self.rpc.close()
         await self.market.close()
+        await self.dex_screener.close()
+        await self.x_social.close()
+        await self.tracker_token_risk.close()
         if self.discovery:
             await self.discovery.close()
         if self.profile_discovery:
@@ -252,9 +282,7 @@ class SmartMoneyEngine:
     async def _run_daily_profit_guard(self) -> None:
         while True:
             try:
-                paused = (
-                    await self.database.get_setting("paused", "false")
-                ) == "true"
+                paused = (await self.database.get_setting("paused", "false")) == "true"
                 if not paused:
                     await self._enforce_daily_profit_lock()
             except asyncio.CancelledError:
@@ -289,9 +317,7 @@ class SmartMoneyEngine:
                 >= self.settings.effective_discovery_7d_refresh_seconds
             )
             if refresh_weekly:
-                self._weekly_pool = await self.discovery.weekly_pool(
-                    self.discovery_policy
-                )
+                self._weekly_pool = await self.discovery.weekly_pool(self.discovery_policy)
                 if self.discovery_policy.include_kols:
                     try:
                         self._weekly_pool.extend(
@@ -315,9 +341,7 @@ class SmartMoneyEngine:
             daily_pool = await self.discovery.daily_pool(self.discovery_policy)
             if self.discovery_policy.include_kols:
                 try:
-                    daily_pool.extend(
-                        await self.discovery.kol_daily_pool(self.discovery_policy)
-                    )
+                    daily_pool.extend(await self.discovery.kol_daily_pool(self.discovery_policy))
                 except DiscoveryError as exc:
                     logger.warning(
                         "Public-KOL 24H discovery unavailable; using general feed: %s",
@@ -353,8 +377,7 @@ class SmartMoneyEngine:
         if (
             self._social_nominations
             and self.last_profile_refresh_at is not None
-            and now - self.last_profile_refresh_at
-            < self.settings.pump_profile_refresh_seconds
+            and now - self.last_profile_refresh_at < self.settings.pump_profile_refresh_seconds
         ):
             return
         try:
@@ -393,8 +416,8 @@ class SmartMoneyEngine:
             and now - self.last_rotation_at < self.settings.rotation_refresh_seconds
         ):
             return None
-        eligible, forward_rejections, forward_evaluated = (
-            await self._apply_forward_paper_evidence(self._candidate_pool)
+        eligible, forward_rejections, forward_evaluated = await self._apply_forward_paper_evidence(
+            self._candidate_pool
         )
         if not eligible:
             self.last_rotation_result = RotationResult(
@@ -425,9 +448,7 @@ class SmartMoneyEngine:
         }
         result = RotationResult(
             selected=raw_result.selected,
-            evaluated=(
-                raw_result.evaluated + tuple(forward_evaluated) + feed_removed
-            ),
+            evaluated=(raw_result.evaluated + tuple(forward_evaluated) + feed_removed),
             rejection_reasons={
                 **feed_rejections,
                 **raw_result.rejection_reasons,
@@ -457,9 +478,7 @@ class SmartMoneyEngine:
 
     async def _apply_forward_paper_evidence(
         self, candidates: list[DiscoveryCandidate]
-    ) -> tuple[
-        list[DiscoveryCandidate], dict[str, str], list[DiscoveryCandidate]
-    ]:
+    ) -> tuple[list[DiscoveryCandidate], dict[str, str], list[DiscoveryCandidate]]:
         """Penalize proven forward losers without judging brand-new candidates early."""
 
         performance = await self.database.paper_wallet_performance(
@@ -775,20 +794,13 @@ class SmartMoneyEngine:
             return
         await self._process_signal(signal)
 
-    async def _handle_new_swap(
-        self, swap: DetectedSwap, trader: TrackedTrader
-    ) -> None:
+    async def _handle_new_swap(self, swap: DetectedSwap, trader: TrackedTrader) -> None:
         mode = await self.execution_mode()
-        daily_locked = (
-            mode is ExecutionMode.PAPER
-            and await self._daily_profit_entries_locked()
-        )
+        daily_locked = mode is ExecutionMode.PAPER and await self._daily_profit_entries_locked()
         if daily_locked:
             if swap.side is Side.BUY:
                 return
-            if not await self.database.has_paper_mirror_position(
-                trader.address, swap.token_mint
-            ):
+            if not await self.database.has_paper_mirror_position(trader.address, swap.token_mint):
                 return
         exit_only = (
             mode is ExecutionMode.PAPER
@@ -796,9 +808,7 @@ class SmartMoneyEngine:
             and await self.database.trader_is_exit_only(trader.address)
         )
         has_linked_lot = (
-            await self.database.has_paper_mirror_position(
-                trader.address, swap.token_mint
-            )
+            await self.database.has_paper_mirror_position(trader.address, swap.token_mint)
             if exit_only and swap.side is Side.SELL
             else False
         )
@@ -813,10 +823,62 @@ class SmartMoneyEngine:
             await self._mirror_paper_swap(swap, trader)
         else:
             await self._consider_signal(swap)
+        if swap.side is Side.BUY and self.settings.coin_callouts_enabled:
+            self._queue_coin_callout(swap.token_mint)
 
-    async def _mirror_paper_swap(
-        self, swap: DetectedSwap, trader: TrackedTrader
-    ) -> None:
+    def _queue_coin_callout(self, mint: str) -> None:
+        task = asyncio.create_task(
+            self._run_coin_callout(mint),
+            name=f"coin-callout-{mint[:8]}",
+        )
+        self._callout_tasks.add(task)
+        task.add_done_callback(self._callout_tasks.discard)
+
+    async def _run_coin_callout(self, mint: str) -> None:
+        try:
+            buyers = await self.database.recent_verified_token_buyers(
+                mint,
+                int(time.time()) - self.settings.coin_callout_window_seconds,
+            )
+            buyer_count = len(buyers)
+            now = int(time.time())
+            previous = self._last_callout_state.get(mint)
+            if (
+                previous
+                and buyer_count <= previous[1]
+                and (now - previous[0] < self.settings.coin_callout_cooldown_seconds)
+            ):
+                return
+            callout = await self.analyze_coin(mint, buyers=buyers)
+            self._last_callout_state[mint] = (now, buyer_count)
+            if callout.score >= self.settings.coin_callout_min_alert_score or callout.hard_blockers:
+                await self.notifier.on_coin_callout(callout)
+        except Exception as exc:
+            await self.notifier.on_error("Analyzing coin callout", exc)
+
+    async def analyze_coin(
+        self,
+        mint: str,
+        *,
+        buyers: list[tuple[str, str]] | None = None,
+    ) -> CoinCallout:
+        if buyers is None:
+            buyers = await self.database.recent_verified_token_buyers(
+                mint,
+                int(time.time()) - self.settings.coin_callout_window_seconds,
+            )
+        try:
+            token_info = await self.market.token_info(mint)
+        except JupiterError:
+            token_info = None
+        aliases = tuple(alias for _address, alias in buyers)
+        return await self.callout_analyzer.analyze(
+            mint=mint,
+            token_info=token_info,
+            smart_wallets=aliases,
+        )
+
+    async def _mirror_paper_swap(self, swap: DetectedSwap, trader: TrackedTrader) -> None:
         if self.settings.paper_force_observation_mode:
             source_price = swap.token_price_usd
             size = self.settings.default_copy_usd
@@ -843,9 +905,7 @@ class SmartMoneyEngine:
                     message=result.message,
                 )
             else:
-                penalty = Decimal(
-                    self.settings.paper_observation_penalty_bps
-                ) / Decimal(10_000)
+                penalty = Decimal(self.settings.paper_observation_penalty_bps) / Decimal(10_000)
                 observation_price = (
                     source_price * (Decimal("1") + penalty)
                     if swap.side is Side.BUY
@@ -864,9 +924,7 @@ class SmartMoneyEngine:
         sniper_mode = (
             swap.side is Side.SELL
             and self.settings.paper_sniper_test_enabled
-            and await self.database.paper_mirror_open_lot_is_sniper(
-                trader.address, swap.token_mint
-            )
+            and await self.database.paper_mirror_open_lot_is_sniper(trader.address, swap.token_mint)
         )
 
         # A tracked wallet's transaction price is historical by the time this process
@@ -886,9 +944,7 @@ class SmartMoneyEngine:
                 and source_price is not None
                 and source_price > 0
             ):
-                penalty = Decimal(self.settings.paper_pump_source_fallback_bps) / Decimal(
-                    10_000
-                )
+                penalty = Decimal(self.settings.paper_pump_source_fallback_bps) / Decimal(10_000)
                 price = (
                     source_price * (Decimal("1") + penalty)
                     if swap.side is Side.BUY
@@ -901,9 +957,7 @@ class SmartMoneyEngine:
                 and source_price is not None
                 and source_price > 0
             ):
-                penalty = Decimal(
-                    self.settings.paper_sniper_source_penalty_bps
-                ) / Decimal(10_000)
+                penalty = Decimal(self.settings.paper_sniper_source_penalty_bps) / Decimal(10_000)
                 price = (
                     source_price * (Decimal("1") + penalty)
                     if swap.side is Side.BUY
@@ -922,8 +976,7 @@ class SmartMoneyEngine:
                 side=swap.side,
                 size_usd=size,
                 message=(
-                    "Skipped: no current Jupiter price was available for a realistic "
-                    "paper fill"
+                    "Skipped: no current Jupiter price was available for a realistic paper fill"
                 ),
             )
             await self.database.log_execution(
@@ -979,10 +1032,7 @@ class SmartMoneyEngine:
                             self.settings.max_copy_usd,
                         )
                     else:
-                        reasons = (
-                            "; ".join(decision.reasons)
-                            or "risk policy blocked entry"
-                        )
+                        reasons = "; ".join(decision.reasons) or "risk policy blocked entry"
                         if self.settings.paper_sniper_test_enabled and sniper_reason:
                             reasons = f"{reasons}; sniper lane rejected — {sniper_reason}"
                         result = ExecutionResult(
@@ -1074,9 +1124,7 @@ class SmartMoneyEngine:
             "Top-holder concentration is ",
         )
         hard_reasons = [
-            reason
-            for reason in decision.reasons
-            if not reason.startswith(soft_prefixes)
+            reason for reason in decision.reasons if not reason.startswith(soft_prefixes)
         ]
         if hard_reasons:
             return False, "; ".join(hard_reasons)
@@ -1088,10 +1136,7 @@ class SmartMoneyEngine:
             return False, "mint authority is enabled"
         if token_info.liquidity_usd is None:
             return False, "liquidity is unknown"
-        if (
-            token_info.liquidity_usd
-            < self.settings.paper_sniper_min_liquidity_usd
-        ):
+        if token_info.liquidity_usd < self.settings.paper_sniper_min_liquidity_usd:
             return (
                 False,
                 f"liquidity ${token_info.liquidity_usd:,.0f} is below the sniper floor",
@@ -1106,8 +1151,7 @@ class SmartMoneyEngine:
             )
         if (
             token_info.top_holders_percent is not None
-            and token_info.top_holders_percent
-            > self.settings.paper_sniper_max_top_holders_percent
+            and token_info.top_holders_percent > self.settings.paper_sniper_max_top_holders_percent
         ):
             return (
                 False,
@@ -1116,9 +1160,7 @@ class SmartMoneyEngine:
             )
         return True, "launch-stage PAPER lane"
 
-    async def _process_signal(
-        self, signal: Signal, *, known_price: Decimal | None = None
-    ) -> None:
+    async def _process_signal(self, signal: Signal, *, known_price: Decimal | None = None) -> None:
         signal_id = await self.database.record_signal(signal)
         token_info: TokenInfo | None
         try:
@@ -1181,9 +1223,7 @@ class SmartMoneyEngine:
         if mode is ExecutionMode.PAPER:
             strategy_positions = await self.database.paper_positions()
             strategy_positions = [
-                item
-                for item in strategy_positions
-                if item["token_mint"] != PAPER_DEMO_MINT
+                item for item in strategy_positions if item["token_mint"] != PAPER_DEMO_MINT
             ]
             mirror_positions = await self.database.paper_mirror_positions()
             positions = strategy_positions + mirror_positions
@@ -1297,9 +1337,7 @@ class SmartMoneyEngine:
             if price is None or price <= 0 or average_entry <= 0:
                 continue
 
-            peak = await self.database.update_paper_mirror_peak(
-                trader_address, mint, price
-            )
+            peak = await self.database.update_paper_mirror_peak(trader_address, mint, price)
             change_percent = ((price / average_entry) - Decimal("1")) * Decimal("100")
             peak_gain_percent = ((peak / average_entry) - Decimal("1")) * Decimal("100")
             pullback_percent = ((price / peak) - Decimal("1")) * Decimal("100")
@@ -1311,8 +1349,7 @@ class SmartMoneyEngine:
             elif change_percent >= self.settings.raw_mirror_take_profit_percent:
                 reason = f"take profit (+{change_percent:.2f}%)"
             elif (
-                peak_gain_percent
-                >= self.settings.raw_mirror_trailing_activation_percent
+                peak_gain_percent >= self.settings.raw_mirror_trailing_activation_percent
                 and pullback_percent <= -self.settings.raw_mirror_trailing_stop_percent
             ):
                 reason = (
@@ -1341,9 +1378,7 @@ class SmartMoneyEngine:
         for candidate in discovered:
             local = merged.get(candidate.address)
             wins = int(
-                Decimal(candidate.closed_tokens)
-                * candidate.win_rate_percent
-                / Decimal("100")
+                Decimal(candidate.closed_tokens) * candidate.win_rate_percent / Decimal("100")
             )
             losses = max(0, candidate.closed_tokens - wins)
             external_metrics = TraderMetrics(
@@ -1367,8 +1402,7 @@ class SmartMoneyEngine:
             )
             weekly_losses = max(0, candidate.trades_7d - weekly_wins)
             weekly_cost = (
-                candidate.realized_pnl_7d
-                / (candidate.roi_7d_percent / Decimal("100"))
+                candidate.realized_pnl_7d / (candidate.roi_7d_percent / Decimal("100"))
                 if candidate.roi_7d_percent > 0
                 else Decimal("0")
             )
@@ -1397,8 +1431,7 @@ class SmartMoneyEngine:
             closed_local = local.metrics_24h.wins + local.metrics_24h.losses
             if local.metrics_24h.trades >= 10 and closed_local >= 3:
                 blended_score = (
-                    local.score * Decimal("0.60")
-                    + candidate.score * Decimal("0.40")
+                    local.score * Decimal("0.60") + candidate.score * Decimal("0.40")
                 ).quantize(Decimal("0.01"))
             else:
                 blended_score = candidate.score
@@ -1454,9 +1487,7 @@ class SmartMoneyEngine:
         stored_day = await self.database.get_setting("paper_daily_lock_day")
         if stored_day != day:
             return False
-        return (
-            await self.database.get_setting("paper_daily_lock_triggered", "false")
-        ) == "true"
+        return (await self.database.get_setting("paper_daily_lock_triggered", "false")) == "true"
 
     async def _paper_daily_lock_status_from_summary(
         self,
@@ -1466,18 +1497,14 @@ class SmartMoneyEngine:
     ) -> PaperDailyLockStatus:
         day, start_timestamp, end_timestamp = self._paper_day_window(now)
         stored_day = await self.database.get_setting("paper_daily_lock_day")
-        raw_baseline = await self.database.get_setting(
-            "paper_daily_lock_baseline_equity_usd"
-        )
+        raw_baseline = await self.database.get_setting("paper_daily_lock_baseline_equity_usd")
         if stored_day != day or raw_baseline is None:
             baseline = await self.database.first_paper_equity_between(
                 start_timestamp, end_timestamp
             )
             baseline = baseline if baseline is not None else summary.equity_usd
             await self.database.set_setting("paper_daily_lock_day", day)
-            await self.database.set_setting(
-                "paper_daily_lock_baseline_equity_usd", str(baseline)
-            )
+            await self.database.set_setting("paper_daily_lock_baseline_equity_usd", str(baseline))
             await self.database.set_setting("paper_daily_lock_triggered", "false")
             await self.database.set_setting("paper_daily_lock_triggered_at", "")
             await self.database.set_setting("paper_daily_lock_reason", "")
@@ -1487,17 +1514,11 @@ class SmartMoneyEngine:
         else:
             baseline = Decimal(raw_baseline)
             locked = (
-                await self.database.get_setting(
-                    "paper_daily_lock_triggered", "false"
-                )
+                await self.database.get_setting("paper_daily_lock_triggered", "false")
             ) == "true"
-            raw_triggered_at = await self.database.get_setting(
-                "paper_daily_lock_triggered_at", ""
-            )
+            raw_triggered_at = await self.database.get_setting("paper_daily_lock_triggered_at", "")
             triggered_at = int(raw_triggered_at) if raw_triggered_at else None
-            lock_reason = await self.database.get_setting(
-                "paper_daily_lock_reason", ""
-            ) or None
+            lock_reason = await self.database.get_setting("paper_daily_lock_reason", "") or None
 
         positions = [
             item
@@ -1524,9 +1545,7 @@ class SmartMoneyEngine:
     async def paper_daily_lock_status(self) -> PaperDailyLockStatus:
         summary = await self.paper_summary()
         async with self._daily_profit_lock:
-            return await self._paper_daily_lock_status_from_summary(
-                summary, now=int(time.time())
-            )
+            return await self._paper_daily_lock_status_from_summary(summary, now=int(time.time()))
 
     async def _enforce_daily_profit_lock(self) -> bool:
         if not (
@@ -1557,12 +1576,8 @@ class SmartMoneyEngine:
 
             if lock_reason is not None:
                 await self.database.set_setting("paper_daily_lock_triggered", "true")
-                await self.database.set_setting(
-                    "paper_daily_lock_triggered_at", str(now)
-                )
-                await self.database.set_setting(
-                    "paper_daily_lock_reason", lock_reason
-                )
+                await self.database.set_setting("paper_daily_lock_triggered_at", str(now))
+                await self.database.set_setting("paper_daily_lock_reason", lock_reason)
                 status = replace(
                     status,
                     locked=True,
@@ -1575,9 +1590,7 @@ class SmartMoneyEngine:
                 await self._liquidate_daily_profit_positions(status)
             return status.locked
 
-    async def _liquidate_daily_profit_positions(
-        self, status: PaperDailyLockStatus
-    ) -> None:
+    async def _liquidate_daily_profit_positions(self, status: PaperDailyLockStatus) -> None:
         positions = [
             item
             for item in await self.database.paper_all_positions()
@@ -1704,11 +1717,7 @@ class SmartMoneyEngine:
     async def paper_summary(self) -> PaperSummary:
         positions = await self.database.paper_all_positions()
         mints = sorted(
-            {
-                item["token_mint"]
-                for item in positions
-                if item["token_mint"] != PAPER_DEMO_MINT
-            }
+            {item["token_mint"] for item in positions if item["token_mint"] != PAPER_DEMO_MINT}
         )
         try:
             prices = await self.market.prices(mints) if mints else {}
@@ -1892,9 +1901,7 @@ class SmartMoneyEngine:
             "rotation_last_refresh": self.last_rotation_at,
             "candidate_pool_size": len(self._candidate_pool),
             "kol_discovery_enabled": self.settings.discovery_include_kols,
-            "pump_profile_discovery_enabled": (
-                self.settings.pump_profile_discovery_enabled
-            ),
+            "pump_profile_discovery_enabled": (self.settings.pump_profile_discovery_enabled),
             "pump_profile_nominations": len(self._social_nominations),
             "pump_profile_verified_matches": self.profile_verified_matches,
             "pump_profile_last_refresh": self.last_profile_refresh_at,
@@ -1914,10 +1921,10 @@ class SmartMoneyEngine:
             "stream_commitment": self.stream.commitment,
             "paper_mirror_raw_swaps": self.settings.paper_mirror_raw_swaps,
             "paper_use_executable_quotes": self.settings.paper_use_executable_quotes,
-            "paper_force_observation_mode": (
-                self.settings.paper_force_observation_mode
-            ),
+            "paper_force_observation_mode": (self.settings.paper_force_observation_mode),
             "paper_daily_profit_lock": daily_lock,
             "quote_ready": bool(self.settings.jupiter_api_key),
             "consecutive_quote_failures": self.executor.consecutive_quote_failures,
+            "coin_callouts_enabled": self.settings.coin_callouts_enabled,
+            "x_social_configured": self.x_social.configured,
         }

@@ -81,9 +81,7 @@ class SolanaRPC:
                         body = {"raw": body_text[:500]}
 
                     rpc_error = body.get("error") if isinstance(body, dict) else None
-                    rpc_error_code = (
-                        rpc_error.get("code") if isinstance(rpc_error, dict) else None
-                    )
+                    rpc_error_code = rpc_error.get("code") if isinstance(rpc_error, dict) else None
                     retryable = response.status == 429 or rpc_error_code == 429
                     retryable = retryable or response.status >= 500
                     if retryable and attempt < self.max_retries:

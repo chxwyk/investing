@@ -258,9 +258,7 @@ def test_complete_general_rows_outrank_limited_kol_nominations() -> None:
 
 
 def test_merge_can_confirm_a_wallet_across_general_and_public_kol_feeds() -> None:
-    daily = parse_window_candidates(
-        {"traders": [row(WALLET_ONE)]}, policy(), days=1
-    )
+    daily = parse_window_candidates({"traders": [row(WALLET_ONE)]}, policy(), days=1)
     weekly_payload = {
         "traders": [
             {
@@ -303,9 +301,7 @@ async def test_leaderboard_paginates_and_passes_cursor() -> None:
         )
     )
 
-    result = await client.daily_pool(
-        replace(policy(), fetch_limit=1, candidate_pages=5)
-    )
+    result = await client.daily_pool(replace(policy(), fetch_limit=1, candidate_pages=5))
 
     assert [candidate.address for candidate in result] == [WALLET_ONE, WALLET_TWO]
     first_params = client._request.await_args_list[0].kwargs["params"]

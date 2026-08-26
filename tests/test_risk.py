@@ -75,4 +75,3 @@ async def test_allows_healthy_paper_signal(settings) -> None:
         assert decision.allowed is True
     finally:
         await database.close()
-

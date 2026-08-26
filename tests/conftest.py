@@ -21,6 +21,7 @@ def settings(monkeypatch: pytest.MonkeyPatch, tmp_path) -> Settings:
         "MAX_TOP_HOLDERS_PERCENT": "70",
         "PAPER_USE_EXECUTABLE_QUOTES": "false",
         "PAPER_FORCE_OBSERVATION_MODE": "false",
+        "COIN_CALLOUTS_ENABLED": "false",
     }
     for key, value in values.items():
         monkeypatch.setenv(key, value)

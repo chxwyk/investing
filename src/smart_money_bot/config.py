@@ -47,7 +47,13 @@ class Settings:
     rpc_max_retries: int
     jupiter_api_key: str | None
     solana_tracker_api_key: str | None
+    x_api_bearer_token: str | None
     database_path: str
+
+    coin_callouts_enabled: bool
+    coin_callout_window_seconds: int
+    coin_callout_cooldown_seconds: int
+    coin_callout_min_alert_score: Decimal
 
     auto_discovery_enabled: bool
     discovery_refresh_seconds: int
@@ -174,10 +180,7 @@ class Settings:
             discord_alert_channel_id=_optional_int("DISCORD_ALERT_CHANNEL_ID"),
             discord_alert_user_id=_optional_int("DISCORD_ALERT_USER_ID"),
             discord_admin_role_ids=_int_set("DISCORD_ADMIN_ROLE_IDS"),
-            fomo_referral_code=os.getenv(
-                "FOMO_REFERRAL_CODE", "WetOuterLemur"
-            ).strip()
-            or None,
+            fomo_referral_code=os.getenv("FOMO_REFERRAL_CODE", "WetOuterLemur").strip() or None,
             solana_rpc_url=os.getenv(
                 "SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com"
             ).strip(),
@@ -185,7 +188,12 @@ class Settings:
             rpc_max_retries=_int("RPC_MAX_RETRIES", 4),
             jupiter_api_key=os.getenv("JUPITER_API_KEY", "").strip() or None,
             solana_tracker_api_key=os.getenv("SOLANA_TRACKER_API_KEY", "").strip() or None,
+            x_api_bearer_token=os.getenv("X_API_BEARER_TOKEN", "").strip() or None,
             database_path=os.getenv("DATABASE_PATH", "./data/smart_money.db").strip(),
+            coin_callouts_enabled=_bool("COIN_CALLOUTS_ENABLED", True),
+            coin_callout_window_seconds=_int("COIN_CALLOUT_WINDOW_SECONDS", 300),
+            coin_callout_cooldown_seconds=_int("COIN_CALLOUT_COOLDOWN_SECONDS", 300),
+            coin_callout_min_alert_score=_decimal("COIN_CALLOUT_MIN_ALERT_SCORE", "45"),
             auto_discovery_enabled=_bool("AUTO_DISCOVERY_ENABLED", True),
             discovery_refresh_seconds=_int("DISCOVERY_REFRESH_SECONDS", 1200),
             discovery_7d_refresh_seconds=_int("DISCOVERY_7D_REFRESH_SECONDS", 21600),
@@ -193,34 +201,22 @@ class Settings:
             discovery_fetch_limit=_int("DISCOVERY_FETCH_LIMIT", 100),
             discovery_max_wallets=_int("DISCOVERY_MAX_WALLETS", 25),
             discovery_min_24h_pnl_usd=_decimal("DISCOVERY_MIN_24H_PNL_USD", "100"),
-            discovery_min_win_rate_percent=_decimal(
-                "DISCOVERY_MIN_WIN_RATE_PERCENT", "55"
-            ),
+            discovery_min_win_rate_percent=_decimal("DISCOVERY_MIN_WIN_RATE_PERCENT", "55"),
             discovery_min_roi_percent=_decimal("DISCOVERY_MIN_ROI_PERCENT", "3"),
             discovery_min_trades=_int("DISCOVERY_MIN_TRADES", 5),
             discovery_max_trades=_int("DISCOVERY_MAX_TRADES", 250),
             discovery_min_closed_tokens=_int("DISCOVERY_MIN_CLOSED_TOKENS", 2),
-            discovery_max_single_token_percent=_decimal(
-                "DISCOVERY_MAX_SINGLE_TOKEN_PERCENT", "70"
-            ),
+            discovery_max_single_token_percent=_decimal("DISCOVERY_MAX_SINGLE_TOKEN_PERCENT", "70"),
             discovery_include_kols=_bool("DISCOVERY_INCLUDE_KOLS", True),
             discovery_kol_limit=_int("DISCOVERY_KOL_LIMIT", 100),
-            pump_profile_discovery_enabled=_bool(
-                "PUMP_PROFILE_DISCOVERY_ENABLED", True
-            ),
+            pump_profile_discovery_enabled=_bool("PUMP_PROFILE_DISCOVERY_ENABLED", True),
             pump_profile_pages=_int("PUMP_PROFILE_PAGES", 1),
             pump_profile_min_followers=_int("PUMP_PROFILE_MIN_FOLLOWERS", 1000),
             pump_profile_limit=_int("PUMP_PROFILE_LIMIT", 50),
-            pump_profile_max_page_fetches=_int(
-                "PUMP_PROFILE_MAX_PAGE_FETCHES", 25
-            ),
-            pump_profile_refresh_seconds=_int(
-                "PUMP_PROFILE_REFRESH_SECONDS", 21600
-            ),
+            pump_profile_max_page_fetches=_int("PUMP_PROFILE_MAX_PAGE_FETCHES", 25),
+            pump_profile_refresh_seconds=_int("PUMP_PROFILE_REFRESH_SECONDS", 21600),
             discovery_min_7d_pnl_usd=_decimal("DISCOVERY_MIN_7D_PNL_USD", "300"),
-            discovery_min_7d_win_rate_percent=_decimal(
-                "DISCOVERY_MIN_7D_WIN_RATE_PERCENT", "55"
-            ),
+            discovery_min_7d_win_rate_percent=_decimal("DISCOVERY_MIN_7D_WIN_RATE_PERCENT", "55"),
             discovery_min_7d_roi_percent=_decimal("DISCOVERY_MIN_7D_ROI_PERCENT", "5"),
             discovery_min_7d_trades=_int("DISCOVERY_MIN_7D_TRADES", 10),
             discovery_max_7d_trades=_int("DISCOVERY_MAX_7D_TRADES", 1000),
@@ -229,25 +225,17 @@ class Settings:
             rotation_probe_transactions=_int("ROTATION_PROBE_TRANSACTIONS", 6),
             rotation_min_recent_swaps=_int("ROTATION_MIN_RECENT_SWAPS", 1),
             rotation_min_pump_swaps=_int("ROTATION_MIN_PUMP_SWAPS", 1),
-            rotation_require_pump_activity=_bool(
-                "ROTATION_REQUIRE_PUMP_ACTIVITY", True
-            ),
-            forward_evidence_min_closed_sells=_int(
-                "FORWARD_EVIDENCE_MIN_CLOSED_SELLS", 5
-            ),
+            rotation_require_pump_activity=_bool("ROTATION_REQUIRE_PUMP_ACTIVITY", True),
+            forward_evidence_min_closed_sells=_int("FORWARD_EVIDENCE_MIN_CLOSED_SELLS", 5),
             forward_evidence_min_profit_factor=_decimal(
                 "FORWARD_EVIDENCE_MIN_PROFIT_FACTOR", "1.0"
             ),
-            forward_evidence_max_loss_usd=_decimal(
-                "FORWARD_EVIDENCE_MAX_LOSS_USD", "10"
-            ),
-            realtime_wallet_stream_enabled=_bool(
-                "REALTIME_WALLET_STREAM_ENABLED", True
-            ),
+            forward_evidence_max_loss_usd=_decimal("FORWARD_EVIDENCE_MAX_LOSS_USD", "10"),
+            realtime_wallet_stream_enabled=_bool("REALTIME_WALLET_STREAM_ENABLED", True),
             solana_ws_url=os.getenv("SOLANA_WS_URL", "").strip() or None,
-            realtime_stream_commitment=os.getenv(
-                "REALTIME_STREAM_COMMITMENT", "processed"
-            ).strip().lower(),
+            realtime_stream_commitment=os.getenv("REALTIME_STREAM_COMMITMENT", "processed")
+            .strip()
+            .lower(),
             poll_interval_seconds=_int("POLL_INTERVAL_SECONDS", 60),
             bootstrap_hours=_int("BOOTSTRAP_HOURS", 24),
             max_backfill_transactions=_int("MAX_BACKFILL_TRANSACTIONS", 100),
@@ -262,39 +250,23 @@ class Settings:
             simulated_slippage_bps=_int("SIMULATED_SLIPPAGE_BPS", 100),
             paper_mirror_raw_swaps=_bool("PAPER_MIRROR_RAW_SWAPS", True),
             paper_require_current_price=_bool("PAPER_REQUIRE_CURRENT_PRICE", True),
-            paper_allow_pump_source_fallback=_bool(
-                "PAPER_ALLOW_PUMP_SOURCE_FALLBACK", False
-            ),
-            paper_pump_source_fallback_bps=_int(
-                "PAPER_PUMP_SOURCE_FALLBACK_BPS", 300
-            ),
-            paper_raw_entry_filter_enabled=_bool(
-                "PAPER_RAW_ENTRY_FILTER_ENABLED", True
-            ),
-            paper_force_observation_mode=_bool(
-                "PAPER_FORCE_OBSERVATION_MODE", False
-            ),
-            paper_observation_penalty_bps=_int(
-                "PAPER_OBSERVATION_PENALTY_BPS", 300
-            ),
-            paper_seed_tracking_baselines=_bool(
-                "PAPER_SEED_TRACKING_BASELINES", False
-            ),
+            paper_allow_pump_source_fallback=_bool("PAPER_ALLOW_PUMP_SOURCE_FALLBACK", False),
+            paper_pump_source_fallback_bps=_int("PAPER_PUMP_SOURCE_FALLBACK_BPS", 300),
+            paper_raw_entry_filter_enabled=_bool("PAPER_RAW_ENTRY_FILTER_ENABLED", True),
+            paper_force_observation_mode=_bool("PAPER_FORCE_OBSERVATION_MODE", False),
+            paper_observation_penalty_bps=_int("PAPER_OBSERVATION_PENALTY_BPS", 300),
+            paper_seed_tracking_baselines=_bool("PAPER_SEED_TRACKING_BASELINES", False),
             paper_baseline_max_positions_per_wallet=_int(
                 "PAPER_BASELINE_MAX_POSITIONS_PER_WALLET", 10
             ),
             paper_sniper_test_enabled=_bool("PAPER_SNIPER_TEST_ENABLED", False),
             paper_sniper_copy_usd=_decimal("PAPER_SNIPER_COPY_USD", "2"),
-            paper_sniper_min_liquidity_usd=_decimal(
-                "PAPER_SNIPER_MIN_LIQUIDITY_USD", "2000"
-            ),
+            paper_sniper_min_liquidity_usd=_decimal("PAPER_SNIPER_MIN_LIQUIDITY_USD", "2000"),
             paper_sniper_min_holders=_int("PAPER_SNIPER_MIN_HOLDERS", 20),
             paper_sniper_max_top_holders_percent=_decimal(
                 "PAPER_SNIPER_MAX_TOP_HOLDERS_PERCENT", "85"
             ),
-            paper_sniper_source_penalty_bps=_int(
-                "PAPER_SNIPER_SOURCE_PENALTY_BPS", 500
-            ),
+            paper_sniper_source_penalty_bps=_int("PAPER_SNIPER_SOURCE_PENALTY_BPS", 500),
             paper_sniper_max_entry_drift_percent=_decimal(
                 "PAPER_SNIPER_MAX_ENTRY_DRIFT_PERCENT", "20"
             ),
@@ -302,47 +274,23 @@ class Settings:
                 "PAPER_SNIPER_MAX_QUOTE_PRICE_IMPACT_PERCENT", "5"
             ),
             paper_daily_target_usd=_decimal("PAPER_DAILY_TARGET_USD", "100"),
-            paper_daily_profit_lock_enabled=_bool(
-                "PAPER_DAILY_PROFIT_LOCK_ENABLED", True
-            ),
-            paper_daily_loss_limit_usd=_decimal(
-                "PAPER_DAILY_LOSS_LIMIT_USD", "20"
-            ),
-            paper_daily_loss_lock_enabled=_bool(
-                "PAPER_DAILY_LOSS_LOCK_ENABLED", True
-            ),
+            paper_daily_profit_lock_enabled=_bool("PAPER_DAILY_PROFIT_LOCK_ENABLED", True),
+            paper_daily_loss_limit_usd=_decimal("PAPER_DAILY_LOSS_LIMIT_USD", "20"),
+            paper_daily_loss_lock_enabled=_bool("PAPER_DAILY_LOSS_LOCK_ENABLED", True),
             paper_daily_lock_timezone=os.getenv(
                 "PAPER_DAILY_LOCK_TIMEZONE", "America/Los_Angeles"
             ).strip(),
-            paper_daily_profit_check_seconds=_int(
-                "PAPER_DAILY_PROFIT_CHECK_SECONDS", 15
-            ),
-            paper_use_executable_quotes=_bool(
-                "PAPER_USE_EXECUTABLE_QUOTES", True
-            ),
-            paper_quote_output_buffer_bps=_int(
-                "PAPER_QUOTE_OUTPUT_BUFFER_BPS", 50
-            ),
-            max_adverse_entry_drift_percent=_decimal(
-                "MAX_ADVERSE_ENTRY_DRIFT_PERCENT", "5"
-            ),
-            max_quote_price_impact_percent=_decimal(
-                "MAX_QUOTE_PRICE_IMPACT_PERCENT", "1.5"
-            ),
+            paper_daily_profit_check_seconds=_int("PAPER_DAILY_PROFIT_CHECK_SECONDS", 15),
+            paper_use_executable_quotes=_bool("PAPER_USE_EXECUTABLE_QUOTES", True),
+            paper_quote_output_buffer_bps=_int("PAPER_QUOTE_OUTPUT_BUFFER_BPS", 50),
+            max_adverse_entry_drift_percent=_decimal("MAX_ADVERSE_ENTRY_DRIFT_PERCENT", "5"),
+            max_quote_price_impact_percent=_decimal("MAX_QUOTE_PRICE_IMPACT_PERCENT", "1.5"),
             max_quote_latency_ms=_int("MAX_QUOTE_LATENCY_MS", 5000),
-            max_consecutive_quote_failures=_int(
-                "MAX_CONSECUTIVE_QUOTE_FAILURES", 5
-            ),
+            max_consecutive_quote_failures=_int("MAX_CONSECUTIVE_QUOTE_FAILURES", 5),
             readiness_min_active_days=_int("READINESS_MIN_ACTIVE_DAYS", 14),
-            readiness_min_closed_trades=_int(
-                "READINESS_MIN_CLOSED_TRADES", 100
-            ),
-            readiness_min_profit_factor=_decimal(
-                "READINESS_MIN_PROFIT_FACTOR", "1.25"
-            ),
-            readiness_max_drawdown_percent=_decimal(
-                "READINESS_MAX_DRAWDOWN_PERCENT", "10"
-            ),
+            readiness_min_closed_trades=_int("READINESS_MIN_CLOSED_TRADES", 100),
+            readiness_min_profit_factor=_decimal("READINESS_MIN_PROFIT_FACTOR", "1.25"),
+            readiness_max_drawdown_percent=_decimal("READINESS_MAX_DRAWDOWN_PERCENT", "10"),
             readiness_min_quote_success_percent=_decimal(
                 "READINESS_MIN_QUOTE_SUCCESS_PERCENT", "95"
             ),
@@ -357,21 +305,13 @@ class Settings:
             stop_loss_percent=_decimal("STOP_LOSS_PERCENT", "12"),
             take_profit_percent=_decimal("TAKE_PROFIT_PERCENT", "30"),
             max_hold_seconds=_int("MAX_HOLD_SECONDS", 21_600),
-            raw_mirror_stop_loss_percent=_decimal(
-                "RAW_MIRROR_STOP_LOSS_PERCENT", "6"
-            ),
-            raw_mirror_take_profit_percent=_decimal(
-                "RAW_MIRROR_TAKE_PROFIT_PERCENT", "15"
-            ),
+            raw_mirror_stop_loss_percent=_decimal("RAW_MIRROR_STOP_LOSS_PERCENT", "6"),
+            raw_mirror_take_profit_percent=_decimal("RAW_MIRROR_TAKE_PROFIT_PERCENT", "15"),
             raw_mirror_trailing_activation_percent=_decimal(
                 "RAW_MIRROR_TRAILING_ACTIVATION_PERCENT", "5"
             ),
-            raw_mirror_trailing_stop_percent=_decimal(
-                "RAW_MIRROR_TRAILING_STOP_PERCENT", "3"
-            ),
-            raw_mirror_max_hold_seconds=_int(
-                "RAW_MIRROR_MAX_HOLD_SECONDS", 3_600
-            ),
+            raw_mirror_trailing_stop_percent=_decimal("RAW_MIRROR_TRAILING_STOP_PERCENT", "3"),
+            raw_mirror_max_hold_seconds=_int("RAW_MIRROR_MAX_HOLD_SECONDS", 3_600),
             enable_live_trading=_bool("ENABLE_LIVE_TRADING", False),
             live_trading_ack=os.getenv("LIVE_TRADING_ACK", "").strip(),
             trading_private_key=os.getenv("TRADING_PRIVATE_KEY", "").strip() or None,
@@ -417,6 +357,12 @@ class Settings:
     def validate(self) -> None:
         if self.consensus_min_traders < 1:
             raise ValueError("CONSENSUS_MIN_TRADERS must be at least 1")
+        if not 60 <= self.coin_callout_window_seconds <= 3600:
+            raise ValueError("COIN_CALLOUT_WINDOW_SECONDS must be between 60 and 3600")
+        if not 30 <= self.coin_callout_cooldown_seconds <= 3600:
+            raise ValueError("COIN_CALLOUT_COOLDOWN_SECONDS must be between 30 and 3600")
+        if not 0 <= self.coin_callout_min_alert_score <= 100:
+            raise ValueError("COIN_CALLOUT_MIN_ALERT_SCORE must be between 0 and 100")
         if not 1 <= self.rpc_requests_per_second <= 100:
             raise ValueError("RPC_REQUESTS_PER_SECOND must be between 1 and 100")
         if not 0 <= self.rpc_max_retries <= 10:
@@ -456,31 +402,23 @@ class Settings:
         if not 1 <= self.pump_profile_limit <= 500:
             raise ValueError("PUMP_PROFILE_LIMIT must be between 1 and 500")
         if not 0 <= self.pump_profile_max_page_fetches <= 100:
-            raise ValueError(
-                "PUMP_PROFILE_MAX_PAGE_FETCHES must be between 0 and 100"
-            )
+            raise ValueError("PUMP_PROFILE_MAX_PAGE_FETCHES must be between 0 and 100")
         if self.pump_profile_refresh_seconds < 3600:
             raise ValueError("PUMP_PROFILE_REFRESH_SECONDS must be at least 3600")
         if self.discovery_min_7d_pnl_usd < 0:
             raise ValueError("DISCOVERY_MIN_7D_PNL_USD cannot be negative")
         if not 0 <= self.discovery_min_7d_win_rate_percent <= 100:
-            raise ValueError(
-                "DISCOVERY_MIN_7D_WIN_RATE_PERCENT must be between 0 and 100"
-            )
+            raise ValueError("DISCOVERY_MIN_7D_WIN_RATE_PERCENT must be between 0 and 100")
         if self.discovery_min_7d_roi_percent < 0:
             raise ValueError("DISCOVERY_MIN_7D_ROI_PERCENT cannot be negative")
         if self.discovery_min_7d_trades < 1:
             raise ValueError("DISCOVERY_MIN_7D_TRADES must be at least 1")
         if self.discovery_max_7d_trades < self.discovery_min_7d_trades:
-            raise ValueError(
-                "DISCOVERY_MAX_7D_TRADES cannot be below DISCOVERY_MIN_7D_TRADES"
-            )
+            raise ValueError("DISCOVERY_MAX_7D_TRADES cannot be below DISCOVERY_MIN_7D_TRADES")
         if self.rotation_refresh_seconds < 300:
             raise ValueError("ROTATION_REFRESH_SECONDS must be at least 300")
         if self.rotation_max_idle_seconds < self.rotation_refresh_seconds:
-            raise ValueError(
-                "ROTATION_MAX_IDLE_SECONDS cannot be below ROTATION_REFRESH_SECONDS"
-            )
+            raise ValueError("ROTATION_MAX_IDLE_SECONDS cannot be below ROTATION_REFRESH_SECONDS")
         if not 1 <= self.rotation_probe_transactions <= 25:
             raise ValueError("ROTATION_PROBE_TRANSACTIONS must be between 1 and 25")
         if self.rotation_min_recent_swaps < 1:
@@ -494,9 +432,7 @@ class Settings:
         if self.forward_evidence_max_loss_usd <= 0:
             raise ValueError("FORWARD_EVIDENCE_MAX_LOSS_USD must be positive")
         if self.realtime_stream_commitment not in {"processed", "confirmed"}:
-            raise ValueError(
-                "REALTIME_STREAM_COMMITMENT must be processed or confirmed"
-            )
+            raise ValueError("REALTIME_STREAM_COMMITMENT must be processed or confirmed")
         if self.poll_interval_seconds < 5:
             raise ValueError("POLL_INTERVAL_SECONDS must be at least 5")
         if self.max_copy_usd <= 0 or self.default_copy_usd <= 0:
@@ -508,17 +444,11 @@ class Settings:
         if not 0 <= self.simulated_slippage_bps <= 10_000:
             raise ValueError("SIMULATED_SLIPPAGE_BPS must be between 0 and 10000")
         if not 0 <= self.paper_pump_source_fallback_bps <= 10_000:
-            raise ValueError(
-                "PAPER_PUMP_SOURCE_FALLBACK_BPS must be between 0 and 10000"
-            )
+            raise ValueError("PAPER_PUMP_SOURCE_FALLBACK_BPS must be between 0 and 10000")
         if not 0 <= self.paper_observation_penalty_bps <= 10_000:
-            raise ValueError(
-                "PAPER_OBSERVATION_PENALTY_BPS must be between 0 and 10000"
-            )
+            raise ValueError("PAPER_OBSERVATION_PENALTY_BPS must be between 0 and 10000")
         if not 1 <= self.paper_baseline_max_positions_per_wallet <= 50:
-            raise ValueError(
-                "PAPER_BASELINE_MAX_POSITIONS_PER_WALLET must be between 1 and 50"
-            )
+            raise ValueError("PAPER_BASELINE_MAX_POSITIONS_PER_WALLET must be between 1 and 50")
         if self.paper_sniper_copy_usd <= 0:
             raise ValueError("PAPER_SNIPER_COPY_USD must be positive")
         if self.paper_sniper_copy_usd > self.max_copy_usd:
@@ -528,21 +458,13 @@ class Settings:
         if self.paper_sniper_min_holders < 1:
             raise ValueError("PAPER_SNIPER_MIN_HOLDERS must be at least 1")
         if not 1 <= self.paper_sniper_max_top_holders_percent <= 100:
-            raise ValueError(
-                "PAPER_SNIPER_MAX_TOP_HOLDERS_PERCENT must be between 1 and 100"
-            )
+            raise ValueError("PAPER_SNIPER_MAX_TOP_HOLDERS_PERCENT must be between 1 and 100")
         if not 0 <= self.paper_sniper_source_penalty_bps <= 10_000:
-            raise ValueError(
-                "PAPER_SNIPER_SOURCE_PENALTY_BPS must be between 0 and 10000"
-            )
+            raise ValueError("PAPER_SNIPER_SOURCE_PENALTY_BPS must be between 0 and 10000")
         if self.paper_sniper_max_entry_drift_percent < 0:
-            raise ValueError(
-                "PAPER_SNIPER_MAX_ENTRY_DRIFT_PERCENT cannot be negative"
-            )
+            raise ValueError("PAPER_SNIPER_MAX_ENTRY_DRIFT_PERCENT cannot be negative")
         if self.paper_sniper_max_quote_price_impact_percent <= 0:
-            raise ValueError(
-                "PAPER_SNIPER_MAX_QUOTE_PRICE_IMPACT_PERCENT must be positive"
-            )
+            raise ValueError("PAPER_SNIPER_MAX_QUOTE_PRICE_IMPACT_PERCENT must be positive")
         if self.stop_loss_percent <= 0 or self.take_profit_percent <= 0:
             raise ValueError("Stop-loss and take-profit percentages must be positive")
         if self.max_hold_seconds < 60:
@@ -554,13 +476,9 @@ class Settings:
         try:
             ZoneInfo(self.paper_daily_lock_timezone)
         except ZoneInfoNotFoundError as exc:
-            raise ValueError(
-                "PAPER_DAILY_LOCK_TIMEZONE must be a valid IANA timezone"
-            ) from exc
+            raise ValueError("PAPER_DAILY_LOCK_TIMEZONE must be a valid IANA timezone") from exc
         if self.paper_daily_profit_check_seconds < 5:
-            raise ValueError(
-                "PAPER_DAILY_PROFIT_CHECK_SECONDS must be at least 5"
-            )
+            raise ValueError("PAPER_DAILY_PROFIT_CHECK_SECONDS must be at least 5")
         if not 0 <= self.paper_quote_output_buffer_bps < 10_000:
             raise ValueError("PAPER_QUOTE_OUTPUT_BUFFER_BPS must be between 0 and 9999")
         if self.max_adverse_entry_drift_percent < 0:
@@ -580,9 +498,7 @@ class Settings:
         if not 0 < self.readiness_max_drawdown_percent <= 100:
             raise ValueError("READINESS_MAX_DRAWDOWN_PERCENT must be between 0 and 100")
         if not 0 <= self.readiness_min_quote_success_percent <= 100:
-            raise ValueError(
-                "READINESS_MIN_QUOTE_SUCCESS_PERCENT must be between 0 and 100"
-            )
+            raise ValueError("READINESS_MIN_QUOTE_SUCCESS_PERCENT must be between 0 and 100")
         raw_percentages = (
             self.raw_mirror_stop_loss_percent,
             self.raw_mirror_take_profit_percent,

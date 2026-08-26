@@ -33,9 +33,7 @@ class ConsensusStrategy:
         self.minimum_trader_score = minimum_trader_score
         self._events: dict[tuple[str, str], deque[_Event]] = defaultdict(deque)
 
-    async def ingest(
-        self, swap: DetectedSwap, rankings: list[ScoredTrader]
-    ) -> Signal | None:
+    async def ingest(self, swap: DetectedSwap, rankings: list[ScoredTrader]) -> Signal | None:
         ranking = {item.metrics_24h.address: item for item in rankings}
         scored = ranking.get(swap.trader_address)
         trader = await self.database.resolve_trader(swap.trader_address)
@@ -48,9 +46,7 @@ class ConsensusStrategy:
         now = int(time.time())
         key = (swap.token_mint, swap.side.value)
         events = self._events[key]
-        events.append(
-            _Event(swap=swap, alias=scored.metrics_24h.alias, score=adjusted_score)
-        )
+        events.append(_Event(swap=swap, alias=scored.metrics_24h.alias, score=adjusted_score))
         cutoff = now - self.window_seconds
         while events and events[0].swap.block_time < cutoff:
             events.popleft()
@@ -70,13 +66,9 @@ class ConsensusStrategy:
             return None
 
         chosen = selected[: max(required_traders, 5)]
-        combined_score = sum((item.score for item in chosen), Decimal("0")) / Decimal(
-            len(chosen)
-        )
+        combined_score = sum((item.score for item in chosen), Decimal("0")) / Decimal(len(chosen))
         prices = [
-            item.swap.token_price_usd
-            for item in chosen
-            if item.swap.token_price_usd is not None
+            item.swap.token_price_usd for item in chosen if item.swap.token_price_usd is not None
         ]
         reference_price = prices[0] if prices else None
         return Signal(

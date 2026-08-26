@@ -61,4 +61,3 @@ class Connection:
 
 async def connect(path: str) -> Connection:
     return Connection(path)
-

@@ -7,6 +7,16 @@ transactions, and mirrors every newly detected hot-wallet swap in PAPER mode. PA
 as either a forced source-price observation ledger or an executable Jupiter quote-shadow
 trial; the two answer different questions and are labeled separately.
 
+Version 2.19 adds asynchronous coin-intelligence callouts. A detected BUY keeps the fast
+quote/PAPER path; a separate task cross-checks the mint against DEX Screener pair flow,
+existing Jupiter token safety metadata, independently verified smart-wallet buyers, and—when
+`X_API_BEARER_TOKEN` is configured—the official X recent-search API. X evidence is searched
+by full contract address, deduplicated, and discounted for young/low-quality author clusters.
+The existing Solana Tracker key also supplies its documented 1–10 token risk score, rugged
+state, bundler, insider, sniper, developer, and holder-concentration evidence. Paid DEX boosts
+are labeled rather than treated as organic proof. Callouts never unlock live trading or bypass
+the existing risk gate.
+
 Automatic discovery uses the authorized Solana Tracker PnL V2 API—not Fomo or KOLScan
 scraping. It combines the strict general-trader leaderboard with the provider's documented
 public-KOL period leaderboard, refreshes the 24-hour pool every three hours, caches an
@@ -55,6 +65,10 @@ unless four separate controls are deliberately configured.
 - Uses independent-wallet consensus and risk gates for alert/live strategy execution.
 - Posts raw wallet activity and the matching paper fills to Discord.
 - Adds one-tap Fomo, Pump.fun, Jupiter, DexScreener, and Solscan buttons to every token alert.
+- Posts scored coin callouts without delaying the copy path; a second independent verified
+  wallet buying the same mint forces a fresh callout even inside the normal cooldown.
+- Provides `/smartmoney coin` for an on-demand contract-address report covering smart money,
+  DEX flow, token safety, and official X evidence.
 - Can mention one Discord user on every newly detected raw buy.
 - Blocks suspicious, low-liquidity, concentrated, mintable, or freezable tokens when the
   required Jupiter safety metadata is available.
@@ -190,7 +204,8 @@ when no prior public BUY exists
 inside the scanned history, no current baseline price is available, or the PAPER account lacks
 cash. Set `PAPER_MIRROR_RAW_SWAPS=false` to restore consensus-only paper behavior.
 
-The v2.18.0 discovery, selective-entry, daily loss/profit locks, social nomination, quote, fallback, rotation, and exit controls are
+The v2.19.0 discovery, callout, selective-entry, daily loss/profit locks, social nomination,
+quote, fallback, rotation, and exit controls are
 intentionally configurable:
 
 ```text
@@ -416,6 +431,8 @@ RPC_REQUESTS_PER_SECOND=8
 RPC_MAX_RETRIES=4
 SOLANA_TRACKER_API_KEY=...
 JUPITER_API_KEY=...
+# Optional; required only for scored X/Twitter evidence in coin callouts.
+X_API_BEARER_TOKEN=...
 DATABASE_PATH=/data/smart_money.db
 RAILWAY_RUN_UID=0
 ```
@@ -440,6 +457,7 @@ in that URL private. Helius documents the endpoint format as
 | `/smartmoney candidates` | Show pool size, Pump verification, selected wallets, and exact rejection reasons. |
 | `/smartmoney rotation` | Show recent admissions/removals and the exact reason for each. |
 | `/smartmoney sources` | Show which discovery/platform/stream sources are actually connected. |
+| `/smartmoney coin` | Score any Solana contract using verified buyers, token safety, DEX flow, and official X evidence. |
 | `/smartmoney trader-add` | Optionally add a manual public-wallet override. |
 | `/smartmoney trader-import` | Optionally bulk import `alias,wallet,weight` CSV rows. |
 | `/smartmoney trader-remove` | Remove a tracked wallet. |

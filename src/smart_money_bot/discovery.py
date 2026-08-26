@@ -149,18 +149,12 @@ class SolanaTrackerClient:
             "excludeArbitrage": "true",
             "pnlMode": "strict",
             "minDays": "2" if weekly else "1",
-            "minTrades": str(
-                policy.minimum_7d_trades if weekly else policy.minimum_trades
-            ),
+            "minTrades": str(policy.minimum_7d_trades if weekly else policy.minimum_trades),
             "minInvested": "1",
             "minWinRate": str(
-                policy.minimum_7d_win_rate_percent
-                if weekly
-                else policy.minimum_win_rate_percent
+                policy.minimum_7d_win_rate_percent if weekly else policy.minimum_win_rate_percent
             ),
-            "minRoi": str(
-                policy.minimum_7d_roi_percent if weekly else policy.minimum_roi_percent
-            ),
+            "minRoi": str(policy.minimum_7d_roi_percent if weekly else policy.minimum_roi_percent),
             "minClosedTokens": str(policy.minimum_closed_tokens),
             "maxSingleTokenPct": str(policy.maximum_single_token_percent),
         }
@@ -173,12 +167,8 @@ class SolanaTrackerClient:
             if cursor:
                 params["cursor"] = cursor
             payload = await self._request("/v2/pnl/leaderboard/top", params=params)
-            if not isinstance(payload, dict) or not isinstance(
-                payload.get("traders"), list
-            ):
-                raise DiscoveryError(
-                    "Solana Tracker leaderboard response has an unexpected shape"
-                )
+            if not isinstance(payload, dict) or not isinstance(payload.get("traders"), list):
+                raise DiscoveryError("Solana Tracker leaderboard response has an unexpected shape")
             for row in payload["traders"]:
                 if not isinstance(row, dict):
                     continue
@@ -187,9 +177,7 @@ class SolanaTrackerClient:
                     seen_wallets.add(wallet)
                     traders.append(row)
             pagination = (
-                payload.get("pagination")
-                if isinstance(payload.get("pagination"), dict)
-                else {}
+                payload.get("pagination") if isinstance(payload.get("pagination"), dict) else {}
             )
             next_cursor = pagination.get("nextCursor")
             if not pagination.get("hasMore") or not isinstance(next_cursor, str):
@@ -197,9 +185,7 @@ class SolanaTrackerClient:
             cursor = next_cursor
         return {"traders": traders, "pagination": pagination}
 
-    async def _kol_period_payload(
-        self, policy: DiscoveryPolicy, *, period: str
-    ) -> Any:
+    async def _kol_period_payload(self, policy: DiscoveryPolicy, *, period: str) -> Any:
         if period not in {"1d", "7d"}:
             raise ValueError("Only 1d and 7d KOL windows are supported")
         return await self._request(
@@ -224,9 +210,7 @@ class SolanaTrackerClient:
                         continue
                     body = await response.text()
                     if response.status >= 400:
-                        raise DiscoveryError(
-                            f"Solana Tracker HTTP {response.status}: {body[:500]}"
-                        )
+                        raise DiscoveryError(f"Solana Tracker HTTP {response.status}: {body[:500]}")
                     try:
                         return await response.json(content_type=None)
                     except ValueError as exc:
@@ -442,13 +426,10 @@ def parse_kol_window_candidates(
             )
         )
         trades = _first_integer(counts.get("trades"), counts.get("total"))
-        has_trades = any(
-            value is not None for value in (counts.get("trades"), counts.get("total"))
-        )
+        has_trades = any(value is not None for value in (counts.get("trades"), counts.get("total")))
         closed_values = (tokens.get("closed"), counts.get("closed"))
         has_token_outcomes = any(
-            value is not None
-            for value in (tokens.get("profitable"), tokens.get("losing"))
+            value is not None for value in (tokens.get("profitable"), tokens.get("losing"))
         )
         has_closed_tokens = any(value is not None for value in closed_values) or has_token_outcomes
         closed_tokens = _first_integer(*closed_values)
@@ -569,8 +550,7 @@ def merge_verified_windows(
                 closed_tokens=day.closed_tokens,
                 invested_24h_usd=day.invested_usd,
                 volume_24h_usd=day.volume_usd,
-                last_trade_ms=max(day.last_trade_ms or 0, week.last_trade_ms or 0)
-                or None,
+                last_trade_ms=max(day.last_trade_ms or 0, week.last_trade_ms or 0) or None,
                 score=score,
                 rank=0,
                 realized_pnl_7d=week.realized_pnl_usd,

@@ -23,9 +23,7 @@ from .rotation import is_pump_mint
 
 
 class ExecutionManager:
-    def __init__(
-        self, settings: Settings, database: Database, market: JupiterClient
-    ) -> None:
+    def __init__(self, settings: Settings, database: Database, market: JupiterClient) -> None:
         self.settings = settings
         self.database = database
         self.market = market
@@ -131,9 +129,7 @@ class ExecutionManager:
                 execution_kind="SNIPER_QUOTE" if sniper_mode else "RAW_MIRROR",
                 readiness_tracking=not sniper_mode,
                 max_entry_drift_percent=(
-                    self.settings.paper_sniper_max_entry_drift_percent
-                    if sniper_mode
-                    else None
+                    self.settings.paper_sniper_max_entry_drift_percent if sniper_mode else None
                 ),
                 max_price_impact_percent=(
                     self.settings.paper_sniper_max_quote_price_impact_percent
@@ -149,9 +145,7 @@ class ExecutionManager:
                 and swap.token_price_usd is not None
                 and swap.token_price_usd > 0
             ):
-                penalty = Decimal(
-                    self.settings.paper_sniper_source_penalty_bps
-                ) / Decimal(10_000)
+                penalty = Decimal(self.settings.paper_sniper_source_penalty_bps) / Decimal(10_000)
                 market_price_usd = (
                     swap.token_price_usd * (Decimal("1") + penalty)
                     if swap.side is Side.BUY
@@ -172,9 +166,7 @@ class ExecutionManager:
             size_usd=size_usd,
             fee_bps=self.settings.simulated_fee_bps,
             slippage_bps=self.settings.simulated_slippage_bps,
-            max_position_usd=(
-                None if observation_mode else self.settings.max_copy_usd
-            ),
+            max_position_usd=(None if observation_mode else self.settings.max_copy_usd),
             execution_kind=(
                 "TRACKING_BASELINE"
                 if baseline_mode
@@ -182,17 +174,9 @@ class ExecutionManager:
                     "FORCED_OBSERVATION"
                     if observation_mode
                     else (
-                        (
-                            "SNIPER_SOURCE_FALLBACK"
-                            if pump_source_fallback
-                            else "SNIPER_PAPER"
-                        )
+                        ("SNIPER_SOURCE_FALLBACK" if pump_source_fallback else "SNIPER_PAPER")
                         if sniper_mode
-                        else (
-                            "PUMP_SOURCE_FALLBACK"
-                            if pump_source_fallback
-                            else "RAW_MIRROR"
-                        )
+                        else ("PUMP_SOURCE_FALLBACK" if pump_source_fallback else "RAW_MIRROR")
                     )
                 )
             ),
@@ -202,9 +186,7 @@ class ExecutionManager:
             if swap.side is Side.BUY:
                 message = "Skipped: no paper cash or raw-lot capacity remains for this buy"
             else:
-                message = await self._unmatched_sell_message(
-                    trader.address, swap.token_mint
-                )
+                message = await self._unmatched_sell_message(trader.address, swap.token_mint)
             result = ExecutionResult(
                 success=False,
                 mode=ExecutionMode.PAPER,
@@ -457,19 +439,15 @@ class ExecutionManager:
 
         if swap.side is Side.BUY:
             quote_price = amount_usd / quote.output_amount
-            drift = (
-                (quote_price / swap.token_price_usd) - Decimal("1")
-            ) * Decimal("100")
+            drift = ((quote_price / swap.token_price_usd) - Decimal("1")) * Decimal("100")
             blocker: str | None = None
             if drift > entry_drift_limit:
                 blocker = (
-                    f"entry drift +{drift:.2f}% exceeds the "
-                    f"{entry_drift_limit:.2f}% chase limit"
+                    f"entry drift +{drift:.2f}% exceeds the {entry_drift_limit:.2f}% chase limit"
                 )
             elif price_impact > price_impact_limit:
                 blocker = (
-                    f"Jupiter price impact {price_impact:.2f}% exceeds "
-                    f"{price_impact_limit:.2f}%"
+                    f"Jupiter price impact {price_impact:.2f}% exceeds {price_impact_limit:.2f}%"
                 )
             elif quote.observed_latency_ms > self.settings.max_quote_latency_ms:
                 blocker = (
@@ -606,18 +584,14 @@ class ExecutionManager:
         base_price = await self._paper_base_price()
         amount_raw = int(
             (
-                size_usd
-                / base_price
-                * (Decimal(10) ** self.settings.live_base_decimals)
+                size_usd / base_price * (Decimal(10) ** self.settings.live_base_decimals)
             ).to_integral_value(rounding=ROUND_DOWN)
         )
         if amount_raw <= 0:
             raise JupiterError("configured paper size is below one base-token unit")
         return amount_raw
 
-    def _paper_skip(
-        self, swap: DetectedSwap, size_usd: Decimal, reason: str
-    ) -> ExecutionResult:
+    def _paper_skip(self, swap: DetectedSwap, size_usd: Decimal, reason: str) -> ExecutionResult:
         return ExecutionResult(
             success=False,
             mode=ExecutionMode.PAPER,
@@ -634,9 +608,7 @@ class ExecutionManager:
         *,
         include_prefix: bool = True,
     ) -> str:
-        latest = await self.database.paper_mirror_latest_event(
-            trader_address, token_mint
-        )
+        latest = await self.database.paper_mirror_latest_event(trader_address, token_mint)
         if latest is None:
             reason = (
                 "no open paper lot exists because no earlier BUY for this wallet/token "
@@ -711,9 +683,7 @@ class ExecutionManager:
                 fee_bps=self.settings.simulated_fee_bps,
                 slippage_bps=self.settings.simulated_slippage_bps,
                 execution_kind=(
-                    "MANUAL_OBSERVATION_EXIT"
-                    if execution_kind == "MANUAL_EXIT"
-                    else execution_kind
+                    "MANUAL_OBSERVATION_EXIT" if execution_kind == "MANUAL_EXIT" else execution_kind
                 ),
                 exit_reason=reason,
                 source_price_usd=market_price_usd,
@@ -820,9 +790,7 @@ class ExecutionManager:
         trader_address = str(position["trader_address"])
         token_mint = str(position["token_mint"])
         cost_basis = Decimal(str(position["cost_basis_usd"]))
-        sniper_lot = await self.database.paper_mirror_open_lot_is_sniper(
-            trader_address, token_mint
-        )
+        sniper_lot = await self.database.paper_mirror_open_lot_is_sniper(trader_address, token_mint)
         execution_kind = "SNIPER_RISK_EXIT" if sniper_lot else "RISK_EXIT"
         if self.settings.paper_use_executable_quotes:
             swap = DetectedSwap(

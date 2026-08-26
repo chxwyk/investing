@@ -4,6 +4,7 @@ import csv
 import io
 import logging
 import time
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Literal
 from urllib.parse import urlencode
@@ -18,6 +19,7 @@ from .constants import BOT_VERSION, PAPER_DEMO_ENTRY_PRICE_USD, PAPER_DEMO_MINT
 from .engine import SmartMoneyEngine
 from .errors import DiscoveryError, JupiterError
 from .models import (
+    CoinCallout,
     DetectedSwap,
     DiscoveryCandidate,
     DiscoveryRefresh,
@@ -53,11 +55,7 @@ def _return_percent(current_value: Decimal, cost_basis: Decimal) -> Decimal:
 
 
 def _raw_entry_gate_status(enabled: bool) -> str:
-    return (
-        "enabled"
-        if enabled
-        else "DISABLED — set PAPER_RAW_ENTRY_FILTER_ENABLED=true"
-    )
+    return "enabled" if enabled else "DISABLED — set PAPER_RAW_ENTRY_FILTER_ENABLED=true"
 
 
 FOMO_SOLANA_CHAIN_ID = "1399811149"
@@ -145,9 +143,111 @@ def _discovery_lines(candidates: tuple[DiscoveryCandidate, ...] | list[Discovery
     return "\n\n".join(lines) or "No qualified wallets in the latest snapshot."
 
 
-def _paper_trade_field(
-    item: dict[str, object], traders: dict[str, str]
-) -> tuple[str, str]:
+def _coin_callout_embed(callout: CoinCallout) -> discord.Embed:
+    colors = {
+        "STRONG WATCH": 0x00D084,
+        "WATCH": 0x2ECC71,
+        "EARLY — NEEDS CONFIRMATION": 0xF1C40F,
+        "BLOCKED": 0xE74C3C,
+        "AVOID / TOO WEAK": 0x95A5A6,
+    }
+    label = callout.symbol or _short(callout.mint)
+    embed = discord.Embed(
+        title=f"COIN CALLOUT • {callout.verdict} • {label}",
+        description=(
+            f"Evidence score **{callout.score}/100** • confidence **{callout.confidence}**\n"
+            "A watch score is research evidence—not a promise or an automatic live buy."
+        ),
+        color=colors.get(callout.verdict, 0x95A5A6),
+        timestamp=datetime.fromtimestamp(callout.generated_at, tz=UTC),
+    )
+    embed.add_field(
+        name="Verified smart money",
+        value=(
+            f"{len(callout.smart_wallets)} independent buyer(s) in the live window\n"
+            + (", ".join(callout.smart_wallets)[:800] if callout.smart_wallets else "None yet")
+        ),
+        inline=False,
+    )
+    dex = callout.dex
+    if dex.available:
+        total_5m = dex.buys_5m + dex.sells_5m
+        price_change = (
+            dex.price_change_5m_percent if dex.price_change_5m_percent is not None else "unknown"
+        )
+        embed.add_field(
+            name="DEX flow",
+            value=(
+                f"Liquidity `{_money(dex.liquidity_usd)}` • MC `{_money(dex.market_cap_usd)}`\n"
+                f"5m buys/sells `{dex.buys_5m}/{dex.sells_5m}` ({total_5m} tx) • "
+                f"volume `{_money(dex.volume_5m_usd)}`\n"
+                f"5m price `{price_change}%`"
+            ),
+            inline=False,
+        )
+    else:
+        embed.add_field(name="DEX flow", value="Official pair data unavailable", inline=False)
+    social = callout.social
+    if social.available:
+        embed.add_field(
+            name="X/Twitter evidence",
+            value=(
+                f"Posts `{social.posts}` • unique authors `{social.unique_authors}` • "
+                f"established `{social.established_authors}` • "
+                f"influential `{social.influential_authors}`\n"
+                f"Velocity `{social.posts_per_minute}/min` • engagements `{social.engagements}` • "
+                f"duplicate text `{social.duplicate_percent}%`"
+            ),
+            inline=False,
+        )
+    else:
+        embed.add_field(
+            name="X/Twitter evidence",
+            value="Not scored—official X API access is not configured or did not respond.",
+            inline=False,
+        )
+    tracker = callout.tracker_risk
+    if tracker.available:
+        risk_score = tracker.score if tracker.score is not None else "unknown"
+        bundled = tracker.bundlers_percent if tracker.bundlers_percent is not None else "unknown"
+        insiders = tracker.insiders_percent if tracker.insiders_percent is not None else "unknown"
+        snipers = tracker.snipers_percent if tracker.snipers_percent is not None else "unknown"
+        embed.add_field(
+            name="Rug / launch manipulation",
+            value=(
+                f"Risk `{risk_score}/10` • "
+                f"rugged `{'yes' if tracker.rugged else 'no'}`\n"
+                f"Bundlers `{bundled}%` • insiders `{insiders}%` • snipers `{snipers}%`"
+            ),
+            inline=False,
+        )
+    else:
+        embed.add_field(
+            name="Rug / launch manipulation",
+            value="Solana Tracker token-risk evidence unavailable.",
+            inline=False,
+        )
+    if callout.positives:
+        embed.add_field(
+            name="Positive evidence",
+            value="\n".join(f"• {item}" for item in callout.positives)[:1024],
+            inline=False,
+        )
+    risks = callout.hard_blockers + callout.warnings
+    if risks:
+        embed.add_field(
+            name="Risks / missing proof",
+            value="\n".join(f"• {item}" for item in risks)[:1024],
+            inline=False,
+        )
+    embed.add_field(name="Contract", value=f"`{callout.mint}`", inline=False)
+    embed.set_footer(
+        text="Contract-address X search • duplicate/bot penalty • DEX/on-chain cross-check"
+    )
+    return embed
+
+
+def _paper_trade_field(item: dict[str, object], traders: dict[str, str]) -> tuple[str, str]:
     side = str(item["side"])
     mint = str(item["token_mint"])
     quantity = Decimal(str(item["quantity"]))
@@ -165,11 +265,7 @@ def _paper_trade_field(
     if side == Side.SELL.value:
         realized = Decimal(str(item["realized_pnl_usd"]))
         matched_cost = (gross - fee) - realized
-        roi = (
-            realized / matched_cost * Decimal("100")
-            if matched_cost > 0
-            else Decimal("0")
-        )
+        roi = realized / matched_cost * Decimal("100") if matched_cost > 0 else Decimal("0")
         reason = item.get("exit_reason")
         reason_text = f"\nExit: {reason}" if reason else ""
         result = f"P&L `{_money(realized)}` • ROI `{roi:+.2f}%`"
@@ -182,11 +278,7 @@ def _paper_trade_field(
         router = str(item.get("quote_router") or "unknown")
         impact = Decimal(str(item.get("price_impact_percent") or 0))
         drift_raw = item.get("price_drift_percent")
-        drift_text = (
-            f" • drift `{Decimal(str(drift_raw)):+.2f}%`"
-            if drift_raw is not None
-            else ""
-        )
+        drift_text = f" • drift `{Decimal(str(drift_raw)):+.2f}%`" if drift_raw is not None else ""
         quote_text = f"\nQuote `{router}` • impact `{impact:.2f}%`{drift_text}"
 
     name = f"{side} • {kind} • {_short(mint)}"
@@ -306,8 +398,7 @@ class PaperTradesView(discord.ui.View):
             offset=self.page * self.page_size,
         )
         self.traders = {
-            trader.address: trader.alias
-            for trader in await self.bot.engine.database.list_traders()
+            trader.address: trader.alias for trader in await self.bot.engine.database.list_traders()
         }
         self._sync_buttons()
 
@@ -349,9 +440,7 @@ class PaperTradesView(discord.ui.View):
         await self.reload()
         await interaction.response.edit_message(embed=self.embed(), view=self)
 
-    @discord.ui.button(
-        label="1/1", style=discord.ButtonStyle.secondary, disabled=True, row=0
-    )
+    @discord.ui.button(label="1/1", style=discord.ButtonStyle.secondary, disabled=True, row=0)
     async def page_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
@@ -413,8 +502,7 @@ class PaperPositionsView(discord.ui.View):
         self.positions = await self.bot.engine.database.paper_all_positions()
         self.index = min(self.index, max(0, len(self.positions) - 1))
         self.traders = {
-            trader.address: trader.alias
-            for trader in await self.bot.engine.database.list_traders()
+            trader.address: trader.alias for trader in await self.bot.engine.database.list_traders()
         }
         mints = sorted(
             {
@@ -506,9 +594,7 @@ class PaperPositionsView(discord.ui.View):
         self._sync_buttons()
         await interaction.response.edit_message(embed=self.embed(), view=self)
 
-    @discord.ui.button(
-        label="1/1", style=discord.ButtonStyle.secondary, disabled=True, row=0
-    )
+    @discord.ui.button(label="1/1", style=discord.ButtonStyle.secondary, disabled=True, row=0)
     async def page_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
@@ -595,17 +681,13 @@ class PaperSellConfirmationView(discord.ui.View):
             position_kind=str(self.position.get("position_kind") or "STRATEGY"),
             token_mint=str(self.position["token_mint"]),
             source_trader=(
-                str(self.position["source_trader"])
-                if self.position.get("source_trader")
-                else None
+                str(self.position["source_trader"]) if self.position.get("source_trader") else None
             ),
             requested_by=str(interaction.user),
         )
         result_embed = discord.Embed(
             title=(
-                "Manual PAPER sell filled"
-                if result.success
-                else "Manual PAPER sell not filled"
+                "Manual PAPER sell filled" if result.success else "Manual PAPER sell not filled"
             ),
             description=result.message,
             color=0x2ECC71 if result.success else 0xE74C3C,
@@ -764,9 +846,7 @@ class SmartMoneyBot(commands.Bot):
         embed.add_field(name="Rotated out", value=str(len(refresh.disabled_wallets)))
         embed.add_field(name="Watching", value=str(len(refresh.candidates)))
         embed.add_field(name="Strict candidate pool", value=str(refresh.candidate_pool_size))
-        embed.add_field(
-            name="Pump-verified", value=str(refresh.verified_pump_wallets)
-        )
+        embed.add_field(name="Pump-verified", value=str(refresh.verified_pump_wallets))
         if refresh.removal_events:
             removal_text = "\n".join(
                 f"• `{_short(event.address)}` — {event.reason}; "
@@ -784,9 +864,7 @@ class SmartMoneyBot(commands.Bot):
         self, signal: Signal, token_info: TokenInfo | None, decision: RiskDecision
     ) -> None:
         symbol = (
-            token_info.symbol
-            if token_info and token_info.symbol
-            else _short(signal.token_mint)
+            token_info.symbol if token_info and token_info.symbol else _short(signal.token_mint)
         )
         status = "PASSED" if decision.allowed else "BLOCKED"
         color = 0x00D084 if decision.allowed else 0xF1C40F
@@ -799,18 +877,14 @@ class SmartMoneyBot(commands.Bot):
         embed.add_field(name="Trader score", value=f"{signal.combined_score}/100")
         embed.add_field(name="Reference price", value=_money(signal.reference_price_usd))
         embed.add_field(name="Risk gate", value=status)
-        embed.add_field(
-            name="Traders", value=", ".join(signal.trader_aliases)[:1024], inline=False
-        )
+        embed.add_field(name="Traders", value=", ".join(signal.trader_aliases)[:1024], inline=False)
         if token_info:
             embed.add_field(name="Liquidity", value=_money(token_info.liquidity_usd))
             embed.add_field(
                 name="Organic score",
                 value=str(token_info.organic_score or "unknown"),
             )
-            embed.add_field(
-                name="Verified", value="Yes" if token_info.verified else "No/unknown"
-            )
+            embed.add_field(name="Verified", value="Yes" if token_info.verified else "No/unknown")
         if decision.reasons:
             embed.add_field(
                 name="Checks",
@@ -839,6 +913,13 @@ class SmartMoneyBot(commands.Bot):
                 inline=False,
             )
         await self._send_alert(embed, token_mint=result.token_mint)
+
+    async def on_coin_callout(self, callout: CoinCallout) -> None:
+        await self._send_alert(
+            _coin_callout_embed(callout),
+            token_mint=callout.mint,
+            ping_user=callout.verdict in {"STRONG WATCH", "WATCH"},
+        )
 
     async def on_daily_profit_lock(self, status: PaperDailyLockStatus) -> None:
         loss_lock = status.lock_reason == "LOSS_LIMIT"
@@ -987,9 +1068,7 @@ class SmartMoneyCommands(
             await interaction.followup.send(f"Could not import CSV: {exc}", ephemeral=True)
 
     @app_commands.command(name="trader-remove", description="Stop monitoring a wallet.")
-    async def trader_remove(
-        self, interaction: discord.Interaction, alias_or_wallet: str
-    ) -> None:
+    async def trader_remove(self, interaction: discord.Interaction, alias_or_wallet: str) -> None:
         if not await self._require_admin(interaction):
             return
         removed = await self.bot.engine.database.remove_trader(alias_or_wallet.strip())
@@ -1135,20 +1214,14 @@ class SmartMoneyCommands(
                 f"score `{candidate.score}` • Pump `{candidate.pump_swaps}`"
             )
         rejected = [
-            candidate
-            for candidate in result.evaluated
-            if candidate.address not in selected
+            candidate for candidate in result.evaluated if candidate.address not in selected
         ]
         for candidate in rejected[:12]:
             reason = result.rejection_reasons.get(
                 candidate.address, "outranked by stronger current candidates"
             )
-            lines.append(
-                f"❌ **{candidate.alias}** `{_short(candidate.address)}` • {reason}"
-            )
-        await interaction.response.send_message(
-            "\n".join(lines)[:4000], ephemeral=True
-        )
+            lines.append(f"❌ **{candidate.alias}** `{_short(candidate.address)}` • {reason}")
+        await interaction.response.send_message("\n".join(lines)[:4000], ephemeral=True)
 
     @app_commands.command(
         name="rotation", description="Show recent automatic wallet admissions and removals."
@@ -1157,9 +1230,7 @@ class SmartMoneyCommands(
         await interaction.response.defer(thinking=True, ephemeral=True)
         events = await self.bot.engine.database.rotation_events(limit=10)
         if not events:
-            await interaction.followup.send(
-                "No rotation events recorded yet.", ephemeral=True
-            )
+            await interaction.followup.send("No rotation events recorded yet.", ephemeral=True)
             return
         lines = []
         for event in events:
@@ -1191,8 +1262,15 @@ class SmartMoneyCommands(
             if status["stream_connected"]
             else "polling fallback"
         )
+        x_status = (
+            "official recent-search connected"
+            if status["x_social_configured"]
+            else "API key needed"
+        )
         text = (
             "**Solana Tracker:** connected for strict 24H + 7D general-trader screening\n"
+            "**Solana Tracker token safety:** risk score, rugged state, bundlers, "
+            "insiders, snipers, developer and holder concentration\n"
             f"**Public-KOL period feed:** "
             f"{'enabled' if status['kol_discovery_enabled'] else 'disabled'} • authorized "
             "24H/7D nominations, never automatic trust\n"
@@ -1205,12 +1283,36 @@ class SmartMoneyCommands(
             "identity\n"
             f"**Graduated Pump/Jupiter routes:** covered by the same persistent token mint\n"
             f"**Helius/Solana realtime:** {stream_status}\n"
+            "**DEX Screener coin intelligence:** enabled for live pair liquidity, flow, "
+            "volume, profiles, and paid-boost labeling\n"
+            f"**X/Twitter coin intelligence:** {x_status}"
+            " • contract-address search • author-quality and duplicate-text checks\n"
             "**Fomo:** the official app exposes leaderboards, profiles, follows, and alerts, "
             "but no documented public API/webhook was found. The bot will not claim a "
             "private endpoint is authorized; Fomo candidates require an official feed or a "
             "public wallet identity before the same full verification can run."
         )
         await interaction.response.send_message(text, ephemeral=True)
+
+    @app_commands.command(
+        name="coin", description="Cross-check a Solana coin across smart money, DEX flow, and X."
+    )
+    @app_commands.describe(mint="Solana token contract address")
+    async def coin(self, interaction: discord.Interaction, mint: str) -> None:
+        try:
+            mint = str(Pubkey.from_string(mint.strip()))
+        except ValueError:
+            await interaction.response.send_message(
+                "That is not a valid Solana token contract address.", ephemeral=True
+            )
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        callout = await self.bot.engine.analyze_coin(mint)
+        await interaction.followup.send(
+            embed=_coin_callout_embed(callout),
+            view=_token_view(mint, self.bot.settings.fomo_referral_code),
+            ephemeral=True,
+        )
 
     @app_commands.command(name="leaderboard", description="Risk-adjusted tracked-wallet ranking.")
     @app_commands.describe(window="Show 24-hour or 7-day performance")
@@ -1287,10 +1389,7 @@ class SmartMoneyCommands(
         embed.add_field(name="Expectancy / exit", value=_money(summary.expectancy_usd))
         embed.add_field(
             name="Average win / loss",
-            value=(
-                f"{_money(summary.average_win_usd)} / "
-                f"-{_money(summary.average_loss_usd)}"
-            ),
+            value=(f"{_money(summary.average_win_usd)} / -{_money(summary.average_loss_usd)}"),
         )
         embed.add_field(
             name="Today marked / guardrails",
@@ -1392,8 +1491,7 @@ class SmartMoneyCommands(
         embed.add_field(name="Remaining gates", value=blockers[:1024], inline=False)
         embed.set_footer(
             text=(
-                "Passing means review a tiny live pilot next—not that $50-$100/day "
-                "is guaranteed."
+                "Passing means review a tiny live pilot next—not that $50-$100/day is guaranteed."
             )
         )
         await interaction.followup.send(embed=embed)
@@ -1431,9 +1529,7 @@ class SmartMoneyCommands(
             can_sell=self._is_admin(interaction.user),
         )
         if not view.positions:
-            await interaction.response.send_message(
-                "No open paper positions.", ephemeral=True
-            )
+            await interaction.response.send_message("No open paper positions.", ephemeral=True)
             return
         await interaction.response.send_message(
             embed=view.embed(),
@@ -1445,9 +1541,7 @@ class SmartMoneyCommands(
         name="paper-demo",
         description="Instantly test a fake paper buy and a winning or losing paper sell.",
     )
-    @app_commands.describe(
-        action="Open a fake position, or close it with a simulated win/loss."
-    )
+    @app_commands.describe(action="Open a fake position, or close it with a simulated win/loss.")
     async def paper_demo(
         self,
         interaction: discord.Interaction,
@@ -1572,7 +1666,7 @@ class SmartMoneyCommands(
             return
         if confirmation != "RESET PAPER":
             await interaction.response.send_message(
-                'Type `RESET PAPER` exactly to confirm.', ephemeral=True
+                "Type `RESET PAPER` exactly to confirm.", ephemeral=True
             )
             return
         await self.bot.engine.database.reset_paper()
@@ -1601,7 +1695,7 @@ class SmartMoneyCommands(
         chosen = ExecutionMode(new_mode.upper())
         if chosen is ExecutionMode.LIVE and confirmation != "ENABLE LIVE":
             await interaction.response.send_message(
-                'Type `ENABLE LIVE` in confirmation. The environment lock must also be configured.',
+                "Type `ENABLE LIVE` in confirmation. The environment lock must also be configured.",
                 ephemeral=True,
             )
             return
@@ -1647,9 +1741,7 @@ class SmartMoneyCommands(
         s = self.bot.settings
         daily_lock = status["paper_daily_profit_lock"]
         assert isinstance(daily_lock, PaperDailyLockStatus)
-        last_scan = (
-            f"<t:{status['last_scan']}:R>" if status["last_scan"] else "not completed yet"
-        )
+        last_scan = f"<t:{status['last_scan']}:R>" if status["last_scan"] else "not completed yet"
         discovery_refresh = (
             f"<t:{status['discovery_last_refresh']}:R>"
             if status["discovery_last_refresh"]
@@ -1683,16 +1775,10 @@ class SmartMoneyCommands(
         paper_entry = (
             "source transaction price + configured adverse penalty"
             if observation_mode
-            else (
-                "current price required"
-                if s.paper_require_current_price
-                else "fallback allowed"
-            )
+            else ("current price required" if s.paper_require_current_price else "fallback allowed")
         )
         fill_policy = (
-            "FORCE OBSERVATION (PAPER only)"
-            if observation_mode
-            else "executable quote shadow"
+            "FORCE OBSERVATION (PAPER only)" if observation_mode else "executable quote shadow"
         )
         raw_entry_gate = (
             "bypassed by forced PAPER observation"
@@ -1700,9 +1786,7 @@ class SmartMoneyCommands(
             else _raw_entry_gate_status(s.paper_raw_entry_filter_enabled)
         )
         pump_verified = status["rotation_verified_pump_wallets"]
-        pump_verified_text = (
-            str(pump_verified) if pump_verified is not None else "not checked yet"
-        )
+        pump_verified_text = str(pump_verified) if pump_verified is not None else "not checked yet"
         text = (
             f"**Bot version:** {BOT_VERSION}\n"
             f"**RPC:** {status['rpc']}\n"
@@ -1739,6 +1823,11 @@ class SmartMoneyCommands(
             f"{s.max_consecutive_quote_failures}\n"
             f"**Raw-buy pings:** "
             f"{'ready' if self.bot.settings.discord_alert_user_id else 'user ID not set'}\n"
+            f"**Coin callouts:** "
+            f"{'enabled' if status['coin_callouts_enabled'] else 'disabled'} • "
+            "DEX/on-chain cross-check • "
+            f"X {'connected' if status['x_social_configured'] else 'key needed'} • "
+            f"minimum alert score {s.coin_callout_min_alert_score}/100\n"
             f"**Paused:** {status['paused']}\n"
             f"**Tracked wallets:** {status['wallets']}\n"
             f"**Exit-only wallets:** {status['exit_only_wallets']} "
@@ -1764,9 +1853,7 @@ class SmartMoneyCommands(
     async def limits(self, interaction: discord.Interaction) -> None:
         s = self.bot.settings
         paper_copy = (
-            "every new raw tracked-wallet swap"
-            if s.paper_mirror_raw_swaps
-            else "consensus only"
+            "every new raw tracked-wallet swap" if s.paper_mirror_raw_swaps else "consensus only"
         )
         fill_policy = (
             "force every valid detected swap (observation only)"

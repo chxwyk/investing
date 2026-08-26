@@ -48,9 +48,7 @@ class CandidateRotator:
         self.settings = settings
         self.rpc = rpc
         self.detector = detector
-        self._semaphore = asyncio.Semaphore(
-            max(1, min(settings.rpc_requests_per_second, 12))
-        )
+        self._semaphore = asyncio.Semaphore(max(1, min(settings.rpc_requests_per_second, 12)))
 
     async def evaluate(
         self,
@@ -64,15 +62,9 @@ class CandidateRotator:
         )
         evaluated = [candidate for candidate, _ in probes]
         rejection_reasons = {
-            candidate.address: reason
-            for candidate, reason in probes
-            if reason is not None
+            candidate.address: reason for candidate, reason in probes if reason is not None
         }
-        qualified = [
-            candidate
-            for candidate, reason in probes
-            if reason is None
-        ]
+        qualified = [candidate for candidate, reason in probes if reason is None]
         qualified.sort(key=_hot_sort_key, reverse=True)
         selected = qualified[: self.settings.discovery_max_wallets]
         selected_addresses = {candidate.address for candidate in selected}
@@ -83,8 +75,7 @@ class CandidateRotator:
                 )
 
         ranked = [
-            replace(candidate, rank=index)
-            for index, candidate in enumerate(selected, start=1)
+            replace(candidate, rank=index) for index, candidate in enumerate(selected, start=1)
         ]
         return RotationResult(
             selected=tuple(ranked),
@@ -149,9 +140,7 @@ class CandidateRotator:
             recent_swaps=swaps,
             pump_swaps=pump_swaps,
             last_activity_at=last_activity_at,
-            selection_reason=(
-                f"{evidence}; {swaps} recent swaps ({pump_swaps} Pump)"
-            ),
+            selection_reason=(f"{evidence}; {swaps} recent swaps ({pump_swaps} Pump)"),
         )
         if swaps < self.settings.rotation_min_recent_swaps:
             return updated, (
@@ -180,7 +169,7 @@ def is_pump_trade(transaction: dict, mint: str) -> bool:
 
     if is_pump_mint(mint):
         return True
-    message = ((transaction.get("transaction") or {}).get("message") or {})
+    message = (transaction.get("transaction") or {}).get("message") or {}
     instructions = list(message.get("instructions") or [])
     meta = transaction.get("meta") or {}
     for group in meta.get("innerInstructions") or []:

@@ -41,9 +41,7 @@ def candidate(address: str, *, last_trade_ms: int) -> DiscoveryCandidate:
 
 class FakeRPC:
     async def get_signatures_for_address(self, address: str, **kwargs):
-        return [
-            {"signature": f"sig-{address}", "blockTime": 1_000_000, "err": None}
-        ]
+        return [{"signature": f"sig-{address}", "blockTime": 1_000_000, "err": None}]
 
     async def get_transaction(self, signature: str):
         mint = "Memecoin111111111111111111111111111111pump"
@@ -120,11 +118,7 @@ def test_pump_mint_and_websocket_url_detection() -> None:
     assert is_pump_mint("AbCdPump") is True
     assert is_pump_mint("AbCdElse") is False
     assert is_pump_trade(
-        {
-            "transaction": {
-                "message": {"instructions": [{"programId": PUMP_PROGRAM_ID}]}
-            }
-        },
+        {"transaction": {"message": {"instructions": [{"programId": PUMP_PROGRAM_ID}]}}},
         "NoSuffix",
     )
     assert (

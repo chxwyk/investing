@@ -50,9 +50,7 @@ class RiskEngine:
                 if mode is ExecutionMode.LIVE:
                     blockers.append("Liquidity is unknown")
             elif token_info.liquidity_usd < self.settings.min_token_liquidity_usd:
-                blockers.append(
-                    f"Liquidity ${token_info.liquidity_usd:,.0f} is below minimum"
-                )
+                blockers.append(f"Liquidity ${token_info.liquidity_usd:,.0f} is below minimum")
             if (
                 token_info.holder_count is not None
                 and token_info.holder_count < self.settings.min_token_holders
@@ -71,9 +69,7 @@ class RiskEngine:
                 token_info.top_holders_percent is not None
                 and token_info.top_holders_percent > self.settings.max_top_holders_percent
             ):
-                blockers.append(
-                    f"Top-holder concentration is {token_info.top_holders_percent}%"
-                )
+                blockers.append(f"Top-holder concentration is {token_info.top_holders_percent}%")
 
         if mode is ExecutionMode.PAPER:
             daily_pnl = await self.database.paper_daily_realized_pnl()

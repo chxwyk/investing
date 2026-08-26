@@ -58,9 +58,7 @@ def test_profile_wallet_resolution_requires_public_wallet_context() -> None:
     assert wallet_from_profile_slug(WALLET) == WALLET
     assert wallet_from_profile_slug("public-name") is None
     assert (
-        parse_pump_profile_wallet(
-            f'<a href="https://solscan.io/account/{OTHER}">wallet</a>'
-        )
+        parse_pump_profile_wallet(f'<a href="https://solscan.io/account/{OTHER}">wallet</a>')
         == OTHER
     )
     assert parse_pump_profile_wallet("no public wallet here") is None

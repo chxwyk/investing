@@ -98,4 +98,3 @@ async def test_ignores_plain_token_transfer() -> None:
         transaction, wallet=WALLET, signature="sig-transfer", block_time=1_700_000_002
     )
     assert swap is None
-

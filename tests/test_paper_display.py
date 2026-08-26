@@ -30,9 +30,7 @@ async def test_paper_views_paginate_without_posting_long_text(settings) -> None:
             fee_bps=0,
             slippage_bps=0,
         )
-        bot.engine.market.prices = AsyncMock(
-            return_value={"mint-a": Decimal("1.25")}
-        )
+        bot.engine.market.prices = AsyncMock(return_value={"mint-a": Decimal("1.25")})
 
         positions = await PaperPositionsView.create(bot, 123, can_sell=True)
         trades = await PaperTradesView.create(bot, 123, page_size=5)

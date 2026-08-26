@@ -77,9 +77,7 @@ async def test_forward_gate_rejects_mature_loser_and_rewards_mature_winner(
         }
     )
 
-    eligible, rejected, evaluated = await engine._apply_forward_paper_evidence(
-        [loser, winner]
-    )
+    eligible, rejected, evaluated = await engine._apply_forward_paper_evidence([loser, winner])
 
     assert [item.address for item in eligible] == ["winner"]
     assert eligible[0].score == Decimal("82.00")

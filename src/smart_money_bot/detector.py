@@ -66,9 +66,7 @@ class SwapDetector:
         token_amount = abs(token_delta)
         quote_amount = abs(quote_delta)
         quote_price = (
-            Decimal("1")
-            if quote_mint in STABLE_MINTS
-            else await self._safe_price(quote_mint)
+            Decimal("1") if quote_mint in STABLE_MINTS else await self._safe_price(quote_mint)
         )
         usd_value = quote_amount * quote_price if quote_price is not None else None
         if usd_value is not None and usd_value < self.min_trade_usd:
@@ -88,9 +86,7 @@ class SwapDetector:
             token_price_usd=token_price,
         )
 
-    async def _largest_quote(
-        self, candidates: list[tuple[str, Decimal]]
-    ) -> tuple[str, Decimal]:
+    async def _largest_quote(self, candidates: list[tuple[str, Decimal]]) -> tuple[str, Decimal]:
         valued: list[tuple[Decimal, str, Decimal]] = []
         for mint, amount in candidates:
             price = Decimal("1") if mint in STABLE_MINTS else await self._safe_price(mint)
@@ -122,7 +118,7 @@ def _owned_token_balances(entries: list[dict[str, Any]], wallet: str) -> dict[st
 
 def _native_sol_delta(transaction: dict[str, Any], wallet: str) -> Decimal:
     meta = transaction.get("meta") or {}
-    message = ((transaction.get("transaction") or {}).get("message") or {})
+    message = (transaction.get("transaction") or {}).get("message") or {}
     account_keys = message.get("accountKeys") or []
     normalized: list[str] = []
     for key in account_keys:
