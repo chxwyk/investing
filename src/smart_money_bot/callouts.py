@@ -18,6 +18,40 @@ from .models import (
     XSocialSnapshot,
 )
 
+CRYPTO_PROFILE_TERMS = {
+    "bitcoin",
+    "blockchain",
+    "crypto",
+    "degen",
+    "memecoin",
+    "meme coin",
+    "onchain",
+    "pump.fun",
+    "solana",
+    "token",
+    "trader",
+    "web3",
+}
+
+COIN_PROMOTION_PHRASES = {
+    "ape in",
+    "buy now",
+    "ca:",
+    "contract address",
+    "cto",
+    "fair launch",
+    "just launched",
+    "launching",
+    "meme coin",
+    "memecoin",
+    "moon",
+    "pump.fun",
+    "send it",
+    "ticker",
+}
+
+CASHTAG_RE = re.compile(r"(?<![A-Za-z0-9])\$[A-Za-z][A-Za-z0-9_]{1,14}\b")
+
 
 def _decimal(value: Any) -> Decimal | None:
     if value is None or value == "":
@@ -35,6 +69,11 @@ def _integer(value: Any) -> int:
         return 0
 
 
+def _phrase_present(text: str, phrase: str) -> bool:
+    escaped = re.escape(phrase.casefold())
+    return bool(re.search(rf"(?<![a-z0-9]){escaped}(?![a-z0-9])", text))
+
+
 class DexScreenerClient:
     """Public, documented DEX Screener token-pair lookup with a short cache."""
 
@@ -49,7 +88,7 @@ class DexScreenerClient:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
                 timeout=self.timeout,
-                headers={"User-Agent": "SmartMoneyCopyBot/2.22 coin-intelligence"},
+                headers={"User-Agent": "SmartMoneyCopyBot/2.23 coin-intelligence"},
             )
         return self._session
 
@@ -158,10 +197,14 @@ class XRecentSearchClient:
         timeout_seconds: int = 15,
         max_results: int = 10,
         cache_seconds: int = 60,
+        trusted_crypto_accounts: tuple[str, ...] = (),
     ) -> None:
         self.bearer_token = bearer_token
         self.max_results = max(10, min(100, max_results))
         self.cache_seconds = max(30, cache_seconds)
+        self.trusted_crypto_accounts = frozenset(
+            item.casefold().lstrip("@") for item in trusted_crypto_accounts if item.strip()
+        )
         self.timeout = aiohttp.ClientTimeout(total=timeout_seconds)
         self._session: aiohttp.ClientSession | None = None
         self._cache: dict[str, tuple[float, XSocialSnapshot]] = {}
@@ -202,7 +245,9 @@ class XRecentSearchClient:
             "max_results": str(self.max_results),
             "tweet.fields": "author_id,created_at,public_metrics,text",
             "expansions": "author_id",
-            "user.fields": "created_at,public_metrics,verified,verified_type",
+            "user.fields": (
+                "username,description,location,created_at,public_metrics,verified,verified_type"
+            ),
         }
         try:
             async with session.get(
@@ -224,7 +269,12 @@ class XRecentSearchClient:
             self.last_status_code = None
             self.last_error = f"request failed: {str(exc)[:120]}"
             return XSocialSnapshot(available=False, query=query, error=self.last_error)
-        snapshot = parse_x_snapshot(body, query=query, contract=mint)
+        snapshot = parse_x_snapshot(
+            body,
+            query=query,
+            contract=mint,
+            trusted_crypto_accounts=self.trusted_crypto_accounts,
+        )
         self.last_status_code = 200
         self.last_error = None
         self.last_success_at = int(time.time())
@@ -242,7 +292,7 @@ class XRecentSearchClient:
                 available=False,
                 error="X_API_BEARER_TOKEN not configured",
             )
-        query = f'"{cleaned[:80]}" -is:retweet'
+        query = build_x_narrative_query(cleaned)
         cached = self._cache.get(query)
         now = time.monotonic()
         if cached and now - cached[0] <= self.cache_seconds:
@@ -254,7 +304,9 @@ class XRecentSearchClient:
             "max_results": str(self.max_results),
             "tweet.fields": "author_id,created_at,public_metrics,text",
             "expansions": "author_id",
-            "user.fields": "created_at,public_metrics,verified,verified_type",
+            "user.fields": (
+                "username,description,location,created_at,public_metrics,verified,verified_type"
+            ),
         }
         try:
             async with session.get(
@@ -277,7 +329,11 @@ class XRecentSearchClient:
             self.last_error = f"request failed: {str(exc)[:120]}"
             return XSocialSnapshot(available=False, query=query, error=self.last_error)
 
-        snapshot = parse_x_snapshot(body, query=query)
+        snapshot = parse_x_snapshot(
+            body,
+            query=query,
+            trusted_crypto_accounts=self.trusted_crypto_accounts,
+        )
         self.last_status_code = 200
         self.last_error = None
         self.last_success_at = int(time.time())
@@ -301,6 +357,17 @@ def build_x_query(mint: str, *, symbol: str | None = None, name: str | None = No
     }:
         terms.append(f'"{cleaned_name}"')
     return f"({' OR '.join(dict.fromkeys(terms))}) -is:retweet"
+
+
+def build_x_narrative_query(narrative: str) -> str:
+    """Search one idea only where X users also use explicit crypto/coin language."""
+
+    cleaned = re.sub(r"[\"\\]", "", narrative).strip()[:80]
+    return (
+        f'"{cleaned}" (crypto OR memecoin OR "meme coin" OR solana OR pumpfun OR '
+        '"pump.fun" OR token OR ticker OR "contract address" OR "CA:") '
+        "-is:retweet lang:en"
+    )
 
 
 class SolanaTrackerTokenRiskClient:
@@ -382,6 +449,7 @@ def parse_x_snapshot(
     *,
     query: str = "",
     contract: str = "",
+    trusted_crypto_accounts: frozenset[str] | None = None,
 ) -> XSocialSnapshot:
     if not isinstance(payload, dict):
         return XSocialSnapshot(available=False, query=query, error="invalid X response")
@@ -389,14 +457,19 @@ def parse_x_snapshot(
     users = (payload.get("includes") or {}).get("users") or []
     if not isinstance(posts, list) or not isinstance(users, list):
         return XSocialSnapshot(available=False, query=query, error="invalid X response")
+    trusted_crypto_accounts = trusted_crypto_accounts or frozenset()
     by_id = {str(item.get("id")): item for item in users if isinstance(item, dict)}
     author_ids: set[str] = set()
     established: set[str] = set()
     influential: set[str] = set()
     suspicious: set[str] = set()
+    crypto_authors: set[str] = set()
+    credible_crypto_authors: set[str] = set()
     engagements = 0
     normalized_texts: list[str] = []
     contract_posts = 0
+    coin_intent_posts = 0
+    promoter_posts = 0
     timestamps: list[datetime] = []
     now = datetime.now(UTC)
     for post in posts:
@@ -405,13 +478,16 @@ def parse_x_snapshot(
         author_id = str(post.get("author_id") or "")
         if author_id:
             author_ids.add(author_id)
+        raw_text = str(post.get("text") or "")
+        lowered_text = raw_text.casefold()
         metrics = post.get("public_metrics") or {}
         engagements += sum(
             _integer(metrics.get(key))
             for key in ("like_count", "retweet_count", "reply_count", "quote_count")
         )
-        normalized = normalize_post_text(str(post.get("text") or ""))
-        if contract and contract.lower() in str(post.get("text") or "").lower():
+        normalized = normalize_post_text(raw_text)
+        has_contract = bool(contract and contract.casefold() in lowered_text)
+        if has_contract:
             contract_posts += 1
         if normalized:
             normalized_texts.append(normalized)
@@ -419,11 +495,34 @@ def parse_x_snapshot(
         if created:
             timestamps.append(created)
         user = by_id.get(author_id) or {}
+        username = str(user.get("username") or "").casefold().lstrip("@")
+        profile_text = (
+            f"{user.get('description') or ''} {user.get('location') or ''}"
+        ).casefold()
         user_metrics = user.get("public_metrics") or {}
         followers = _integer(user_metrics.get("followers_count"))
         following = _integer(user_metrics.get("following_count"))
         account_created = _parse_time(user.get("created_at"))
         age_days = (now - account_created).days if account_created else 0
+        profile_is_crypto = username in trusted_crypto_accounts or any(
+            _phrase_present(profile_text, term) for term in CRYPTO_PROFILE_TERMS
+        )
+        post_has_crypto_language = any(
+            _phrase_present(lowered_text, term) for term in CRYPTO_PROFILE_TERMS
+        )
+        has_coin_intent = (
+            has_contract
+            or bool(CASHTAG_RE.search(raw_text))
+            or any(_phrase_present(lowered_text, phrase) for phrase in COIN_PROMOTION_PHRASES)
+        )
+        if has_coin_intent:
+            coin_intent_posts += 1
+        if author_id and (profile_is_crypto or (post_has_crypto_language and has_coin_intent)):
+            crypto_authors.add(author_id)
+            if has_coin_intent:
+                promoter_posts += 1
+            if age_days >= 90 and followers >= 500:
+                credible_crypto_authors.add(author_id)
         if author_id and age_days >= 90 and followers >= 100:
             established.add(author_id)
         if author_id and (followers >= 5_000 or bool(user.get("verified"))):
@@ -455,6 +554,10 @@ def parse_x_snapshot(
         established_authors=len(established),
         influential_authors=len(influential),
         suspicious_authors=len(suspicious),
+        crypto_authors=len(crypto_authors),
+        credible_crypto_authors=len(credible_crypto_authors),
+        coin_intent_posts=coin_intent_posts,
+        promoter_posts=promoter_posts,
         engagements=engagements,
         duplicate_percent=duplicate_percent.quantize(Decimal("0.01")),
         posts_per_minute=velocity.quantize(Decimal("0.01")),
@@ -674,9 +777,10 @@ def score_callout(
         warnings.append("DEX pair activity is unavailable")
 
     if social.available:
-        social_points = Decimal(min(8, social.unique_authors // 2))
-        social_points += Decimal(min(5, social.established_authors))
-        social_points += Decimal(min(4, social.influential_authors * 2))
+        social_points = Decimal(min(6, social.crypto_authors * 2))
+        social_points += Decimal(min(6, social.credible_crypto_authors * 3))
+        social_points += Decimal(min(5, social.promoter_posts))
+        social_points += Decimal(min(4, social.contract_posts * 2))
         if social.posts_per_minute >= Decimal("1"):
             social_points += 4
         elif social.posts_per_minute >= Decimal("0.25"):
@@ -691,8 +795,10 @@ def score_callout(
                 "X activity matched the verified name/ticker but not the contract address"
             )
         score += social_points
-        if social.unique_authors >= 10:
-            positives.append(f"{social.unique_authors} unique X authors mention the contract")
+        if social.contract_posts >= 3 and social.crypto_authors >= 3:
+            positives.append(
+                f"{social.crypto_authors} crypto-native X authors are promoting the contract"
+            )
         if social.duplicate_percent >= 50:
             score -= 8
             warnings.append(
@@ -709,6 +815,15 @@ def score_callout(
         verdict = "BLOCKED"
     elif score >= 70 and smart_count >= 2 and social.available and social.unique_authors >= 8:
         verdict = "STRONG WATCH"
+    elif (
+        score >= 60
+        and dex.available
+        and social.contract_posts >= 3
+        and social.crypto_authors >= 3
+        and social.credible_crypto_authors >= 2
+        and social.promoter_posts >= 3
+    ):
+        verdict = "TRENDING COIN — VERIFY ENTRY"
     elif score >= 55 and smart_count >= 1:
         verdict = "WATCH"
     elif score >= 40:

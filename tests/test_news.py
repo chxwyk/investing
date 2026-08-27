@@ -65,6 +65,26 @@ def test_named_breaking_event_is_coin_actionable_before_contract_exists() -> Non
     assert is_coin_actionable_news(alert) is True
 
 
+def test_routine_sports_and_foreign_business_items_are_not_actionable() -> None:
+    sports = NewsAlert(
+        source="ESPN",
+        headline="Predictions for every major NBA award",
+        summary="Analysts publish their preseason picks.",
+        url="https://espn.com/nba/predictions",
+        narrative_terms=("NBA", "Predictions"),
+    )
+    business = NewsAlert(
+        source="Reuters",
+        headline="Advisers launch Venezuela commercial creditor committee",
+        summary="The committee will organize claims.",
+        url="https://reuters.com/world/venezuela-creditors",
+        narrative_terms=("Venezuela", "Advisers"),
+    )
+
+    assert is_coin_actionable_news(sports) is False
+    assert is_coin_actionable_news(business) is False
+
+
 def test_x_stream_payload_becomes_fast_news_alert() -> None:
     now = datetime.now(UTC).isoformat()
     alert = parse_x_news_payload(

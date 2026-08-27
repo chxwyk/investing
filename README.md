@@ -7,15 +7,18 @@ transactions, and mirrors every newly detected hot-wallet swap in PAPER mode. PA
 as either a forced source-price observation ledger or an executable Jupiter quote-shadow
 trial; the two answer different questions and are labeled separately.
 
-Version 2.22 replaces the crypto-news gate with a cultural launch-opportunity score. Politics,
-sports, celebrities, brands/products, internet culture, gaming/technology, world events, and
-crypto are evaluated by the same 100-point model: source credibility (15), speed (15), viral
-meme clarity (25), wider X activity (15), independent confirmation (10), existing-coin
-competition (10), and coin-name/ticker clarity (10). Results are labeled `LAUNCH READY`,
-`WATCH`, `COIN FOUND`, or suppressed as `SKIP`; a non-crypto event is never rejected merely
-for being non-crypto.
+Version 2.23 makes the launch radar crypto-first. Existing coins need repeated exact-contract
+promotion from credible crypto-native X accounts. New crypto narratives need active promotion
+from several established crypto accounts before `LAUNCH READY`. Non-crypto news can enter only
+through a major U.S. breakout lane that requires an exceptional event, two additional news
+confirmations, fast broad X activity, and visible crypto-community pickup. Routine sports,
+entertainment, product, and foreign-business headlines are suppressed rather than converted
+into launch ideas. The 100-point score remains, but the crypto-demand gate is mandatory.
 
-For `LAUNCH READY` alerts, v2.22 can expose one admin-only Discord button that uploads a
+Version 2.23 also splits long `/smartmoney status` and `/smartmoney sources` responses beneath
+Discord's 2,000-character limit and caps the live RPC health check at eight seconds.
+
+For `LAUNCH READY` alerts, v2.23 can expose one admin-only Discord button that uploads a
 generated community-meme image and metadata to public IPFS, asks Pump.fun's official build API
 for a create + initial-buy transaction, signs with a separate low-balance launch wallet, and
 submits it through the configured Solana RPC. There is no second confirmation modal. The path
@@ -244,7 +247,7 @@ when no prior public BUY exists
 inside the scanned history, no current baseline price is available, or the PAPER account lacks
 cash. Set `PAPER_MIRROR_RAW_SWAPS=false` to restore consensus-only paper behavior.
 
-The v2.22.0 discovery, cultural launch-radar, callout, selective-entry, daily loss/profit
+The v2.23.0 discovery, crypto-first launch-radar, callout, selective-entry, daily loss/profit
 locks, social nomination, quote, fallback, rotation, and exit controls are
 intentionally configurable:
 
@@ -297,6 +300,7 @@ REALTIME_WALLET_STREAM_ENABLED=true
 REALTIME_STREAM_COMMITMENT=processed
 NEWS_RADAR_ENABLED=true
 X_NEWS_STREAM_ENABLED=true
+X_CRYPTO_TRUSTED_ACCOUNTS=WatcherGuru|CoinDesk|Cointelegraph|solana|pumpdotfun|lookonchain|ArkhamIntel
 NEWS_POLL_SECONDS=30
 NEWS_MIN_SCORE=45
 NEWS_LAUNCH_READY_SCORE=72
@@ -313,24 +317,28 @@ These values are hypotheses to validate in PAPER mode, not optimized or guarante
 settings. Use `/smartmoney paper`, `/smartmoney positions`, `/smartmoney paper-trades`, and
 `/smartmoney readiness` to evaluate them before changing size.
 
-## Cultural news and launch radar
+## Crypto-first news and launch radar
 
 The radar has two independent inputs. X uses the official filtered-stream endpoint, so a
-matching public post arrives without polling. RSS/Atom polls selected official government,
-world, sports, entertainment, technology, market, and crypto feeds every 30 seconds. Each item
-is deduplicated, time-decayed, source-scored, and checked for a Solana mint. The topic does not
-need to be crypto-related. The score instead asks whether the event is credible, fresh,
-recognizable, socially active, independently confirmed, not already crowded by competing
-coins, and easy to express as a short coin identity.
+matching public post arrives without polling. Its default rule follows established crypto
+sources, exact contract/launch language, and a small set of major U.S. breaking-news accounts.
+RSS/Atom polls selected U.S. government, market, and crypto feeds every 30 seconds. Routine
+world, sports, entertainment, and product feeds are not included by default.
 
-Scores from 45 through 71 are `WATCH`. A score of 72 or more can be `LAUNCH READY`, but only if
-the source, speed, viral clarity, identity, and competition sub-gates also pass and the story is
-not framed as an unconfirmed rumor. If a source already includes a contract, the result is
-`COIN FOUND` and duplicate creation is blocked. If no mint exists yet, DEX Screener is checked
-immediately and again after 30, 90, and 180 seconds; a new matching pair still receives the
-normal token-risk report.
+Every X evidence response separates generic authors from crypto-native authors, credible
+crypto authors, promotion posts, and exact-contract posts. A generic keyword match cannot
+unlock a launch. `X_CRYPTO_TRUSTED_ACCOUNTS` is an auditable pipe-separated allowlist used only
+as author-quality evidence; an allowlisted account still cannot bypass duplicate, velocity,
+competition, source, or confirmation checks.
 
-The default X rule follows a deliberately small set of high-signal official/news accounts to
+Scores from 45 through 71 are `WATCH`. A score of 72 or more can be `LAUNCH READY` only if the
+normal source, speed, viral clarity, identity, and competition sub-gates pass **and** either the
+crypto-trend promotion gate or major-U.S.-breakout gate passes. If a source contains a contract,
+`COIN FOUND` requires repeated exact-contract promotion by credible crypto accounts; weaker
+single-post contracts go through the normal risk callout without becoming a high-confidence
+news alert. Existing contracts can never launch a duplicate.
+
+The default X rule follows a deliberately small set of crypto and major U.S. news accounts to
 limit paid X reads. Customize `X_NEWS_STREAM_RULE` using valid X filtered-stream syntax instead
 of broad keywords that can consume credits quickly. `X_SEARCH_MAX_RESULTS=10` similarly caps
 each on-demand coin-evidence search. `/smartmoney sources` and `/smartmoney status` show the

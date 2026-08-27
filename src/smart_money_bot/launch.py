@@ -214,6 +214,75 @@ KNOWN_NEWS_DOMAINS = {
     "whitehouse.gov",
 }
 
+CRYPTO_NATIVE_TERMS = {
+    "bitcoin",
+    "blockchain",
+    "crypto",
+    "ethereum",
+    "memecoin",
+    "meme coin",
+    "onchain",
+    "pump.fun",
+    "solana",
+    "token",
+    "wallet",
+}
+
+CRYPTO_SOURCE_ACCOUNTS = {
+    "@arkhamintel",
+    "@coindesk",
+    "@cointelegraph",
+    "@lookonchain",
+    "@pumpdotfun",
+    "@solana",
+    "@watcherguru",
+}
+
+US_SOURCE_ACCOUNTS = {
+    "@ap",
+    "@elonmusk",
+    "@realdonaldtrump",
+    "@whitehouse",
+}
+
+US_RELEVANCE_TERMS = {
+    "america",
+    "american",
+    "congress",
+    "federal",
+    "nasa",
+    "nba",
+    "nfl",
+    "president",
+    "sec",
+    "supreme court",
+    "trump",
+    "u.s.",
+    "united states",
+    "white house",
+}
+
+EXCEPTIONAL_EVENT_PHRASES = {
+    "arrested",
+    "assassination",
+    "attack",
+    "banned",
+    "ceasefire",
+    "championship",
+    "declares emergency",
+    "died",
+    "dies",
+    "emergency",
+    "explosion",
+    "indicted",
+    "resigned",
+    "resigns",
+    "shutdown",
+    "super bowl",
+    "supreme court",
+    "world series",
+}
+
 IDENTITY_STOP = {
     "agency",
     "breaking",
@@ -381,6 +450,50 @@ def score_launch_opportunity(
     if alert.token_mints:
         blockers.append("a Solana contract already appears in the source")
 
+    crypto_native = _is_crypto_native(alert, lowered)
+    us_relevant = _is_us_relevant(alert, lowered)
+    exceptional_event = _is_exceptional_event(lowered, category=category)
+    contract_promotion_ready = bool(alert.token_mints) and _crypto_attention_ready(
+        x_evidence,
+        require_contract=True,
+    )
+    narrative_crypto_ready = not alert.token_mints and _crypto_attention_ready(
+        x_evidence,
+        require_contract=False,
+    )
+    major_breakout_ready = (
+        exceptional_event
+        and us_relevant
+        and cross_source_count >= 2
+        and _major_breakout_ready(x_evidence)
+    )
+    crypto_attention_ready = contract_promotion_ready or narrative_crypto_ready
+    lane = (
+        "EXISTING COIN PROMOTION"
+        if alert.token_mints
+        else "CRYPTO TREND"
+        if crypto_native
+        else "MAJOR U.S. BREAKING"
+        if exceptional_event and us_relevant
+        else "GENERAL NEWS — NOT ELIGIBLE"
+    )
+
+    if alert.token_mints and not contract_promotion_ready:
+        warnings.append(
+            "exact contract is not yet being promoted by enough credible crypto accounts"
+        )
+    elif crypto_native and not narrative_crypto_ready:
+        warnings.append("not enough credible crypto accounts are actively pushing this narrative")
+    elif exceptional_event and us_relevant and not major_breakout_ready:
+        if cross_source_count < 2:
+            warnings.append("major-event lane needs two additional independent news confirmations")
+        warnings.append("major-event lane still lacks explosive crypto-community pickup")
+    elif not crypto_native:
+        warnings.append("routine or non-U.S. general news is not eligible for one-click launch")
+
+    if not x_evidence.available:
+        warnings.append("official X crypto-attention evidence is unavailable; launch stays locked")
+
     score = max(
         0,
         min(
@@ -396,7 +509,16 @@ def score_launch_opportunity(
     )
     if dry_hits and event_hits == 0 and not alert.token_mints:
         score = min(score, watch_score - 1)
-    if alert.token_mints and score >= watch_score:
+    if (
+        not alert.token_mints
+        and not crypto_native
+        and not (exceptional_event and us_relevant)
+    ):
+        score = min(score, watch_score - 1)
+    if alert.token_mints and not contract_promotion_ready:
+        score = min(score, watch_score - 1)
+
+    if alert.token_mints and contract_promotion_ready and score >= watch_score:
         verdict = "COIN FOUND"
     elif (
         score >= launch_ready_score
@@ -405,6 +527,10 @@ def score_launch_opportunity(
         and viral_score >= 13
         and identity_score >= 6
         and competition_score >= 4
+        and (
+            (crypto_native and narrative_crypto_ready)
+            or major_breakout_ready
+        )
         and not blockers
     ):
         verdict = "LAUNCH READY"
@@ -413,7 +539,13 @@ def score_launch_opportunity(
     else:
         verdict = "SKIP"
 
-    confidence = "HIGH" if score >= 80 else "MEDIUM" if score >= 55 else "LOW"
+    confidence = (
+        "HIGH"
+        if verdict in {"LAUNCH READY", "COIN FOUND"} and score >= 80
+        else "MEDIUM"
+        if score >= 55
+        else "LOW"
+    )
     return LaunchOpportunity(
         alert=replace(alert, score=score, urgency=confidence),
         score=score,
@@ -430,6 +562,10 @@ def score_launch_opportunity(
         confirmation_score=confirmation_score,
         competition_score=competition_score,
         identity_score=identity_score,
+        lane=lane,
+        crypto_attention_ready=crypto_attention_ready or major_breakout_ready,
+        exceptional_event=exceptional_event,
+        us_relevant=us_relevant,
         cross_source_count=cross_source_count,
         competition=competition,
         x_evidence=x_evidence,
@@ -486,29 +622,112 @@ def _speed_score(age_seconds: int | None) -> int:
 
 def _x_score(alert: NewsAlert, snapshot: XSocialSnapshot) -> int:
     score = 0
-    if alert.source == "X filtered stream":
+    text = f"{alert.headline} {alert.summary}".casefold()
+    if alert.source == "X filtered stream" and _is_crypto_native(alert, text):
         score += 2
-        if alert.author_verified:
-            score += 2
-        if alert.author_followers >= 100_000:
-            score += 2
     if snapshot.available:
-        score += min(4, snapshot.unique_authors // 2)
-        score += min(3, snapshot.established_authors)
-        score += min(2, snapshot.influential_authors)
-        if snapshot.posts_per_minute >= Decimal("1"):
-            score += 2
-        elif snapshot.posts_per_minute >= Decimal("0.25"):
+        score += min(3, snapshot.crypto_authors)
+        score += min(3, snapshot.credible_crypto_authors)
+        score += min(3, snapshot.promoter_posts)
+        score += min(2, snapshot.contract_posts)
+        if snapshot.unique_authors >= 5:
             score += 1
-        if snapshot.engagements >= 1_000:
-            score += 2
-        elif snapshot.engagements >= 100:
+        if snapshot.posts_per_minute >= Decimal("0.25"):
             score += 1
-        if snapshot.duplicate_percent >= Decimal("70"):
+        if snapshot.engagements >= 100:
+            score += 1
+        if snapshot.duplicate_percent >= Decimal("50"):
             score -= 3
-        if snapshot.suspicious_authors > snapshot.established_authors:
+        if snapshot.unique_authors and snapshot.suspicious_authors * 2 >= snapshot.unique_authors:
             score -= 2
     return max(0, min(15, score))
+
+
+def _is_crypto_native(alert: NewsAlert, lowered_text: str) -> bool:
+    return (
+        bool(alert.token_mints)
+        or alert.author.casefold() in CRYPTO_SOURCE_ACCOUNTS
+        or any(_keyword_present(lowered_text, term) for term in CRYPTO_NATIVE_TERMS)
+    )
+
+
+def _is_us_relevant(alert: NewsAlert, lowered_text: str) -> bool:
+    host = urlparse(alert.url).netloc.casefold().removeprefix("www.")
+    return (
+        alert.author.casefold() in US_SOURCE_ACCOUNTS
+        or host.endswith(".gov")
+        or host in {"espn.com", "whitehouse.gov"}
+        or any(_keyword_present(lowered_text, term) for term in US_RELEVANCE_TERMS)
+    )
+
+
+def _is_exceptional_event(lowered_text: str, *, category: str) -> bool:
+    if any(_keyword_present(lowered_text, phrase) for phrase in EXCEPTIONAL_EVENT_PHRASES):
+        return True
+    if category == "INTERNET / MEME" and "viral" in lowered_text:
+        return True
+    if (
+        _keyword_present(lowered_text, "breaking")
+        and any(
+            _keyword_present(lowered_text, subject)
+            for subject in {"trump", "white house", "president", "elon musk"}
+        )
+        and any(
+            _keyword_present(lowered_text, action)
+            for action in {"announce", "announces", "ban", "bans", "sign", "signs"}
+        )
+    ):
+        return True
+    return _keyword_present(lowered_text, "breaking") and sum(
+        _keyword_present(lowered_text, word)
+        for word in {"arrest", "ban", "collapse", "crash", "fires", "suspended"}
+    ) >= 1
+
+
+def _crypto_attention_ready(
+    snapshot: XSocialSnapshot,
+    *,
+    require_contract: bool,
+) -> bool:
+    if not snapshot.available or snapshot.duplicate_percent >= Decimal("50"):
+        return False
+    if snapshot.unique_authors and snapshot.suspicious_authors * 2 >= snapshot.unique_authors:
+        return False
+    if require_contract:
+        return (
+            snapshot.unique_authors >= 3
+            and snapshot.contract_posts >= 2
+            and snapshot.crypto_authors >= 2
+            and snapshot.credible_crypto_authors >= 1
+            and snapshot.promoter_posts >= 2
+        )
+    return (
+        snapshot.unique_authors >= 5
+        and snapshot.established_authors >= 2
+        and snapshot.crypto_authors >= 3
+        and snapshot.credible_crypto_authors >= 2
+        and snapshot.promoter_posts >= 2
+        and (
+            snapshot.posts_per_minute >= Decimal("0.25")
+            or snapshot.engagements >= 50
+        )
+    )
+
+
+def _major_breakout_ready(snapshot: XSocialSnapshot) -> bool:
+    return (
+        snapshot.available
+        and snapshot.unique_authors >= 8
+        and snapshot.established_authors >= 4
+        and snapshot.influential_authors >= 2
+        and snapshot.crypto_authors >= 3
+        and snapshot.credible_crypto_authors >= 2
+        and snapshot.promoter_posts >= 2
+        and snapshot.posts_per_minute >= Decimal("0.50")
+        and snapshot.engagements >= 100
+        and snapshot.duplicate_percent < Decimal("40")
+        and snapshot.suspicious_authors * 2 < snapshot.unique_authors
+    )
 
 
 def _competition_score(snapshot: NarrativeCompetition) -> int:

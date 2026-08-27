@@ -7,24 +7,32 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .constants import LIVE_ACK_TEXT, PUMP_LAUNCH_ACK_TEXT, USDC_MINT
 
+DEFAULT_X_CRYPTO_TRUSTED_ACCOUNTS = "|".join(
+    (
+        "WatcherGuru",
+        "CoinDesk",
+        "Cointelegraph",
+        "solana",
+        "pumpdotfun",
+        "lookonchain",
+        "ArkhamIntel",
+    )
+)
+
 DEFAULT_X_NEWS_RULE = (
-    "(from:realDonaldTrump OR from:elonmusk OR from:WhiteHouse OR from:AP OR "
-    "from:Reuters OR from:BBCBreaking OR from:SportsCenter OR from:espn OR "
-    "from:BleacherReport OR from:TMZ OR from:PopBase OR from:DiscussingFilm OR "
-    "from:IGN OR from:Dexerto OR from:Complex OR from:Rap OR from:NASA OR "
-    "from:Apple OR from:Tesla OR from:WatcherGuru OR from:CoinDesk OR "
-    "from:solana OR from:pumpdotfun) -is:retweet -is:reply"
+    "((from:WatcherGuru OR from:CoinDesk OR from:Cointelegraph OR from:solana OR "
+    "from:pumpdotfun OR from:lookonchain OR from:ArkhamIntel) OR "
+    "((from:realDonaldTrump OR from:elonmusk OR from:WhiteHouse OR from:AP OR "
+    "from:Reuters) (breaking OR emergency OR arrested OR resigns OR dies OR attack OR "
+    "shutdown OR \"supreme court\")) OR ((\"pump.fun\" OR \"contract address\" OR "
+    "\"CA:\") (solana OR memecoin OR token))) lang:en -is:retweet -is:reply"
 )
 
 DEFAULT_NEWS_RSS_FEEDS = "|".join(
     (
         "https://www.whitehouse.gov/briefings-statements/feed/",
         "https://www.sec.gov/news/pressreleases.rss",
-        "https://feeds.bbci.co.uk/news/world/rss.xml",
-        "https://feeds.bbci.co.uk/news/entertainment_and_arts/rss.xml",
-        "https://feeds.bbci.co.uk/news/technology/rss.xml",
-        "https://feeds.bbci.co.uk/sport/rss.xml",
-        "https://www.espn.com/espn/rss/news",
+        "https://www.federalreserve.gov/feeds/press_all.xml",
         "https://www.coindesk.com/arc/outboundfeeds/rss/",
         "https://cointelegraph.com/rss",
     )
@@ -81,6 +89,7 @@ class Settings:
     jupiter_api_key: str | None
     solana_tracker_api_key: str | None
     x_api_bearer_token: str | None
+    x_crypto_trusted_accounts: tuple[str, ...]
     database_path: str
 
     coin_callouts_enabled: bool
@@ -253,6 +262,9 @@ class Settings:
             jupiter_api_key=os.getenv("JUPITER_API_KEY", "").strip() or None,
             solana_tracker_api_key=os.getenv("SOLANA_TRACKER_API_KEY", "").strip() or None,
             x_api_bearer_token=os.getenv("X_API_BEARER_TOKEN", "").strip() or None,
+            x_crypto_trusted_accounts=_str_tuple(
+                "X_CRYPTO_TRUSTED_ACCOUNTS", DEFAULT_X_CRYPTO_TRUSTED_ACCOUNTS
+            ),
             database_path=os.getenv("DATABASE_PATH", "./data/smart_money.db").strip(),
             coin_callouts_enabled=_bool("COIN_CALLOUTS_ENABLED", True),
             coin_callout_window_seconds=_int("COIN_CALLOUT_WINDOW_SECONDS", 300),

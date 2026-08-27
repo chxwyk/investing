@@ -2,6 +2,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from smart_money_bot.callouts import (
+    build_x_narrative_query,
     build_x_query,
     parse_dex_snapshot,
     parse_tracker_risk,
@@ -101,6 +102,62 @@ def test_x_query_adds_verified_identity_without_dropping_contract() -> None:
     assert '"$PATS"' in query
     assert '"Patriots"' in query
     assert query.endswith("-is:retweet")
+
+
+def test_narrative_query_requires_explicit_crypto_language() -> None:
+    query = build_x_narrative_query("Project Kitchen")
+
+    assert '"Project Kitchen"' in query
+    assert "memecoin" in query
+    assert '"contract address"' in query
+    assert "lang:en" in query
+
+
+def test_x_parser_identifies_credible_crypto_promoters() -> None:
+    old = (datetime.now(UTC) - timedelta(days=365)).isoformat()
+    recent = (datetime.now(UTC) - timedelta(minutes=2)).isoformat()
+    payload = {
+        "data": [
+            {
+                "author_id": "1",
+                "created_at": recent,
+                "text": f"Just launched $KITCHEN on pump.fun CA: {MINT}",
+                "public_metrics": {"like_count": 100},
+            },
+            {
+                "author_id": "2",
+                "created_at": recent,
+                "text": f"Ape in carefully — contract address {MINT}",
+                "public_metrics": {"like_count": 50},
+            },
+        ],
+        "includes": {
+            "users": [
+                {
+                    "id": "1",
+                    "username": "knowncrypto",
+                    "description": "Solana memecoin trader",
+                    "created_at": old,
+                    "public_metrics": {"followers_count": 5_000, "following_count": 100},
+                },
+                {
+                    "id": "2",
+                    "username": "secondcrypto",
+                    "description": "Crypto and onchain research",
+                    "created_at": old,
+                    "public_metrics": {"followers_count": 1_000, "following_count": 100},
+                },
+            ]
+        },
+    }
+
+    item = parse_x_snapshot(payload, query=MINT, contract=MINT)
+
+    assert item.crypto_authors == 2
+    assert item.credible_crypto_authors == 2
+    assert item.coin_intent_posts == 2
+    assert item.promoter_posts == 2
+    assert item.contract_posts == 2
 
 
 def test_tracker_risk_parser_preserves_launch_manipulation_evidence() -> None:

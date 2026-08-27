@@ -72,6 +72,28 @@ def _raw_entry_gate_status(enabled: bool) -> str:
     return "enabled" if enabled else "DISABLED — set PAPER_RAW_ENTRY_FILTER_ENABLED=true"
 
 
+def _split_discord_text(text: str, *, limit: int = 1900) -> tuple[str, ...]:
+    """Split a long ephemeral response at line boundaries under Discord's hard limit."""
+
+    chunks: list[str] = []
+    current = ""
+    for line in text.splitlines(keepends=True):
+        while len(line) > limit:
+            if current:
+                chunks.append(current.rstrip())
+                current = ""
+            chunks.append(line[:limit])
+            line = line[limit:]
+        if len(current) + len(line) > limit:
+            chunks.append(current.rstrip())
+            current = line
+        else:
+            current += line
+    if current:
+        chunks.append(current.rstrip())
+    return tuple(chunks) or ("No status data was produced.",)
+
+
 FOMO_SOLANA_CHAIN_ID = "1399811149"
 PAPER_DEMO_ENTRY_PRICE = Decimal(PAPER_DEMO_ENTRY_PRICE_USD)
 
@@ -301,6 +323,7 @@ def _discovery_lines(candidates: tuple[DiscoveryCandidate, ...] | list[Discovery
 def _coin_callout_embed(callout: CoinCallout) -> discord.Embed:
     colors = {
         "STRONG WATCH": 0x00D084,
+        "TRENDING COIN — VERIFY ENTRY": 0x00D084,
         "WATCH": 0x2ECC71,
         "EARLY — NEEDS CONFIRMATION": 0xF1C40F,
         "BLOCKED": 0xE74C3C,
@@ -345,13 +368,14 @@ def _coin_callout_embed(callout: CoinCallout) -> discord.Embed:
     social = callout.social
     if social.available:
         embed.add_field(
-            name="X/Twitter evidence",
+            name="Crypto X promotion",
             value=(
                 f"Posts `{social.posts}` • contract `{social.contract_posts}` • "
-                f"identity `{social.identity_posts}`\n"
+                f"promotion `{social.promoter_posts}`\n"
                 f"Unique authors `{social.unique_authors}` • "
                 f"established `{social.established_authors}` • "
-                f"influential `{social.influential_authors}`\n"
+                f"crypto-native `{social.crypto_authors}` • credible crypto "
+                f"`{social.credible_crypto_authors}`\n"
                 f"Velocity `{social.posts_per_minute}/min` • engagements `{social.engagements}` • "
                 f"duplicate text `{social.duplicate_percent}%`"
             ),
@@ -427,18 +451,27 @@ def _news_alert_embed(
                 "A Solana contract is already in the source. Use the direct research/buy "
                 "links; this alert cannot launch a duplicate coin."
                 if alert.token_mints
-                else "No source contract was found. `LAUNCH READY` means the event passed "
-                "the cultural-opportunity threshold; `WATCH` means evidence is still short."
+                else "No source contract was found. `LAUNCH READY` means the idea passed "
+                "the crypto-attention gate; `WATCH` means demand evidence is still short."
             )
         ),
         color=colors.get(opportunity.verdict, 0x95A5A6),
         timestamp=datetime.fromtimestamp(alert.received_at or int(time.time()), tz=UTC),
     )
     embed.add_field(
-        name="Launch-opportunity score",
+        name="Crypto-attention opportunity",
         value=(
             f"**{opportunity.score}/100** • confidence **{opportunity.confidence}**{timing}\n"
             f"Proposed identity: **{opportunity.coin_name}** (`${opportunity.coin_symbol}`)"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Admission lane",
+        value=(
+            f"**{opportunity.lane}** • crypto-demand gate "
+            f"`{'passed' if opportunity.crypto_attention_ready else 'not passed'}` • "
+            f"U.S. relevance `{'yes' if opportunity.us_relevant else 'no'}`"
         ),
         inline=False,
     )
@@ -447,7 +480,7 @@ def _news_alert_embed(
         value=(
             f"Source `{opportunity.source_score}/15` • speed `{opportunity.speed_score}/15` • "
             f"meme potential `{opportunity.viral_score}/25`\n"
-            f"X traction `{opportunity.x_score}/15` • independent confirmation "
+            f"Crypto X traction `{opportunity.x_score}/15` • independent confirmation "
             f"`{opportunity.confirmation_score}/10` • open coin space "
             f"`{opportunity.competition_score}/10` • identity "
             f"`{opportunity.identity_score}/10`"
@@ -472,10 +505,13 @@ def _news_alert_embed(
     if opportunity.x_evidence.available:
         x = opportunity.x_evidence
         embed.add_field(
-            name="Wider X evidence",
+            name="Crypto X evidence",
             value=(
                 f"Posts `{x.posts}` • authors `{x.unique_authors}` • established "
                 f"`{x.established_authors}` • influential `{x.influential_authors}`\n"
+                f"Crypto-native authors `{x.crypto_authors}` • credible crypto authors "
+                f"`{x.credible_crypto_authors}` • promotion posts `{x.promoter_posts}` • "
+                f"exact-contract posts `{x.contract_posts}`\n"
                 f"Velocity `{x.posts_per_minute}/min` • engagements `{x.engagements}` • "
                 f"duplicate text `{x.duplicate_percent}%`"
             ),
@@ -537,7 +573,12 @@ def _pump_launch_result_embed(result: PumpLaunchResult) -> discord.Embed:
             value=f"[View on Solscan](https://solscan.io/tx/{result.signature})",
             inline=False,
         )
-    embed.set_footer(text="Dedicated launch wallet • duplicate lock • daily count/SOL limits")
+    embed.set_footer(
+        text=(
+            "Public Pump.fun coin after confirmation • anyone can use the Open coin link • "
+            "dedicated wallet/daily limits"
+        )
+    )
     return embed
 
 
@@ -1612,6 +1653,7 @@ class SmartMoneyCommands(
         name="sources", description="Show which platform data sources are actually connected."
     )
     async def sources(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(thinking=True, ephemeral=True)
         status = await self.bot.engine.status()
         stream_status = (
             f"connected ({status['stream_subscriptions']} subscriptions)"
@@ -1659,11 +1701,11 @@ class SmartMoneyCommands(
             "**DEX Screener coin intelligence:** enabled for live pair liquidity, flow, "
             "volume, profiles, and paid-boost labeling\n"
             f"**X/Twitter coin intelligence:** {x_status}"
-            " • contract + DEX-listed name/ticker • author-quality and duplicate-text checks\n"
+            " • exact-contract promotion • crypto-author quality • duplicate-text checks\n"
             f"**X near-realtime news stream:** {news_stream_status} • configured account/news "
-            "rule • cross-category cultural-event scoring • narrative extraction\n"
+            "rule • crypto-first filtering • exceptional U.S. event lane\n"
             f"**RSS/news radar:** {'ready' if status['news_rss_ready'] else 'starting'} • "
-            "government, world, sports, entertainment, technology, market, and crypto\n"
+            "U.S. government/markets plus crypto sources; routine culture/sports removed\n"
             f"**One-click Pump.fun launch:** "
             f"{'unlocked' if status['pump_launch_unlocked'] else 'locked'} • "
             "admin-only • separate capped wallet • public IPFS metadata\n"
@@ -1679,7 +1721,8 @@ class SmartMoneyCommands(
             "private endpoint is authorized; Fomo candidates require an official feed or a "
             "public wallet identity before the same full verification can run."
         )
-        await interaction.response.send_message(text, ephemeral=True)
+        for chunk in _split_discord_text(text):
+            await interaction.followup.send(chunk, ephemeral=True)
 
     @app_commands.command(
         name="coin", description="Cross-check a Solana coin across smart money, DEX flow, and X."
@@ -2247,11 +2290,11 @@ class SmartMoneyCommands(
             f"X {x_callout_health} • "
             f"minimum alert score {s.coin_callout_min_alert_score}/100\n"
             f"**News radar:** {'enabled' if status['news_radar_enabled'] else 'disabled'} • "
-            "politics/sports/celebrity/products/internet/gaming/world/crypto • "
+            "crypto-first • exceptional U.S. events require broad crypto pickup • "
             f"X stream {x_news_health} • RSS {rss_health}\n"
-            f"**Cultural launch score:** WATCH {s.news_min_score}+ • LAUNCH READY "
-            f"{s.news_launch_ready_score}+ • source/speed/meme/X/confirmation/"
-            "competition/identity\n"
+            f"**Crypto-demand launch score:** WATCH {s.news_min_score}+ • LAUNCH READY "
+            f"{s.news_launch_ready_score}+ plus crypto-account promotion gate • "
+            "source/speed/meme/X/confirmation/competition/identity\n"
             f"**One-click Pump launch:** "
             f"{'unlocked' if status['pump_launch_unlocked'] else 'locked'} • "
             f"{s.pump_launch_initial_buy_sol} SOL initial buy • max "
@@ -2280,7 +2323,10 @@ class SmartMoneyCommands(
             f"**Last scan:** {last_scan}\n"
             f"**Last error:** {status['last_error'] or 'none'}"
         )
-        await interaction.followup.send(text, ephemeral=True)
+        chunks = _split_discord_text(text)
+        for index, chunk in enumerate(chunks, start=1):
+            prefix = f"**Status {index}/{len(chunks)}**\n" if len(chunks) > 1 else ""
+            await interaction.followup.send(f"{prefix}{chunk}", ephemeral=True)
 
     @app_commands.command(name="limits", description="Show the active strategy and risk limits.")
     async def limits(self, interaction: discord.Interaction) -> None:

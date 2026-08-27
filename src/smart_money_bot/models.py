@@ -153,6 +153,10 @@ class XSocialSnapshot:
     established_authors: int = 0
     influential_authors: int = 0
     suspicious_authors: int = 0
+    crypto_authors: int = 0
+    credible_crypto_authors: int = 0
+    coin_intent_posts: int = 0
+    promoter_posts: int = 0
     engagements: int = 0
     duplicate_percent: Decimal = Decimal("0")
     posts_per_minute: Decimal = Decimal("0")
@@ -223,6 +227,10 @@ class LaunchOpportunity:
     confirmation_score: int
     competition_score: int
     identity_score: int
+    lane: str
+    crypto_attention_ready: bool
+    exceptional_event: bool
+    us_relevant: bool
     cross_source_count: int
     competition: NarrativeCompetition
     x_evidence: XSocialSnapshot

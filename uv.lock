@@ -686,7 +686,7 @@ wheels = [
 
 [[package]]
 name = "smart-money-copy-bot"
-version = "2.22.0"
+version = "2.23.0"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },

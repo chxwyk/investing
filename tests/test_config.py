@@ -231,6 +231,7 @@ def test_news_radar_defaults_to_fast_but_cost_bounded_sources(monkeypatch) -> No
         "NEWS_RADAR_ENABLED",
         "X_NEWS_STREAM_ENABLED",
         "X_NEWS_STREAM_RULE",
+        "X_CRYPTO_TRUSTED_ACCOUNTS",
         "NEWS_RSS_FEEDS",
         "J7_AUTHORIZED_FEED_URL",
         "NEWS_POLL_SECONDS",
@@ -255,6 +256,9 @@ def test_news_radar_defaults_to_fast_but_cost_bounded_sources(monkeypatch) -> No
     assert settings.news_radar_enabled is True
     assert settings.x_news_stream_enabled is True
     assert "from:elonmusk" in settings.x_news_stream_rule
+    assert "from:WatcherGuru" in settings.x_news_stream_rule
+    assert "from:espn" not in settings.x_news_stream_rule
+    assert "WatcherGuru" in settings.x_crypto_trusted_accounts
     assert settings.news_rss_feeds
     assert settings.j7_authorized_feed_url is None
     assert settings.news_poll_seconds == 30

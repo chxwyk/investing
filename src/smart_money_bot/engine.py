@@ -156,6 +156,7 @@ class SmartMoneyEngine:
             settings.x_api_bearer_token,
             max_results=settings.x_search_max_results,
             cache_seconds=settings.news_x_trend_cache_seconds,
+            trusted_crypto_accounts=settings.x_crypto_trusted_accounts,
         )
         self.tracker_token_risk = SolanaTrackerTokenRiskClient(settings.solana_tracker_api_key)
         self.callout_analyzer = CoinCalloutAnalyzer(
@@ -941,11 +942,16 @@ class SmartMoneyEngine:
         ):
             return
 
-        x_task = (
-            self.x_social.narrative_snapshot(preliminary.primary_narrative)
-            if self.x_social.configured
-            else None
-        )
+        x_task = None
+        if self.x_social.configured:
+            if alert.token_mints:
+                x_task = self.x_social.snapshot(
+                    alert.token_mints[0],
+                    symbol=preliminary.coin_symbol,
+                    name=preliminary.coin_name,
+                )
+            else:
+                x_task = self.x_social.narrative_snapshot(preliminary.primary_narrative)
         competition_task = (
             self.news_matcher.competition(preliminary.primary_narrative)
             if self.settings.news_dex_match_enabled
@@ -974,14 +980,14 @@ class SmartMoneyEngine:
             launch_ready_score=self.settings.news_launch_ready_score,
         )
         self._remember_news_event(alert, now=now)
+        for mint in alert.token_mints:
+            self._queue_coin_callout(mint)
         if opportunity.verdict == "SKIP" or opportunity.score < self.settings.news_min_score:
             return
         if len(self._news_alert_times) >= self.settings.news_max_alerts_per_hour:
             return
         self._news_alert_times.append(now)
         await self.notifier.on_news_alert(opportunity.alert, opportunity)
-        for mint in alert.token_mints:
-            self._queue_coin_callout(mint)
         if (
             self.settings.news_dex_match_enabled
             and not alert.token_mints
@@ -2172,7 +2178,9 @@ class SmartMoneyEngine:
 
     async def status(self) -> dict[str, object]:
         try:
-            rpc_health = await self.rpc.health()
+            rpc_health = await asyncio.wait_for(self.rpc.health(), timeout=8)
+        except TimeoutError:
+            rpc_health = "timeout after 8s"
         except RpcError as exc:
             rpc_health = f"error: {exc}"
         daily_lock = await self.paper_daily_lock_status()

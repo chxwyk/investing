@@ -4,7 +4,7 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
-from smart_money_bot.bot import _news_lead_view, _token_view
+from smart_money_bot.bot import _news_lead_view, _split_discord_text, _token_view
 from smart_money_bot.models import NewsAlert
 
 
@@ -63,3 +63,14 @@ async def test_fomo_link_can_omit_referral() -> None:
     fomo_button = next(item for item in view.children if item.label == "Open in Fomo")
 
     assert "r=" not in fomo_button.url
+
+
+def test_long_status_is_split_below_discord_content_limit() -> None:
+    text = "\n".join(f"status line {index}: " + "x" * 90 for index in range(80))
+
+    chunks = _split_discord_text(text)
+
+    assert len(chunks) > 1
+    assert all(len(chunk) <= 1900 for chunk in chunks)
+    assert "status line 0" in chunks[0]
+    assert "status line 79" in chunks[-1]

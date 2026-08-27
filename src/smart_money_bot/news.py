@@ -163,8 +163,7 @@ COIN_INTENT_PHRASES = {
     "meme coin",
     "contract address",
     "ticker",
-    "launch",
-    "listing",
+    "pump.fun",
 }
 
 TECHNICAL_NEWS_PHRASES = {
@@ -182,6 +181,47 @@ VIRAL_SOURCE_ACCOUNTS = {
     "@whitehouse",
     "@pumpdotfun",
     "@solana",
+    "@watcherguru",
+    "@coindesk",
+    "@cointelegraph",
+    "@lookonchain",
+    "@arkhamintel",
+}
+
+CRYPTO_NEWS_TERMS = {
+    "bitcoin",
+    "blockchain",
+    "crypto",
+    "ethereum",
+    "memecoin",
+    "meme coin",
+    "onchain",
+    "pump.fun",
+    "solana",
+    "token",
+    "wallet",
+}
+
+MAJOR_EVENT_PHRASES = {
+    "arrested",
+    "assassination",
+    "attack",
+    "banned",
+    "ceasefire",
+    "collapse",
+    "declares emergency",
+    "died",
+    "dies",
+    "emergency",
+    "explosion",
+    "fired",
+    "indicted",
+    "resigned",
+    "resigns",
+    "shutdown",
+    "supreme court",
+    "suspended",
+    "war",
 }
 
 # Named narratives that routinely seed fast copycat tokens. This is intentionally
@@ -303,7 +343,7 @@ def score_news(
 
 
 def is_coin_actionable_news(alert: NewsAlert) -> bool:
-    """Broad prefilter for events that could plausibly become a meme narrative."""
+    """Cost-control gate for crypto-native or genuinely exceptional event leads."""
 
     if alert.token_mints:
         return True
@@ -311,17 +351,31 @@ def is_coin_actionable_news(alert: NewsAlert) -> bool:
         return False
 
     text = f"{alert.headline}\n{alert.summary}".casefold()
-    high_impact_hits = sum(1 for word in HIGH_IMPACT_WORDS if word in text)
-    has_coin_intent = any(phrase in text for phrase in COIN_INTENT_PHRASES)
-    has_social_identity = bool(TAG_RE.search(f"{alert.headline}\n{alert.summary}"))
-    viral_source = alert.author.casefold() in VIRAL_SOURCE_ACCOUNTS
-    technical_only = any(phrase in text for phrase in TECHNICAL_NEWS_PHRASES)
+    has_coin_intent = any(_phrase_present(text, phrase) for phrase in COIN_INTENT_PHRASES)
+    crypto_native = any(_phrase_present(text, term) for term in CRYPTO_NEWS_TERMS)
+    crypto_source = alert.author.casefold() in VIRAL_SOURCE_ACCOUNTS
+    major_event = any(_phrase_present(text, phrase) for phrase in MAJOR_EVENT_PHRASES)
+    major_event = major_event or (
+        _phrase_present(text, "breaking")
+        and any(
+            _phrase_present(text, subject)
+            for subject in {"trump", "white house", "president", "elon musk"}
+        )
+        and any(
+            _phrase_present(text, action)
+            for action in {"announce", "announces", "ban", "bans", "sign", "signs"}
+        )
+    )
+    technical_only = any(_phrase_present(text, phrase) for phrase in TECHNICAL_NEWS_PHRASES)
 
-    if technical_only and not has_coin_intent and high_impact_hits == 0:
+    if technical_only and not has_coin_intent:
         return False
-    if has_coin_intent or has_social_identity or high_impact_hits or viral_source:
-        return True
-    return bool(alert.narrative_terms) and (alert.score >= 30 or alert.author_verified)
+    return has_coin_intent or crypto_native or crypto_source or major_event
+
+
+def _phrase_present(text: str, phrase: str) -> bool:
+    escaped = re.escape(phrase.casefold())
+    return bool(re.search(rf"(?<![a-z0-9]){escaped}(?![a-z0-9])", text))
 
 
 def _parse_iso_time(value: Any) -> int:
@@ -392,7 +446,7 @@ def parse_x_news_payload(payload: Any) -> NewsAlert | None:
 
 class XFilteredNewsStream:
     BASE_URL = "https://api.x.com"
-    RULE_TAG = "smart-money-news-v220"
+    RULE_TAG = "smart-money-news-v230"
 
     def __init__(self, bearer_token: str | None, rule: str) -> None:
         self.bearer_token = bearer_token
@@ -415,7 +469,7 @@ class XFilteredNewsStream:
                 timeout=aiohttp.ClientTimeout(total=None, sock_connect=15, sock_read=90),
                 headers={
                     "Authorization": f"Bearer {self.bearer_token}",
-                    "User-Agent": "SmartMoneyCopyBot/2.22 news-radar",
+                    "User-Agent": "SmartMoneyCopyBot/2.23 news-radar",
                 },
             )
         return self._session
@@ -612,7 +666,7 @@ class RssNewsPoller:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=15),
-                headers={"User-Agent": "SmartMoneyCopyBot/2.22 news-radar"},
+                headers={"User-Agent": "SmartMoneyCopyBot/2.23 news-radar"},
             )
         return self._session
 
@@ -690,7 +744,7 @@ class DexNarrativeMatcher:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=12),
-                headers={"User-Agent": "SmartMoneyCopyBot/2.22 narrative-match"},
+                headers={"User-Agent": "SmartMoneyCopyBot/2.23 narrative-match"},
             )
         return self._session
 
