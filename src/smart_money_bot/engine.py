@@ -36,6 +36,7 @@ from .executor import ExecutionManager
 from .launch import (
     OneClickLaunchClient,
     alert_key,
+    is_manual_launch_opportunity,
     score_launch_opportunity,
     should_publish_news_opportunity,
 )
@@ -1094,15 +1095,25 @@ class SmartMoneyEngine:
             now=now,
             watch_score=self.settings.news_min_score,
             launch_ready_score=self.settings.news_launch_ready_score,
+            no_x_candidates_enabled=self.settings.no_x_launch_candidates_enabled,
+            no_x_launch_min_score=self.settings.no_x_launch_min_score,
+        )
+        preliminary_floor = (
+            self.settings.news_min_score
+            if self.settings.no_x_launch_candidates_enabled
+            else self.settings.news_x_verify_min_score
         )
         if (
-            preliminary.score < self.settings.news_x_verify_min_score
+            preliminary.score < preliminary_floor
             and not alert.token_mints
         ):
             return
 
         x_task = None
-        if self.x_social.search_enabled:
+        if (
+            self.x_social.search_enabled
+            and preliminary.score >= self.settings.news_x_verify_min_score
+        ):
             if alert.token_mints:
                 x_task = self.x_social.snapshot(
                     alert.token_mints[0],
@@ -1137,6 +1148,8 @@ class SmartMoneyEngine:
             now=now,
             watch_score=self.settings.news_min_score,
             launch_ready_score=self.settings.news_launch_ready_score,
+            no_x_candidates_enabled=self.settings.no_x_launch_candidates_enabled,
+            no_x_launch_min_score=self.settings.no_x_launch_min_score,
         )
         self._remember_news_event(alert, now=now)
         # Discord receives only something the user can actually launch. WATCH/SKIP
@@ -1188,6 +1201,16 @@ class SmartMoneyEngine:
     ) -> PumpLaunchResult:
         now = int(time.time())
         key = alert_key(opportunity.alert)
+        if not is_manual_launch_opportunity(opportunity):
+            return PumpLaunchResult(
+                success=False,
+                status="BLOCKED",
+                message="This alert did not pass a manual launch-candidate tier.",
+                alert_key=key,
+                name=opportunity.coin_name,
+                symbol=opportunity.coin_symbol,
+                created_at=now,
+            )
         if not self.pump_launcher.configured:
             return PumpLaunchResult(
                 success=False,
@@ -2447,6 +2470,10 @@ class SmartMoneyEngine:
             "trade_activity_alerts_enabled": self.settings.trade_activity_alerts_enabled,
             "news_radar_enabled": self.settings.news_radar_enabled,
             "news_source_image_enabled": self.settings.news_source_image_enabled,
+            "no_x_launch_candidates_enabled": (
+                self.settings.no_x_launch_candidates_enabled
+            ),
+            "no_x_launch_min_score": self.settings.no_x_launch_min_score,
             "x_news_stream_enabled": self.settings.x_news_stream_enabled,
             "x_news_stream_configured": self.x_news_stream.configured,
             "x_news_stream_connected": self.x_news_stream.connected,

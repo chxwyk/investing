@@ -19,6 +19,11 @@ from .config import Settings
 from .constants import BOT_VERSION, PAPER_DEMO_ENTRY_PRICE_USD, PAPER_DEMO_MINT
 from .engine import SmartMoneyEngine
 from .errors import DiscoveryError, JupiterError
+from .launch import (
+    NO_X_LAUNCH_VERDICT,
+    X_VERIFIED_LAUNCH_VERDICT,
+    is_manual_launch_opportunity,
+)
 from .models import (
     CoinCallout,
     DetectedSwap,
@@ -249,10 +254,12 @@ class NewsOpportunityView(discord.ui.View):
                     row=1,
                 )
             )
-        self.launch_button.disabled = (
-            opportunity.verdict != "LAUNCH READY" or not bot.engine.pump_launcher.configured
+        launchable = (
+            is_manual_launch_opportunity(opportunity)
+            and opportunity.score >= bot.settings.pump_launch_min_score
         )
-        if opportunity.verdict != "LAUNCH READY":
+        self.launch_button.disabled = not launchable or not bot.engine.pump_launcher.configured
+        if not launchable:
             self.launch_button.label = "Internal research only"
         elif not bot.engine.pump_launcher.configured:
             self.launch_button.label = "One-click launch locked"
@@ -303,6 +310,28 @@ class NewsOpportunityView(discord.ui.View):
             button.label = "Launched"
         else:
             button.label = f"Launch {result.status.lower()}"[:80]
+        if interaction.message:
+            with suppress(discord.HTTPException):
+                await interaction.message.edit(view=self)
+
+    @discord.ui.button(
+        label="Ignore",
+        style=discord.ButtonStyle.secondary,
+        row=2,
+        custom_id="smartmoney:ignore-news-coin:v1",
+    )
+    async def ignore_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        self.launch_button.disabled = True
+        button.disabled = True
+        button.label = "Ignored"
+        await interaction.response.send_message(
+            "Candidate ignored. No launch was submitted.",
+            ephemeral=True,
+        )
         if interaction.message:
             with suppress(discord.HTTPException):
                 await interaction.message.edit(view=self)
@@ -524,30 +553,43 @@ def _news_alert_embed(
 ) -> discord.Embed:
     colors = {
         "COIN FOUND": 0x3498DB,
-        "LAUNCH READY": 0xE74C3C,
+        X_VERIFIED_LAUNCH_VERDICT: 0xE74C3C,
+        NO_X_LAUNCH_VERDICT: 0xF39C12,
         "WATCH": 0xF1C40F,
         "SKIP": 0x95A5A6,
     }
     source = alert.author or alert.source
     delay = max(0, alert.received_at - alert.created_at) if alert.created_at else None
     timing = f" • received `{delay}s` after publication" if delay is not None else ""
+    if opportunity.verdict == NO_X_LAUNCH_VERDICT:
+        title = f"🔥 {NO_X_LAUNCH_VERDICT} • {opportunity.category} • {source}"
+    elif opportunity.verdict == X_VERIFIED_LAUNCH_VERDICT:
+        title = f"🚀 LAUNCH READY — X VERIFIED • {opportunity.category} • {source}"
+    else:
+        title = f"NEWS RADAR • {opportunity.verdict} • {opportunity.category} • {source}"
     embed = discord.Embed(
-        title=f"NEWS RADAR • {opportunity.verdict} • {opportunity.category} • {source}"[:256],
+        title=title[:256],
         description=(
             f"**{alert.headline[:700]}**\n\n"
             + (
                 "A Solana contract is already in the source. Use the direct research/buy "
                 "links; this alert cannot launch a duplicate coin."
                 if alert.token_mints
-                else "No source contract was found. This public alert passed the crypto-demand, "
-                "source, competition, and launch-identity gates."
+                else (
+                    "No source contract was found. This passed the stricter free-source, "
+                    "freshness, independent-confirmation, competition, and identity gates. "
+                    "**X/social velocity was not verified.**"
+                    if opportunity.verdict == NO_X_LAUNCH_VERDICT
+                    else "No source contract was found. This public alert passed the "
+                    "X-verified crypto-demand, source, competition, and launch-identity gates."
+                )
             )
         ),
         color=colors.get(opportunity.verdict, 0x95A5A6),
         timestamp=datetime.fromtimestamp(alert.received_at or int(time.time()), tz=UTC),
     )
     embed.add_field(
-        name="Crypto-attention opportunity",
+        name="Score",
         value=(
             f"**{opportunity.score}/100** • confidence **{opportunity.confidence}**{timing}\n"
             f"Proposed identity: **{opportunity.coin_name}** (`${opportunity.coin_symbol}`)"
@@ -557,8 +599,9 @@ def _news_alert_embed(
     embed.add_field(
         name="Admission lane",
         value=(
-            f"**{opportunity.lane}** • crypto-demand gate "
-            f"`{'passed' if opportunity.crypto_attention_ready else 'not passed'}` • "
+            f"**{opportunity.lane}** • free candidate gate "
+            f"`{'passed' if opportunity.no_x_candidate_ready else 'not used'}` • "
+            f"X-verified gate `{'passed' if opportunity.x_verified else 'not verified'}` • "
             f"U.S. relevance `{'yes' if opportunity.us_relevant else 'no'}`"
         ),
         inline=False,
@@ -568,7 +611,9 @@ def _news_alert_embed(
         value=(
             f"Source `{opportunity.source_score}/15` • speed `{opportunity.speed_score}/15` • "
             f"meme potential `{opportunity.viral_score}/25`\n"
-            f"Crypto X traction `{opportunity.x_score}/15` • independent confirmation "
+            f"X traction "
+            f"`{f'{opportunity.x_score}/15' if opportunity.x_verified else 'unverified'}` • "
+            "independent confirmation "
             f"`{opportunity.confirmation_score}/10` • open coin space "
             f"`{opportunity.competition_score}/10` • identity "
             f"`{opportunity.identity_score}/10`"
@@ -613,6 +658,12 @@ def _news_alert_embed(
                 value=" • ".join(f"`{item}`" for item in x.notable_accounts)[:1024],
                 inline=False,
             )
+    else:
+        embed.add_field(
+            name="X verification",
+            value="⚠️ **X/social velocity was not verified.**",
+            inline=False,
+        )
     if opportunity.positives:
         embed.add_field(
             name="Positive evidence",
@@ -648,7 +699,11 @@ def _news_alert_embed(
         text=(
             "COIN FOUND • direct links below • token-risk callout follows"
             if alert.token_mints
-            else "No coin yet • DEX matcher keeps checking • launch button is admin-only"
+            else (
+                "Manual J7 candidate • never auto-launches • launch button is admin-only"
+                if opportunity.verdict == NO_X_LAUNCH_VERDICT
+                else "No coin yet • DEX matcher keeps checking • launch button is admin-only"
+            )
         )
     )
     return embed
@@ -1443,7 +1498,8 @@ class SmartMoneyBot(commands.Bot):
         await self._send_alert(
             _news_alert_embed(alert, opportunity),
             token_mint=mint,
-            ping_user=opportunity.verdict in {"COIN FOUND", "LAUNCH READY"},
+            ping_user=opportunity.verdict
+            in {"COIN FOUND", X_VERIFIED_LAUNCH_VERDICT, NO_X_LAUNCH_VERDICT},
             view=None if mint else NewsOpportunityView(self, opportunity),
         )
 
@@ -1823,6 +1879,13 @@ class SmartMoneyCommands(
                 )
             )
         )
+        x_launch_lane_status = (
+            "disabled (zero-cost mode)"
+            if not status["x_paid_search_enabled"]
+            else "enabled"
+            if status["x_social_configured"]
+            else "credentials unavailable"
+        )
         scan_counts = status["coin_scan_counts"]
         assert isinstance(scan_counts, dict)
         recent_scans = self.bot.engine.recent_coin_scans()
@@ -1915,6 +1978,11 @@ class SmartMoneyCommands(
             "rule • crypto-first filtering • exceptional U.S. event lane\n"
             f"**RSS/news radar:** {'ready' if status['news_rss_ready'] else 'starting'} • "
             "U.S. government/markets plus crypto sources; routine culture/sports removed\n"
+            f"**Free launch candidates:** "
+            f"{'enabled' if status['no_x_launch_candidates_enabled'] else 'disabled'} • "
+            f"{status['no_x_launch_min_score']}+ • no X claim • manual launch only\n"
+            f"**X-verified launch lane:** "
+            f"{x_launch_lane_status}\n"
             f"**Launch artwork:** "
             f"{'source-led image' if status['news_source_image_enabled'] else 'fallback art'} "
             "• 1024x1024 • unofficial-meme label • IPFS upload\n"
@@ -2430,6 +2498,21 @@ class SmartMoneyCommands(
                 )
             )
         )
+        x_verified_lane_status = (
+            "disabled (zero-cost mode)"
+            if not status["x_paid_search_enabled"]
+            else "enabled"
+            if status["x_social_configured"]
+            else "unavailable (X credentials missing)"
+        )
+        j7_launch_status = (
+            "ready"
+            if status["pump_launch_unlocked"]
+            and status["launch_provider"] == "J7 Tracker"
+            else "not selected"
+            if status["pump_launch_unlocked"]
+            else "locked"
+        )
         x_radar_health = (
             "active"
             if status["x_paid_search_enabled"]
@@ -2546,14 +2629,19 @@ class SmartMoneyCommands(
             f"{status['fomo_radar_scans']} scans • latest public candidate batch "
             f"{len(status['fomo_radar_last_candidates'])}\n"
             f"**News radar:** {'enabled' if status['news_radar_enabled'] else 'disabled'} • "
-            "crypto-first • exceptional U.S. events require broad crypto pickup • "
+            "crypto-first • exceptional U.S. events require independent confirmation • "
             f"X stream {x_news_health} • RSS {rss_health}\n"
+            f"**Free launch candidates:** "
+            f"{'enabled' if status['no_x_launch_candidates_enabled'] else 'disabled'} • "
+            f"minimum {status['no_x_launch_min_score']}/100 • manual launch only\n"
+            f"**X verified launch lane:** {x_verified_lane_status}\n"
+            f"**J7 launch provider:** {j7_launch_status}\n"
             f"**Launch artwork:** "
             f"{'source-led' if status['news_source_image_enabled'] else 'fallback only'} • "
             "three ranked candidates • 1024x1024 IPFS PNG\n"
-            f"**Crypto-demand launch score:** public alerts are LAUNCH READY only • "
-            f"{s.news_launch_ready_score}+ plus authentic crypto-account promotion gate • "
-            "source/speed/meme/X/confirmation/competition/identity\n"
+            f"**Launch hierarchy:** WATCH • NO-X CANDIDATE {s.no_x_launch_min_score}+ • "
+            f"X VERIFIED READY {s.news_launch_ready_score}+ • "
+            "source/speed/meme/confirmation/competition/identity\n"
             f"**One-click launch:** "
             f"{'unlocked' if status['pump_launch_unlocked'] else 'locked'} • "
             f"provider {status['launch_provider']} • "

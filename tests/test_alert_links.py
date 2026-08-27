@@ -1,17 +1,23 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 
 import pytest
 
+import smart_money_bot.bot as bot_module
 from smart_money_bot.bot import (
+    NewsOpportunityView,
     SmartMoneyCommands,
+    _member_is_admin,
+    _news_alert_embed,
     _news_lead_view,
     _pump_launch_result_embed,
     _split_discord_text,
     _token_view,
 )
-from smart_money_bot.models import NewsAlert, PumpLaunchResult
+from smart_money_bot.launch import NO_X_LAUNCH_VERDICT, score_launch_opportunity
+from smart_money_bot.models import NarrativeCompetition, NewsAlert, PumpLaunchResult
 
 
 @pytest.mark.asyncio
@@ -92,6 +98,57 @@ def test_successful_launch_embed_contains_pump_and_fomo_routes() -> None:
     assert f"https://pump.fun/coin/{mint}" in fields["Pump.fun"]
     assert "https://fomo.family/coin?" in fields["Fomo"]
     assert mint in fields["Fomo"]
+
+
+@pytest.mark.asyncio
+async def test_no_x_candidate_exposes_manual_j7_button_and_warning() -> None:
+    now = 1_800_000_000
+    alert = NewsAlert(
+        source="CoinDesk",
+        headline=(
+            'BREAKING: Solana traders launch viral "Kitchen Moment" meme after record rally'
+        ),
+        summary="Crypto traders say the meme is spreading across Solana communities.",
+        url="https://coindesk.com/markets/kitchen-moment",
+        narrative_terms=("Kitchen Moment", "Solana"),
+        created_at=now - 20,
+        received_at=now,
+    )
+    opportunity = score_launch_opportunity(
+        alert,
+        competition=NarrativeCompetition(query="Kitchen Moment"),
+        cross_source_count=2,
+        now=now,
+        no_x_candidates_enabled=True,
+        no_x_launch_min_score=78,
+    )
+    fake_bot = SimpleNamespace(
+        settings=SimpleNamespace(pump_launch_min_score=72),
+        engine=SimpleNamespace(
+            pump_launcher=SimpleNamespace(configured=True, provider="J7 Tracker")
+        ),
+    )
+
+    view = NewsOpportunityView(fake_bot, opportunity)
+    buttons = {item.label: item for item in view.children}
+    embed = _news_alert_embed(alert, opportunity)
+
+    assert opportunity.verdict == NO_X_LAUNCH_VERDICT
+    assert buttons["Launch via J7 Tracker"].disabled is False
+    assert buttons["Ignore"].disabled is False
+    assert "NO X VERIFIED" in embed.title
+    assert "X/social velocity was not verified" in embed.description
+
+
+def test_unauthorized_discord_member_cannot_pass_launch_guard(monkeypatch) -> None:
+    class FakeMember:
+        guild_permissions = SimpleNamespace(administrator=False)
+        roles = [SimpleNamespace(id=999)]
+
+    monkeypatch.setattr(bot_module.discord, "Member", FakeMember)
+    settings = SimpleNamespace(discord_admin_role_ids=frozenset({123}))
+
+    assert _member_is_admin(FakeMember(), settings) is False
 
 
 def test_long_status_is_split_below_discord_content_limit() -> None:

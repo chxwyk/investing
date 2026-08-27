@@ -237,6 +237,8 @@ def test_news_radar_defaults_to_fast_but_cost_bounded_sources(monkeypatch) -> No
         "NEWS_POLL_SECONDS",
         "NEWS_MIN_SCORE",
         "NEWS_LAUNCH_READY_SCORE",
+        "NO_X_LAUNCH_CANDIDATES_ENABLED",
+        "NO_X_LAUNCH_MIN_SCORE",
         "NEWS_X_VERIFY_MIN_SCORE",
         "NEWS_X_TREND_CACHE_SECONDS",
         "NEWS_MAX_ALERTS_PER_HOUR",
@@ -285,6 +287,8 @@ def test_news_radar_defaults_to_fast_but_cost_bounded_sources(monkeypatch) -> No
     assert settings.news_poll_seconds == 30
     assert settings.news_min_score == 45
     assert settings.news_launch_ready_score == 72
+    assert settings.no_x_launch_candidates_enabled is True
+    assert settings.no_x_launch_min_score == 78
     assert settings.news_x_verify_min_score == 70
     assert settings.news_max_alerts_per_hour == 30
     assert settings.news_source_image_enabled is True

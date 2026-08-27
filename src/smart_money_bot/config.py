@@ -134,6 +134,8 @@ class Settings:
     news_poll_seconds: int
     news_min_score: int
     news_launch_ready_score: int
+    no_x_launch_candidates_enabled: bool
+    no_x_launch_min_score: int
     news_x_verify_min_score: int
     news_x_trend_cache_seconds: int
     news_max_alerts_per_hour: int
@@ -334,6 +336,10 @@ class Settings:
             news_poll_seconds=_int("NEWS_POLL_SECONDS", 30),
             news_min_score=_int("NEWS_MIN_SCORE", 45),
             news_launch_ready_score=_int("NEWS_LAUNCH_READY_SCORE", 72),
+            no_x_launch_candidates_enabled=_bool(
+                "NO_X_LAUNCH_CANDIDATES_ENABLED", True
+            ),
+            no_x_launch_min_score=_int("NO_X_LAUNCH_MIN_SCORE", 78),
             news_x_verify_min_score=_int("NEWS_X_VERIFY_MIN_SCORE", 70),
             news_x_trend_cache_seconds=_int("NEWS_X_TREND_CACHE_SECONDS", 3600),
             news_max_alerts_per_hour=_int("NEWS_MAX_ALERTS_PER_HOUR", 30),
@@ -594,6 +600,10 @@ class Settings:
         if not self.news_min_score <= self.news_launch_ready_score <= 100:
             raise ValueError(
                 "NEWS_LAUNCH_READY_SCORE must be between NEWS_MIN_SCORE and 100"
+            )
+        if not self.news_min_score <= self.no_x_launch_min_score <= 100:
+            raise ValueError(
+                "NO_X_LAUNCH_MIN_SCORE must be between NEWS_MIN_SCORE and 100"
             )
         if not 0 <= self.news_x_verify_min_score <= 100:
             raise ValueError("NEWS_X_VERIFY_MIN_SCORE must be between 0 and 100")

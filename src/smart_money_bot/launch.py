@@ -28,6 +28,12 @@ from .models import (
 )
 from .rpc import SolanaRPC
 
+NO_X_LAUNCH_VERDICT = "LAUNCH CANDIDATE — NO X VERIFIED"
+X_VERIFIED_LAUNCH_VERDICT = "LAUNCH READY"
+MANUAL_LAUNCH_VERDICTS = frozenset(
+    {NO_X_LAUNCH_VERDICT, X_VERIFIED_LAUNCH_VERDICT}
+)
+
 CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
     "POLITICS": (
         "president",
@@ -210,6 +216,8 @@ KNOWN_NEWS_DOMAINS = {
     "apnews.com",
     "bbc.com",
     "bbc.co.uk",
+    "coindesk.com",
+    "cointelegraph.com",
     "espn.com",
     "reuters.com",
     "sec.gov",
@@ -374,6 +382,8 @@ def score_launch_opportunity(
     now: int | None = None,
     watch_score: int = 45,
     launch_ready_score: int = 72,
+    no_x_candidates_enabled: bool = True,
+    no_x_launch_min_score: int = 78,
 ) -> LaunchOpportunity:
     now = now or int(time.time())
     x_evidence = x_evidence or XSocialSnapshot(available=False, error="not checked yet")
@@ -470,6 +480,14 @@ def score_launch_opportunity(
         and _major_breakout_ready(x_evidence)
     )
     crypto_attention_ready = contract_promotion_ready or narrative_crypto_ready
+    x_verified_ready = bool(
+        not alert.token_mints
+        and x_evidence.available
+        and (
+            (crypto_native and narrative_crypto_ready)
+            or major_breakout_ready
+        )
+    )
     lane = (
         "EXISTING COIN PROMOTION"
         if alert.token_mints
@@ -484,17 +502,14 @@ def score_launch_opportunity(
         warnings.append(
             "exact contract is not yet being promoted by enough credible crypto accounts"
         )
-    elif crypto_native and not narrative_crypto_ready:
+    elif crypto_native and x_evidence.available and not narrative_crypto_ready:
         warnings.append("not enough credible crypto accounts are actively pushing this narrative")
-    elif exceptional_event and us_relevant and not major_breakout_ready:
+    elif exceptional_event and us_relevant and x_evidence.available and not major_breakout_ready:
         if cross_source_count < 2:
             warnings.append("major-event lane needs two additional independent news confirmations")
         warnings.append("major-event lane still lacks explosive crypto-community pickup")
     elif not crypto_native:
         warnings.append("routine or non-U.S. general news is not eligible for one-click launch")
-
-    if not x_evidence.available:
-        warnings.append("official X crypto-attention evidence is unavailable; launch stays locked")
 
     score = max(
         0,
@@ -520,6 +535,37 @@ def score_launch_opportunity(
     if alert.token_mints and not contract_promotion_ready:
         score = min(score, watch_score - 1)
 
+    free_confirmation_ready = bool(
+        (crypto_native and cross_source_count >= 1)
+        or (
+            exceptional_event
+            and us_relevant
+            and cross_source_count >= 2
+        )
+    )
+    competition_clear = bool(
+        competition.error is None
+        and competition_score >= 8
+    )
+    no_x_candidate_ready = bool(
+        no_x_candidates_enabled
+        and not x_evidence.available
+        and not alert.token_mints
+        and score >= no_x_launch_min_score
+        and source_score >= 12
+        and speed_score >= 11
+        and viral_score >= 18
+        and identity_score >= 8
+        and competition_clear
+        and free_confirmation_ready
+        and not blockers
+    )
+
+    if not x_evidence.available:
+        warnings.append("X/social velocity was not verified.")
+        if not no_x_candidate_ready:
+            warnings.append("the stricter free launch-candidate gate did not pass")
+
     if alert.token_mints and contract_promotion_ready and score >= watch_score:
         verdict = "COIN FOUND"
     elif (
@@ -535,7 +581,9 @@ def score_launch_opportunity(
         )
         and not blockers
     ):
-        verdict = "LAUNCH READY"
+        verdict = X_VERIFIED_LAUNCH_VERDICT
+    elif no_x_candidate_ready:
+        verdict = NO_X_LAUNCH_VERDICT
     elif score >= watch_score:
         verdict = "WATCH"
     else:
@@ -543,7 +591,7 @@ def score_launch_opportunity(
 
     confidence = (
         "HIGH"
-        if verdict in {"LAUNCH READY", "COIN FOUND"} and score >= 80
+        if verdict in MANUAL_LAUNCH_VERDICTS | {"COIN FOUND"} and score >= 80
         else "MEDIUM"
         if score >= 55
         else "LOW"
@@ -566,6 +614,8 @@ def score_launch_opportunity(
         identity_score=identity_score,
         lane=lane,
         crypto_attention_ready=crypto_attention_ready or major_breakout_ready,
+        x_verified=x_verified_ready,
+        no_x_candidate_ready=no_x_candidate_ready,
         exceptional_event=exceptional_event,
         us_relevant=us_relevant,
         cross_source_count=cross_source_count,
@@ -773,11 +823,21 @@ def _identity_score(primary: str, name: str, symbol: str, alert: NewsAlert) -> i
 def should_publish_news_opportunity(opportunity: LaunchOpportunity) -> bool:
     """Public news alerts must be immediately actionable through the launch button."""
 
+    if opportunity.alert.token_mints or opportunity.blockers:
+        return False
+    if opportunity.verdict == X_VERIFIED_LAUNCH_VERDICT:
+        return opportunity.x_verified and opportunity.crypto_attention_ready
+    if opportunity.verdict == NO_X_LAUNCH_VERDICT:
+        return opportunity.no_x_candidate_ready and not opportunity.x_verified
+    return False
+
+
+def is_manual_launch_opportunity(opportunity: LaunchOpportunity) -> bool:
+    """Allow only explicit manual launch tiers; WATCH/SKIP/COIN FOUND stay blocked."""
+
     return bool(
-        not opportunity.alert.token_mints
-        and opportunity.verdict == "LAUNCH READY"
-        and opportunity.crypto_attention_ready
-        and not opportunity.blockers
+        opportunity.verdict in MANUAL_LAUNCH_VERDICTS
+        and should_publish_news_opportunity(opportunity)
     )
 
 
@@ -1024,8 +1084,8 @@ class PumpLaunchClient:
         key = alert_key(opportunity.alert)
         if not self.configured:
             raise PumpLaunchError("one-click Pump launch is locked or missing required secrets")
-        if opportunity.verdict != "LAUNCH READY":
-            raise PumpLaunchError("only a LAUNCH READY alert can use one-click launch")
+        if not is_manual_launch_opportunity(opportunity):
+            raise PumpLaunchError("only a manual launch candidate or X-verified alert can launch")
         if opportunity.score < self.settings.pump_launch_min_score:
             raise PumpLaunchError("opportunity score is below PUMP_LAUNCH_MIN_SCORE")
         if opportunity.alert.token_mints:
@@ -1242,8 +1302,8 @@ class J7LaunchClient(PumpLaunchClient):
         key = alert_key(opportunity.alert)
         if not self.configured:
             raise PumpLaunchError("J7 launch is locked or missing required credentials")
-        if opportunity.verdict != "LAUNCH READY":
-            raise PumpLaunchError("only a LAUNCH READY alert can use one-click launch")
+        if not is_manual_launch_opportunity(opportunity):
+            raise PumpLaunchError("only a manual launch candidate or X-verified alert can launch")
         if opportunity.score < self.settings.pump_launch_min_score:
             raise PumpLaunchError("opportunity score is below PUMP_LAUNCH_MIN_SCORE")
         if opportunity.alert.token_mints:

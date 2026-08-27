@@ -236,6 +236,8 @@ class LaunchOpportunity:
     identity_score: int
     lane: str
     crypto_attention_ready: bool
+    x_verified: bool
+    no_x_candidate_ready: bool
     exceptional_event: bool
     us_relevant: bool
     cross_source_count: int

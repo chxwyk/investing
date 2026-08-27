@@ -7,6 +7,16 @@ transactions, and mirrors every newly detected hot-wallet swap in PAPER mode. PA
 as either a forced source-price observation ledger or an executable Jupiter quote-shadow
 trial; the two answer different questions and are labeled separately.
 
+Version 2.30 adds a strict **free/no-X manual launch-candidate lane**. With paid X disabled,
+an authorized RSS/Atom story can now become `LAUNCH CANDIDATE — NO X VERIFIED` only at 78+
+with a credible publisher, fast detection, strong meme identity, completed low-competition
+check, no source contract or blocker, and independent-source confirmation. The card explicitly
+says X/social velocity was not verified and exposes the same admin-only J7 button, but never
+launches automatically. Paid X remains optional; when enabled, the existing stronger promotion
+and velocity rules can still produce `LAUNCH READY — X VERIFIED`. J7 remains the execution
+backend rather than a required trend-data source, and every existing SQLite reservation,
+duplicate guard, launch-count/SOL cap, artwork, IPFS, and administrator check remains active.
+
 Version 2.29 adds a **J7-style launch-image recommender** without scraping J7. Authorized
 RSS/Atom and optional X-stream alerts preserve up to three ranked lead images. The launch card
 previews the first recommendation; the launcher downloads the first usable public HTTPS image,
@@ -305,7 +315,7 @@ when no prior public BUY exists
 inside the scanned history, no current baseline price is available, or the PAPER account lacks
 cash. Set `PAPER_MIRROR_RAW_SWAPS=false` to restore consensus-only paper behavior.
 
-The v2.29.0 discovery, zero-cost Fomo radar, optional X verification, crypto-first launch-radar,
+The v2.30.0 discovery, zero-cost Fomo radar, optional X verification, crypto-first launch-radar,
 verified-only
 callout, selective-entry, daily loss/profit
 locks, social nomination, quote, fallback, rotation, and exit controls are
@@ -364,6 +374,8 @@ X_CRYPTO_TRUSTED_ACCOUNTS=WatcherGuru|CoinDesk|Cointelegraph|solana|pumpdotfun|l
 NEWS_POLL_SECONDS=30
 NEWS_MIN_SCORE=45
 NEWS_LAUNCH_READY_SCORE=72
+NO_X_LAUNCH_CANDIDATES_ENABLED=true
+NO_X_LAUNCH_MIN_SCORE=78
 NEWS_X_VERIFY_MIN_SCORE=70
 NEWS_X_TREND_CACHE_SECONDS=3600
 NEWS_MAX_ALERTS_PER_HOUR=30
@@ -408,9 +420,13 @@ unlock a launch. `X_CRYPTO_TRUSTED_ACCOUNTS` is an auditable pipe-separated allo
 as author-quality evidence; an allowlisted account still cannot bypass duplicate, velocity,
 competition, source, or confirmation checks.
 
-Scores from 45 through 71 are `WATCH`. A score of 72 or more can be `LAUNCH READY` only if the
-normal source, speed, viral clarity, identity, and competition sub-gates pass **and** either the
-crypto-trend promotion gate or major-U.S.-breakout gate passes. If a source contains a contract,
+Scores below the launch tiers remain internal `WATCH`/`SKIP` evidence. With X unavailable, a
+78+ score can become `LAUNCH CANDIDATE — NO X VERIFIED` only when the credible-source,
+freshness, meme-clarity, identity, independent-confirmation, and completed low-competition
+sub-gates all pass. Crypto-native stories need additional independent pickup; qualifying major
+U.S. stories need at least two additional independent confirmations. With paid X enabled, the
+existing 72+ path can become `LAUNCH READY — X VERIFIED` only if the crypto-account promotion
+and velocity gate also passes. If a source contains a contract,
 `COIN FOUND` requires repeated exact-contract promotion by credible crypto accounts; weaker
 single-post contracts go through the normal risk callout without becoming a high-confidence
 news alert. Existing contracts can never launch a duplicate.
@@ -454,8 +470,10 @@ The old direct Pump.fun signer remains available as a fallback by setting
 `PUMP_ONE_CLICK_LAUNCH_ENABLED=true` and `PUMP_LAUNCH_PRIVATE_KEY` to a separate capped launch
 wallet. If both paths are fully configured, J7 is preferred. Never use a recovery phrase.
 
-The launch button is shown only on `LAUNCH READY` alerts and only Discord administrators or
-configured `DISCORD_ADMIN_ROLE_IDS` can press it. One click creates and submits the transaction;
+The launch button is shown only on `LAUNCH CANDIDATE — NO X VERIFIED` or
+`LAUNCH READY — X VERIFIED` alerts and only Discord administrators or configured
+`DISCORD_ADMIN_ROLE_IDS` can press it. No alert ever launches automatically. One click creates
+and submits the transaction;
 there is no per-launch confirmation dialog. SQLite reserves the source alert before any upload
 or signature so double clicks and restarts cannot produce a second coin from the same alert.
 Metadata labels the asset as a community meme and explicitly says it is not official or

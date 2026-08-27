@@ -8,7 +8,10 @@ from PIL import Image
 
 from smart_money_bot.launch import (
     J7_REGION_BASES,
+    NO_X_LAUNCH_VERDICT,
+    X_VERIFIED_LAUNCH_VERDICT,
     build_j7_launch_payload,
+    is_manual_launch_opportunity,
     is_safe_launch_image_url,
     render_opportunity_image,
     score_launch_opportunity,
@@ -37,6 +40,102 @@ def _strong_x() -> XSocialSnapshot:
         duplicate_percent=Decimal("10"),
         query='"Sprite Chill" -is:retweet',
     )
+
+
+def _strong_free_story(now: int) -> NewsAlert:
+    return NewsAlert(
+        source="CoinDesk",
+        headline=(
+            'BREAKING: Solana traders launch viral "Kitchen Moment" meme after record rally'
+        ),
+        summary=(
+            "Crypto traders say the Kitchen Moment is spreading across Solana communities."
+        ),
+        url="https://coindesk.com/markets/kitchen-moment",
+        narrative_terms=("Kitchen Moment", "Solana"),
+        created_at=now - 20,
+        received_at=now,
+    )
+
+
+def test_x_disabled_weak_story_is_not_a_launch_candidate() -> None:
+    now = 1_800_000_000
+    alert = NewsAlert(
+        source="CoinDesk",
+        headline="Solana market commentary mentions a possible kitchen theme",
+        summary="Analysts discussed the market during a routine update.",
+        url="https://coindesk.com/markets/commentary",
+        narrative_terms=("Kitchen",),
+        created_at=now - 600,
+        received_at=now,
+    )
+
+    result = score_launch_opportunity(
+        alert,
+        competition=NarrativeCompetition(query="Kitchen"),
+        cross_source_count=0,
+        now=now,
+        no_x_candidates_enabled=True,
+        no_x_launch_min_score=78,
+    )
+
+    assert result.verdict != NO_X_LAUNCH_VERDICT
+    assert result.no_x_candidate_ready is False
+    assert should_publish_news_opportunity(result) is False
+
+
+def test_x_disabled_strong_multi_source_story_becomes_no_x_candidate() -> None:
+    now = 1_800_000_000
+
+    result = score_launch_opportunity(
+        _strong_free_story(now),
+        competition=NarrativeCompetition(query="Kitchen Moment"),
+        cross_source_count=2,
+        now=now,
+        no_x_candidates_enabled=True,
+        no_x_launch_min_score=78,
+    )
+
+    assert result.score >= 78
+    assert result.verdict == NO_X_LAUNCH_VERDICT
+    assert result.no_x_candidate_ready is True
+    assert result.x_verified is False
+    assert result.x_evidence.available is False
+    assert "X/social velocity was not verified." in result.warnings
+    assert should_publish_news_opportunity(result) is True
+    assert is_manual_launch_opportunity(result) is True
+
+
+def test_no_x_general_news_requires_two_additional_confirmations() -> None:
+    now = 1_800_000_000
+    alert = NewsAlert(
+        source="Reuters",
+        headline=(
+            'BREAKING: President signs unexpected "Kitchen Act" after viral campaign'
+        ),
+        summary="The surprise announcement is spreading rapidly across U.S. markets.",
+        url="https://reuters.com/world/us/kitchen-act",
+        narrative_terms=("Kitchen Act", "President"),
+        created_at=now - 20,
+        received_at=now,
+    )
+
+    one_confirmation = score_launch_opportunity(
+        alert,
+        competition=NarrativeCompetition(query="Kitchen Act"),
+        cross_source_count=1,
+        now=now,
+    )
+    two_confirmations = score_launch_opportunity(
+        alert,
+        competition=NarrativeCompetition(query="Kitchen Act"),
+        cross_source_count=2,
+        now=now,
+    )
+
+    assert one_confirmation.no_x_candidate_ready is False
+    assert two_confirmations.verdict == NO_X_LAUNCH_VERDICT
+    assert two_confirmations.lane == "MAJOR U.S. BREAKING"
 
 
 def test_routine_non_crypto_product_event_cannot_be_launch_ready() -> None:
@@ -125,8 +224,10 @@ def test_crypto_native_narrative_requires_crypto_promotion() -> None:
     )
 
     assert weak.verdict != "LAUNCH READY"
-    assert strong.verdict == "LAUNCH READY"
+    assert strong.verdict == X_VERIFIED_LAUNCH_VERDICT
     assert strong.lane == "CRYPTO TREND"
+    assert strong.x_verified is True
+    assert strong.no_x_candidate_ready is False
     assert should_publish_news_opportunity(weak) is False
     assert should_publish_news_opportunity(strong) is True
 
@@ -204,6 +305,9 @@ def test_existing_contract_requires_repeated_crypto_account_promotion() -> None:
 
     assert result.verdict == "COIN FOUND"
     assert result.crypto_attention_ready is True
+    assert result.no_x_candidate_ready is False
+    assert is_manual_launch_opportunity(result) is False
+    assert should_publish_news_opportunity(result) is False
 
 
 def test_dry_reporting_story_stays_below_watch_threshold() -> None:
