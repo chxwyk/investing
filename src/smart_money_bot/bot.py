@@ -1750,6 +1750,24 @@ class SmartMoneyCommands(
         )
         scan_counts = status["coin_scan_counts"]
         assert isinstance(scan_counts, dict)
+        recent_scans = self.bot.engine.recent_coin_scans()
+        recent_scan_lines: list[str] = []
+        for item in recent_scans[:5]:
+            social = item.social
+            x_text = (
+                f"X {social.posts} posts / {social.contract_authors} exact-contract authors"
+                if social.available
+                else f"X {social.error or 'not requested'}"
+            )
+            recent_scan_lines.append(
+                f"• **{item.scan_stage}** `{_short(item.mint)}` • score `{item.score}` • "
+                f"{x_text} • {item.scan_reason or item.verdict}"
+            )
+        recent_scan_text = (
+            "\n**Recent coin/X scans:**\n" + "\n".join(recent_scan_lines) + "\n"
+            if recent_scan_lines
+            else "\n**Recent coin/X scans:** none completed since deployment\n"
+        )
         text = (
             "**Solana Tracker:** connected for strict 24H + 7D general-trader screening\n"
             "**Solana Tracker token safety:** risk score, rugged state, bundlers, "
@@ -1778,6 +1796,8 @@ class SmartMoneyCommands(
             f"{scan_counts.get('x_checked', 0)} X-checked • "
             f"{scan_counts.get('watch', 0)} developing WATCH alerts • "
             f"{scan_counts.get('verified', 0)} VERIFIED TREND alerts\n"
+            + recent_scan_text
+            +
             f"**X near-realtime news stream:** {news_stream_status} • configured account/news "
             "rule • crypto-first filtering • exceptional U.S. event lane\n"
             f"**RSS/news radar:** {'ready' if status['news_rss_ready'] else 'starting'} • "
@@ -1819,37 +1839,6 @@ class SmartMoneyCommands(
             view=_token_view(mint, self.bot.settings.fomo_referral_code),
             ephemeral=True,
         )
-
-    @app_commands.command(
-        name="scans", description="Show recent free-prefilter and paid-X coin scan results."
-    )
-    async def scans(self, interaction: discord.Interaction) -> None:
-        rows = self.bot.engine.recent_coin_scans()
-        if not rows:
-            await interaction.response.send_message(
-                "No coin scans have completed since this deployment.", ephemeral=True
-            )
-            return
-        lines: list[str] = []
-        for item in rows[:10]:
-            social = item.social
-            x_text = (
-                f"X `{social.posts}` posts / `{social.contract_authors}` exact-contract authors"
-                if social.available
-                else f"X `{social.error or 'not requested'}`"
-            )
-            lines.append(
-                f"**{item.scan_stage} • {item.symbol or _short(item.mint)}** • "
-                f"score `{item.score}` • prefilter `{item.prefilter_score}`\n"
-                f"`{_short(item.mint)}` • {x_text}\n"
-                f"why: {item.scan_reason or item.verdict}"
-            )
-        embed = discord.Embed(
-            title="Recent Coin / X Scan Audit",
-            description="\n\n".join(lines)[:4096],
-            color=0x5865F2,
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(name="leaderboard", description="Risk-adjusted tracked-wallet ranking.")
     @app_commands.describe(window="Show 24-hour or 7-day performance")

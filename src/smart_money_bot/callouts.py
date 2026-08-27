@@ -100,7 +100,7 @@ class DexScreenerClient:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
                 timeout=self.timeout,
-                headers={"User-Agent": "SmartMoneyCopyBot/2.25 coin-intelligence"},
+                headers={"User-Agent": "SmartMoneyCopyBot/2.25.1 coin-intelligence"},
             )
         return self._session
 

@@ -11,9 +11,10 @@ Version 2.25 adds a persistent **paid-X budget pipeline**. Automatic coin candid
 the free token, Tracker, DEX-flow, smart-wallet, and executable-route checks before the bot
 spends an X recent-search request. SQLite enforces a restart-safe daily X-search ceiling.
 Developing exact-contract activity can produce a clearly labeled, non-pinging `X COIN WATCH`,
-while only the existing complete 70+ gate produces `VERIFIED TREND`. `/smartmoney scans`
+while only the existing complete 70+ gate produces `VERIFIED TREND`. `/smartmoney sources`
 shows recent free rejections, paid checks, X evidence, and reasons instead of hiding every
-failed scan. The continuous paid X news stream now defaults off, while RSS remains live;
+failed scan without exceeding Discord's 25-command group limit. The continuous paid X news
+stream now defaults off, while RSS remains live;
 every coin alert includes direct Jupiter BUY and SELL links.
 
 Version 2.24 changed the alert pipeline to **verify first, alert second**. Automatic Discord
@@ -267,7 +268,7 @@ when no prior public BUY exists
 inside the scanned history, no current baseline price is available, or the PAPER account lacks
 cash. Set `PAPER_MIRROR_RAW_SWAPS=false` to restore consensus-only paper behavior.
 
-The v2.25.0 discovery, budgeted X verification, crypto-first launch-radar, verified-only
+The v2.25.1 discovery, budgeted X verification, crypto-first launch-radar, verified-only
 callout, selective-entry, daily loss/profit
 locks, social nomination, quote, fallback, rotation, and exit controls are
 intentionally configurable:

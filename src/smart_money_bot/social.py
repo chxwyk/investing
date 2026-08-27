@@ -71,7 +71,7 @@ class PumpProfileDiscovery:
                 timeout=self.timeout,
                 headers={
                     "User-Agent": (
-                        "SmartMoneyCopyBot/2.25 (+public profile verification; "
+                        "SmartMoneyCopyBot/2.25.1 (+public profile verification; "
                         "contact via deployed Discord bot)"
                     )
                 },

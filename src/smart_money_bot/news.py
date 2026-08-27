@@ -469,7 +469,7 @@ class XFilteredNewsStream:
                 timeout=aiohttp.ClientTimeout(total=None, sock_connect=15, sock_read=90),
                 headers={
                     "Authorization": f"Bearer {self.bearer_token}",
-                    "User-Agent": "SmartMoneyCopyBot/2.25 news-radar",
+                    "User-Agent": "SmartMoneyCopyBot/2.25.1 news-radar",
                 },
             )
         return self._session
@@ -666,7 +666,7 @@ class RssNewsPoller:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=15),
-                headers={"User-Agent": "SmartMoneyCopyBot/2.25 news-radar"},
+                headers={"User-Agent": "SmartMoneyCopyBot/2.25.1 news-radar"},
             )
         return self._session
 
@@ -744,7 +744,7 @@ class DexNarrativeMatcher:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=12),
-                headers={"User-Agent": "SmartMoneyCopyBot/2.25 narrative-match"},
+                headers={"User-Agent": "SmartMoneyCopyBot/2.25.1 narrative-match"},
             )
         return self._session
 

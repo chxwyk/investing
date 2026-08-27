@@ -4,7 +4,12 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
-from smart_money_bot.bot import _news_lead_view, _split_discord_text, _token_view
+from smart_money_bot.bot import (
+    SmartMoneyCommands,
+    _news_lead_view,
+    _split_discord_text,
+    _token_view,
+)
 from smart_money_bot.models import NewsAlert
 
 
@@ -76,3 +81,7 @@ def test_long_status_is_split_below_discord_content_limit() -> None:
     assert all(len(chunk) <= 1900 for chunk in chunks)
     assert "status line 0" in chunks[0]
     assert "status line 79" in chunks[-1]
+
+
+def test_smartmoney_group_stays_within_discord_command_limit() -> None:
+    assert len(SmartMoneyCommands.__cog_app_commands__) <= 25
