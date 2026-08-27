@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -98,7 +100,7 @@ class DexScreenerClient:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
                 timeout=self.timeout,
-                headers={"User-Agent": "SmartMoneyCopyBot/2.24 coin-intelligence"},
+                headers={"User-Agent": "SmartMoneyCopyBot/2.25 coin-intelligence"},
             )
         return self._session
 
@@ -208,6 +210,7 @@ class XRecentSearchClient:
         max_results: int = 10,
         cache_seconds: int = 60,
         trusted_crypto_accounts: tuple[str, ...] = (),
+        budget_reserver: Callable[[], Awaitable[bool]] | None = None,
     ) -> None:
         self.bearer_token = bearer_token
         self.max_results = max(10, min(100, max_results))
@@ -215,12 +218,15 @@ class XRecentSearchClient:
         self.trusted_crypto_accounts = frozenset(
             item.casefold().lstrip("@") for item in trusted_crypto_accounts if item.strip()
         )
+        self.budget_reserver = budget_reserver
         self.timeout = aiohttp.ClientTimeout(total=timeout_seconds)
         self._session: aiohttp.ClientSession | None = None
         self._cache: dict[str, tuple[float, XSocialSnapshot]] = {}
         self.last_success_at: int | None = None
         self.last_error: str | None = None
         self.last_status_code: int | None = None
+        self.requests_attempted = 0
+        self.budget_rejections = 0
 
     @property
     def configured(self) -> bool:
@@ -234,6 +240,18 @@ class XRecentSearchClient:
     async def close(self) -> None:
         if self._session and not self._session.closed:
             await self._session.close()
+
+    async def _reserve_request(self) -> bool:
+        if self.budget_reserver is None:
+            self.requests_attempted += 1
+            return True
+        if await self.budget_reserver():
+            self.requests_attempted += 1
+            return True
+        self.budget_rejections += 1
+        self.last_status_code = None
+        self.last_error = "daily X search budget exhausted"
+        return False
 
     async def snapshot(
         self,
@@ -249,6 +267,12 @@ class XRecentSearchClient:
         now = time.monotonic()
         if cached and now - cached[0] <= self.cache_seconds:
             return cached[1]
+        if not await self._reserve_request():
+            return XSocialSnapshot(
+                available=False,
+                query=query,
+                error=self.last_error,
+            )
         session = await self._get_session()
         params = {
             "query": query,
@@ -307,6 +331,13 @@ class XRecentSearchClient:
         now = time.monotonic()
         if cached and now - cached[0] <= self.cache_seconds:
             return cached[1]
+
+        if not await self._reserve_request():
+            return XSocialSnapshot(
+                available=False,
+                query=query,
+                error=self.last_error,
+            )
 
         session = await self._get_session()
         params = {
@@ -618,11 +649,13 @@ class CoinCalloutAnalyzer:
         social: XRecentSearchClient,
         tracker_risk: SolanaTrackerTokenRiskClient,
         market: JupiterClient | None = None,
+        prefilter_min_score: Decimal = Decimal("35"),
     ) -> None:
         self.dex = dex
         self.social = social
         self.tracker_risk = tracker_risk
         self.market = market
+        self.prefilter_min_score = prefilter_min_score
 
     async def _executable_quote(
         self,
@@ -650,19 +683,46 @@ class CoinCalloutAnalyzer:
         mint: str,
         token_info: TokenInfo | None,
         smart_wallets: tuple[str, ...],
+        force_x_search: bool = False,
     ) -> CoinCallout:
-        dex, social, tracker_risk, quote_result = await asyncio.gather(
+        dex, tracker_risk, quote_result = await asyncio.gather(
             self.dex.snapshot(mint),
-            self.social.snapshot(
-                mint,
-                symbol=token_info.symbol if token_info else None,
-                name=token_info.name if token_info else None,
-            ),
             self.tracker_risk.snapshot(mint),
             self._executable_quote(token_info),
         )
         executable_quote, quote_error = quote_result
-        return score_callout(
+        prefilter = score_callout(
+            mint=mint,
+            token_info=token_info,
+            dex=dex,
+            social=XSocialSnapshot(
+                available=False,
+                error="paid X check deferred until free evidence passes",
+            ),
+            tracker_risk=tracker_risk,
+            smart_wallets=smart_wallets,
+            executable_quote=executable_quote,
+            quote_error=quote_error,
+        )
+        allowed, reason = should_request_x_search(
+            prefilter,
+            configured_score_floor=self.prefilter_min_score,
+        )
+        if not allowed and not force_x_search:
+            return replace(
+                prefilter,
+                prefilter_score=prefilter.score,
+                x_search_attempted=False,
+                scan_stage="FREE_REJECTED",
+                scan_reason=reason,
+            )
+
+        social = await self.social.snapshot(
+            mint,
+            symbol=token_info.symbol if token_info else None,
+            name=token_info.name if token_info else None,
+        )
+        final = score_callout(
             mint=mint,
             token_info=token_info,
             dex=dex,
@@ -671,6 +731,19 @@ class CoinCalloutAnalyzer:
             smart_wallets=smart_wallets,
             executable_quote=executable_quote,
             quote_error=quote_error,
+        )
+        return replace(
+            final,
+            prefilter_score=prefilter.score,
+            x_search_attempted=True,
+            scan_stage="X_CHECKED" if social.available else "X_UNAVAILABLE",
+            scan_reason=(
+                "manual X check"
+                if force_x_search and social.available
+                else "free evidence passed; paid X verification completed"
+                if social.available
+                else social.error or "paid X verification did not return evidence"
+            ),
         )
 
 
@@ -1035,4 +1108,82 @@ def should_publish_coin_callout(
         callout.public_alert_eligible
         and callout.verdict == "VERIFIED TREND"
         and callout.score >= max(configured_score_floor, Decimal("70"))
+    )
+
+
+def should_request_x_search(
+    callout: CoinCallout,
+    *,
+    configured_score_floor: Decimal,
+) -> tuple[bool, str]:
+    """Spend X credits only after the free safety, market, and route checks pass."""
+
+    if callout.hard_blockers:
+        return False, callout.hard_blockers[0]
+    if callout.score < configured_score_floor:
+        return False, (
+            f"free evidence score {callout.score}/100 is below the "
+            f"{configured_score_floor}/100 paid-X threshold"
+        )
+    token = callout.token_info
+    if not token:
+        return False, "complete token metadata is unavailable"
+    if (
+        token.holder_count is None
+        or token.top_holders_percent is None
+        or token.dev_balance_percent is None
+        or token.mint_authority_disabled is not True
+        or token.freeze_authority_disabled is not True
+    ):
+        return False, "complete authority, holder, concentration, and developer proof is missing"
+    tracker = callout.tracker_risk
+    if not (
+        tracker.available
+        and tracker.score is not None
+        and tracker.bundlers_percent is not None
+        and tracker.insiders_percent is not None
+        and tracker.snipers_percent is not None
+    ):
+        return False, "complete Tracker rug, bundler, insider, and sniper proof is missing"
+    dex = callout.dex
+    if not dex.available or dex.liquidity_usd is None:
+        return False, "DEX liquidity and activity are unavailable"
+    if token.liquidity_usd is None:
+        return False, "provider liquidity is unavailable"
+    if min(token.liquidity_usd, dex.liquidity_usd) < Decimal("2000"):
+        return False, "cross-source liquidity is below $2,000"
+    if dex.buys_5m + dex.sells_5m < 3 or dex.buys_5m < dex.sells_5m:
+        return False, "early five-minute market flow does not favor buyers"
+    if dex.volume_5m_usd < Decimal("250"):
+        return False, "five-minute trading volume is below $250"
+    if not callout.smart_wallets:
+        return False, "no financially verified tracked wallet bought in the live window"
+    quote = callout.executable_quote
+    if quote is None:
+        return False, "the $5 executable Jupiter route is unavailable"
+    if quote.price_impact_percent > Decimal("3"):
+        return False, "the $5 executable route has more than 3% price impact"
+    return True, "free evidence passed"
+
+
+def should_publish_coin_watch(
+    callout: CoinCallout,
+    *,
+    configured_score_floor: Decimal,
+) -> bool:
+    """Expose credible developing X activity without presenting it as a buy signal."""
+
+    social = callout.social
+    return bool(
+        callout.x_search_attempted
+        and callout.scan_stage == "X_CHECKED"
+        and social.available
+        and not callout.hard_blockers
+        and callout.score >= max(configured_score_floor, Decimal("50"))
+        and social.contract_posts >= 2
+        and social.contract_authors >= 2
+        and social.crypto_authors >= 1
+        and social.promoter_posts >= 1
+        and social.duplicate_percent < Decimal("50")
+        and callout.executable_quote is not None
     )

@@ -18,6 +18,7 @@ from .callouts import (
     SolanaTrackerTokenRiskClient,
     XRecentSearchClient,
     should_publish_coin_callout,
+    should_publish_coin_watch,
 )
 from .config import Settings
 from .constants import PAPER_DEMO_ENTRY_PRICE_USD, PAPER_DEMO_MINT
@@ -94,6 +95,8 @@ class Notifier(Protocol):
 
     async def on_coin_callout(self, callout: CoinCallout) -> None: ...
 
+    async def on_coin_watch(self, callout: CoinCallout) -> None: ...
+
     async def on_news_alert(
         self,
         alert: NewsAlert,
@@ -125,6 +128,9 @@ class NullNotifier:
         return None
 
     async def on_coin_callout(self, callout: CoinCallout) -> None:
+        return None
+
+    async def on_coin_watch(self, callout: CoinCallout) -> None:
         return None
 
     async def on_news_alert(
@@ -163,6 +169,7 @@ class SmartMoneyEngine:
             max_results=settings.x_search_max_results,
             cache_seconds=settings.news_x_trend_cache_seconds,
             trusted_crypto_accounts=settings.x_crypto_trusted_accounts,
+            budget_reserver=self._reserve_x_search,
         )
         self.tracker_token_risk = SolanaTrackerTokenRiskClient(settings.solana_tracker_api_key)
         self.callout_analyzer = CoinCalloutAnalyzer(
@@ -170,6 +177,7 @@ class SmartMoneyEngine:
             self.x_social,
             self.tracker_token_risk,
             self.market,
+            prefilter_min_score=settings.coin_x_prefilter_min_score,
         )
         self.x_news_stream = XFilteredNewsStream(
             settings.x_api_bearer_token,
@@ -226,6 +234,15 @@ class SmartMoneyEngine:
         self._recent_news_events: deque[tuple[int, str, frozenset[str]]] = deque()
         self._narrative_matches_seen: set[str] = set()
         self._last_callout_state: dict[str, tuple[int, int]] = {}
+        self._recent_coin_scans: deque[CoinCallout] = deque(maxlen=12)
+        self._coin_scan_counts = {
+            "total": 0,
+            "free_rejected": 0,
+            "x_checked": 0,
+            "x_unavailable": 0,
+            "watch": 0,
+            "verified": 0,
+        }
         self._scan_lock = asyncio.Lock()
         self._discovery_lock = asyncio.Lock()
         self._daily_profit_lock = asyncio.Lock()
@@ -244,6 +261,40 @@ class SmartMoneyEngine:
         self._weekly_pool: list[WindowCandidate] = []
         self._candidate_pool = []
         self._social_nominations: list[SocialNomination] = []
+
+    def _x_usage_day(self) -> str:
+        return datetime.now(ZoneInfo(self.settings.x_daily_search_timezone)).date().isoformat()
+
+    async def _reserve_x_search(self) -> bool:
+        allowed, _count = await self.database.reserve_daily_api_request(
+            provider="x",
+            operation="recent_search",
+            usage_day=self._x_usage_day(),
+            request_limit=self.settings.x_daily_search_limit,
+        )
+        return allowed
+
+    async def x_search_usage_today(self) -> int:
+        return await self.database.daily_api_request_count(
+            provider="x",
+            operation="recent_search",
+            usage_day=self._x_usage_day(),
+        )
+
+    def _record_coin_scan(self, callout: CoinCallout) -> None:
+        self._recent_coin_scans.appendleft(callout)
+        self._coin_scan_counts["total"] += 1
+        if callout.scan_stage == "FREE_REJECTED":
+            self._coin_scan_counts["free_rejected"] += 1
+        elif callout.scan_stage == "X_CHECKED":
+            self._coin_scan_counts["x_checked"] += 1
+        elif callout.scan_stage == "X_UNAVAILABLE":
+            self._coin_scan_counts["x_unavailable"] += 1
+        if callout.public_alert_eligible:
+            self._coin_scan_counts["verified"] += 1
+
+    def recent_coin_scans(self) -> tuple[CoinCallout, ...]:
+        return tuple(self._recent_coin_scans)
 
     async def initialize(self) -> None:
         if self._initialized:
@@ -1179,6 +1230,15 @@ class SmartMoneyEngine:
                 configured_score_floor=self.settings.coin_callout_min_alert_score,
             ):
                 await self.notifier.on_coin_callout(callout)
+            elif (
+                self.settings.coin_watch_alerts_enabled
+                and should_publish_coin_watch(
+                    callout,
+                    configured_score_floor=self.settings.coin_watch_min_score,
+                )
+            ):
+                self._coin_scan_counts["watch"] += 1
+                await self.notifier.on_coin_watch(callout)
         except Exception as exc:
             await self.notifier.on_error("Analyzing coin callout", exc)
 
@@ -1187,6 +1247,7 @@ class SmartMoneyEngine:
         mint: str,
         *,
         buyers: list[tuple[str, str]] | None = None,
+        force_x_search: bool = False,
     ) -> CoinCallout:
         if buyers is None:
             buyers = await self.database.recent_verified_token_buyers(
@@ -1198,11 +1259,14 @@ class SmartMoneyEngine:
         except JupiterError:
             token_info = None
         aliases = tuple(alias for _address, alias in buyers)
-        return await self.callout_analyzer.analyze(
+        callout = await self.callout_analyzer.analyze(
             mint=mint,
             token_info=token_info,
             smart_wallets=aliases,
+            force_x_search=force_x_search,
         )
+        self._record_coin_scan(callout)
+        return callout
 
     async def _mirror_paper_swap(self, swap: DetectedSwap, trader: TrackedTrader) -> None:
         if self.settings.paper_force_observation_mode:
@@ -2213,6 +2277,7 @@ class SmartMoneyEngine:
         except RpcError as exc:
             rpc_health = f"error: {exc}"
         daily_lock = await self.paper_daily_lock_status()
+        x_search_usage = await self.x_search_usage_today()
         return {
             "rpc": rpc_health,
             "mode": (await self.execution_mode()).value,
@@ -2254,10 +2319,15 @@ class SmartMoneyEngine:
             "quote_ready": bool(self.settings.jupiter_api_key),
             "consecutive_quote_failures": self.executor.consecutive_quote_failures,
             "coin_callouts_enabled": self.settings.coin_callouts_enabled,
+            "coin_watch_alerts_enabled": self.settings.coin_watch_alerts_enabled,
+            "coin_scan_counts": dict(self._coin_scan_counts),
             "x_social_configured": self.x_social.configured,
             "x_social_last_success": self.x_social.last_success_at,
             "x_social_last_error": self.x_social.last_error,
+            "x_search_usage_today": x_search_usage,
+            "x_search_daily_limit": self.settings.x_daily_search_limit,
             "news_radar_enabled": self.settings.news_radar_enabled,
+            "x_news_stream_enabled": self.settings.x_news_stream_enabled,
             "x_news_stream_configured": self.x_news_stream.configured,
             "x_news_stream_connected": self.x_news_stream.connected,
             "x_news_stream_rule_active": self.x_news_stream.rule_active,

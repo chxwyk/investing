@@ -580,3 +580,45 @@ async def test_pump_launch_reservation_blocks_duplicate_and_counts_daily_limit(t
         assert sol == Decimal("0.01")
     finally:
         await database.close()
+
+
+@pytest.mark.asyncio
+async def test_x_daily_budget_persists_and_refuses_request_over_limit(tmp_path) -> None:
+    path = tmp_path / "x-budget.db"
+    database = Database(str(path), Decimal("1000"))
+    await database.connect()
+    try:
+        first = await database.reserve_daily_api_request(
+            provider="x",
+            operation="recent_search",
+            usage_day="2026-08-27",
+            request_limit=2,
+        )
+        second = await database.reserve_daily_api_request(
+            provider="x",
+            operation="recent_search",
+            usage_day="2026-08-27",
+            request_limit=2,
+        )
+        blocked = await database.reserve_daily_api_request(
+            provider="x",
+            operation="recent_search",
+            usage_day="2026-08-27",
+            request_limit=2,
+        )
+        assert first == (True, 1)
+        assert second == (True, 2)
+        assert blocked == (False, 2)
+    finally:
+        await database.close()
+
+    reopened = Database(str(path), Decimal("1000"))
+    await reopened.connect()
+    try:
+        assert await reopened.daily_api_request_count(
+            provider="x",
+            operation="recent_search",
+            usage_day="2026-08-27",
+        ) == 2
+    finally:
+        await reopened.close()

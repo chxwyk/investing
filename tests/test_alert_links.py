@@ -27,11 +27,13 @@ async def test_token_view_builds_exact_solana_coin_links() -> None:
 
     assert buttons["Open in Pump.fun"].url == f"https://pump.fun/coin/{mint}"
     assert buttons["Buy on Jupiter"].url == f"https://jup.ag/swap/SOL-{mint}"
+    assert buttons["Sell on Jupiter"].url == f"https://jup.ag/swap/{mint}-SOL"
     assert buttons["Chart"].url == f"https://dexscreener.com/solana/{mint}"
     assert buttons["Solscan"].url == f"https://solscan.io/token/{mint}"
     assert buttons["Open in Fomo"].row == 0
     assert buttons["Open in Pump.fun"].row == 0
     assert buttons["Buy on Jupiter"].row == 0
+    assert buttons["Sell on Jupiter"].row == 0
     assert buttons["Chart"].row == 1
     assert buttons["Solscan"].row == 1
 

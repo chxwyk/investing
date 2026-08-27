@@ -295,6 +295,10 @@ class CoinCallout:
     executable_quote: SwapQuote | None = None
     quote_error: str | None = None
     public_alert_eligible: bool = False
+    prefilter_score: Decimal = Decimal("0")
+    x_search_attempted: bool = False
+    scan_stage: str = "UNSCANNED"
+    scan_reason: str = ""
 
 
 @dataclass(frozen=True, slots=True)

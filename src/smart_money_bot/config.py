@@ -102,7 +102,12 @@ class Settings:
     coin_callout_window_seconds: int
     coin_callout_cooldown_seconds: int
     coin_callout_min_alert_score: Decimal
+    coin_x_prefilter_min_score: Decimal
+    coin_watch_alerts_enabled: bool
+    coin_watch_min_score: Decimal
     x_search_max_results: int
+    x_daily_search_limit: int
+    x_daily_search_timezone: str
 
     news_radar_enabled: bool
     x_news_stream_enabled: bool
@@ -274,11 +279,18 @@ class Settings:
             database_path=os.getenv("DATABASE_PATH", "./data/smart_money.db").strip(),
             coin_callouts_enabled=_bool("COIN_CALLOUTS_ENABLED", True),
             coin_callout_window_seconds=_int("COIN_CALLOUT_WINDOW_SECONDS", 300),
-            coin_callout_cooldown_seconds=_int("COIN_CALLOUT_COOLDOWN_SECONDS", 300),
+            coin_callout_cooldown_seconds=_int("COIN_CALLOUT_COOLDOWN_SECONDS", 3600),
             coin_callout_min_alert_score=_decimal("COIN_CALLOUT_MIN_ALERT_SCORE", "70"),
-            x_search_max_results=_int("X_SEARCH_MAX_RESULTS", 25),
+            coin_x_prefilter_min_score=_decimal("COIN_X_PREFILTER_MIN_SCORE", "35"),
+            coin_watch_alerts_enabled=_bool("COIN_WATCH_ALERTS_ENABLED", True),
+            coin_watch_min_score=_decimal("COIN_WATCH_MIN_SCORE", "55"),
+            x_search_max_results=_int("X_SEARCH_MAX_RESULTS", 10),
+            x_daily_search_limit=_int("X_DAILY_SEARCH_LIMIT", 25),
+            x_daily_search_timezone=os.getenv(
+                "X_DAILY_SEARCH_TIMEZONE", "America/Los_Angeles"
+            ).strip(),
             news_radar_enabled=_bool("NEWS_RADAR_ENABLED", True),
-            x_news_stream_enabled=_bool("X_NEWS_STREAM_ENABLED", True),
+            x_news_stream_enabled=_bool("X_NEWS_STREAM_ENABLED", False),
             x_news_stream_rule=os.getenv("X_NEWS_STREAM_RULE", DEFAULT_X_NEWS_RULE).strip(),
             news_rss_feeds=_str_tuple("NEWS_RSS_FEEDS", DEFAULT_NEWS_RSS_FEEDS),
             j7_authorized_feed_url=(
@@ -287,8 +299,8 @@ class Settings:
             news_poll_seconds=_int("NEWS_POLL_SECONDS", 30),
             news_min_score=_int("NEWS_MIN_SCORE", 45),
             news_launch_ready_score=_int("NEWS_LAUNCH_READY_SCORE", 72),
-            news_x_verify_min_score=_int("NEWS_X_VERIFY_MIN_SCORE", 35),
-            news_x_trend_cache_seconds=_int("NEWS_X_TREND_CACHE_SECONDS", 90),
+            news_x_verify_min_score=_int("NEWS_X_VERIFY_MIN_SCORE", 70),
+            news_x_trend_cache_seconds=_int("NEWS_X_TREND_CACHE_SECONDS", 3600),
             news_max_alerts_per_hour=_int("NEWS_MAX_ALERTS_PER_HOUR", 30),
             news_dex_match_enabled=_bool("NEWS_DEX_MATCH_ENABLED", True),
             news_dex_match_min_liquidity_usd=_decimal(
@@ -493,8 +505,18 @@ class Settings:
             raise ValueError("COIN_CALLOUT_COOLDOWN_SECONDS must be between 30 and 3600")
         if not 0 <= self.coin_callout_min_alert_score <= 100:
             raise ValueError("COIN_CALLOUT_MIN_ALERT_SCORE must be between 0 and 100")
+        if not 0 <= self.coin_x_prefilter_min_score <= 100:
+            raise ValueError("COIN_X_PREFILTER_MIN_SCORE must be between 0 and 100")
+        if not 0 <= self.coin_watch_min_score <= 100:
+            raise ValueError("COIN_WATCH_MIN_SCORE must be between 0 and 100")
         if not 10 <= self.x_search_max_results <= 100:
             raise ValueError("X_SEARCH_MAX_RESULTS must be between 10 and 100")
+        if not 1 <= self.x_daily_search_limit <= 500:
+            raise ValueError("X_DAILY_SEARCH_LIMIT must be between 1 and 500")
+        try:
+            ZoneInfo(self.x_daily_search_timezone)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError("X_DAILY_SEARCH_TIMEZONE must be a valid IANA timezone") from exc
         if len(self.x_news_stream_rule) > 1024:
             raise ValueError("X_NEWS_STREAM_RULE cannot exceed 1024 characters")
         if not 15 <= self.news_poll_seconds <= 3600:

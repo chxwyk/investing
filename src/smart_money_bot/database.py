@@ -308,6 +308,15 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_pump_launches_time
                 ON pump_launches(created_at DESC);
 
+            CREATE TABLE IF NOT EXISTS api_usage_daily (
+                provider TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                usage_day TEXT NOT NULL,
+                request_count INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (provider, operation, usage_day)
+            );
+
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -381,6 +390,69 @@ class Database:
             (str(now),),
         )
         await self.db.commit()
+
+    async def reserve_daily_api_request(
+        self,
+        *,
+        provider: str,
+        operation: str,
+        usage_day: str,
+        request_limit: int,
+    ) -> tuple[bool, int]:
+        """Persistently reserve one paid API request without exceeding its daily cap."""
+
+        now = int(time.time())
+        async with self._write_lock:
+            await self.db.execute("BEGIN IMMEDIATE")
+            try:
+                await self.db.execute(
+                    """
+                    INSERT OR IGNORE INTO api_usage_daily(
+                        provider, operation, usage_day, request_count, updated_at
+                    ) VALUES (?, ?, ?, 0, ?)
+                    """,
+                    (provider, operation, usage_day, now),
+                )
+                cursor = await self.db.execute(
+                    """
+                    UPDATE api_usage_daily
+                    SET request_count = request_count + 1, updated_at = ?
+                    WHERE provider = ? AND operation = ? AND usage_day = ?
+                      AND request_count < ?
+                    """,
+                    (now, provider, operation, usage_day, request_limit),
+                )
+                count_cursor = await self.db.execute(
+                    """
+                    SELECT request_count FROM api_usage_daily
+                    WHERE provider = ? AND operation = ? AND usage_day = ?
+                    """,
+                    (provider, operation, usage_day),
+                )
+                row = await count_cursor.fetchone()
+                count = int(row["request_count"] if row else 0)
+                await self.db.commit()
+                return cursor.rowcount > 0, count
+            except Exception:
+                await self.db.rollback()
+                raise
+
+    async def daily_api_request_count(
+        self,
+        *,
+        provider: str,
+        operation: str,
+        usage_day: str,
+    ) -> int:
+        cursor = await self.db.execute(
+            """
+            SELECT request_count FROM api_usage_daily
+            WHERE provider = ? AND operation = ? AND usage_day = ?
+            """,
+            (provider, operation, usage_day),
+        )
+        row = await cursor.fetchone()
+        return int(row["request_count"] if row else 0)
 
     async def _ensure_column(self, table: str, column: str, definition: str) -> None:
         cursor = await self.db.execute(f"PRAGMA table_info({table})")

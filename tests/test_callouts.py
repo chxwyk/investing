@@ -1,7 +1,10 @@
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from smart_money_bot.callouts import (
+    CoinCalloutAnalyzer,
+    XRecentSearchClient,
     build_x_narrative_query,
     build_x_query,
     parse_dex_snapshot,
@@ -9,6 +12,7 @@ from smart_money_bot.callouts import (
     parse_x_snapshot,
     score_callout,
     should_publish_coin_callout,
+    should_publish_coin_watch,
 )
 from smart_money_bot.models import (
     DexSnapshot,
@@ -404,3 +408,128 @@ def test_large_liquidity_disagreement_blocks_fake_market_claim() -> None:
     assert report.verdict == "BLOCKED"
     assert report.public_alert_eligible is False
     assert any("disagree" in item for item in report.hard_blockers)
+
+
+async def test_x_daily_budget_blocks_before_network_request() -> None:
+    calls = 0
+
+    async def reject_budget() -> bool:
+        nonlocal calls
+        calls += 1
+        return False
+
+    client = XRecentSearchClient("x-token", budget_reserver=reject_budget)
+    try:
+        result = await client.snapshot(MINT)
+    finally:
+        await client.close()
+
+    assert calls == 1
+    assert result.available is False
+    assert result.error == "daily X search budget exhausted"
+    assert client.requests_attempted == 0
+    assert client.budget_rejections == 1
+
+
+async def test_free_prefilter_rejects_hard_risk_without_spending_x() -> None:
+    class FakeDex:
+        async def snapshot(self, mint: str) -> DexSnapshot:
+            del mint
+            return DexSnapshot(
+                available=True,
+                liquidity_usd=Decimal("50000"),
+                buys_5m=10,
+                sells_5m=2,
+                volume_5m_usd=Decimal("5000"),
+            )
+
+    class FakeSocial:
+        calls = 0
+
+        async def snapshot(self, mint: str, **kwargs) -> XSocialSnapshot:
+            del mint, kwargs
+            self.calls += 1
+            return XSocialSnapshot(available=True, posts=10)
+
+    class FakeTracker:
+        async def snapshot(self, mint: str) -> TokenRiskSnapshot:
+            del mint
+            return _complete_tracker_risk()
+
+    social = FakeSocial()
+    analyzer = CoinCalloutAnalyzer(FakeDex(), social, FakeTracker())
+    report = await analyzer.analyze(
+        mint=MINT,
+        token_info=TokenInfo(
+            mint=MINT,
+            holder_count=100,
+            liquidity_usd=Decimal("50000"),
+            top_holders_percent=Decimal("10"),
+            dev_balance_percent=Decimal("1"),
+            suspicious=True,
+            mint_authority_disabled=True,
+            freeze_authority_disabled=True,
+        ),
+        smart_wallets=("Alpha",),
+    )
+
+    assert social.calls == 0
+    assert report.scan_stage == "FREE_REJECTED"
+    assert report.x_search_attempted is False
+
+    forced = await analyzer.analyze(
+        mint=MINT,
+        token_info=report.token_info,
+        smart_wallets=("Alpha",),
+        force_x_search=True,
+    )
+    assert social.calls == 1
+    assert forced.scan_stage == "X_CHECKED"
+    assert forced.x_search_attempted is True
+
+
+def test_developing_watch_requires_real_exact_contract_x_activity() -> None:
+    report = score_callout(
+        mint=MINT,
+        token_info=TokenInfo(
+            mint=MINT,
+            holder_count=100,
+            liquidity_usd=Decimal("50000"),
+            top_holders_percent=Decimal("10"),
+            dev_balance_percent=Decimal("1"),
+            suspicious=False,
+            mint_authority_disabled=True,
+            freeze_authority_disabled=True,
+        ),
+        dex=DexSnapshot(
+            available=True,
+            liquidity_usd=Decimal("50000"),
+            buys_5m=20,
+            sells_5m=5,
+            volume_5m_usd=Decimal("5000"),
+        ),
+        social=XSocialSnapshot(
+            available=True,
+            posts=3,
+            contract_posts=3,
+            unique_authors=2,
+            crypto_authors=2,
+            contract_authors=2,
+            credible_contract_authors=1,
+            promoter_posts=2,
+            posts_per_minute=Decimal("0.2"),
+        ),
+        tracker_risk=_complete_tracker_risk(),
+        smart_wallets=("Alpha",),
+        executable_quote=_executable_quote(),
+    )
+    report = replace(
+        report,
+        x_search_attempted=True,
+        scan_stage="X_CHECKED",
+    )
+
+    assert should_publish_coin_watch(
+        report,
+        configured_score_floor=Decimal("50"),
+    ) is True

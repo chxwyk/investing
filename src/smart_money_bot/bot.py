@@ -137,6 +137,14 @@ def _token_view(mint: str, fomo_referral_code: str | None = None) -> discord.ui.
     )
     view.add_item(
         discord.ui.Button(
+            label="Sell on Jupiter",
+            style=discord.ButtonStyle.link,
+            url=f"https://jup.ag/swap/{mint}-SOL",
+            row=0,
+        )
+    )
+    view.add_item(
+        discord.ui.Button(
             label="Chart",
             style=discord.ButtonStyle.link,
             url=f"https://dexscreener.com/solana/{mint}",
@@ -332,8 +340,12 @@ def _coin_callout_embed(callout: CoinCallout) -> discord.Embed:
         title=f"COIN CALLOUT • {callout.verdict} • {label}",
         description=(
             f"Evidence score **{callout.score}/100** • confidence **{callout.confidence}**\n"
-            "Published automatic callouts passed the exact-contract, market, X-account, "
-            "rug-risk, and executable-route gates. This is evidence—not a profit promise."
+            + (
+                "This passed the exact-contract, market, X-account, rug-risk, and "
+                "executable-route gates. This is evidence—not a profit promise."
+                if callout.public_alert_eligible
+                else "This is research evidence—not a buy signal or a profit promise."
+            )
         ),
         color=colors.get(callout.verdict, 0x95A5A6),
         timestamp=datetime.fromtimestamp(callout.generated_at, tz=UTC),
@@ -445,11 +457,22 @@ def _coin_callout_embed(callout: CoinCallout) -> discord.Embed:
             inline=False,
         )
     embed.add_field(name="Contract", value=f"`{callout.mint}`", inline=False)
+    embed.set_footer(text=f"Scan stage: {callout.scan_stage} • {callout.scan_reason[:140]}")
+    return embed
+
+
+def _coin_watch_embed(callout: CoinCallout) -> discord.Embed:
+    embed = _coin_callout_embed(callout)
+    label = callout.symbol or _short(callout.mint)
+    embed.title = f"X COIN WATCH • DEVELOPING • {label}"
+    embed.description = (
+        f"Evidence score **{callout.score}/100** • paid X verification found developing "
+        "exact-contract activity. It has **not** passed the VERIFIED TREND gate and is not "
+        "an automatic buy signal. Use the research links and wait for stronger confirmation."
+    )
+    embed.color = 0xF1C40F
     embed.set_footer(
-        text=(
-            "Automatic channel posts VERIFIED TREND only • exact mint, cross-source liquidity, "
-            "Tracker safety, authentic X promotion, and executable route required"
-        )
+        text="WATCH only • no user ping • VERIFIED TREND requires the complete 70+ evidence gate"
     )
     return embed
 
@@ -1333,6 +1356,13 @@ class SmartMoneyBot(commands.Bot):
             ping_user=callout.public_alert_eligible,
         )
 
+    async def on_coin_watch(self, callout: CoinCallout) -> None:
+        await self._send_alert(
+            _coin_watch_embed(callout),
+            token_mint=callout.mint,
+            ping_user=False,
+        )
+
     async def on_news_alert(
         self,
         alert: NewsAlert,
@@ -1704,16 +1734,22 @@ class SmartMoneyCommands(
             )
         )
         news_stream_status = (
-            "connected"
-            if status["x_news_stream_connected"]
+            "disabled (budget mode)"
+            if not status["x_news_stream_enabled"]
             else (
-                f"error: {status['x_news_stream_last_error']}"
-                if status["x_news_stream_last_error"]
-                else "starting"
-                if status["x_news_stream_configured"]
-                else "not configured"
+                "connected"
+                if status["x_news_stream_connected"]
+                else (
+                    f"error: {status['x_news_stream_last_error']}"
+                    if status["x_news_stream_last_error"]
+                    else "starting"
+                    if status["x_news_stream_configured"]
+                    else "not configured"
+                )
             )
         )
+        scan_counts = status["coin_scan_counts"]
+        assert isinstance(scan_counts, dict)
         text = (
             "**Solana Tracker:** connected for strict 24H + 7D general-trader screening\n"
             "**Solana Tracker token safety:** risk score, rugged state, bundlers, "
@@ -1734,6 +1770,14 @@ class SmartMoneyCommands(
             "volume, profiles, and paid-boost labeling\n"
             f"**X/Twitter coin intelligence:** {x_status}"
             " • exact-contract promotion • crypto-author quality • duplicate-text checks\n"
+            f"**Paid X search budget:** {status['x_search_usage_today']}/"
+            f"{status['x_search_daily_limit']} used today • free prefilter before every "
+            "automatic paid search\n"
+            f"**Coin scan visibility:** {scan_counts.get('total', 0)} analyzed since restart • "
+            f"{scan_counts.get('free_rejected', 0)} rejected before X • "
+            f"{scan_counts.get('x_checked', 0)} X-checked • "
+            f"{scan_counts.get('watch', 0)} developing WATCH alerts • "
+            f"{scan_counts.get('verified', 0)} VERIFIED TREND alerts\n"
             f"**X near-realtime news stream:** {news_stream_status} • configured account/news "
             "rule • crypto-first filtering • exceptional U.S. event lane\n"
             f"**RSS/news radar:** {'ready' if status['news_rss_ready'] else 'starting'} • "
@@ -1769,12 +1813,43 @@ class SmartMoneyCommands(
             )
             return
         await interaction.response.defer(thinking=True, ephemeral=True)
-        callout = await self.bot.engine.analyze_coin(mint)
+        callout = await self.bot.engine.analyze_coin(mint, force_x_search=True)
         await interaction.followup.send(
             embed=_coin_callout_embed(callout),
             view=_token_view(mint, self.bot.settings.fomo_referral_code),
             ephemeral=True,
         )
+
+    @app_commands.command(
+        name="scans", description="Show recent free-prefilter and paid-X coin scan results."
+    )
+    async def scans(self, interaction: discord.Interaction) -> None:
+        rows = self.bot.engine.recent_coin_scans()
+        if not rows:
+            await interaction.response.send_message(
+                "No coin scans have completed since this deployment.", ephemeral=True
+            )
+            return
+        lines: list[str] = []
+        for item in rows[:10]:
+            social = item.social
+            x_text = (
+                f"X `{social.posts}` posts / `{social.contract_authors}` exact-contract authors"
+                if social.available
+                else f"X `{social.error or 'not requested'}`"
+            )
+            lines.append(
+                f"**{item.scan_stage} • {item.symbol or _short(item.mint)}** • "
+                f"score `{item.score}` • prefilter `{item.prefilter_score}`\n"
+                f"`{_short(item.mint)}` • {x_text}\n"
+                f"why: {item.scan_reason or item.verdict}"
+            )
+        embed = discord.Embed(
+            title="Recent Coin / X Scan Audit",
+            description="\n\n".join(lines)[:4096],
+            color=0x5865F2,
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(name="leaderboard", description="Risk-adjusted tracked-wallet ranking.")
     @app_commands.describe(window="Show 24-hour or 7-day performance")
@@ -2231,14 +2306,18 @@ class SmartMoneyCommands(
             )
         )
         x_news_health = (
-            "connected"
-            if status["x_news_stream_connected"]
+            "disabled (budget mode)"
+            if not status["x_news_stream_enabled"]
             else (
-                f"error • {status['x_news_stream_last_error']}"
-                if status["x_news_stream_last_error"]
-                else "starting"
-                if status["x_news_stream_configured"]
-                else "not configured"
+                "connected"
+                if status["x_news_stream_connected"]
+                else (
+                    f"error • {status['x_news_stream_last_error']}"
+                    if status["x_news_stream_last_error"]
+                    else "starting"
+                    if status["x_news_stream_configured"]
+                    else "not configured"
+                )
             )
         )
         rss_health = (
@@ -2322,6 +2401,10 @@ class SmartMoneyCommands(
             "$5 executable route • complete Tracker/holder proof • "
             f"X {x_callout_health} • "
             f"minimum final score {max(s.coin_callout_min_alert_score, Decimal('70'))}/100\n"
+            f"**X search budget:** {status['x_search_usage_today']}/"
+            f"{status['x_search_daily_limit']} today • free prefilter "
+            f"{s.coin_x_prefilter_min_score}/100 • developing WATCH alerts "
+            f"{'enabled' if status['coin_watch_alerts_enabled'] else 'disabled'}\n"
             f"**News radar:** {'enabled' if status['news_radar_enabled'] else 'disabled'} • "
             "crypto-first • exceptional U.S. events require broad crypto pickup • "
             f"X stream {x_news_health} • RSS {rss_health}\n"

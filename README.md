@@ -7,7 +7,16 @@ transactions, and mirrors every newly detected hot-wallet swap in PAPER mode. PA
 as either a forced source-price observation ledger or an executable Jupiter quote-shadow
 trial; the two answer different questions and are labeled separately.
 
-Version 2.24 changes the alert pipeline to **verify first, alert second**. Automatic Discord
+Version 2.25 adds a persistent **paid-X budget pipeline**. Automatic coin candidates now run
+the free token, Tracker, DEX-flow, smart-wallet, and executable-route checks before the bot
+spends an X recent-search request. SQLite enforces a restart-safe daily X-search ceiling.
+Developing exact-contract activity can produce a clearly labeled, non-pinging `X COIN WATCH`,
+while only the existing complete 70+ gate produces `VERIFIED TREND`. `/smartmoney scans`
+shows recent free rejections, paid checks, X evidence, and reasons instead of hiding every
+failed scan. The continuous paid X news stream now defaults off, while RSS remains live;
+every coin alert includes direct Jupiter BUY and SELL links.
+
+Version 2.24 changed the alert pipeline to **verify first, alert second**. Automatic Discord
 coin callouts now publish only `VERIFIED TREND` results. A token must have exact-mint X posts
 from several credible crypto accounts, low duplicate/new-account pressure, complete Tracker
 rug/bundler/insider/sniper evidence, disabled mint/freeze authorities, acceptable holder and
@@ -258,7 +267,8 @@ when no prior public BUY exists
 inside the scanned history, no current baseline price is available, or the PAPER account lacks
 cash. Set `PAPER_MIRROR_RAW_SWAPS=false` to restore consensus-only paper behavior.
 
-The v2.24.0 discovery, crypto-first launch-radar, verified-only callout, selective-entry, daily loss/profit
+The v2.25.0 discovery, budgeted X verification, crypto-first launch-radar, verified-only
+callout, selective-entry, daily loss/profit
 locks, social nomination, quote, fallback, rotation, and exit controls are
 intentionally configurable:
 
@@ -310,14 +320,20 @@ FORWARD_EVIDENCE_MAX_LOSS_USD=10
 REALTIME_WALLET_STREAM_ENABLED=true
 REALTIME_STREAM_COMMITMENT=processed
 NEWS_RADAR_ENABLED=true
-X_NEWS_STREAM_ENABLED=true
+X_NEWS_STREAM_ENABLED=false
 X_CRYPTO_TRUSTED_ACCOUNTS=WatcherGuru|CoinDesk|Cointelegraph|solana|pumpdotfun|lookonchain|ArkhamIntel
 NEWS_POLL_SECONDS=30
 NEWS_MIN_SCORE=45
 NEWS_LAUNCH_READY_SCORE=72
-NEWS_X_VERIFY_MIN_SCORE=35
-NEWS_X_TREND_CACHE_SECONDS=90
+NEWS_X_VERIFY_MIN_SCORE=70
+NEWS_X_TREND_CACHE_SECONDS=3600
 NEWS_MAX_ALERTS_PER_HOUR=30
+X_SEARCH_MAX_RESULTS=10
+X_DAILY_SEARCH_LIMIT=25
+X_DAILY_SEARCH_TIMEZONE=America/Los_Angeles
+COIN_X_PREFILTER_MIN_SCORE=35
+COIN_WATCH_ALERTS_ENABLED=true
+COIN_WATCH_MIN_SCORE=55
 NEWS_DEX_MATCH_ENABLED=true
 NEWS_DEX_MATCH_MIN_LIQUIDITY_USD=2000
 NEWS_DEX_MATCH_MAX_AGE_MINUTES=60

@@ -243,6 +243,11 @@ def test_news_radar_defaults_to_fast_but_cost_bounded_sources(monkeypatch) -> No
         "NEWS_DEX_MATCH_ENABLED",
         "NEWS_PAIR_RECHECK_SECONDS",
         "X_SEARCH_MAX_RESULTS",
+        "X_DAILY_SEARCH_LIMIT",
+        "X_DAILY_SEARCH_TIMEZONE",
+        "COIN_X_PREFILTER_MIN_SCORE",
+        "COIN_WATCH_ALERTS_ENABLED",
+        "COIN_WATCH_MIN_SCORE",
         "PUMP_ONE_CLICK_LAUNCH_ENABLED",
         "PUMP_LAUNCH_ACK",
         "PUMP_LAUNCH_PRIVATE_KEY",
@@ -254,7 +259,7 @@ def test_news_radar_defaults_to_fast_but_cost_bounded_sources(monkeypatch) -> No
     settings = Settings.from_env(require_discord_token=False)
 
     assert settings.news_radar_enabled is True
-    assert settings.x_news_stream_enabled is True
+    assert settings.x_news_stream_enabled is False
     assert "from:elonmusk" in settings.x_news_stream_rule
     assert "from:WatcherGuru" in settings.x_news_stream_rule
     assert "from:espn" not in settings.x_news_stream_rule
@@ -264,10 +269,15 @@ def test_news_radar_defaults_to_fast_but_cost_bounded_sources(monkeypatch) -> No
     assert settings.news_poll_seconds == 30
     assert settings.news_min_score == 45
     assert settings.news_launch_ready_score == 72
-    assert settings.news_x_verify_min_score == 35
+    assert settings.news_x_verify_min_score == 70
     assert settings.news_max_alerts_per_hour == 30
     assert settings.news_dex_match_enabled is True
     assert settings.pump_one_click_launch_enabled is False
     assert settings.pump_launch_is_unlocked is False
     assert settings.news_pair_recheck_seconds == (0, 30, 90, 180)
-    assert settings.x_search_max_results == 25
+    assert settings.x_search_max_results == 10
+    assert settings.x_daily_search_limit == 25
+    assert settings.x_daily_search_timezone == "America/Los_Angeles"
+    assert settings.coin_x_prefilter_min_score == Decimal("35")
+    assert settings.coin_watch_alerts_enabled is True
+    assert settings.coin_watch_min_score == Decimal("55")
