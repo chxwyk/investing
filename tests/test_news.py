@@ -133,3 +133,43 @@ def test_rss_parser_creates_narrative_alert() -> None:
     assert alerts[0].url == "https://example.test/story"
     assert "ALPHA" in alerts[0].narrative_terms
     assert alerts[0].score >= 20
+
+
+def test_rss_parser_keeps_ranked_lead_images() -> None:
+    feed = """
+    <rss xmlns:media="http://search.yahoo.com/mrss/"><channel><title>Fast News</title><item>
+      <title>BREAKING: KITCHEN MOMENT goes viral</title>
+      <description><![CDATA[<p>Confirmed.</p><img src="https://img.example.test/backup.jpg">]]></description>
+      <link>https://example.test/story</link>
+      <media:content url="https://img.example.test/lead.jpg" medium="image" />
+      <media:thumbnail url="https://img.example.test/thumb.jpg" />
+    </item></channel></rss>
+    """
+
+    alerts = parse_feed(feed, source_url="https://example.test/feed")
+
+    assert alerts[0].image_urls == (
+        "https://img.example.test/lead.jpg",
+        "https://img.example.test/thumb.jpg",
+        "https://img.example.test/backup.jpg",
+    )
+
+
+def test_x_payload_keeps_public_media_preview() -> None:
+    alert = parse_x_news_payload(
+        {
+            "data": {"id": "456", "author_id": "9", "text": "BREAKING: KITCHEN"},
+            "includes": {
+                "users": [{"id": "9", "username": "newsdesk"}],
+                "media": [
+                    {
+                        "type": "photo",
+                        "url": "https://pbs.twimg.com/media/example.jpg",
+                    }
+                ],
+            },
+        }
+    )
+
+    assert alert is not None
+    assert alert.image_urls == ("https://pbs.twimg.com/media/example.jpg",)

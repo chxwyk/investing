@@ -256,6 +256,8 @@ class NewsOpportunityView(discord.ui.View):
             self.launch_button.label = "Internal research only"
         elif not bot.engine.pump_launcher.configured:
             self.launch_button.label = "One-click launch locked"
+        else:
+            self.launch_button.label = f"Launch via {bot.engine.pump_launcher.provider}"
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if _member_is_admin(interaction.user, self.bot.settings):
@@ -287,7 +289,10 @@ class NewsOpportunityView(discord.ui.View):
             self.opportunity,
             requested_by=str(interaction.user.id),
         )
-        result_embed = _pump_launch_result_embed(result)
+        result_embed = _pump_launch_result_embed(
+            result,
+            self.bot.settings.fomo_referral_code,
+        )
         await interaction.followup.send(embed=result_embed, ephemeral=True)
         if result.success:
             await self.bot._send_alert(
@@ -376,6 +381,16 @@ def _coin_callout_embed(callout: CoinCallout) -> discord.Embed:
             ),
             inline=False,
         )
+        if dex.x_handle:
+            embed.add_field(
+                name="Token community link",
+                value=(
+                    f"[Open @{dex.x_handle} on X](https://x.com/{dex.x_handle}) • "
+                    "profile link found in public token metadata; tweet views and "
+                    "engagement are not verified in zero-cost mode"
+                ),
+                inline=False,
+            )
     else:
         embed.add_field(name="DEX flow", value="Official pair data unavailable", inline=False)
     social = callout.social
@@ -402,6 +417,15 @@ def _coin_callout_embed(callout: CoinCallout) -> discord.Embed:
             embed.add_field(
                 name="Notable crypto accounts pushing it",
                 value=" • ".join(f"`{item}`" for item in social.notable_accounts)[:1024],
+                inline=False,
+            )
+        if social.notable_posts:
+            embed.add_field(
+                name="Open the X posts",
+                value=" • ".join(
+                    f"[Post {index}]({url})"
+                    for index, url in enumerate(social.notable_posts, start=1)
+                )[:1024],
                 inline=False,
             )
     else:
@@ -473,6 +497,23 @@ def _coin_watch_embed(callout: CoinCallout) -> discord.Embed:
     embed.color = 0xF1C40F
     embed.set_footer(
         text="WATCH only • no user ping • VERIFIED TREND requires the complete 70+ evidence gate"
+    )
+    return embed
+
+
+def _fomo_watch_embed(callout: CoinCallout) -> discord.Embed:
+    embed = _coin_callout_embed(callout)
+    label = callout.symbol or _short(callout.mint)
+    embed.title = f"FOMO WATCH • ON-CHAIN MOMENTUM • {label}"
+    embed.description = (
+        f"Free-data score **{callout.score}/100** • this passed the complete public "
+        "liquidity, holder, authority, Tracker-risk, five-minute buy-flow, volume, and "
+        "executable-Jupiter-route gates. Paid X searches are disabled, so community post "
+        "views are **not** claimed. Open the X profile and Fomo links to inspect it manually."
+    )
+    embed.color = 0x5865F2
+    embed.set_footer(
+        text="FOMO WATCH • public on-chain/DEX evidence • research alert, not a profit promise"
     )
     return embed
 
@@ -593,6 +634,16 @@ def _news_alert_embed(
         )
     if alert.url:
         embed.add_field(name="Original source", value=f"[Open source]({alert.url})", inline=False)
+    if alert.image_urls:
+        embed.add_field(
+            name="Recommended coin image",
+            value=(
+                "The source feed's lead image will be cropped, labeled as an unofficial meme, "
+                "uploaded to IPFS, and sent to the launch backend."
+            ),
+            inline=False,
+        )
+        embed.set_image(url=alert.image_urls[0])
     embed.set_footer(
         text=(
             "COIN FOUND • direct links below • token-risk callout follows"
@@ -603,12 +654,15 @@ def _news_alert_embed(
     return embed
 
 
-def _pump_launch_result_embed(result: PumpLaunchResult) -> discord.Embed:
+def _pump_launch_result_embed(
+    result: PumpLaunchResult,
+    fomo_referral_code: str | None = None,
+) -> discord.Embed:
     embed = discord.Embed(
         title=(
-            f"PUMP LAUNCH • {result.status} • ${result.symbol}"
+            f"TOKEN LAUNCH • {result.status} • ${result.symbol}"
             if result.success
-            else f"PUMP LAUNCH • {result.status}"
+            else f"TOKEN LAUNCH • {result.status}"
         ),
         description=result.message,
         color=0x2ECC71 if result.success else 0xE74C3C,
@@ -622,6 +676,10 @@ def _pump_launch_result_embed(result: PumpLaunchResult) -> discord.Embed:
             name="Pump.fun",
             value=f"[Open coin](https://pump.fun/coin/{result.mint})",
         )
+        embed.add_field(
+            name="Fomo",
+            value=f"[Open coin in Fomo]({_fomo_coin_url(result.mint, fomo_referral_code)})",
+        )
     if result.signature:
         embed.add_field(
             name="Transaction",
@@ -630,7 +688,7 @@ def _pump_launch_result_embed(result: PumpLaunchResult) -> discord.Embed:
         )
     embed.set_footer(
         text=(
-            "Public Pump.fun coin after confirmation • anyone can use the Open coin link • "
+            "Public Solana coin • Pump.fun is immediate • Fomo may need time to index the mint • "
             "dedicated wallet/daily limits"
         )
     )
@@ -1224,6 +1282,8 @@ class SmartMoneyBot(commands.Bot):
             logger.exception("Could not post to alert channel")
 
     async def on_swap(self, swap: DetectedSwap, trader: TrackedTrader) -> None:
+        if not self.settings.trade_activity_alerts_enabled:
+            return
         color = 0x2ECC71 if swap.side is Side.BUY else 0xE74C3C
         embed = discord.Embed(
             title=f"RAW {swap.side.value} detected • {trader.alias}",
@@ -1287,6 +1347,8 @@ class SmartMoneyBot(commands.Bot):
     async def on_signal(
         self, signal: Signal, token_info: TokenInfo | None, decision: RiskDecision
     ) -> None:
+        if not self.settings.trade_activity_alerts_enabled:
+            return
         symbol = (
             token_info.symbol if token_info and token_info.symbol else _short(signal.token_mint)
         )
@@ -1319,6 +1381,8 @@ class SmartMoneyBot(commands.Bot):
         await self._send_alert(embed, token_mint=signal.token_mint)
 
     async def on_execution(self, result: ExecutionResult) -> None:
+        if not self.settings.trade_activity_alerts_enabled:
+            return
         unmatched_sell = (
             result.side is Side.SELL
             and not result.success
@@ -1361,6 +1425,13 @@ class SmartMoneyBot(commands.Bot):
             _coin_watch_embed(callout),
             token_mint=callout.mint,
             ping_user=False,
+        )
+
+    async def on_fomo_watch(self, callout: CoinCallout) -> None:
+        await self._send_alert(
+            _fomo_watch_embed(callout),
+            token_mint=callout.mint,
+            ping_user=True,
         )
 
     async def on_news_alert(
@@ -1723,7 +1794,9 @@ class SmartMoneyCommands(
             else "polling fallback"
         )
         x_status = (
-            f"working (last success <t:{status['x_social_last_success']}:R>)"
+            "disabled (zero-cost mode)"
+            if not status["x_paid_search_enabled"]
+            else f"working (last success <t:{status['x_social_last_success']}:R>)"
             if status["x_social_last_success"]
             else (
                 f"configured but failing: {status['x_social_last_error']}"
@@ -1734,7 +1807,9 @@ class SmartMoneyCommands(
             )
         )
         news_stream_status = (
-            "disabled (budget mode)"
+            "disabled (zero-cost mode)"
+            if not status["x_paid_search_enabled"]
+            else "disabled (budget mode)"
             if not status["x_news_stream_enabled"]
             else (
                 "connected"
@@ -1768,6 +1843,29 @@ class SmartMoneyCommands(
             if recent_scan_lines
             else "\n**Recent coin/X scans:** none completed since deployment\n"
         )
+        radar_last_scan_text = (
+            f"<t:{status['x_radar_last_scan']}:R>"
+            if status["x_radar_last_scan"]
+            else "not completed"
+        )
+        radar_error_text = (
+            f" • error: {status['x_radar_last_error']}"
+            if status["x_radar_last_error"]
+            else ""
+        )
+        fomo_radar_error_text = (
+            f" • {status['fomo_radar_last_error']}"
+            if status["fomo_radar_last_error"]
+            else ""
+        )
+        x_budget_text = (
+            "disabled—zero X API spend"
+            if not status["x_paid_search_enabled"]
+            else (
+                f"{status['x_search_usage_today']}/{status['x_search_daily_limit']} "
+                "used today"
+            )
+        )
         text = (
             "**Solana Tracker:** connected for strict 24H + 7D general-trader screening\n"
             "**Solana Tracker token safety:** risk score, rugged state, bundlers, "
@@ -1788,28 +1886,47 @@ class SmartMoneyCommands(
             "volume, profiles, and paid-boost labeling\n"
             f"**X/Twitter coin intelligence:** {x_status}"
             " • exact-contract promotion • crypto-author quality • duplicate-text checks\n"
-            f"**Paid X search budget:** {status['x_search_usage_today']}/"
-            f"{status['x_search_daily_limit']} used today • free prefilter before every "
-            "automatic paid search\n"
+            f"**Paid X search budget:** {x_budget_text}\n"
+            f"**Proactive X radar:** "
+            f"{'enabled' if status['x_radar_enabled'] else 'disabled'} • searches immediately "
+            f"and every {status['x_radar_poll_seconds'] // 60}m • "
+            f"{status['x_radar_scans']} completed • last scan "
+            f"{radar_last_scan_text}"
+            f" • last batch {status['x_radar_last_posts']} posts / "
+            f"{status['x_radar_last_new_posts']} new / "
+            f"{len(status['x_radar_last_contracts'])} contracts"
+            f"{radar_error_text}\n"
             f"**Coin scan visibility:** {scan_counts.get('total', 0)} analyzed since restart • "
             f"{scan_counts.get('free_rejected', 0)} rejected before X • "
+            f"{scan_counts.get('free_checked', 0)} free-data checked • "
             f"{scan_counts.get('x_checked', 0)} X-checked • "
             f"{scan_counts.get('watch', 0)} developing WATCH alerts • "
-            f"{scan_counts.get('verified', 0)} VERIFIED TREND alerts\n"
+            f"{scan_counts.get('verified', 0)} VERIFIED TREND alerts • "
+            f"{scan_counts.get('fomo_watch', 0)} FOMO WATCH alerts\n"
             + recent_scan_text
             +
+            f"**Free Fomo radar:** "
+            f"{'enabled' if status['fomo_radar_enabled'] else 'disabled'} • public DEX/Pump "
+            f"profiles and trending nominations every {status['fomo_radar_poll_seconds'] // 60}m"
+            f" • {status['fomo_radar_scans']} scans • last batch "
+            f"{len(status['fomo_radar_last_candidates'])} Solana candidates"
+            f"{fomo_radar_error_text}\n"
             f"**X near-realtime news stream:** {news_stream_status} • configured account/news "
             "rule • crypto-first filtering • exceptional U.S. event lane\n"
             f"**RSS/news radar:** {'ready' if status['news_rss_ready'] else 'starting'} • "
             "U.S. government/markets plus crypto sources; routine culture/sports removed\n"
-            f"**One-click Pump.fun launch:** "
+            f"**Launch artwork:** "
+            f"{'source-led image' if status['news_source_image_enabled'] else 'fallback art'} "
+            "• 1024x1024 • unofficial-meme label • IPFS upload\n"
+            f"**One-click token launch:** "
             f"{'unlocked' if status['pump_launch_unlocked'] else 'locked'} • "
-            "admin-only • separate capped wallet • public IPFS metadata\n"
+            f"provider {status['launch_provider']} • admin-only • topic artwork • "
+            "public IPFS metadata\n"
             f"**J7 Tracker:** "
             + (
                 f"authorized feed {status['j7_feed_health']}\n"
                 if status["j7_feed_configured"]
-                else "optional authorized RSS/Atom adapter ready; no public API documented\n"
+                else "deploy API supported; social-feed API not publicly documented\n"
             )
             +
             "**Fomo:** the official app exposes leaderboards, profiles, follows, and alerts, "
@@ -2284,7 +2401,9 @@ class SmartMoneyCommands(
             else "not completed yet"
         )
         x_callout_health = (
-            f"working • last success <t:{status['x_social_last_success']}:R>"
+            "disabled • zero X API spend"
+            if not status["x_paid_search_enabled"]
+            else f"working • last success <t:{status['x_social_last_success']}:R>"
             if status["x_social_last_success"]
             else (
                 f"ERROR • {status['x_social_last_error']}"
@@ -2295,7 +2414,9 @@ class SmartMoneyCommands(
             )
         )
         x_news_health = (
-            "disabled (budget mode)"
+            "disabled (zero-cost mode)"
+            if not status["x_paid_search_enabled"]
+            else "disabled (budget mode)"
             if not status["x_news_stream_enabled"]
             else (
                 "connected"
@@ -2308,6 +2429,25 @@ class SmartMoneyCommands(
                     else "not configured"
                 )
             )
+        )
+        x_radar_health = (
+            "active"
+            if status["x_paid_search_enabled"]
+            and status["x_radar_enabled"]
+            and status["x_social_configured"]
+            else "inactive"
+        )
+        raw_buy_ping_status = (
+            "muted"
+            if not status["trade_activity_alerts_enabled"]
+            else "ready"
+            if self.bot.settings.discord_alert_user_id
+            else "user ID not set"
+        )
+        x_search_text = (
+            "disabled—zero X API spend"
+            if not status["x_paid_search_enabled"]
+            else f"{status['x_search_usage_today']}/{status['x_search_daily_limit']} today"
         )
         rss_health = (
             f"ready • last refresh <t:{status['news_rss_last_refresh']}:R>"
@@ -2382,26 +2522,41 @@ class SmartMoneyCommands(
             f"{'ready' if status['quote_ready'] else 'JUPITER_API_KEY needed'}\n"
             f"**Consecutive quote failures:** {status['consecutive_quote_failures']} / "
             f"{s.max_consecutive_quote_failures}\n"
-            f"**Raw-buy pings:** "
-            f"{'ready' if self.bot.settings.discord_alert_user_id else 'user ID not set'}\n"
+            f"**Raw-buy pings:** {raw_buy_ping_status}\n"
+            f"**Trade activity alerts:** "
+            f"{'enabled' if status['trade_activity_alerts_enabled'] else 'muted—callouts only'}\n"
             f"**Coin callouts:** "
             f"{'enabled' if status['coin_callouts_enabled'] else 'disabled'} • "
-            "VERIFIED TREND only • exact-contract X promotion • cross-source liquidity • "
+            "free FOMO WATCH plus optional X VERIFIED TREND • cross-source liquidity • "
             "$5 executable route • complete Tracker/holder proof • "
             f"X {x_callout_health} • "
-            f"minimum final score {max(s.coin_callout_min_alert_score, Decimal('70'))}/100\n"
-            f"**X search budget:** {status['x_search_usage_today']}/"
-            f"{status['x_search_daily_limit']} today • free prefilter "
-            f"{s.coin_x_prefilter_min_score}/100 • developing WATCH alerts "
+            f"X minimum {max(s.coin_callout_min_alert_score, Decimal('70'))}/100 • "
+            f"free Fomo minimum {s.fomo_watch_min_score}/100\n"
+            f"**X search budget:** {x_search_text} • free prefilter "
+            f"{s.coin_x_prefilter_min_score}/100 • optional X WATCH alerts "
             f"{'enabled' if status['coin_watch_alerts_enabled'] else 'disabled'}\n"
+            f"**Proactive X radar:** {x_radar_health}"
+            f" • every {status['x_radar_poll_seconds'] // 60}m • "
+            f"{status['x_radar_scans']} searches since restart • last batch "
+            f"{status['x_radar_last_posts']} posts / "
+            f"{len(status['x_radar_last_contracts'])} contracts\n"
+            f"**Free Fomo radar:** "
+            f"{'active' if status['fomo_radar_enabled'] else 'disabled'} • every "
+            f"{status['fomo_radar_poll_seconds'] // 60}m • "
+            f"{status['fomo_radar_scans']} scans • latest public candidate batch "
+            f"{len(status['fomo_radar_last_candidates'])}\n"
             f"**News radar:** {'enabled' if status['news_radar_enabled'] else 'disabled'} • "
             "crypto-first • exceptional U.S. events require broad crypto pickup • "
             f"X stream {x_news_health} • RSS {rss_health}\n"
+            f"**Launch artwork:** "
+            f"{'source-led' if status['news_source_image_enabled'] else 'fallback only'} • "
+            "three ranked candidates • 1024x1024 IPFS PNG\n"
             f"**Crypto-demand launch score:** public alerts are LAUNCH READY only • "
             f"{s.news_launch_ready_score}+ plus authentic crypto-account promotion gate • "
             "source/speed/meme/X/confirmation/competition/identity\n"
-            f"**One-click Pump launch:** "
+            f"**One-click launch:** "
             f"{'unlocked' if status['pump_launch_unlocked'] else 'locked'} • "
+            f"provider {status['launch_provider']} • "
             f"{s.pump_launch_initial_buy_sol} SOL initial buy • max "
             f"{s.pump_launch_max_per_day}/day and "
             f"{s.pump_launch_max_sol_per_day} SOL/day\n"

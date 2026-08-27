@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import io
+import ipaddress
 import json
+import math
 import re
 import textwrap
 import time
@@ -12,7 +14,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 import aiohttp
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps, UnidentifiedImageError
 
 from .config import Settings
 from .errors import PumpLaunchError
@@ -779,8 +781,17 @@ def should_publish_news_opportunity(opportunity: LaunchOpportunity) -> bool:
     )
 
 
-def render_opportunity_image(opportunity: LaunchOpportunity) -> bytes:
-    """Create a deterministic news-card PNG for Pump metadata without external AI calls."""
+def render_opportunity_image(
+    opportunity: LaunchOpportunity,
+    source_image: bytes | None = None,
+) -> bytes:
+    """Create original topic-aware coin art without an external image-generation bill."""
+
+    if source_image:
+        try:
+            return _render_source_photo_art(opportunity, source_image)
+        except (OSError, UnidentifiedImageError, ValueError):
+            pass
 
     digest = hashlib.sha256(opportunity.primary_narrative.encode("utf-8")).digest()
     background = (max(18, digest[0] // 2), max(18, digest[1] // 2), max(24, digest[2] // 2))
@@ -794,23 +805,156 @@ def render_opportunity_image(opportunity: LaunchOpportunity) -> bytes:
         title_font = symbol_font = small_font = ImageFont.load_default()
 
     accent = (min(255, digest[3] + 80), min(255, digest[4] + 80), min(255, digest[5] + 80))
+    muted = tuple(max(45, channel // 2) for channel in accent)
+    draw.polygon(((0, 0), (1024, 0), (1024, 420), (0, 610)), fill=muted)
+    draw.ellipse((670, -130, 1130, 330), outline=accent, width=22)
+    draw.ellipse((-180, 760, 280, 1220), outline=accent, width=18)
     draw.rounded_rectangle((55, 55, 969, 969), radius=52, outline=accent, width=10)
-    draw.text((90, 90), opportunity.category, fill=accent, font=small_font)
-    title_lines = textwrap.wrap(opportunity.coin_name.upper(), width=14)[:3]
-    y = 270
+    draw.rounded_rectangle((85, 82, 520, 145), radius=26, fill=background)
+    draw.text((110, 98), opportunity.category, fill=accent, font=small_font)
+
+    _draw_topic_mark(draw, opportunity.category, accent, background)
+
+    title_lines = textwrap.wrap(opportunity.coin_name.upper(), width=16)[:2]
+    y = 555
     for line in title_lines:
         draw.text((90, y), line, fill="white", font=title_font)
-        y += 105
-    draw.text((90, 710), f"${opportunity.coin_symbol}", fill=accent, font=symbol_font)
-    draw.text((90, 880), "COMMUNITY MEME • NOT OFFICIAL", fill=(220, 220, 220), font=small_font)
+        y += 102
+    draw.rounded_rectangle((80, 790, 600, 885), radius=34, fill=accent)
+    draw.text((110, 807), f"${opportunity.coin_symbol}", fill=background, font=symbol_font)
+    draw.text((90, 916), "COMMUNITY MEME | NOT OFFICIAL", fill=(225, 225, 225), font=small_font)
     output = io.BytesIO()
     image.save(output, format="PNG", optimize=True)
     return output.getvalue()
 
 
+def _render_source_photo_art(opportunity: LaunchOpportunity, source_image: bytes) -> bytes:
+    with Image.open(io.BytesIO(source_image)) as original:
+        original.load()
+        if original.width < 240 or original.height < 240:
+            raise ValueError("source image is too small")
+        image = ImageOps.fit(
+            original.convert("RGB"),
+            (1024, 1024),
+            method=Image.Resampling.LANCZOS,
+            centering=(0.5, 0.45),
+        ).convert("RGBA")
+
+    shade = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    shade_draw = ImageDraw.Draw(shade)
+    for y in range(380, 1024):
+        alpha = min(220, 35 + int((y - 380) * 0.31))
+        shade_draw.line((0, y, 1024, y), fill=(5, 7, 12, alpha))
+    shade_draw.rounded_rectangle(
+        (52, 52, 972, 972),
+        radius=56,
+        outline=(255, 255, 255, 230),
+        width=12,
+    )
+    image = Image.alpha_composite(image, shade)
+    draw = ImageDraw.Draw(image)
+    try:
+        title_font = ImageFont.load_default(size=86)
+        symbol_font = ImageFont.load_default(size=56)
+        small_font = ImageFont.load_default(size=29)
+    except TypeError:
+        title_font = symbol_font = small_font = ImageFont.load_default()
+
+    digest = hashlib.sha256(opportunity.primary_narrative.encode("utf-8")).digest()
+    accent = (min(255, digest[3] + 80), min(255, digest[4] + 80), min(255, digest[5] + 80))
+    draw.rounded_rectangle((80, 70, 525, 137), radius=28, fill=(5, 7, 12, 205))
+    draw.text((108, 87), "SOURCE-LED COIN ART", fill=accent, font=small_font)
+    title_lines = textwrap.wrap(opportunity.coin_name.upper(), width=16)[:2]
+    y = 640
+    for line in title_lines:
+        draw.text((82, y), line, fill="white", font=title_font, stroke_width=3, stroke_fill="black")
+        y += 98
+    draw.rounded_rectangle((78, 850, 585, 936), radius=34, fill=accent)
+    draw.text((108, 863), f"${opportunity.coin_symbol}", fill=(5, 7, 12), font=symbol_font)
+    draw.text((610, 881), "UNOFFICIAL MEME", fill="white", font=small_font)
+
+    output = io.BytesIO()
+    image.convert("RGB").save(output, format="PNG", optimize=True)
+    return output.getvalue()
+
+
+def _draw_topic_mark(
+    draw: ImageDraw.ImageDraw,
+    category: str,
+    accent: tuple[int, int, int],
+    background: tuple[int, int, int],
+) -> None:
+    """Draw a bold category motif so every launch is more than a generic text card."""
+
+    category = category.upper()
+    if category == "SPORTS":
+        draw.arc((350, 190, 675, 480), 0, 180, fill=accent, width=34)
+        draw.rectangle((445, 305, 580, 455), fill=accent)
+        draw.rectangle((495, 445, 530, 505), fill=accent)
+        draw.rounded_rectangle((420, 495, 605, 535), radius=18, fill=accent)
+    elif category == "POLITICS":
+        draw.polygon(((320, 290), (512, 175), (705, 290)), fill=accent)
+        draw.rectangle((330, 300, 695, 340), fill=accent)
+        for x in (365, 455, 545, 635):
+            draw.rectangle((x, 340, x + 35, 485), fill=accent)
+        draw.rectangle((300, 485, 725, 525), fill=accent)
+    elif category == "CELEBRITY":
+        points: list[tuple[float, float]] = []
+        for index in range(10):
+            radius = 170 if index % 2 == 0 else 72
+            angle = -math.pi / 2 + index * math.pi / 5
+            points.append((512 + radius * math.cos(angle), 350 + radius * math.sin(angle)))
+        draw.polygon(points, fill=accent)
+    elif category == "BRAND / PRODUCT":
+        draw.rounded_rectangle((330, 205, 695, 520), radius=58, fill=accent)
+        draw.rectangle((390, 170, 635, 245), fill=accent)
+        draw.rounded_rectangle((390, 305, 635, 430), radius=28, fill=background)
+    elif category == "INTERNET / MEME":
+        draw.rounded_rectangle((285, 205, 650, 425), radius=62, fill=accent)
+        draw.polygon(((390, 410), (335, 505), (475, 425)), fill=accent)
+        draw.ellipse((350, 295, 390, 335), fill=background)
+        draw.ellipse((455, 295, 495, 335), fill=background)
+        draw.ellipse((560, 295, 600, 335), fill=background)
+    elif category == "GAMING / TECH":
+        draw.rounded_rectangle((295, 245, 730, 475), radius=100, fill=accent)
+        draw.rectangle((380, 320, 500, 360), fill=background)
+        draw.rectangle((420, 280, 460, 400), fill=background)
+        draw.ellipse((590, 295, 635, 340), fill=background)
+        draw.ellipse((650, 360, 695, 405), fill=background)
+    elif category == "CRYPTO":
+        draw.ellipse((330, 165, 695, 530), fill=accent, outline="white", width=12)
+        draw.ellipse((385, 220, 640, 475), fill=background)
+        for x, top, bottom in ((430, 350, 435), (485, 280, 430), (540, 315, 440), (595, 240, 420)):
+            draw.rectangle((x, top, x + 25, bottom), fill=accent)
+    elif category == "WORLD EVENT":
+        draw.ellipse((350, 185, 675, 510), outline=accent, width=28)
+        draw.ellipse((410, 245, 615, 450), outline=accent, width=22)
+        draw.ellipse((475, 310, 550, 385), fill=accent)
+    else:
+        draw.polygon(
+            ((535, 165), (350, 385), (485, 385), (445, 535), (680, 300), (535, 300)),
+            fill=accent,
+        )
+
+
+def is_safe_launch_image_url(value: str) -> bool:
+    parsed = urlparse(value)
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+        return False
+    host = parsed.hostname.casefold().rstrip(".")
+    if host == "localhost" or host.endswith(".localhost"):
+        return False
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return True
+    return address.is_global
+
+
 class PumpLaunchClient:
     BUILD_URL = "https://fun-block.pump.fun/agents/create-coin"
     PINATA_UPLOAD_URL = "https://uploads.pinata.cloud/v3/files"
+    MAX_SOURCE_IMAGE_BYTES = 8 * 1024 * 1024
 
     def __init__(self, settings: Settings, rpc: SolanaRPC) -> None:
         self.settings = settings
@@ -839,6 +983,42 @@ class PumpLaunchClient:
         if self._session and not self._session.closed:
             await self._session.close()
 
+    async def _render_launch_art(self, opportunity: LaunchOpportunity) -> bytes:
+        session = await self._get_session()
+        candidates = (
+            opportunity.alert.image_urls[:3]
+            if self.settings.news_source_image_enabled
+            else ()
+        )
+        for image_url in candidates:
+            if not is_safe_launch_image_url(image_url):
+                continue
+            try:
+                async with session.get(image_url, allow_redirects=True) as response:
+                    if response.status >= 400 or not is_safe_launch_image_url(str(response.url)):
+                        continue
+                    content_type = str(response.headers.get("Content-Type") or "").casefold()
+                    if not content_type.startswith("image/"):
+                        continue
+                    if (
+                        response.content_length is not None
+                        and response.content_length > self.MAX_SOURCE_IMAGE_BYTES
+                    ):
+                        continue
+                    chunks: list[bytes] = []
+                    total = 0
+                    async for chunk in response.content.iter_chunked(64 * 1024):
+                        total += len(chunk)
+                        if total > self.MAX_SOURCE_IMAGE_BYTES:
+                            chunks = []
+                            break
+                        chunks.append(chunk)
+                    if chunks:
+                        return render_opportunity_image(opportunity, b"".join(chunks))
+            except (TimeoutError, aiohttp.ClientError, ValueError):
+                continue
+        return render_opportunity_image(opportunity)
+
     async def launch(self, opportunity: LaunchOpportunity) -> PumpLaunchResult:
         created_at = int(time.time())
         key = alert_key(opportunity.alert)
@@ -859,7 +1039,7 @@ class PumpLaunchClient:
         wallet = str(keypair.pubkey())
         image_cid = await self._pin_file(
             filename=f"{opportunity.coin_symbol.lower()}-launch.png",
-            content=render_opportunity_image(opportunity),
+            content=await self._render_launch_art(opportunity),
             content_type="image/png",
         )
         image_uri = f"https://ipfs.io/ipfs/{image_cid}"
@@ -968,7 +1148,7 @@ class PumpLaunchClient:
     async def _pin_file(self, *, filename: str, content: bytes, content_type: str) -> str:
         jwt = self.settings.pinata_jwt or ""
         if not jwt:
-            raise PumpLaunchError("PINATA_JWT is required for Pump metadata")
+            raise PumpLaunchError("PINATA_JWT is required for the public launch image")
         session = await self._get_session()
         form = aiohttp.FormData()
         form.add_field("file", content, filename=filename, content_type=content_type)
@@ -995,6 +1175,176 @@ class PumpLaunchClient:
         if not cid:
             raise PumpLaunchError("Pinata upload response omitted a CID")
         return cid
+
+
+J7_REGION_BASES = {
+    "europe": "https://eu.j7tracker.io/deploy",
+    "na-east": "https://nyc.j7tracker.io/deploy",
+    "na-west": "https://lax.j7tracker.io/deploy",
+    "asia": "https://sgp.j7tracker.io/deploy",
+    "australia": "https://aus.j7tracker.io/deploy",
+}
+
+
+def build_j7_launch_payload(
+    opportunity: LaunchOpportunity,
+    settings: Settings,
+    *,
+    image_url: str,
+) -> dict[str, Any]:
+    """Build only documented J7 external-deploy fields; credentials stay in headers/body."""
+
+    source_url = opportunity.alert.url
+    payload: dict[str, Any] = {
+        "type": "create_token",
+        "external": True,
+        "api_key": settings.j7_launch_api_key or "",
+        "mode": "pump",
+        "name": opportunity.coin_name,
+        "ticker": opportunity.coin_symbol,
+        "buy_amount": float(settings.pump_launch_initial_buy_sol),
+        "image_url": image_url,
+        "image_type": "url",
+        "sell_panel_enabled": True,
+        "private_desc": False,
+        "description": (
+            f"Community-created meme inspired by public news: "
+            f"{opportunity.alert.headline[:280]}. Not official or affiliated with the "
+            "people, brands, publisher, or event named in the source."
+        ),
+        "mayhem_mode": settings.pump_launch_mayhem_mode,
+        "cashback_mode": settings.pump_launch_cashback,
+        "agent_mode": settings.pump_launch_tokenized_agent,
+        "buyback_bps": settings.pump_launch_buyback_bps,
+    }
+    if source_url:
+        if "x.com/" in source_url or "twitter.com/" in source_url:
+            payload["twitter"] = source_url
+        else:
+            payload["website"] = source_url
+    return payload
+
+
+class J7LaunchClient(PumpLaunchClient):
+    """Launch through J7's documented API using its encrypted per-wallet key."""
+
+    @property
+    def configured(self) -> bool:
+        return self.settings.j7_launch_is_unlocked
+
+    @property
+    def wallet_address(self) -> str | None:
+        # J7 intentionally exposes an encrypted wallet key, not the raw signer address.
+        return None
+
+    async def launch(self, opportunity: LaunchOpportunity) -> PumpLaunchResult:
+        created_at = int(time.time())
+        key = alert_key(opportunity.alert)
+        if not self.configured:
+            raise PumpLaunchError("J7 launch is locked or missing required credentials")
+        if opportunity.verdict != "LAUNCH READY":
+            raise PumpLaunchError("only a LAUNCH READY alert can use one-click launch")
+        if opportunity.score < self.settings.pump_launch_min_score:
+            raise PumpLaunchError("opportunity score is below PUMP_LAUNCH_MIN_SCORE")
+        if opportunity.alert.token_mints:
+            raise PumpLaunchError("a source contract already exists; launch was blocked")
+
+        image_cid = await self._pin_file(
+            filename=f"{opportunity.coin_symbol.lower()}-launch.png",
+            content=await self._render_launch_art(opportunity),
+            content_type="image/png",
+        )
+        image_url = f"https://ipfs.io/ipfs/{image_cid}"
+        payload = build_j7_launch_payload(opportunity, self.settings, image_url=image_url)
+        base_url = J7_REGION_BASES[self.settings.j7_launch_region]
+        session = await self._get_session()
+
+        # Warm the same regional path immediately before a time-sensitive deploy.
+        try:
+            async with session.get(f"{base_url}/ping") as response:
+                await response.read()
+        except (TimeoutError, aiohttp.ClientError):
+            pass
+
+        try:
+            async with session.post(
+                f"{base_url}/submit",
+                data=json.dumps(payload, separators=(",", ":")),
+                headers={
+                    "Authorization": f"Bearer {self.settings.j7_launch_session_token}",
+                    "Content-Type": "text/plain;charset=UTF-8",
+                },
+            ) as response:
+                body = await response.json(content_type=None)
+                if response.status >= 400:
+                    detail = _error_detail(body)
+                    raise PumpLaunchError(
+                        f"J7 launch HTTP {response.status}: {detail or 'request rejected'}"
+                    )
+        except PumpLaunchError:
+            raise
+        except (TimeoutError, aiohttp.ClientError, ValueError) as exc:
+            raise PumpLaunchError(f"J7 launch request failed: {exc}") from exc
+
+        if not isinstance(body, dict):
+            raise PumpLaunchError("J7 launch returned an invalid response")
+        if body.get("type") != "token_create_success":
+            detail = _error_detail(body)
+            raise PumpLaunchError(f"J7 launch failed: {detail or 'request rejected'}")
+        mint = str(body.get("mint_address") or body.get("address") or "")
+        signature = str(body.get("signature") or body.get("tx_hash") or "")
+        if not mint:
+            raise PumpLaunchError("J7 launch response omitted the mint address")
+        return PumpLaunchResult(
+            success=True,
+            status="SUBMITTED",
+            message="J7 Tracker created the Pump.fun coin and submitted the initial buy",
+            alert_key=key,
+            name=opportunity.coin_name,
+            symbol=opportunity.coin_symbol,
+            mint=mint,
+            signature=signature,
+            metadata_uri=image_url,
+            explorer_url=(
+                f"https://solscan.io/tx/{signature}"
+                if signature
+                else f"https://pump.fun/coin/{mint}"
+            ),
+            created_at=created_at,
+        )
+
+
+class OneClickLaunchClient:
+    """Prefer J7's encrypted-key route and retain direct Pump signing as a fallback."""
+
+    def __init__(self, settings: Settings, rpc: SolanaRPC) -> None:
+        self.j7 = J7LaunchClient(settings, rpc)
+        self.pump = PumpLaunchClient(settings, rpc)
+
+    @property
+    def configured(self) -> bool:
+        return self.j7.configured or self.pump.configured
+
+    @property
+    def provider(self) -> str:
+        if self.j7.configured:
+            return "J7 Tracker"
+        if self.pump.configured:
+            return "Pump.fun direct"
+        return "none"
+
+    @property
+    def wallet_address(self) -> str | None:
+        return self.pump.wallet_address if self.pump.configured else None
+
+    async def launch(self, opportunity: LaunchOpportunity) -> PumpLaunchResult:
+        if self.j7.configured:
+            return await self.j7.launch(opportunity)
+        return await self.pump.launch(opportunity)
+
+    async def close(self) -> None:
+        await self.j7.close()
+        await self.pump.close()
 
 
 def _error_detail(body: Any) -> str:

@@ -7,10 +7,11 @@ import pytest
 from smart_money_bot.bot import (
     SmartMoneyCommands,
     _news_lead_view,
+    _pump_launch_result_embed,
     _split_discord_text,
     _token_view,
 )
-from smart_money_bot.models import NewsAlert
+from smart_money_bot.models import NewsAlert, PumpLaunchResult
 
 
 @pytest.mark.asyncio
@@ -70,6 +71,27 @@ async def test_fomo_link_can_omit_referral() -> None:
     fomo_button = next(item for item in view.children if item.label == "Open in Fomo")
 
     assert "r=" not in fomo_button.url
+
+
+def test_successful_launch_embed_contains_pump_and_fomo_routes() -> None:
+    mint = "CBRRJc94xJpVnNWiMX2JemVQh7CxY2E27UnYL5tqpump"
+    embed = _pump_launch_result_embed(
+        PumpLaunchResult(
+            success=True,
+            status="SUBMITTED",
+            message="created",
+            alert_key="story",
+            name="Kitchen Coin",
+            symbol="KC",
+            mint=mint,
+        ),
+        "WetOuterLemur",
+    )
+    fields = {field.name: field.value for field in embed.fields}
+
+    assert f"https://pump.fun/coin/{mint}" in fields["Pump.fun"]
+    assert "https://fomo.family/coin?" in fields["Fomo"]
+    assert mint in fields["Fomo"]
 
 
 def test_long_status_is_split_below_discord_content_limit() -> None:

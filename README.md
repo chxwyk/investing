@@ -7,7 +7,43 @@ transactions, and mirrors every newly detected hot-wallet swap in PAPER mode. PA
 as either a forced source-price observation ledger or an executable Jupiter quote-shadow
 trial; the two answer different questions and are labeled separately.
 
-Version 2.25 adds a persistent **paid-X budget pipeline**. Automatic coin candidates now run
+Version 2.29 adds a **J7-style launch-image recommender** without scraping J7. Authorized
+RSS/Atom and optional X-stream alerts preserve up to three ranked lead images. The launch card
+previews the first recommendation; the launcher downloads the first usable public HTTPS image,
+center-crops it to 1024x1024, adds the coin name/ticker plus an `UNOFFICIAL MEME` label, uploads
+the final PNG to IPFS, and sends its URL through J7's documented `image_url` field. Missing,
+unsafe, non-image, oversized, or broken candidates fall back to the original generated category
+art. Successful launches now show explicit Pump.fun and Fomo routes using the returned Solana
+mint; Pump.fun is immediate while Fomo may need time to index a new mint.
+
+Version 2.28 added an official **J7 Tracker launch route**. Qualified Discord alerts can send
+their name, ticker, public source, capped initial buy, and generated topic artwork through J7's
+documented regional deploy API using J7's encrypted per-wallet Solana key. The raw wallet private
+key is not sent to or stored by this bot on the J7 path. The client warms the selected regional
+endpoint before submitting and preserves the existing duplicate and daily-SOL locks. The coin
+art is now an original category-specific 1024x1024 image rather than a plain name/ticker card.
+J7's public documentation covers deploy/trade endpoints, but does not document an export API for
+its authenticated social tracker; detection therefore remains on authorized RSS/news, optional
+official X, and on-chain sources.
+
+Version 2.27 switched the default alert experience to **zero-paid-X Fomo mode**. The master
+X cost switch defaults off and prevents recent search and filtered-stream requests even when
+an old bearer token remains configured. A free radar checks public DEX/Pump profiles and
+trending nominations immediately and every five minutes, then requires complete Tracker risk,
+authority, holder, concentration, cross-source liquidity, buy-flow, volume, official X-profile
+link, and executable Jupiter-route evidence before sending a pinging `FOMO WATCH`. The card
+opens directly in Fomo and clearly says that X views/engagement were not verified. Raw wallet
+BUY/SELL, consensus, and PAPER fill cards default muted while all internal tracking continues.
+
+Version 2.26 adds a proactive, budgeted **X contract radar**. It performs one search as soon
+as the bot starts and repeats every 30 minutes by default, looking for current Solana/memecoin
+launch language and exact contract addresses. One response can nominate several contracts;
+the matching X posts are reused by the safety analyzer instead of charging for a second exact-
+contract search. Automatic `X COIN WATCH` and `VERIFIED TREND` cards include direct links to
+the underlying X posts plus Pump.fun, Jupiter, chart, and Solscan controls. One promoter alone
+still cannot generate an automatic public callout.
+
+Version 2.25 added a persistent **paid-X budget pipeline**. Automatic coin candidates now run
 the free token, Tracker, DEX-flow, smart-wallet, and executable-route checks before the bot
 spends an X recent-search request. SQLite enforces a restart-safe daily X-search ceiling.
 Developing exact-contract activity can produce a clearly labeled, non-pinging `X COIN WATCH`,
@@ -58,7 +94,7 @@ and rechecks DEX Screener for a newly created Solana pair matching the narrative
 pair still passes the normal DEX, token-safety, verified-wallet, and X evidence checks; a
 headline never becomes an automatic live buy. An optional `J7_AUTHORIZED_FEED_URL` accepts a
 legitimately provided J7 RSS/Atom feed, but the bot does not scrape J7's authenticated product
-or store J7 login credentials.
+and the feed adapter never accepts J7 login credentials.
 
 Version 2.19 added asynchronous coin-intelligence callouts. A detected BUY keeps the fast
 quote/PAPER path; a separate task cross-checks the mint against DEX Screener pair flow,
@@ -151,7 +187,8 @@ unless four separate controls are deliberately configured.
 
 ## What it deliberately does not do
 
-- It does not log into, scrape, reverse-engineer, or control a Fomo or J7 Tracker account.
+- It does not scrape or reverse-engineer Fomo or J7 Tracker. J7 launches use only its documented
+  external deploy endpoint and encrypted per-wallet API key.
 - It does not scrape or automate KOLScan. Only documented provider APIs and public on-chain
   activity are used for automatic candidate discovery.
 - It does not map Fomo usernames to wallets or copy Fomo's leaderboard. Fomo does not expose
@@ -268,7 +305,8 @@ when no prior public BUY exists
 inside the scanned history, no current baseline price is available, or the PAPER account lacks
 cash. Set `PAPER_MIRROR_RAW_SWAPS=false` to restore consensus-only paper behavior.
 
-The v2.25.1 discovery, budgeted X verification, crypto-first launch-radar, verified-only
+The v2.29.0 discovery, zero-cost Fomo radar, optional X verification, crypto-first launch-radar,
+verified-only
 callout, selective-entry, daily loss/profit
 locks, social nomination, quote, fallback, rotation, and exit controls are
 intentionally configurable:
@@ -329,12 +367,23 @@ NEWS_LAUNCH_READY_SCORE=72
 NEWS_X_VERIFY_MIN_SCORE=70
 NEWS_X_TREND_CACHE_SECONDS=3600
 NEWS_MAX_ALERTS_PER_HOUR=30
+NEWS_SOURCE_IMAGE_ENABLED=true
 X_SEARCH_MAX_RESULTS=10
 X_DAILY_SEARCH_LIMIT=25
 X_DAILY_SEARCH_TIMEZONE=America/Los_Angeles
+X_PAID_SEARCH_ENABLED=false
+X_RADAR_ENABLED=false
+X_RADAR_POLL_SECONDS=1800
+X_RADAR_MAX_CONTRACTS_PER_SCAN=3
 COIN_X_PREFILTER_MIN_SCORE=35
 COIN_WATCH_ALERTS_ENABLED=true
 COIN_WATCH_MIN_SCORE=55
+FOMO_RADAR_ENABLED=true
+FOMO_RADAR_POLL_SECONDS=300
+FOMO_RADAR_MAX_CANDIDATES_PER_SCAN=5
+FOMO_RADAR_RECHECK_SECONDS=1800
+FOMO_WATCH_MIN_SCORE=50
+TRADE_ACTIVITY_ALERTS_ENABLED=false
 NEWS_DEX_MATCH_ENABLED=true
 NEWS_DEX_MATCH_MIN_LIQUIDITY_USD=2000
 NEWS_DEX_MATCH_MAX_AGE_MINUTES=60
@@ -347,11 +396,11 @@ settings. Use `/smartmoney paper`, `/smartmoney positions`, `/smartmoney paper-t
 
 ## Crypto-first news and launch radar
 
-The radar has two independent inputs. X uses the official filtered-stream endpoint, so a
-matching public post arrives without polling. Its default rule follows established crypto
-sources, exact contract/launch language, and a small set of major U.S. breaking-news accounts.
-RSS/Atom polls selected U.S. government, market, and crypto feeds every 30 seconds. Routine
-world, sports, entertainment, and product feeds are not included by default.
+The radar has independent free and optional paid inputs. The zero-cost Fomo radar checks public
+DEX/Pump nominations every five minutes. RSS/Atom polls selected U.S. government, market, and
+crypto feeds every 30 seconds. The proactive X recent-search loop and official filtered stream
+remain available but make no requests while `X_PAID_SEARCH_ENABLED=false`. Routine world,
+sports, entertainment, and product feeds are not included by default.
 
 Every X evidence response separates generic authors from crypto-native authors, credible
 crypto authors, promotion posts, and exact-contract posts. A generic keyword match cannot
@@ -367,27 +416,32 @@ single-post contracts go through the normal risk callout without becoming a high
 news alert. Existing contracts can never launch a duplicate.
 
 The default X rule follows a deliberately small set of crypto and major U.S. news accounts to
-limit paid X reads. Customize `X_NEWS_STREAM_RULE` using valid X filtered-stream syntax instead
-of broad keywords that can consume credits quickly. `X_SEARCH_MAX_RESULTS=10` similarly caps
-each on-demand coin-evidence search. `/smartmoney sources` and `/smartmoney status` show the
-last X search error, stream state, RSS state, J7 feed state, narrative matcher state, scoring
-thresholds, and one-click launch lock.
+limit paid X reads. Customize `X_RADAR_QUERY` only with valid X recent-search syntax; broad
+keywords can consume the daily budget without finding usable contracts. `X_SEARCH_MAX_RESULTS=10`
+caps each radar and on-demand response. `/smartmoney sources` and `/smartmoney status` show the
+proactive scan time, posts examined, new posts, extracted contracts, budget usage, last X error,
+stream state, RSS state, J7 feed state, narrative matcher state, scoring thresholds, and one-click
+launch lock.
 
-J7's public site does not document an integration API in this release. If J7 support gives you
-an official RSS/Atom URL, store only that URL as `J7_AUTHORIZED_FEED_URL`. Never place a J7
-password, browser cookie, session token, or copied private endpoint in Railway.
+J7 documents regional token deploy and trade endpoints. This release uses only the documented
+external deploy request. J7 does not currently document a feed/webhook that exports its
+authenticated social tracker. If J7 support provides an official RSS/Atom URL, put that URL in
+`J7_AUTHORIZED_FEED_URL`; do not copy an internal tracker endpoint or browser cookie.
 
-### One-click Pump.fun launch setup
+### One-click token launch setup
 
-This feature spends real SOL even while the copy-trading engine remains in PAPER mode. Create a
-separate burner-style Solana wallet, keep only the amount you accept losing in it, and store its
-private key only in Railway Variables. Create a Pinata JWT for public file uploads and store it
-there too. Never reuse `TRADING_PRIVATE_KEY`.
+This feature spends real SOL even while the copy-trading engine remains in PAPER mode. Keep only
+the amount you accept losing in the launch wallet. The preferred J7 path uses the encrypted
+per-wallet key shown by J7 under Deploy Settings > Wallets plus an official J7 session token; it
+never accepts a recovery phrase or raw private key. Create a Pinata JWT for the generated public
+coin image. Never paste any credential into Discord or ChatGPT.
 
 ```text
-PUMP_ONE_CLICK_LAUNCH_ENABLED=true
+J7_LAUNCH_ENABLED=true
+J7_LAUNCH_SESSION_TOKEN=<official J7 JWT>
+J7_LAUNCH_API_KEY=<encrypted Solana wallet key copied from J7>
+J7_LAUNCH_REGION=na-east
 PUMP_LAUNCH_ACK=I_UNDERSTAND_PUMP_LAUNCHES_SPEND_REAL_SOL
-PUMP_LAUNCH_PRIVATE_KEY=<dedicated launch wallet secret>
 PINATA_JWT=<server-side Pinata JWT>
 PUMP_LAUNCH_INITIAL_BUY_SOL=0.01
 PUMP_LAUNCH_MIN_SCORE=72
@@ -396,12 +450,22 @@ PUMP_LAUNCH_MAX_SOL_PER_DAY=0.05
 PUMP_LAUNCH_TIMEZONE=America/Los_Angeles
 ```
 
+The old direct Pump.fun signer remains available as a fallback by setting
+`PUMP_ONE_CLICK_LAUNCH_ENABLED=true` and `PUMP_LAUNCH_PRIVATE_KEY` to a separate capped launch
+wallet. If both paths are fully configured, J7 is preferred. Never use a recovery phrase.
+
 The launch button is shown only on `LAUNCH READY` alerts and only Discord administrators or
 configured `DISCORD_ADMIN_ROLE_IDS` can press it. One click creates and submits the transaction;
 there is no per-launch confirmation dialog. SQLite reserves the source alert before any upload
 or signature so double clicks and restarts cannot produce a second coin from the same alert.
-Pump metadata labels the asset as a community meme and explicitly says it is not official or
-affiliated with the people, brands, publisher, or event in the source.
+Metadata labels the asset as a community meme and explicitly says it is not official or
+affiliated with the people, brands, publisher, or event in the source. The generated image is
+uploaded to public IPFS and sent to J7 as the documented `image_url` field.
+
+When `NEWS_SOURCE_IMAGE_ENABLED=true`, source-provided lead images take priority over generated
+category art. The bot never guesses a private J7 image endpoint. If an authorized J7 feed later
+includes its recommended image as RSS media/thumbnail/enclosure content, the same parser will use
+that exact recommendation automatically. Review the source's image rights before commercial use.
 
 ## Official PAPER readiness trial
 

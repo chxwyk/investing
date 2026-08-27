@@ -165,6 +165,7 @@ class XSocialSnapshot:
     duplicate_percent: Decimal = Decimal("0")
     posts_per_minute: Decimal = Decimal("0")
     notable_accounts: tuple[str, ...] = ()
+    notable_posts: tuple[str, ...] = ()
     query: str = ""
     error: str | None = None
 
@@ -183,6 +184,7 @@ class NewsAlert:
     matched_rule: str = ""
     narrative_terms: tuple[str, ...] = ()
     token_mints: tuple[str, ...] = ()
+    image_urls: tuple[str, ...] = ()
     created_at: int = 0
     received_at: int = 0
 

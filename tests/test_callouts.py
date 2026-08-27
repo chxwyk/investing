@@ -4,6 +4,7 @@ from decimal import Decimal
 
 from smart_money_bot.callouts import (
     CoinCalloutAnalyzer,
+    DexScreenerClient,
     XRecentSearchClient,
     build_x_narrative_query,
     build_x_query,
@@ -13,6 +14,7 @@ from smart_money_bot.callouts import (
     score_callout,
     should_publish_coin_callout,
     should_publish_coin_watch,
+    should_publish_fomo_watch,
 )
 from smart_money_bot.models import (
     DexSnapshot,
@@ -431,6 +433,152 @@ async def test_x_daily_budget_blocks_before_network_request() -> None:
     assert client.budget_rejections == 1
 
 
+async def test_zero_cost_mode_never_reserves_or_calls_x() -> None:
+    reservations = 0
+
+    async def reserve_budget() -> bool:
+        nonlocal reservations
+        reservations += 1
+        return True
+
+    client = XRecentSearchClient(
+        "x-token",
+        budget_reserver=reserve_budget,
+        paid_search_enabled=False,
+    )
+
+    snapshot = await client.snapshot(MINT)
+    mints = await client.discover_contracts("solana pump.fun")
+
+    assert client.configured is True
+    assert client.search_enabled is False
+    assert reservations == 0
+    assert snapshot.available is False
+    assert snapshot.error == "paid X searches disabled"
+    assert mints == ()
+    assert client.last_radar_error == "paid X searches disabled"
+
+
+async def test_free_dex_radar_nominates_only_valid_solana_contracts() -> None:
+    class FakeResponse:
+        status = 200
+
+        def __init__(self, payload):
+            self.payload = payload
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            del exc_type, exc, traceback
+
+        async def json(self, *, content_type=None):
+            del content_type
+            return self.payload
+
+    class FakeSession:
+        def get(self, url):
+            if "token-profiles" in url:
+                return FakeResponse(
+                    [
+                        {"chainId": "solana", "tokenAddress": MINT},
+                        {"chainId": "ethereum", "tokenAddress": "0xabc"},
+                    ]
+                )
+            return FakeResponse(
+                [
+                    {"chainId": "solana", "tokenAddress": MINT},
+                    {"chainId": "solana", "tokenAddress": "not-a-mint"},
+                ]
+            )
+
+    client = DexScreenerClient()
+
+    async def fake_session():
+        return FakeSession()
+
+    client._get_session = fake_session  # type: ignore[method-assign]
+    mints = await client.trending_mints()
+
+    assert mints == (MINT,)
+    assert client.radar_scans == 1
+    assert client.last_radar_candidates == (MINT,)
+
+
+async def test_proactive_x_radar_finds_contract_and_reuses_paid_response() -> None:
+    old = (datetime.now(UTC) - timedelta(days=365)).isoformat()
+    recent = (datetime.now(UTC) - timedelta(minutes=2)).isoformat()
+    payload = {
+        "data": [
+            {
+                "id": "post-1",
+                "author_id": "author-1",
+                "created_at": recent,
+                "text": f"Just launched on pump.fun CA: {MINT}",
+                "public_metrics": {"like_count": 25, "retweet_count": 4},
+            }
+        ],
+        "includes": {
+            "users": [
+                {
+                    "id": "author-1",
+                    "username": "solanacaller",
+                    "description": "Solana memecoin trader",
+                    "created_at": old,
+                    "public_metrics": {"followers_count": 2_500, "following_count": 100},
+                }
+            ]
+        },
+    }
+
+    class FakeResponse:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            del exc_type, exc, traceback
+
+        async def json(self, *, content_type=None):
+            del content_type
+            return payload
+
+    class FakeSession:
+        def get(self, *args, **kwargs):
+            del args, kwargs
+            return FakeResponse()
+
+    reservations = 0
+
+    async def reserve_budget() -> bool:
+        nonlocal reservations
+        reservations += 1
+        return True
+
+    client = XRecentSearchClient("x-token", budget_reserver=reserve_budget)
+
+    async def fake_session():
+        return FakeSession()
+
+    client._get_session = fake_session  # type: ignore[method-assign]
+
+    mints = await client.discover_contracts("solana pump.fun")
+    cached = await client.snapshot(MINT)
+    duplicate_mints = await client.discover_contracts("solana pump.fun")
+
+    assert mints == (MINT,)
+    assert duplicate_mints == ()
+    assert reservations == 2
+    assert client.radar_scans == 2
+    assert client.last_radar_posts == 1
+    assert client.last_radar_new_posts == 0
+    assert cached.available is True
+    assert cached.contract_posts == 1
+    assert cached.credible_contract_authors == 1
+    assert cached.notable_posts == ("https://x.com/solanacaller/status/post-1",)
+
+
 async def test_free_prefilter_rejects_hard_risk_without_spending_x() -> None:
     class FakeDex:
         async def snapshot(self, mint: str) -> DexSnapshot:
@@ -445,6 +593,7 @@ async def test_free_prefilter_rejects_hard_risk_without_spending_x() -> None:
 
     class FakeSocial:
         calls = 0
+        search_enabled = True
 
         async def snapshot(self, mint: str, **kwargs) -> XSocialSnapshot:
             del mint, kwargs
@@ -486,6 +635,51 @@ async def test_free_prefilter_rejects_hard_risk_without_spending_x() -> None:
     assert social.calls == 1
     assert forced.scan_stage == "X_CHECKED"
     assert forced.x_search_attempted is True
+
+
+def test_fomo_watch_requires_complete_free_market_and_risk_proof() -> None:
+    report = score_callout(
+        mint=MINT,
+        token_info=TokenInfo(
+            mint=MINT,
+            symbol="FREE",
+            holder_count=250,
+            liquidity_usd=Decimal("50000"),
+            top_holders_percent=Decimal("18"),
+            dev_balance_percent=Decimal("1"),
+            suspicious=False,
+            mint_authority_disabled=True,
+            freeze_authority_disabled=True,
+        ),
+        dex=DexSnapshot(
+            available=True,
+            liquidity_usd=Decimal("50000"),
+            buys_5m=30,
+            sells_5m=10,
+            volume_5m_usd=Decimal("5000"),
+            has_x_profile=True,
+            x_handle="freecoin",
+        ),
+        social=XSocialSnapshot(available=False, error="paid X searches disabled"),
+        tracker_risk=_complete_tracker_risk(),
+        smart_wallets=(),
+        executable_quote=_executable_quote(),
+    )
+    report = replace(report, scan_stage="FREE_CHECKED")
+
+    assert should_publish_fomo_watch(
+        report,
+        configured_score_floor=Decimal("50"),
+    )
+
+    weak_flow = replace(
+        report,
+        dex=replace(report.dex, buys_5m=5, sells_5m=15),
+    )
+    assert not should_publish_fomo_watch(
+        weak_flow,
+        configured_score_floor=Decimal("50"),
+    )
 
 
 def test_developing_watch_requires_real_exact_contract_x_activity() -> None:

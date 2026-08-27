@@ -23,6 +23,7 @@ from .models import (
     TokenRiskSnapshot,
     XSocialSnapshot,
 )
+from .news import extract_solana_mints
 
 CRYPTO_PROFILE_TERMS = {
     "bitcoin",
@@ -95,12 +96,16 @@ class DexScreenerClient:
         self.timeout = aiohttp.ClientTimeout(total=timeout_seconds)
         self._session: aiohttp.ClientSession | None = None
         self._cache: dict[str, tuple[float, DexSnapshot]] = {}
+        self.radar_scans = 0
+        self.last_radar_at: int | None = None
+        self.last_radar_candidates: tuple[str, ...] = ()
+        self.last_radar_error: str | None = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
                 timeout=self.timeout,
-                headers={"User-Agent": "SmartMoneyCopyBot/2.25.1 coin-intelligence"},
+                headers={"User-Agent": "SmartMoneyCopyBot/2.29.0 coin-intelligence"},
             )
         return self._session
 
@@ -124,6 +129,41 @@ class DexScreenerClient:
         snapshot = parse_dex_snapshot(payload, mint=mint)
         self._cache[mint] = (now, snapshot)
         return snapshot
+
+    async def trending_mints(self) -> tuple[str, ...]:
+        """Nominate public Solana profiles/boosts; never treat paid boosts as proof."""
+
+        latest_profiles, top_boosts = await asyncio.gather(
+            self._discovery_rows("/token-profiles/latest/v1"),
+            self._discovery_rows("/token-boosts/top/v1"),
+        )
+        mints: list[str] = []
+        for item in (*latest_profiles, *top_boosts):
+            if str(item.get("chainId") or "").casefold() != "solana":
+                continue
+            address = str(item.get("tokenAddress") or "").strip()
+            if address and address in extract_solana_mints(address) and address not in mints:
+                mints.append(address)
+        self.radar_scans += 1
+        self.last_radar_at = int(time.time())
+        self.last_radar_candidates = tuple(mints)
+        self.last_radar_error = None if latest_profiles or top_boosts else "no DEX candidates"
+        return tuple(mints)
+
+    async def _discovery_rows(self, path: str) -> tuple[dict[str, Any], ...]:
+        session = await self._get_session()
+        try:
+            async with session.get(f"{self.BASE_URL}{path}") as response:
+                if response.status >= 400:
+                    self.last_radar_error = f"DEX Screener HTTP {response.status}"
+                    return ()
+                payload = await response.json(content_type=None)
+        except (TimeoutError, aiohttp.ClientError, ValueError) as exc:
+            self.last_radar_error = str(exc)[:160] or "DEX discovery request failed"
+            return ()
+        if not isinstance(payload, list):
+            return ()
+        return tuple(item for item in payload if isinstance(item, dict))
 
 
 def parse_dex_snapshot(payload: Any, *, mint: str) -> DexSnapshot:
@@ -211,8 +251,10 @@ class XRecentSearchClient:
         cache_seconds: int = 60,
         trusted_crypto_accounts: tuple[str, ...] = (),
         budget_reserver: Callable[[], Awaitable[bool]] | None = None,
+        paid_search_enabled: bool = True,
     ) -> None:
         self.bearer_token = bearer_token
+        self.paid_search_enabled = paid_search_enabled
         self.max_results = max(10, min(100, max_results))
         self.cache_seconds = max(30, cache_seconds)
         self.trusted_crypto_accounts = frozenset(
@@ -227,10 +269,22 @@ class XRecentSearchClient:
         self.last_status_code: int | None = None
         self.requests_attempted = 0
         self.budget_rejections = 0
+        self.radar_scans = 0
+        self.last_radar_at: int | None = None
+        self.last_radar_posts = 0
+        self.last_radar_new_posts = 0
+        self.last_radar_contracts: tuple[str, ...] = ()
+        self.last_radar_error: str | None = None
+        self._radar_seen_post_ids: set[str] = set()
+        self._radar_seen_post_order: list[str] = []
 
     @property
     def configured(self) -> bool:
         return bool(self.bearer_token)
+
+    @property
+    def search_enabled(self) -> bool:
+        return bool(self.bearer_token and self.paid_search_enabled)
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -260,6 +314,8 @@ class XRecentSearchClient:
         symbol: str | None = None,
         name: str | None = None,
     ) -> XSocialSnapshot:
+        if not self.paid_search_enabled:
+            return XSocialSnapshot(available=False, error="paid X searches disabled")
         if not self.bearer_token:
             return XSocialSnapshot(available=False, error="X_API_BEARER_TOKEN not configured")
         query = build_x_query(mint, symbol=symbol, name=name)
@@ -321,6 +377,8 @@ class XRecentSearchClient:
         cleaned = re.sub(r"[\"\\]", "", narrative).strip()
         if not cleaned:
             return XSocialSnapshot(available=False, error="empty narrative")
+        if not self.paid_search_enabled:
+            return XSocialSnapshot(available=False, error="paid X searches disabled")
         if not self.bearer_token:
             return XSocialSnapshot(
                 available=False,
@@ -380,6 +438,122 @@ class XRecentSearchClient:
         self.last_success_at = int(time.time())
         self._cache[query] = (now, snapshot)
         return snapshot
+
+    async def discover_contracts(self, query: str) -> tuple[str, ...]:
+        """Proactively find exact Solana contracts in recent public X posts.
+
+        One broad paid search can nominate several contracts. Exact-contract social
+        snapshots are cached from the matching posts so downstream safety analysis
+        does not spend a second X request for the same evidence.
+        """
+
+        cleaned = query.strip()
+        if not self.paid_search_enabled:
+            self.last_radar_error = "paid X searches disabled"
+            return ()
+        if not self.bearer_token:
+            self.last_radar_error = "X_API_BEARER_TOKEN not configured"
+            return ()
+        if not cleaned:
+            self.last_radar_error = "empty X radar query"
+            return ()
+        if not await self._reserve_request():
+            self.last_radar_error = self.last_error
+            return ()
+
+        session = await self._get_session()
+        params = {
+            "query": cleaned,
+            "max_results": str(self.max_results),
+            "tweet.fields": "author_id,created_at,public_metrics,text",
+            "expansions": "author_id",
+            "user.fields": (
+                "username,description,location,created_at,public_metrics,verified,verified_type"
+            ),
+        }
+        try:
+            async with session.get(
+                f"{self.BASE_URL}/2/tweets/search/recent",
+                params=params,
+                headers={"Authorization": f"Bearer {self.bearer_token}"},
+            ) as response:
+                body = await response.json(content_type=None)
+                if response.status >= 400:
+                    detail = str(body.get("detail") or body.get("title") or response.status)
+                    self.last_status_code = response.status
+                    self.last_error = f"HTTP {response.status}: {detail[:120]}"
+                    self.last_radar_error = self.last_error
+                    return ()
+        except (TimeoutError, aiohttp.ClientError, ValueError) as exc:
+            self.last_status_code = None
+            self.last_error = f"request failed: {str(exc)[:120]}"
+            self.last_radar_error = self.last_error
+            return ()
+
+        now = time.monotonic()
+        wall_now = int(time.time())
+        posts = body.get("data") or [] if isinstance(body, dict) else []
+        users = (body.get("includes") or {}).get("users") or [] if isinstance(body, dict) else []
+        if not isinstance(posts, list):
+            posts = []
+        if not isinstance(users, list):
+            users = []
+
+        unseen_posts: list[dict[str, Any]] = []
+        for post in posts:
+            if not isinstance(post, dict):
+                continue
+            post_id = str(post.get("id") or "")
+            if not post_id or post_id in self._radar_seen_post_ids:
+                continue
+            unseen_posts.append(post)
+            self._remember_radar_post(post_id)
+
+        mints: list[str] = []
+        for post in unseen_posts:
+            for mint in extract_solana_mints(str(post.get("text") or "")):
+                if mint not in mints:
+                    mints.append(mint)
+
+        for mint in mints:
+            matching_posts = [
+                post
+                for post in posts
+                if isinstance(post, dict)
+                and mint.casefold() in str(post.get("text") or "").casefold()
+            ]
+            author_ids = {str(post.get("author_id") or "") for post in matching_posts}
+            matching_users = [
+                user
+                for user in users
+                if isinstance(user, dict) and str(user.get("id") or "") in author_ids
+            ]
+            exact_query = build_x_query(mint)
+            snapshot = parse_x_snapshot(
+                {"data": matching_posts, "includes": {"users": matching_users}},
+                query=exact_query,
+                contract=mint,
+                trusted_crypto_accounts=self.trusted_crypto_accounts,
+            )
+            self._cache[exact_query] = (now, snapshot)
+
+        self.last_status_code = 200
+        self.last_error = None
+        self.last_success_at = wall_now
+        self.radar_scans += 1
+        self.last_radar_at = wall_now
+        self.last_radar_posts = len(posts)
+        self.last_radar_new_posts = len(unseen_posts)
+        self.last_radar_contracts = tuple(mints)
+        self.last_radar_error = None
+        return tuple(mints)
+
+    def _remember_radar_post(self, post_id: str) -> None:
+        if len(self._radar_seen_post_order) >= 1000:
+            oldest = self._radar_seen_post_order.pop(0)
+            self._radar_seen_post_ids.discard(oldest)
+        self._radar_seen_post_order.append(post_id)
+        self._radar_seen_post_ids.add(post_id)
 
 
 def build_x_query(mint: str, *, symbol: str | None = None, name: str | None = None) -> str:
@@ -500,6 +674,7 @@ def parse_x_snapshot(
     trusted_crypto_authors: set[str] = set()
     million_follower_authors: set[str] = set()
     notable_by_author: dict[str, tuple[int, str]] = {}
+    notable_posts: list[tuple[int, int, str]] = []
     engagements = 0
     normalized_texts: list[str] = []
     contract_posts = 0
@@ -516,10 +691,11 @@ def parse_x_snapshot(
         raw_text = str(post.get("text") or "")
         lowered_text = raw_text.casefold()
         metrics = post.get("public_metrics") or {}
-        engagements += sum(
+        post_engagements = sum(
             _integer(metrics.get(key))
             for key in ("like_count", "retweet_count", "reply_count", "quote_count")
         )
+        engagements += post_engagements
         normalized = normalize_post_text(raw_text)
         has_contract = bool(contract and contract.casefold() in lowered_text)
         if has_contract:
@@ -569,6 +745,11 @@ def parse_x_snapshot(
                 credible_crypto_authors.add(author_id)
             if has_contract:
                 contract_authors.add(author_id)
+                post_id = str(post.get("id") or "")
+                if username and post_id:
+                    notable_posts.append(
+                        (followers, post_engagements, f"https://x.com/{username}/status/{post_id}")
+                    )
                 if credible_profile:
                     credible_contract_authors.add(author_id)
         if author_id and age_days >= 90 and followers >= 100:
@@ -618,6 +799,14 @@ def parse_x_snapshot(
             for followers, username in sorted(
                 notable_by_author.values(),
                 key=lambda item: (item[0], item[1]),
+                reverse=True,
+            )[:5]
+        ),
+        notable_posts=tuple(
+            url
+            for _followers, _engagements, url in sorted(
+                set(notable_posts),
+                key=lambda item: (item[0], item[1], item[2]),
                 reverse=True,
             )[:5]
         ),
@@ -704,6 +893,14 @@ class CoinCalloutAnalyzer:
             executable_quote=executable_quote,
             quote_error=quote_error,
         )
+        if not self.social.search_enabled:
+            return replace(
+                prefilter,
+                prefilter_score=prefilter.score,
+                x_search_attempted=False,
+                scan_stage="FREE_CHECKED",
+                scan_reason="paid X disabled; free on-chain and market evidence only",
+            )
         allowed, reason = should_request_x_search(
             prefilter,
             configured_score_floor=self.prefilter_min_score,
@@ -1186,4 +1383,62 @@ def should_publish_coin_watch(
         and social.promoter_posts >= 1
         and social.duplicate_percent < Decimal("50")
         and callout.executable_quote is not None
+    )
+
+
+def should_publish_fomo_watch(
+    callout: CoinCallout,
+    *,
+    configured_score_floor: Decimal,
+) -> bool:
+    """Publish a zero-paid-X lead only when free cross-source proof is complete."""
+
+    token = callout.token_info
+    dex = callout.dex
+    tracker = callout.tracker_risk
+    quote = callout.executable_quote
+    if (
+        callout.scan_stage != "FREE_CHECKED"
+        or callout.hard_blockers
+        or callout.score < max(configured_score_floor, Decimal("45"))
+        or token is None
+        or not dex.available
+        or quote is None
+    ):
+        return False
+    if (
+        token.holder_count is None
+        or token.holder_count < 100
+        or token.liquidity_usd is None
+        or token.liquidity_usd < Decimal("10000")
+        or token.top_holders_percent is None
+        or token.top_holders_percent > Decimal("35")
+        or token.dev_balance_percent is None
+        or token.dev_balance_percent > Decimal("5")
+        or token.mint_authority_disabled is not True
+        or token.freeze_authority_disabled is not True
+    ):
+        return False
+    if (
+        not tracker.available
+        or tracker.rugged
+        or tracker.score is None
+        or tracker.score > Decimal("6")
+        or tracker.bundlers_percent is None
+        or tracker.bundlers_percent > Decimal("10")
+        or tracker.insiders_percent is None
+        or tracker.insiders_percent > Decimal("10")
+        or tracker.snipers_percent is None
+        or tracker.snipers_percent > Decimal("20")
+    ):
+        return False
+    total_5m = dex.buys_5m + dex.sells_5m
+    return not (
+        dex.liquidity_usd is None
+        or dex.liquidity_usd < Decimal("10000")
+        or total_5m < 20
+        or dex.buys_5m * 5 < total_5m * 3
+        or dex.volume_5m_usd < Decimal("2500")
+        or not dex.has_x_profile
+        or quote.price_impact_percent > Decimal("2")
     )

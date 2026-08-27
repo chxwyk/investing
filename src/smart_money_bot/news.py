@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import html
+import ipaddress
 import json
 import logging
 import re
@@ -13,7 +15,7 @@ from datetime import datetime
 from decimal import Decimal
 from email.utils import parsedate_to_datetime
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import aiohttp
 from solders.pubkey import Pubkey
@@ -30,6 +32,10 @@ SOLANA_MINT_RE = re.compile(
 TAG_RE = re.compile(r"[$#]([A-Za-z][A-Za-z0-9_]{2,20})")
 QUOTED_RE = re.compile(r"[\"“]([^\"”]{3,40})[\"”]")
 UPPER_RE = re.compile(r"\b([A-Z][A-Z0-9]{2,19})\b")
+HTML_IMAGE_RE = re.compile(
+    r"<img\b[^>]*?\bsrc\s*=\s*['\"]([^'\"]+)['\"]",
+    re.IGNORECASE,
+)
 TITLE_PHRASE_RE = re.compile(
     r"\b([A-Z][A-Za-z0-9'’-]{2,}(?:\s+[A-Z][A-Za-z0-9'’-]{2,}){0,2})\b"
 )
@@ -426,6 +432,7 @@ def parse_x_news_payload(payload: Any) -> NewsAlert | None:
         for item in matched
         if isinstance(item, dict)
     )
+    image_urls = _x_media_urls(payload)
     return NewsAlert(
         source="X filtered stream",
         headline=text[:240],
@@ -439,6 +446,7 @@ def parse_x_news_payload(payload: Any) -> NewsAlert | None:
         matched_rule=matched_rule,
         narrative_terms=terms,
         token_mints=mints,
+        image_urls=image_urls,
         created_at=_parse_iso_time(post.get("created_at")),
         received_at=int(time.time()),
     )
@@ -469,7 +477,7 @@ class XFilteredNewsStream:
                 timeout=aiohttp.ClientTimeout(total=None, sock_connect=15, sock_read=90),
                 headers={
                     "Authorization": f"Bearer {self.bearer_token}",
-                    "User-Agent": "SmartMoneyCopyBot/2.25.1 news-radar",
+                    "User-Agent": "SmartMoneyCopyBot/2.29.0 news-radar",
                 },
             )
         return self._session
@@ -542,8 +550,9 @@ class XFilteredNewsStream:
     async def _consume(self, callback: Callable[[NewsAlert], Awaitable[None]]) -> None:
         session = await self._get_session()
         params = {
-            "tweet.fields": "author_id,created_at,public_metrics,text",
-            "expansions": "author_id",
+            "tweet.fields": "attachments,author_id,created_at,public_metrics,text",
+            "expansions": "attachments.media_keys,author_id",
+            "media.fields": "height,media_key,preview_image_url,type,url,width",
             "user.fields": "username,name,verified,verified_type,public_metrics,created_at",
         }
         async with session.get(
@@ -590,6 +599,72 @@ def _text(node: ET.Element, names: tuple[str, ...]) -> str:
     return ""
 
 
+def _safe_image_url(value: str, *, base_url: str = "") -> str:
+    value = html.unescape(value.strip())
+    if not value:
+        return ""
+    candidate = urljoin(base_url, value)
+    parsed = urlparse(candidate)
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+        return ""
+    host = parsed.hostname.casefold().rstrip(".")
+    if host == "localhost" or host.endswith(".localhost"):
+        return ""
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        if not address.is_global:
+            return ""
+    return candidate
+
+
+def _dedupe_image_urls(values: Iterable[str], *, base_url: str = "") -> tuple[str, ...]:
+    urls: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        candidate = _safe_image_url(value, base_url=base_url)
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        urls.append(candidate)
+        if len(urls) >= 3:
+            break
+    return tuple(urls)
+
+
+def _x_media_urls(payload: Any) -> tuple[str, ...]:
+    includes = payload.get("includes") if isinstance(payload, dict) else None
+    media = includes.get("media") if isinstance(includes, dict) else None
+    values: list[str] = []
+    for item in media or ():
+        if not isinstance(item, dict):
+            continue
+        media_type = str(item.get("type") or "")
+        value = str(item.get("url") or item.get("preview_image_url") or "")
+        if media_type in {"photo", "video", "animated_gif"} and value:
+            values.append(value)
+    return _dedupe_image_urls(values)
+
+
+def _feed_image_urls(row: ET.Element, *, summary: str, base_url: str) -> tuple[str, ...]:
+    values: list[str] = []
+    for child in row.iter():
+        tag = child.tag.rsplit("}", 1)[-1].lower()
+        if tag in {"thumbnail", "content", "enclosure"}:
+            media_type = str(child.attrib.get("type") or "").casefold()
+            medium = str(child.attrib.get("medium") or "").casefold()
+            value = str(child.attrib.get("url") or child.attrib.get("href") or "")
+            is_image = (
+                tag == "thumbnail" or medium == "image" or media_type.startswith("image/")
+            )
+            if value and is_image:
+                values.append(value)
+    values.extend(HTML_IMAGE_RE.findall(summary))
+    return _dedupe_image_urls(values, base_url=base_url)
+
+
 def parse_feed(xml_text: str, *, source_url: str) -> list[NewsAlert]:
     try:
         root = ET.fromstring(xml_text)
@@ -617,6 +692,7 @@ def parse_feed(xml_text: str, *, source_url: str) -> list[NewsAlert]:
             )
             link = str(link_node.attrib.get("href") or "") if link_node is not None else ""
         published = _text(row, ("pubdate", "published", "updated", "date"))
+        image_urls = _feed_image_urls(row, summary=summary, base_url=link or source_url)
         combined = f"{headline}\n{summary}"
         mints = extract_solana_mints(combined)
         terms = extract_narrative_terms(combined)
@@ -638,6 +714,7 @@ def parse_feed(xml_text: str, *, source_url: str) -> list[NewsAlert]:
                 urgency=urgency,
                 narrative_terms=terms,
                 token_mints=mints,
+                image_urls=image_urls,
                 created_at=_parse_iso_time(published),
                 received_at=int(time.time()),
             )
@@ -666,7 +743,7 @@ class RssNewsPoller:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=15),
-                headers={"User-Agent": "SmartMoneyCopyBot/2.25.1 news-radar"},
+                headers={"User-Agent": "SmartMoneyCopyBot/2.29.0 news-radar"},
             )
         return self._session
 
@@ -744,7 +821,7 @@ class DexNarrativeMatcher:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=12),
-                headers={"User-Agent": "SmartMoneyCopyBot/2.25.1 narrative-match"},
+                headers={"User-Agent": "SmartMoneyCopyBot/2.29.0 narrative-match"},
             )
         return self._session
 

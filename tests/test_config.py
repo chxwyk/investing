@@ -240,11 +240,23 @@ def test_news_radar_defaults_to_fast_but_cost_bounded_sources(monkeypatch) -> No
         "NEWS_X_VERIFY_MIN_SCORE",
         "NEWS_X_TREND_CACHE_SECONDS",
         "NEWS_MAX_ALERTS_PER_HOUR",
+        "NEWS_SOURCE_IMAGE_ENABLED",
         "NEWS_DEX_MATCH_ENABLED",
         "NEWS_PAIR_RECHECK_SECONDS",
         "X_SEARCH_MAX_RESULTS",
         "X_DAILY_SEARCH_LIMIT",
         "X_DAILY_SEARCH_TIMEZONE",
+        "X_PAID_SEARCH_ENABLED",
+        "X_RADAR_ENABLED",
+        "X_RADAR_QUERY",
+        "X_RADAR_POLL_SECONDS",
+        "X_RADAR_MAX_CONTRACTS_PER_SCAN",
+        "FOMO_RADAR_ENABLED",
+        "FOMO_RADAR_POLL_SECONDS",
+        "FOMO_RADAR_MAX_CANDIDATES_PER_SCAN",
+        "FOMO_RADAR_RECHECK_SECONDS",
+        "FOMO_WATCH_MIN_SCORE",
+        "TRADE_ACTIVITY_ALERTS_ENABLED",
         "COIN_X_PREFILTER_MIN_SCORE",
         "COIN_WATCH_ALERTS_ENABLED",
         "COIN_WATCH_MIN_SCORE",
@@ -252,6 +264,10 @@ def test_news_radar_defaults_to_fast_but_cost_bounded_sources(monkeypatch) -> No
         "PUMP_LAUNCH_ACK",
         "PUMP_LAUNCH_PRIVATE_KEY",
         "PINATA_JWT",
+        "J7_LAUNCH_ENABLED",
+        "J7_LAUNCH_SESSION_TOKEN",
+        "J7_LAUNCH_API_KEY",
+        "J7_LAUNCH_REGION",
     )
     for name in names:
         monkeypatch.delenv(name, raising=False)
@@ -271,13 +287,47 @@ def test_news_radar_defaults_to_fast_but_cost_bounded_sources(monkeypatch) -> No
     assert settings.news_launch_ready_score == 72
     assert settings.news_x_verify_min_score == 70
     assert settings.news_max_alerts_per_hour == 30
+    assert settings.news_source_image_enabled is True
     assert settings.news_dex_match_enabled is True
     assert settings.pump_one_click_launch_enabled is False
     assert settings.pump_launch_is_unlocked is False
+    assert settings.j7_launch_enabled is False
+    assert settings.j7_launch_is_unlocked is False
+    assert settings.j7_launch_region == "na-east"
     assert settings.news_pair_recheck_seconds == (0, 30, 90, 180)
     assert settings.x_search_max_results == 10
     assert settings.x_daily_search_limit == 25
     assert settings.x_daily_search_timezone == "America/Los_Angeles"
+    assert settings.x_paid_search_enabled is False
+    assert settings.x_radar_enabled is False
+    assert "pump.fun" in settings.x_radar_query
+    assert "contract address" in settings.x_radar_query
+    assert settings.x_radar_poll_seconds == 1800
+    assert settings.x_radar_max_contracts_per_scan == 3
+    assert settings.fomo_radar_enabled is True
+    assert settings.fomo_radar_poll_seconds == 300
+    assert settings.fomo_radar_max_candidates_per_scan == 5
+    assert settings.fomo_radar_recheck_seconds == 1800
+    assert settings.fomo_watch_min_score == Decimal("50")
+    assert settings.trade_activity_alerts_enabled is False
     assert settings.coin_x_prefilter_min_score == Decimal("35")
     assert settings.coin_watch_alerts_enabled is True
     assert settings.coin_watch_min_score == Decimal("55")
+
+
+def test_j7_launch_requires_encrypted_key_session_ack_and_pinata(monkeypatch) -> None:
+    monkeypatch.setenv("J7_LAUNCH_ENABLED", "true")
+    monkeypatch.setenv("J7_LAUNCH_SESSION_TOKEN", "session-jwt")
+    monkeypatch.setenv("J7_LAUNCH_API_KEY", "encrypted-wallet-key")
+    monkeypatch.setenv("J7_LAUNCH_REGION", "na-west")
+    monkeypatch.setenv("PINATA_JWT", "pinata-jwt")
+    monkeypatch.setenv(
+        "PUMP_LAUNCH_ACK",
+        "I_UNDERSTAND_PUMP_LAUNCHES_SPEND_REAL_SOL",
+    )
+
+    settings = Settings.from_env(require_discord_token=False)
+
+    assert settings.j7_launch_is_unlocked is True
+    assert settings.j7_launch_region == "na-west"
+    assert settings.pump_launch_is_unlocked is False

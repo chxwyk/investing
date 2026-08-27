@@ -34,6 +34,12 @@ DEFAULT_X_NEWS_RULE = (
     "\"CA:\") (solana OR memecoin OR token))) lang:en -is:retweet -is:reply"
 )
 
+DEFAULT_X_RADAR_QUERY = (
+    '((solana OR pumpfun OR "pump.fun" OR memecoin OR "meme coin") '
+    '("CA:" OR "contract address" OR "just launched" OR "fair launch" OR '
+    '"ape in" OR buying OR bullish)) -is:retweet -is:reply lang:en'
+)
+
 DEFAULT_NEWS_RSS_FEEDS = "|".join(
     (
         "https://www.whitehouse.gov/briefings-statements/feed/",
@@ -105,9 +111,20 @@ class Settings:
     coin_x_prefilter_min_score: Decimal
     coin_watch_alerts_enabled: bool
     coin_watch_min_score: Decimal
+    fomo_watch_min_score: Decimal
+    trade_activity_alerts_enabled: bool
     x_search_max_results: int
     x_daily_search_limit: int
     x_daily_search_timezone: str
+    x_paid_search_enabled: bool
+    x_radar_enabled: bool
+    x_radar_query: str
+    x_radar_poll_seconds: int
+    x_radar_max_contracts_per_scan: int
+    fomo_radar_enabled: bool
+    fomo_radar_poll_seconds: int
+    fomo_radar_max_candidates_per_scan: int
+    fomo_radar_recheck_seconds: int
 
     news_radar_enabled: bool
     x_news_stream_enabled: bool
@@ -120,6 +137,7 @@ class Settings:
     news_x_verify_min_score: int
     news_x_trend_cache_seconds: int
     news_max_alerts_per_hour: int
+    news_source_image_enabled: bool
     news_dex_match_enabled: bool
     news_dex_match_min_liquidity_usd: Decimal
     news_dex_match_max_age_minutes: int
@@ -138,6 +156,10 @@ class Settings:
     pump_launch_mayhem_mode: bool
     pump_launch_tokenized_agent: bool
     pump_launch_buyback_bps: int
+    j7_launch_enabled: bool
+    j7_launch_session_token: str | None
+    j7_launch_api_key: str | None
+    j7_launch_region: str
 
     auto_discovery_enabled: bool
     discovery_refresh_seconds: int
@@ -284,11 +306,24 @@ class Settings:
             coin_x_prefilter_min_score=_decimal("COIN_X_PREFILTER_MIN_SCORE", "35"),
             coin_watch_alerts_enabled=_bool("COIN_WATCH_ALERTS_ENABLED", True),
             coin_watch_min_score=_decimal("COIN_WATCH_MIN_SCORE", "55"),
+            fomo_watch_min_score=_decimal("FOMO_WATCH_MIN_SCORE", "50"),
+            trade_activity_alerts_enabled=_bool("TRADE_ACTIVITY_ALERTS_ENABLED", False),
             x_search_max_results=_int("X_SEARCH_MAX_RESULTS", 10),
             x_daily_search_limit=_int("X_DAILY_SEARCH_LIMIT", 25),
             x_daily_search_timezone=os.getenv(
                 "X_DAILY_SEARCH_TIMEZONE", "America/Los_Angeles"
             ).strip(),
+            x_paid_search_enabled=_bool("X_PAID_SEARCH_ENABLED", False),
+            x_radar_enabled=_bool("X_RADAR_ENABLED", False),
+            x_radar_query=os.getenv("X_RADAR_QUERY", DEFAULT_X_RADAR_QUERY).strip(),
+            x_radar_poll_seconds=_int("X_RADAR_POLL_SECONDS", 1800),
+            x_radar_max_contracts_per_scan=_int("X_RADAR_MAX_CONTRACTS_PER_SCAN", 3),
+            fomo_radar_enabled=_bool("FOMO_RADAR_ENABLED", True),
+            fomo_radar_poll_seconds=_int("FOMO_RADAR_POLL_SECONDS", 300),
+            fomo_radar_max_candidates_per_scan=_int(
+                "FOMO_RADAR_MAX_CANDIDATES_PER_SCAN", 5
+            ),
+            fomo_radar_recheck_seconds=_int("FOMO_RADAR_RECHECK_SECONDS", 1800),
             news_radar_enabled=_bool("NEWS_RADAR_ENABLED", True),
             x_news_stream_enabled=_bool("X_NEWS_STREAM_ENABLED", False),
             x_news_stream_rule=os.getenv("X_NEWS_STREAM_RULE", DEFAULT_X_NEWS_RULE).strip(),
@@ -302,6 +337,7 @@ class Settings:
             news_x_verify_min_score=_int("NEWS_X_VERIFY_MIN_SCORE", 70),
             news_x_trend_cache_seconds=_int("NEWS_X_TREND_CACHE_SECONDS", 3600),
             news_max_alerts_per_hour=_int("NEWS_MAX_ALERTS_PER_HOUR", 30),
+            news_source_image_enabled=_bool("NEWS_SOURCE_IMAGE_ENABLED", True),
             news_dex_match_enabled=_bool("NEWS_DEX_MATCH_ENABLED", True),
             news_dex_match_min_liquidity_usd=_decimal(
                 "NEWS_DEX_MATCH_MIN_LIQUIDITY_USD", "2000"
@@ -327,6 +363,12 @@ class Settings:
             pump_launch_mayhem_mode=_bool("PUMP_LAUNCH_MAYHEM_MODE", False),
             pump_launch_tokenized_agent=_bool("PUMP_LAUNCH_TOKENIZED_AGENT", False),
             pump_launch_buyback_bps=_int("PUMP_LAUNCH_BUYBACK_BPS", 5000),
+            j7_launch_enabled=_bool("J7_LAUNCH_ENABLED", False),
+            j7_launch_session_token=(
+                os.getenv("J7_LAUNCH_SESSION_TOKEN", "").strip() or None
+            ),
+            j7_launch_api_key=os.getenv("J7_LAUNCH_API_KEY", "").strip() or None,
+            j7_launch_region=os.getenv("J7_LAUNCH_REGION", "na-east").strip().lower(),
             auto_discovery_enabled=_bool("AUTO_DISCOVERY_ENABLED", True),
             discovery_refresh_seconds=_int("DISCOVERY_REFRESH_SECONDS", 1200),
             discovery_7d_refresh_seconds=_int("DISCOVERY_7D_REFRESH_SECONDS", 21600),
@@ -473,6 +515,16 @@ class Settings:
         )
 
     @property
+    def j7_launch_is_unlocked(self) -> bool:
+        return (
+            self.j7_launch_enabled
+            and self.pump_launch_ack == PUMP_LAUNCH_ACK_TEXT
+            and bool(self.j7_launch_session_token)
+            and bool(self.j7_launch_api_key)
+            and bool(self.pinata_jwt)
+        )
+
+    @property
     def discovery_is_configured(self) -> bool:
         return self.auto_discovery_enabled and bool(self.solana_tracker_api_key)
 
@@ -509,6 +561,8 @@ class Settings:
             raise ValueError("COIN_X_PREFILTER_MIN_SCORE must be between 0 and 100")
         if not 0 <= self.coin_watch_min_score <= 100:
             raise ValueError("COIN_WATCH_MIN_SCORE must be between 0 and 100")
+        if not 0 <= self.fomo_watch_min_score <= 100:
+            raise ValueError("FOMO_WATCH_MIN_SCORE must be between 0 and 100")
         if not 10 <= self.x_search_max_results <= 100:
             raise ValueError("X_SEARCH_MAX_RESULTS must be between 10 and 100")
         if not 1 <= self.x_daily_search_limit <= 500:
@@ -517,6 +571,20 @@ class Settings:
             ZoneInfo(self.x_daily_search_timezone)
         except ZoneInfoNotFoundError as exc:
             raise ValueError("X_DAILY_SEARCH_TIMEZONE must be a valid IANA timezone") from exc
+        if not self.x_radar_query:
+            raise ValueError("X_RADAR_QUERY cannot be empty")
+        if len(self.x_radar_query) > 1024:
+            raise ValueError("X_RADAR_QUERY cannot exceed 1024 characters")
+        if not 300 <= self.x_radar_poll_seconds <= 86400:
+            raise ValueError("X_RADAR_POLL_SECONDS must be between 300 and 86400")
+        if not 1 <= self.x_radar_max_contracts_per_scan <= 10:
+            raise ValueError("X_RADAR_MAX_CONTRACTS_PER_SCAN must be between 1 and 10")
+        if not 60 <= self.fomo_radar_poll_seconds <= 86400:
+            raise ValueError("FOMO_RADAR_POLL_SECONDS must be between 60 and 86400")
+        if not 1 <= self.fomo_radar_max_candidates_per_scan <= 20:
+            raise ValueError("FOMO_RADAR_MAX_CANDIDATES_PER_SCAN must be between 1 and 20")
+        if not 300 <= self.fomo_radar_recheck_seconds <= 86400:
+            raise ValueError("FOMO_RADAR_RECHECK_SECONDS must be between 300 and 86400")
         if len(self.x_news_stream_rule) > 1024:
             raise ValueError("X_NEWS_STREAM_RULE cannot exceed 1024 characters")
         if not 15 <= self.news_poll_seconds <= 3600:
@@ -557,6 +625,16 @@ class Settings:
             raise ValueError("PUMP_LAUNCH_TIMEZONE must be a valid IANA timezone") from exc
         if not 0 <= self.pump_launch_buyback_bps <= 10_000:
             raise ValueError("PUMP_LAUNCH_BUYBACK_BPS must be between 0 and 10000")
+        if self.j7_launch_region not in {
+            "na-east",
+            "na-west",
+            "europe",
+            "asia",
+            "australia",
+        }:
+            raise ValueError(
+                "J7_LAUNCH_REGION must be na-east, na-west, europe, asia, or australia"
+            )
         if not 1 <= self.rpc_requests_per_second <= 100:
             raise ValueError("RPC_REQUESTS_PER_SECOND must be between 1 and 100")
         if not 0 <= self.rpc_max_retries <= 10:

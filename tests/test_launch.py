@@ -1,8 +1,15 @@
 from __future__ import annotations
 
+import io
+from dataclasses import replace
 from decimal import Decimal
 
+from PIL import Image
+
 from smart_money_bot.launch import (
+    J7_REGION_BASES,
+    build_j7_launch_payload,
+    is_safe_launch_image_url,
     render_opportunity_image,
     score_launch_opportunity,
     should_publish_news_opportunity,
@@ -274,3 +281,81 @@ def test_launch_card_is_a_real_png() -> None:
 
     assert image.startswith(b"\x89PNG\r\n\x1a\n")
     assert len(image) > 1_000
+
+
+def test_source_photo_becomes_square_labeled_launch_art() -> None:
+    now = 1_800_000_000
+    alert = NewsAlert(
+        source="CoinDesk",
+        headline="BREAKING: Kitchen Coin catches crypto attention",
+        summary="The meme is spreading.",
+        url="https://coindesk.com/story/kitchen",
+        narrative_terms=("Kitchen Coin",),
+        created_at=now - 10,
+        received_at=now,
+    )
+    opportunity = score_launch_opportunity(
+        alert,
+        x_evidence=_strong_x(),
+        competition=NarrativeCompetition(query="Kitchen Coin"),
+        cross_source_count=2,
+        now=now,
+    )
+    source = Image.new("RGB", (1600, 900), (210, 90, 40))
+    raw = io.BytesIO()
+    source.save(raw, format="JPEG")
+
+    rendered = render_opportunity_image(opportunity, raw.getvalue())
+
+    with Image.open(io.BytesIO(rendered)) as result:
+        assert result.size == (1024, 1024)
+        assert result.format == "PNG"
+    assert rendered != render_opportunity_image(opportunity)
+
+
+def test_launch_image_url_rejects_local_or_credentialed_hosts() -> None:
+    assert is_safe_launch_image_url("https://cdn.example.com/lead.jpg") is True
+    assert is_safe_launch_image_url("http://cdn.example.com/lead.jpg") is False
+    assert is_safe_launch_image_url("https://127.0.0.1/secret") is False
+    assert is_safe_launch_image_url("https://user:pass@example.com/photo") is False
+
+
+def test_j7_payload_uses_encrypted_key_and_generated_image(settings) -> None:
+    now = 1_800_000_000
+    alert = NewsAlert(
+        source="CoinDesk",
+        headline='Solana traders rally around viral "Kitchen Coin" meme',
+        summary="Crypto accounts are discussing a possible community token.",
+        url="https://coindesk.com/markets/kitchen-coin",
+        narrative_terms=("Kitchen Coin",),
+        created_at=now - 30,
+        received_at=now,
+    )
+    opportunity = score_launch_opportunity(
+        alert,
+        x_evidence=_strong_x(),
+        competition=NarrativeCompetition(query="Kitchen Coin"),
+        cross_source_count=2,
+        now=now,
+    )
+    configured = replace(
+        settings,
+        j7_launch_api_key="encrypted-solana-wallet-key",
+        j7_launch_session_token="secret-session-jwt",
+    )
+
+    payload = build_j7_launch_payload(
+        opportunity,
+        configured,
+        image_url="https://ipfs.io/ipfs/example",
+    )
+
+    assert payload["external"] is True
+    assert payload["type"] == "create_token"
+    assert payload["mode"] == "pump"
+    assert payload["api_key"] == "encrypted-solana-wallet-key"
+    assert payload["image_url"] == "https://ipfs.io/ipfs/example"
+    assert payload["website"] == alert.url
+    assert "session_id" not in payload
+    assert "private_key" not in payload
+    assert J7_REGION_BASES["na-east"].startswith("https://")

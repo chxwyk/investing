@@ -19,6 +19,7 @@ from .callouts import (
     XRecentSearchClient,
     should_publish_coin_callout,
     should_publish_coin_watch,
+    should_publish_fomo_watch,
 )
 from .config import Settings
 from .constants import PAPER_DEMO_ENTRY_PRICE_USD, PAPER_DEMO_MINT
@@ -33,7 +34,7 @@ from .discovery import (
 from .errors import DiscoveryError, JupiterError, RpcError
 from .executor import ExecutionManager
 from .launch import (
-    PumpLaunchClient,
+    OneClickLaunchClient,
     alert_key,
     score_launch_opportunity,
     should_publish_news_opportunity,
@@ -97,6 +98,8 @@ class Notifier(Protocol):
 
     async def on_coin_watch(self, callout: CoinCallout) -> None: ...
 
+    async def on_fomo_watch(self, callout: CoinCallout) -> None: ...
+
     async def on_news_alert(
         self,
         alert: NewsAlert,
@@ -131,6 +134,9 @@ class NullNotifier:
         return None
 
     async def on_coin_watch(self, callout: CoinCallout) -> None:
+        return None
+
+    async def on_fomo_watch(self, callout: CoinCallout) -> None:
         return None
 
     async def on_news_alert(
@@ -170,6 +176,7 @@ class SmartMoneyEngine:
             cache_seconds=settings.news_x_trend_cache_seconds,
             trusted_crypto_accounts=settings.x_crypto_trusted_accounts,
             budget_reserver=self._reserve_x_search,
+            paid_search_enabled=settings.x_paid_search_enabled,
         )
         self.tracker_token_risk = SolanaTrackerTokenRiskClient(settings.solana_tracker_api_key)
         self.callout_analyzer = CoinCalloutAnalyzer(
@@ -194,7 +201,7 @@ class SmartMoneyEngine:
             min_liquidity_usd=settings.news_dex_match_min_liquidity_usd,
             max_age_minutes=settings.news_dex_match_max_age_minutes,
         )
-        self.pump_launcher = PumpLaunchClient(settings, self.rpc)
+        self.pump_launcher = OneClickLaunchClient(settings, self.rpc)
         self.discovery = (
             SolanaTrackerClient(settings.solana_tracker_api_key)
             if settings.solana_tracker_api_key
@@ -229,6 +236,8 @@ class SmartMoneyEngine:
         self._callout_tasks: set[asyncio.Task[None]] = set()
         self._news_stream_task: asyncio.Task[None] | None = None
         self._news_rss_task: asyncio.Task[None] | None = None
+        self._x_radar_task: asyncio.Task[None] | None = None
+        self._fomo_radar_task: asyncio.Task[None] | None = None
         self._news_match_tasks: set[asyncio.Task[None]] = set()
         self._news_alert_times: deque[int] = deque()
         self._recent_news_events: deque[tuple[int, str, frozenset[str]]] = deque()
@@ -238,11 +247,14 @@ class SmartMoneyEngine:
         self._coin_scan_counts = {
             "total": 0,
             "free_rejected": 0,
+            "free_checked": 0,
             "x_checked": 0,
             "x_unavailable": 0,
             "watch": 0,
             "verified": 0,
+            "fomo_watch": 0,
         }
+        self._fomo_radar_seen: dict[str, int] = {}
         self._scan_lock = asyncio.Lock()
         self._discovery_lock = asyncio.Lock()
         self._daily_profit_lock = asyncio.Lock()
@@ -286,6 +298,8 @@ class SmartMoneyEngine:
         self._coin_scan_counts["total"] += 1
         if callout.scan_stage == "FREE_REJECTED":
             self._coin_scan_counts["free_rejected"] += 1
+        elif callout.scan_stage == "FREE_CHECKED":
+            self._coin_scan_counts["free_checked"] += 1
         elif callout.scan_stage == "X_CHECKED":
             self._coin_scan_counts["x_checked"] += 1
         elif callout.scan_stage == "X_UNAVAILABLE":
@@ -335,7 +349,11 @@ class SmartMoneyEngine:
                 self._consume_stream_events(), name="smart-money-stream-consumer"
             )
         if self.settings.news_radar_enabled:
-            if self.settings.x_news_stream_enabled and self.x_news_stream.configured:
+            if (
+                self.settings.x_paid_search_enabled
+                and self.settings.x_news_stream_enabled
+                and self.x_news_stream.configured
+            ):
                 self._news_stream_task = asyncio.create_task(
                     self.x_news_stream.run(self._handle_news_alert),
                     name="smart-money-x-news-stream",
@@ -345,6 +363,20 @@ class SmartMoneyEngine:
                     self.news_poller.run(self._handle_news_alert),
                     name="smart-money-news-rss",
                 )
+        if (
+            self.settings.x_radar_enabled
+            and self.settings.coin_callouts_enabled
+            and self.x_social.search_enabled
+        ):
+            self._x_radar_task = asyncio.create_task(
+                self._run_x_radar(),
+                name="smart-money-x-radar",
+            )
+        if self.settings.fomo_radar_enabled and self.settings.coin_callouts_enabled:
+            self._fomo_radar_task = asyncio.create_task(
+                self._run_fomo_radar(),
+                name="smart-money-fomo-radar",
+            )
 
     async def close(self) -> None:
         for task in self._news_match_tasks:
@@ -352,15 +384,27 @@ class SmartMoneyEngine:
         if self._news_match_tasks:
             await asyncio.gather(*self._news_match_tasks, return_exceptions=True)
         self._news_match_tasks.clear()
-        for task in (self._news_stream_task, self._news_rss_task):
+        for task in (
+            self._news_stream_task,
+            self._news_rss_task,
+            self._x_radar_task,
+            self._fomo_radar_task,
+        ):
             if task:
                 task.cancel()
-        for task in (self._news_stream_task, self._news_rss_task):
+        for task in (
+            self._news_stream_task,
+            self._news_rss_task,
+            self._x_radar_task,
+            self._fomo_radar_task,
+        ):
             if task:
                 with suppress(asyncio.CancelledError):
                     await task
         self._news_stream_task = None
         self._news_rss_task = None
+        self._x_radar_task = None
+        self._fomo_radar_task = None
         for task in self._callout_tasks:
             task.cancel()
         if self._callout_tasks:
@@ -974,13 +1018,62 @@ class SmartMoneyEngine:
         if swap.side is Side.BUY and self.settings.coin_callouts_enabled:
             self._queue_coin_callout(swap.token_mint)
 
-    def _queue_coin_callout(self, mint: str) -> None:
+    def _queue_coin_callout(self, mint: str, *, force_x_search: bool = False) -> None:
         task = asyncio.create_task(
-            self._run_coin_callout(mint),
+            self._run_coin_callout(mint, force_x_search=force_x_search),
             name=f"coin-callout-{mint[:8]}",
         )
         self._callout_tasks.add(task)
         task.add_done_callback(self._callout_tasks.discard)
+
+    async def _run_x_radar(self) -> None:
+        """Use budgeted recent search as a proactive exact-contract nomination source."""
+
+        while True:
+            try:
+                mints = await self.x_social.discover_contracts(
+                    self.settings.x_radar_query
+                )
+                for mint in mints[: self.settings.x_radar_max_contracts_per_scan]:
+                    # discover_contracts cached the matching exact-contract X posts,
+                    # so this forced analysis does not spend another paid X request.
+                    self._queue_coin_callout(mint, force_x_search=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.x_social.last_radar_error = str(exc)[:200]
+                await self.notifier.on_error("Proactive X radar", exc)
+            await asyncio.sleep(self.settings.x_radar_poll_seconds)
+
+    async def _run_fomo_radar(self) -> None:
+        """Nominate active public DEX/Pump coins without any paid X requests."""
+
+        while True:
+            try:
+                now = int(time.time())
+                mints = await self.dex_screener.trending_mints()
+                due = [
+                    mint
+                    for mint in mints
+                    if now - self._fomo_radar_seen.get(mint, 0)
+                    >= self.settings.fomo_radar_recheck_seconds
+                ]
+                for mint in due[: self.settings.fomo_radar_max_candidates_per_scan]:
+                    self._fomo_radar_seen[mint] = now
+                    self._queue_coin_callout(mint)
+                if len(self._fomo_radar_seen) > 1000:
+                    cutoff = now - self.settings.fomo_radar_recheck_seconds * 2
+                    self._fomo_radar_seen = {
+                        mint: seen_at
+                        for mint, seen_at in self._fomo_radar_seen.items()
+                        if seen_at >= cutoff
+                    }
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.dex_screener.last_radar_error = str(exc)[:200]
+                await self.notifier.on_error("Fomo public-data radar", exc)
+            await asyncio.sleep(self.settings.fomo_radar_poll_seconds)
 
     async def _handle_news_alert(self, alert: NewsAlert) -> None:
         now = int(time.time())
@@ -1009,7 +1102,7 @@ class SmartMoneyEngine:
             return
 
         x_task = None
-        if self.x_social.configured:
+        if self.x_social.search_enabled:
             if alert.token_mints:
                 x_task = self.x_social.snapshot(
                     alert.token_mints[0],
@@ -1099,7 +1192,7 @@ class SmartMoneyEngine:
             return PumpLaunchResult(
                 success=False,
                 status="LOCKED",
-                message="One-click launch is locked or missing its dedicated wallet/Pinata setup.",
+                message="One-click launch is locked or missing its J7/direct-Pump credentials.",
                 alert_key=key,
                 name=opportunity.coin_name,
                 symbol=opportunity.coin_symbol,
@@ -1119,7 +1212,7 @@ class SmartMoneyEngine:
             return PumpLaunchResult(
                 success=False,
                 status="DAILY_LIMIT",
-                message="Daily Pump launch-count limit reached.",
+                message="Daily token launch-count limit reached.",
                 alert_key=key,
                 name=opportunity.coin_name,
                 symbol=opportunity.coin_symbol,
@@ -1129,7 +1222,7 @@ class SmartMoneyEngine:
             return PumpLaunchResult(
                 success=False,
                 status="DAILY_LIMIT",
-                message="Daily Pump initial-buy SOL limit reached.",
+                message="Daily launch initial-buy SOL limit reached.",
                 alert_key=key,
                 name=opportunity.coin_name,
                 symbol=opportunity.coin_symbol,
@@ -1205,7 +1298,7 @@ class SmartMoneyEngine:
                     await self.notifier.on_coin_callout(callout)
                     return
 
-    async def _run_coin_callout(self, mint: str) -> None:
+    async def _run_coin_callout(self, mint: str, *, force_x_search: bool = False) -> None:
         try:
             buyers = await self.database.recent_verified_token_buyers(
                 mint,
@@ -1220,7 +1313,11 @@ class SmartMoneyEngine:
                 and (now - previous[0] < self.settings.coin_callout_cooldown_seconds)
             ):
                 return
-            callout = await self.analyze_coin(mint, buyers=buyers)
+            callout = await self.analyze_coin(
+                mint,
+                buyers=buyers,
+                force_x_search=force_x_search,
+            )
             self._last_callout_state[mint] = (now, buyer_count)
             # Automatic alerts are for evidence-rich leads. Very weak blocked rows remain
             # available through /smartmoney coin, but no longer flood the channel merely
@@ -1239,6 +1336,12 @@ class SmartMoneyEngine:
             ):
                 self._coin_scan_counts["watch"] += 1
                 await self.notifier.on_coin_watch(callout)
+            elif should_publish_fomo_watch(
+                callout,
+                configured_score_floor=self.settings.fomo_watch_min_score,
+            ):
+                self._coin_scan_counts["fomo_watch"] += 1
+                await self.notifier.on_fomo_watch(callout)
         except Exception as exc:
             await self.notifier.on_error("Analyzing coin callout", exc)
 
@@ -2322,11 +2425,28 @@ class SmartMoneyEngine:
             "coin_watch_alerts_enabled": self.settings.coin_watch_alerts_enabled,
             "coin_scan_counts": dict(self._coin_scan_counts),
             "x_social_configured": self.x_social.configured,
+            "x_paid_search_enabled": self.settings.x_paid_search_enabled,
             "x_social_last_success": self.x_social.last_success_at,
             "x_social_last_error": self.x_social.last_error,
             "x_search_usage_today": x_search_usage,
             "x_search_daily_limit": self.settings.x_daily_search_limit,
+            "x_radar_enabled": self.settings.x_radar_enabled,
+            "x_radar_poll_seconds": self.settings.x_radar_poll_seconds,
+            "x_radar_scans": self.x_social.radar_scans,
+            "x_radar_last_scan": self.x_social.last_radar_at,
+            "x_radar_last_posts": self.x_social.last_radar_posts,
+            "x_radar_last_new_posts": self.x_social.last_radar_new_posts,
+            "x_radar_last_contracts": self.x_social.last_radar_contracts,
+            "x_radar_last_error": self.x_social.last_radar_error,
+            "fomo_radar_enabled": self.settings.fomo_radar_enabled,
+            "fomo_radar_poll_seconds": self.settings.fomo_radar_poll_seconds,
+            "fomo_radar_scans": self.dex_screener.radar_scans,
+            "fomo_radar_last_scan": self.dex_screener.last_radar_at,
+            "fomo_radar_last_candidates": self.dex_screener.last_radar_candidates,
+            "fomo_radar_last_error": self.dex_screener.last_radar_error,
+            "trade_activity_alerts_enabled": self.settings.trade_activity_alerts_enabled,
             "news_radar_enabled": self.settings.news_radar_enabled,
+            "news_source_image_enabled": self.settings.news_source_image_enabled,
             "x_news_stream_enabled": self.settings.x_news_stream_enabled,
             "x_news_stream_configured": self.x_news_stream.configured,
             "x_news_stream_connected": self.x_news_stream.connected,
@@ -2348,4 +2468,5 @@ class SmartMoneyEngine:
             "pump_one_click_launch_enabled": self.settings.pump_one_click_launch_enabled,
             "pump_launch_unlocked": self.pump_launcher.configured,
             "pump_launch_wallet": self.pump_launcher.wallet_address,
+            "launch_provider": self.pump_launcher.provider,
         }
