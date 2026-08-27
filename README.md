@@ -7,6 +7,17 @@ transactions, and mirrors every newly detected hot-wallet swap in PAPER mode. PA
 as either a forced source-price observation ledger or an executable Jupiter quote-shadow
 trial; the two answer different questions and are labeled separately.
 
+Version 2.24 changes the alert pipeline to **verify first, alert second**. Automatic Discord
+coin callouts now publish only `VERIFIED TREND` results. A token must have exact-mint X posts
+from several credible crypto accounts, low duplicate/new-account pressure, complete Tracker
+rug/bundler/insider/sniper evidence, disabled mint/freeze authorities, acceptable holder and
+developer concentration, at least $5,000 liquidity confirmed by both Jupiter and DEX data,
+active five-minute buy flow, and an executable $5 Jupiter route below 2% price impact. Name,
+ticker, market-cap, volume, paid boosts, or a single influencer cannot qualify a token. Weak,
+blocked, and incomplete results remain available through `/smartmoney coin` but are not sent
+to the public channel. News `WATCH` cards are also suppressed, so every public news card has
+an active `LAUNCH READY` path instead of a dead launch button.
+
 Version 2.23 makes the launch radar crypto-first. Existing coins need repeated exact-contract
 promotion from credible crypto-native X accounts. New crypto narratives need active promotion
 from several established crypto accounts before `LAUNCH READY`. Non-crypto news can enter only
@@ -247,7 +258,7 @@ when no prior public BUY exists
 inside the scanned history, no current baseline price is available, or the PAPER account lacks
 cash. Set `PAPER_MIRROR_RAW_SWAPS=false` to restore consensus-only paper behavior.
 
-The v2.23.0 discovery, crypto-first launch-radar, callout, selective-entry, daily loss/profit
+The v2.24.0 discovery, crypto-first launch-radar, verified-only callout, selective-entry, daily loss/profit
 locks, social nomination, quote, fallback, rotation, and exit controls are
 intentionally configurable:
 
@@ -545,7 +556,7 @@ RPC_REQUESTS_PER_SECOND=8
 RPC_MAX_RETRIES=4
 SOLANA_TRACKER_API_KEY=...
 JUPITER_API_KEY=...
-# Optional; required only for scored X/Twitter evidence in coin callouts.
+# Required for public coin callouts and LAUNCH READY crypto-demand verification.
 X_API_BEARER_TOKEN=...
 DATABASE_PATH=/data/smart_money.db
 RAILWAY_RUN_UID=0

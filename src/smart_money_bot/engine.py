@@ -17,6 +17,7 @@ from .callouts import (
     DexScreenerClient,
     SolanaTrackerTokenRiskClient,
     XRecentSearchClient,
+    should_publish_coin_callout,
 )
 from .config import Settings
 from .constants import PAPER_DEMO_ENTRY_PRICE_USD, PAPER_DEMO_MINT
@@ -30,7 +31,12 @@ from .discovery import (
 )
 from .errors import DiscoveryError, JupiterError, RpcError
 from .executor import ExecutionManager
-from .launch import PumpLaunchClient, alert_key, score_launch_opportunity
+from .launch import (
+    PumpLaunchClient,
+    alert_key,
+    score_launch_opportunity,
+    should_publish_news_opportunity,
+)
 from .market import JupiterClient
 from .models import (
     CoinCallout,
@@ -163,6 +169,7 @@ class SmartMoneyEngine:
             self.dex_screener,
             self.x_social,
             self.tracker_token_risk,
+            self.market,
         )
         self.x_news_stream = XFilteredNewsStream(
             settings.x_api_bearer_token,
@@ -930,6 +937,14 @@ class SmartMoneyEngine:
             self._news_alert_times.popleft()
         if not is_coin_actionable_news(alert):
             return
+        # A contract in a news/X post is only a nomination. Run the complete coin
+        # verification pipeline first; never publish the headline as proof that the
+        # token is safe, liquid, or authentically promoted.
+        if alert.token_mints:
+            self._remember_news_event(alert, now=now)
+            for mint in alert.token_mints:
+                self._queue_coin_callout(mint)
+            return
         preliminary = score_launch_opportunity(
             alert,
             now=now,
@@ -980,9 +995,9 @@ class SmartMoneyEngine:
             launch_ready_score=self.settings.news_launch_ready_score,
         )
         self._remember_news_event(alert, now=now)
-        for mint in alert.token_mints:
-            self._queue_coin_callout(mint)
-        if opportunity.verdict == "SKIP" or opportunity.score < self.settings.news_min_score:
+        # Discord receives only something the user can actually launch. WATCH/SKIP
+        # rows remain internal research evidence and no longer create dead buttons.
+        if not should_publish_news_opportunity(opportunity):
             return
         if len(self._news_alert_times) >= self.settings.news_max_alerts_per_hour:
             return
@@ -1123,10 +1138,21 @@ class SmartMoneyEngine:
                 match = await self.news_matcher.search(narrative)
                 if match is None or match.mint in self._narrative_matches_seen:
                     continue
-                self._narrative_matches_seen.add(match.mint)
-                await self.notifier.on_narrative_match(alert, match)
-                self._queue_coin_callout(match.mint)
-                return
+                # A ticker/name match is not a verified coin. It must pass exact-mint
+                # X promotion, executable-route, market-flow, and rug checks before
+                # the public channel sees anything.
+                buyers = await self.database.recent_verified_token_buyers(
+                    match.mint,
+                    int(time.time()) - self.settings.coin_callout_window_seconds,
+                )
+                callout = await self.analyze_coin(match.mint, buyers=buyers)
+                if should_publish_coin_callout(
+                    callout,
+                    configured_score_floor=self.settings.coin_callout_min_alert_score,
+                ):
+                    self._narrative_matches_seen.add(match.mint)
+                    await self.notifier.on_coin_callout(callout)
+                    return
 
     async def _run_coin_callout(self, mint: str) -> None:
         try:
@@ -1148,7 +1174,10 @@ class SmartMoneyEngine:
             # Automatic alerts are for evidence-rich leads. Very weak blocked rows remain
             # available through /smartmoney coin, but no longer flood the channel merely
             # because a missing-data or safety blocker exists.
-            if callout.score >= self.settings.coin_callout_min_alert_score:
+            if should_publish_coin_callout(
+                callout,
+                configured_score_floor=self.settings.coin_callout_min_alert_score,
+            ):
                 await self.notifier.on_coin_callout(callout)
         except Exception as exc:
             await self.notifier.on_error("Analyzing coin callout", exc)

@@ -155,11 +155,16 @@ class XSocialSnapshot:
     suspicious_authors: int = 0
     crypto_authors: int = 0
     credible_crypto_authors: int = 0
+    contract_authors: int = 0
+    credible_contract_authors: int = 0
+    trusted_crypto_authors: int = 0
+    million_follower_authors: int = 0
     coin_intent_posts: int = 0
     promoter_posts: int = 0
     engagements: int = 0
     duplicate_percent: Decimal = Decimal("0")
     posts_per_minute: Decimal = Decimal("0")
+    notable_accounts: tuple[str, ...] = ()
     query: str = ""
     error: str | None = None
 
@@ -287,6 +292,9 @@ class CoinCallout:
     warnings: tuple[str, ...]
     hard_blockers: tuple[str, ...]
     generated_at: int
+    executable_quote: SwapQuote | None = None
+    quote_error: str | None = None
+    public_alert_eligible: bool = False
 
 
 @dataclass(frozen=True, slots=True)

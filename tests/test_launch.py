@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from smart_money_bot.launch import render_opportunity_image, score_launch_opportunity
+from smart_money_bot.launch import (
+    render_opportunity_image,
+    score_launch_opportunity,
+    should_publish_news_opportunity,
+)
 from smart_money_bot.models import (
     NarrativeCompetition,
     NewsAlert,
@@ -116,6 +120,8 @@ def test_crypto_native_narrative_requires_crypto_promotion() -> None:
     assert weak.verdict != "LAUNCH READY"
     assert strong.verdict == "LAUNCH READY"
     assert strong.lane == "CRYPTO TREND"
+    assert should_publish_news_opportunity(weak) is False
+    assert should_publish_news_opportunity(strong) is True
 
 
 def test_generic_x_authors_cannot_turn_foreign_business_news_into_launch() -> None:
@@ -149,6 +155,7 @@ def test_generic_x_authors_cannot_turn_foreign_business_news_into_launch() -> No
     assert result.verdict == "SKIP"
     assert result.score < 45
     assert result.lane == "GENERAL NEWS — NOT ELIGIBLE"
+    assert should_publish_news_opportunity(result) is False
 
 
 def test_existing_contract_requires_repeated_crypto_account_promotion() -> None:
@@ -173,6 +180,8 @@ def test_existing_contract_requires_repeated_crypto_account_promotion() -> None:
         established_authors=3,
         crypto_authors=3,
         credible_crypto_authors=2,
+        contract_authors=3,
+        credible_contract_authors=2,
         coin_intent_posts=4,
         promoter_posts=3,
         engagements=150,

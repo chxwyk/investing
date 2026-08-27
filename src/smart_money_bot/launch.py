@@ -630,6 +630,8 @@ def _x_score(alert: NewsAlert, snapshot: XSocialSnapshot) -> int:
         score += min(3, snapshot.credible_crypto_authors)
         score += min(3, snapshot.promoter_posts)
         score += min(2, snapshot.contract_posts)
+        if snapshot.trusted_crypto_authors or snapshot.million_follower_authors:
+            score += 1
         if snapshot.unique_authors >= 5:
             score += 1
         if snapshot.posts_per_minute >= Decimal("0.25"):
@@ -638,7 +640,7 @@ def _x_score(alert: NewsAlert, snapshot: XSocialSnapshot) -> int:
             score += 1
         if snapshot.duplicate_percent >= Decimal("50"):
             score -= 3
-        if snapshot.unique_authors and snapshot.suspicious_authors * 2 >= snapshot.unique_authors:
+        if snapshot.unique_authors and snapshot.suspicious_authors * 3 >= snapshot.unique_authors:
             score -= 2
     return max(0, min(15, score))
 
@@ -689,24 +691,30 @@ def _crypto_attention_ready(
     *,
     require_contract: bool,
 ) -> bool:
-    if not snapshot.available or snapshot.duplicate_percent >= Decimal("50"):
+    if not snapshot.available or snapshot.duplicate_percent >= Decimal("35"):
         return False
-    if snapshot.unique_authors and snapshot.suspicious_authors * 2 >= snapshot.unique_authors:
+    if snapshot.unique_authors and snapshot.suspicious_authors * 3 >= snapshot.unique_authors:
         return False
     if require_contract:
         return (
-            snapshot.unique_authors >= 3
-            and snapshot.contract_posts >= 2
-            and snapshot.crypto_authors >= 2
-            and snapshot.credible_crypto_authors >= 1
-            and snapshot.promoter_posts >= 2
+            snapshot.unique_authors >= 4
+            and snapshot.contract_posts >= 3
+            and snapshot.contract_authors >= 3
+            and snapshot.crypto_authors >= 3
+            and snapshot.credible_contract_authors >= 2
+            and snapshot.promoter_posts >= 3
         )
     return (
         snapshot.unique_authors >= 5
-        and snapshot.established_authors >= 2
-        and snapshot.crypto_authors >= 3
+        and snapshot.established_authors >= 3
+        and snapshot.crypto_authors >= 4
         and snapshot.credible_crypto_authors >= 2
-        and snapshot.promoter_posts >= 2
+        and snapshot.promoter_posts >= 3
+        and (
+            snapshot.influential_authors >= 1
+            or snapshot.trusted_crypto_authors >= 1
+            or snapshot.million_follower_authors >= 1
+        )
         and (
             snapshot.posts_per_minute >= Decimal("0.25")
             or snapshot.engagements >= 50
@@ -725,8 +733,8 @@ def _major_breakout_ready(snapshot: XSocialSnapshot) -> bool:
         and snapshot.promoter_posts >= 2
         and snapshot.posts_per_minute >= Decimal("0.50")
         and snapshot.engagements >= 100
-        and snapshot.duplicate_percent < Decimal("40")
-        and snapshot.suspicious_authors * 2 < snapshot.unique_authors
+        and snapshot.duplicate_percent < Decimal("35")
+        and snapshot.suspicious_authors * 3 < snapshot.unique_authors
     )
 
 
@@ -758,6 +766,17 @@ def _identity_score(primary: str, name: str, symbol: str, alert: NewsAlert) -> i
     if primary.casefold() in f"{alert.headline} {alert.summary}".casefold():
         score += 2
     return min(10, score)
+
+
+def should_publish_news_opportunity(opportunity: LaunchOpportunity) -> bool:
+    """Public news alerts must be immediately actionable through the launch button."""
+
+    return bool(
+        not opportunity.alert.token_mints
+        and opportunity.verdict == "LAUNCH READY"
+        and opportunity.crypto_attention_ready
+        and not opportunity.blockers
+    )
 
 
 def render_opportunity_image(opportunity: LaunchOpportunity) -> bytes:

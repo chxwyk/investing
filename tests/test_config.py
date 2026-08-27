@@ -270,4 +270,4 @@ def test_news_radar_defaults_to_fast_but_cost_bounded_sources(monkeypatch) -> No
     assert settings.pump_one_click_launch_enabled is False
     assert settings.pump_launch_is_unlocked is False
     assert settings.news_pair_recheck_seconds == (0, 30, 90, 180)
-    assert settings.x_search_max_results == 10
+    assert settings.x_search_max_results == 25

@@ -16,12 +16,18 @@ DEFAULT_X_CRYPTO_TRUSTED_ACCOUNTS = "|".join(
         "pumpdotfun",
         "lookonchain",
         "ArkhamIntel",
+        "Bubblemaps",
+        "Rugcheckxyz",
+        "SolanaFloor",
+        "JupiterExchange",
+        "phantom",
     )
 )
 
 DEFAULT_X_NEWS_RULE = (
     "((from:WatcherGuru OR from:CoinDesk OR from:Cointelegraph OR from:solana OR "
-    "from:pumpdotfun OR from:lookonchain OR from:ArkhamIntel) OR "
+    "from:pumpdotfun OR from:lookonchain OR from:ArkhamIntel OR from:Bubblemaps OR "
+    "from:Rugcheckxyz OR from:SolanaFloor OR from:JupiterExchange OR from:phantom) OR "
     "((from:realDonaldTrump OR from:elonmusk OR from:WhiteHouse OR from:AP OR "
     "from:Reuters) (breaking OR emergency OR arrested OR resigns OR dies OR attack OR "
     "shutdown OR \"supreme court\")) OR ((\"pump.fun\" OR \"contract address\" OR "
@@ -269,8 +275,8 @@ class Settings:
             coin_callouts_enabled=_bool("COIN_CALLOUTS_ENABLED", True),
             coin_callout_window_seconds=_int("COIN_CALLOUT_WINDOW_SECONDS", 300),
             coin_callout_cooldown_seconds=_int("COIN_CALLOUT_COOLDOWN_SECONDS", 300),
-            coin_callout_min_alert_score=_decimal("COIN_CALLOUT_MIN_ALERT_SCORE", "45"),
-            x_search_max_results=_int("X_SEARCH_MAX_RESULTS", 10),
+            coin_callout_min_alert_score=_decimal("COIN_CALLOUT_MIN_ALERT_SCORE", "70"),
+            x_search_max_results=_int("X_SEARCH_MAX_RESULTS", 25),
             news_radar_enabled=_bool("NEWS_RADAR_ENABLED", True),
             x_news_stream_enabled=_bool("X_NEWS_STREAM_ENABLED", True),
             x_news_stream_rule=os.getenv("X_NEWS_STREAM_RULE", DEFAULT_X_NEWS_RULE).strip(),

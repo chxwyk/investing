@@ -8,8 +8,15 @@ from smart_money_bot.callouts import (
     parse_tracker_risk,
     parse_x_snapshot,
     score_callout,
+    should_publish_coin_callout,
 )
-from smart_money_bot.models import DexSnapshot, TokenInfo, XSocialSnapshot
+from smart_money_bot.models import (
+    DexSnapshot,
+    SwapQuote,
+    TokenInfo,
+    TokenRiskSnapshot,
+    XSocialSnapshot,
+)
 
 MINT = "HkFGQsW8mr8DTC2AE2WcC7MzwSnynfEryGMQSht271nf"
 
@@ -95,13 +102,13 @@ def test_x_parser_counts_unique_quality_and_duplicate_authors() -> None:
     assert item.identity_posts == 0
 
 
-def test_x_query_adds_verified_identity_without_dropping_contract() -> None:
+def test_x_query_uses_exact_contract_instead_of_spoofable_identity() -> None:
     query = build_x_query(MINT, symbol="PATS", name="Patriots")
 
     assert f'"{MINT}"' in query
-    assert '"$PATS"' in query
-    assert '"Patriots"' in query
-    assert query.endswith("-is:retweet")
+    assert "$PATS" not in query
+    assert "Patriots" not in query
+    assert query.endswith("lang:en")
 
 
 def test_narrative_query_requires_explicit_crypto_language() -> None:
@@ -158,6 +165,9 @@ def test_x_parser_identifies_credible_crypto_promoters() -> None:
     assert item.coin_intent_posts == 2
     assert item.promoter_posts == 2
     assert item.contract_posts == 2
+    assert item.contract_authors == 2
+    assert item.credible_contract_authors == 2
+    assert item.notable_accounts[0].startswith("@knowncrypto")
 
 
 def test_tracker_risk_parser_preserves_launch_manipulation_evidence() -> None:
@@ -221,7 +231,40 @@ def test_callout_never_overrides_hard_token_risk() -> None:
     assert report.hard_blockers
 
 
-def test_strong_watch_requires_cross_source_confirmation() -> None:
+def _executable_quote() -> SwapQuote:
+    return SwapQuote(
+        input_mint="USDC",
+        output_mint=MINT,
+        input_amount_raw=5_000_000,
+        output_amount_raw=1_000_000,
+        other_amount_threshold_raw=990_000,
+        input_amount=Decimal("5"),
+        output_amount=Decimal("1"),
+        input_usd_value=Decimal("5"),
+        output_usd_value=Decimal("4.99"),
+        price_impact_percent=Decimal("0.2"),
+        router="iris",
+        fee_bps=0,
+        api_time_ms=25,
+        observed_latency_ms=30,
+        quoted_at=1_800_000_000,
+    )
+
+
+def _complete_tracker_risk() -> TokenRiskSnapshot:
+    return TokenRiskSnapshot(
+        available=True,
+        score=Decimal("2"),
+        rugged=False,
+        snipers_percent=Decimal("5"),
+        insiders_percent=Decimal("2"),
+        bundlers_percent=Decimal("3"),
+        top10_percent=Decimal("18"),
+        dev_percent=Decimal("1"),
+    )
+
+
+def test_public_callout_requires_complete_cross_source_confirmation() -> None:
     report = score_callout(
         mint=MINT,
         token_info=TokenInfo(
@@ -230,6 +273,7 @@ def test_strong_watch_requires_cross_source_confirmation() -> None:
             holder_count=600,
             liquidity_usd=Decimal("100000"),
             top_holders_percent=Decimal("18"),
+            dev_balance_percent=Decimal("1"),
             suspicious=False,
             verified=True,
             mint_authority_disabled=True,
@@ -251,11 +295,112 @@ def test_strong_watch_requires_cross_source_confirmation() -> None:
             unique_authors=20,
             established_authors=8,
             influential_authors=3,
+            crypto_authors=8,
+            credible_crypto_authors=5,
+            contract_authors=5,
+            credible_contract_authors=3,
+            trusted_crypto_authors=1,
+            promoter_posts=8,
             engagements=500,
             posts_per_minute=Decimal("2"),
         ),
+        tracker_risk=_complete_tracker_risk(),
         smart_wallets=("Alpha", "Beta"),
+        executable_quote=_executable_quote(),
     )
 
     assert report.score >= 70
-    assert report.verdict == "STRONG WATCH"
+    assert report.verdict == "VERIFIED TREND"
+    assert report.public_alert_eligible is True
+    assert should_publish_coin_callout(
+        report,
+        configured_score_floor=Decimal("45"),
+    ) is True
+
+
+def test_name_ticker_buzz_without_exact_contract_promotion_is_not_public() -> None:
+    report = score_callout(
+        mint=MINT,
+        token_info=TokenInfo(
+            mint=MINT,
+            holder_count=600,
+            liquidity_usd=Decimal("100000"),
+            top_holders_percent=Decimal("18"),
+            dev_balance_percent=Decimal("1"),
+            suspicious=False,
+            mint_authority_disabled=True,
+            freeze_authority_disabled=True,
+        ),
+        dex=DexSnapshot(
+            available=True,
+            liquidity_usd=Decimal("100000"),
+            buys_5m=50,
+            sells_5m=20,
+            volume_5m_usd=Decimal("15000"),
+        ),
+        social=XSocialSnapshot(
+            available=True,
+            posts=50,
+            contract_posts=0,
+            unique_authors=20,
+            established_authors=10,
+            influential_authors=5,
+            crypto_authors=10,
+            credible_crypto_authors=8,
+            promoter_posts=10,
+            engagements=5_000,
+            posts_per_minute=Decimal("3"),
+        ),
+        tracker_risk=_complete_tracker_risk(),
+        smart_wallets=("Alpha", "Beta"),
+        executable_quote=_executable_quote(),
+    )
+
+    assert report.public_alert_eligible is False
+    assert report.verdict != "VERIFIED TREND"
+    assert should_publish_coin_callout(
+        report,
+        configured_score_floor=Decimal("45"),
+    ) is False
+
+
+def test_large_liquidity_disagreement_blocks_fake_market_claim() -> None:
+    report = score_callout(
+        mint=MINT,
+        token_info=TokenInfo(
+            mint=MINT,
+            holder_count=600,
+            liquidity_usd=Decimal("5000"),
+            top_holders_percent=Decimal("18"),
+            dev_balance_percent=Decimal("1"),
+            suspicious=False,
+            mint_authority_disabled=True,
+            freeze_authority_disabled=True,
+        ),
+        dex=DexSnapshot(
+            available=True,
+            liquidity_usd=Decimal("500000"),
+            buys_5m=50,
+            sells_5m=20,
+            volume_5m_usd=Decimal("15000"),
+        ),
+        social=XSocialSnapshot(
+            available=True,
+            posts=10,
+            contract_posts=10,
+            unique_authors=8,
+            crypto_authors=8,
+            credible_crypto_authors=5,
+            contract_authors=5,
+            credible_contract_authors=3,
+            promoter_posts=8,
+            trusted_crypto_authors=1,
+        ),
+        tracker_risk=_complete_tracker_risk(),
+        smart_wallets=("Alpha", "Beta"),
+        executable_quote=_executable_quote(),
+    )
+
+    assert report.verdict == "BLOCKED"
+    assert report.public_alert_eligible is False
+    assert any("disagree" in item for item in report.hard_blockers)

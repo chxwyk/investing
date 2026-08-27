@@ -446,7 +446,7 @@ def parse_x_news_payload(payload: Any) -> NewsAlert | None:
 
 class XFilteredNewsStream:
     BASE_URL = "https://api.x.com"
-    RULE_TAG = "smart-money-news-v230"
+    RULE_TAG = "smart-money-news-v240"
 
     def __init__(self, bearer_token: str | None, rule: str) -> None:
         self.bearer_token = bearer_token
@@ -469,7 +469,7 @@ class XFilteredNewsStream:
                 timeout=aiohttp.ClientTimeout(total=None, sock_connect=15, sock_read=90),
                 headers={
                     "Authorization": f"Bearer {self.bearer_token}",
-                    "User-Agent": "SmartMoneyCopyBot/2.23 news-radar",
+                    "User-Agent": "SmartMoneyCopyBot/2.24 news-radar",
                 },
             )
         return self._session
@@ -666,7 +666,7 @@ class RssNewsPoller:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=15),
-                headers={"User-Agent": "SmartMoneyCopyBot/2.23 news-radar"},
+                headers={"User-Agent": "SmartMoneyCopyBot/2.24 news-radar"},
             )
         return self._session
 
@@ -744,7 +744,7 @@ class DexNarrativeMatcher:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=12),
-                headers={"User-Agent": "SmartMoneyCopyBot/2.23 narrative-match"},
+                headers={"User-Agent": "SmartMoneyCopyBot/2.24 narrative-match"},
             )
         return self._session
 

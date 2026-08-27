@@ -10,9 +10,13 @@ from urllib.parse import urlparse
 
 import aiohttp
 
+from .constants import USDC_MINT
+from .errors import JupiterError
+from .market import JupiterClient
 from .models import (
     CoinCallout,
     DexSnapshot,
+    SwapQuote,
     TokenInfo,
     TokenRiskSnapshot,
     XSocialSnapshot,
@@ -35,18 +39,24 @@ CRYPTO_PROFILE_TERMS = {
 
 COIN_PROMOTION_PHRASES = {
     "ape in",
+    "ape",
+    "bullish",
     "buy now",
+    "buying",
     "ca:",
     "contract address",
     "cto",
     "fair launch",
+    "gem",
     "just launched",
     "launching",
     "meme coin",
     "memecoin",
     "moon",
     "pump.fun",
+    "sendor",
     "send it",
+    "sending",
     "ticker",
 }
 
@@ -88,7 +98,7 @@ class DexScreenerClient:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
                 timeout=self.timeout,
-                headers={"User-Agent": "SmartMoneyCopyBot/2.23 coin-intelligence"},
+                headers={"User-Agent": "SmartMoneyCopyBot/2.24 coin-intelligence"},
             )
         return self._session
 
@@ -342,21 +352,10 @@ class XRecentSearchClient:
 
 
 def build_x_query(mint: str, *, symbol: str | None = None, name: str | None = None) -> str:
-    """Build one cost-controlled query covering the contract and verified identity."""
+    """Search only the exact mint; ticker/name matches are too easy to spoof."""
 
-    terms = [f'"{mint}"']
-    cleaned_symbol = re.sub(r"[^A-Za-z0-9_]", "", symbol or "")
-    if 3 <= len(cleaned_symbol) <= 15:
-        terms.append(f'"${cleaned_symbol}"')
-    cleaned_name = re.sub(r"[\"\\]", "", (name or "").strip())
-    if 4 <= len(cleaned_name) <= 40 and cleaned_name.lower() not in {
-        "token",
-        "coin",
-        "solana",
-        "official",
-    }:
-        terms.append(f'"{cleaned_name}"')
-    return f"({' OR '.join(dict.fromkeys(terms))}) -is:retweet"
+    del symbol, name
+    return f'"{mint}" -is:retweet lang:en'
 
 
 def build_x_narrative_query(narrative: str) -> str:
@@ -465,6 +464,11 @@ def parse_x_snapshot(
     suspicious: set[str] = set()
     crypto_authors: set[str] = set()
     credible_crypto_authors: set[str] = set()
+    contract_authors: set[str] = set()
+    credible_contract_authors: set[str] = set()
+    trusted_crypto_authors: set[str] = set()
+    million_follower_authors: set[str] = set()
+    notable_by_author: dict[str, tuple[int, str]] = {}
     engagements = 0
     normalized_texts: list[str] = []
     contract_posts = 0
@@ -521,8 +525,21 @@ def parse_x_snapshot(
             crypto_authors.add(author_id)
             if has_coin_intent:
                 promoter_posts += 1
-            if age_days >= 90 and followers >= 500:
+                if username:
+                    notable_by_author[author_id] = (followers, username)
+            if username in trusted_crypto_accounts:
+                trusted_crypto_authors.add(author_id)
+            if followers >= 1_000_000:
+                million_follower_authors.add(author_id)
+            credible_profile = username in trusted_crypto_accounts or (
+                age_days >= 90 and followers >= 500
+            )
+            if credible_profile:
                 credible_crypto_authors.add(author_id)
+            if has_contract:
+                contract_authors.add(author_id)
+                if credible_profile:
+                    credible_contract_authors.add(author_id)
         if author_id and age_days >= 90 and followers >= 100:
             established.add(author_id)
         if author_id and (followers >= 5_000 or bool(user.get("verified"))):
@@ -556,11 +573,23 @@ def parse_x_snapshot(
         suspicious_authors=len(suspicious),
         crypto_authors=len(crypto_authors),
         credible_crypto_authors=len(credible_crypto_authors),
+        contract_authors=len(contract_authors),
+        credible_contract_authors=len(credible_contract_authors),
+        trusted_crypto_authors=len(trusted_crypto_authors),
+        million_follower_authors=len(million_follower_authors),
         coin_intent_posts=coin_intent_posts,
         promoter_posts=promoter_posts,
         engagements=engagements,
         duplicate_percent=duplicate_percent.quantize(Decimal("0.01")),
         posts_per_minute=velocity.quantize(Decimal("0.01")),
+        notable_accounts=tuple(
+            f"@{username} ({followers:,})"
+            for followers, username in sorted(
+                notable_by_author.values(),
+                key=lambda item: (item[0], item[1]),
+                reverse=True,
+            )[:5]
+        ),
         query=query,
     )
 
@@ -588,10 +617,32 @@ class CoinCalloutAnalyzer:
         dex: DexScreenerClient,
         social: XRecentSearchClient,
         tracker_risk: SolanaTrackerTokenRiskClient,
+        market: JupiterClient | None = None,
     ) -> None:
         self.dex = dex
         self.social = social
         self.tracker_risk = tracker_risk
+        self.market = market
+
+    async def _executable_quote(
+        self,
+        token_info: TokenInfo | None,
+    ) -> tuple[SwapQuote | None, str | None]:
+        if self.market is None or not self.market.api_key:
+            return None, "Jupiter executable quote is not configured"
+        if token_info is None or token_info.decimals is None:
+            return None, "token decimals are unavailable for executable quote verification"
+        try:
+            quote = await self.market.quote_order(
+                input_mint=USDC_MINT,
+                output_mint=token_info.mint,
+                amount_raw=5_000_000,
+                input_decimals=6,
+                output_decimals=token_info.decimals,
+            )
+        except (JupiterError, ValueError) as exc:
+            return None, str(exc)[:180]
+        return quote, None
 
     async def analyze(
         self,
@@ -600,7 +651,7 @@ class CoinCalloutAnalyzer:
         token_info: TokenInfo | None,
         smart_wallets: tuple[str, ...],
     ) -> CoinCallout:
-        dex, social, tracker_risk = await asyncio.gather(
+        dex, social, tracker_risk, quote_result = await asyncio.gather(
             self.dex.snapshot(mint),
             self.social.snapshot(
                 mint,
@@ -608,7 +659,9 @@ class CoinCalloutAnalyzer:
                 name=token_info.name if token_info else None,
             ),
             self.tracker_risk.snapshot(mint),
+            self._executable_quote(token_info),
         )
+        executable_quote, quote_error = quote_result
         return score_callout(
             mint=mint,
             token_info=token_info,
@@ -616,6 +669,8 @@ class CoinCalloutAnalyzer:
             social=social,
             tracker_risk=tracker_risk,
             smart_wallets=smart_wallets,
+            executable_quote=executable_quote,
+            quote_error=quote_error,
         )
 
 
@@ -627,6 +682,8 @@ def score_callout(
     social: XSocialSnapshot,
     tracker_risk: TokenRiskSnapshot | None = None,
     smart_wallets: tuple[str, ...],
+    executable_quote: SwapQuote | None = None,
+    quote_error: str | None = None,
 ) -> CoinCallout:
     score = Decimal("0")
     positives: list[str] = []
@@ -649,12 +706,14 @@ def score_callout(
                 warnings.append(f"high Tracker risk score ({tracker_risk.score}/10)")
         if tracker_risk.danger_flags:
             blockers.extend(f"Tracker danger: {item}" for item in tracker_risk.danger_flags)
-        if tracker_risk.bundlers_percent is not None and tracker_risk.bundlers_percent > 20:
+        if tracker_risk.bundlers_percent is not None and tracker_risk.bundlers_percent > 10:
             blockers.append(f"bundlers control {tracker_risk.bundlers_percent:.1f}% of supply")
-        if tracker_risk.insiders_percent is not None and tracker_risk.insiders_percent > 15:
+        if tracker_risk.insiders_percent is not None and tracker_risk.insiders_percent > 10:
             blockers.append(f"insiders control {tracker_risk.insiders_percent:.1f}% of supply")
         if tracker_risk.snipers_percent is not None and tracker_risk.snipers_percent > 20:
-            warnings.append(f"snipers still control {tracker_risk.snipers_percent:.1f}% of supply")
+            blockers.append(f"snipers still control {tracker_risk.snipers_percent:.1f}% of supply")
+        if tracker_risk.top10_percent is not None and tracker_risk.top10_percent > 35:
+            blockers.append(f"Tracker top 10 control {tracker_risk.top10_percent:.1f}% of supply")
     else:
         warnings.append("Solana Tracker rug/bundler evidence is unavailable")
 
@@ -681,8 +740,8 @@ def score_callout(
         if token_info.verified:
             score += 2
             positives.append("token metadata is verified")
-        if token_info.dev_balance_percent is not None and token_info.dev_balance_percent > 10:
-            warnings.append(f"developer controls {token_info.dev_balance_percent:.1f}%")
+        if token_info.dev_balance_percent is not None and token_info.dev_balance_percent > 5:
+            blockers.append(f"developer controls {token_info.dev_balance_percent:.1f}%")
     else:
         warnings.append("complete Jupiter token safety metadata is unavailable")
 
@@ -729,8 +788,26 @@ def score_callout(
             if concentration <= 50
             else 0
         )
-        if concentration > 50:
-            warnings.append(f"top holders control {concentration:.1f}%")
+        if concentration > 35:
+            blockers.append(f"top holders control {concentration:.1f}%")
+
+    provider_liquidity = token_info.liquidity_usd if token_info else None
+    dex_liquidity = dex.liquidity_usd if dex.available else None
+    liquidity_cross_checked = False
+    if provider_liquidity is not None and dex_liquidity is not None:
+        lower = min(provider_liquidity, dex_liquidity)
+        upper = max(provider_liquidity, dex_liquidity)
+        if lower <= 0 or upper > lower * Decimal("4"):
+            blockers.append(
+                "Jupiter and DEX liquidity disagree by more than 4x; reported liquidity "
+                "is not trusted"
+            )
+        else:
+            liquidity_cross_checked = True
+            score += 3
+            positives.append("liquidity agrees across Jupiter and DEX data")
+    else:
+        warnings.append("liquidity could not be cross-checked across Jupiter and DEX")
 
     smart_count = len(set(smart_wallets))
     score += Decimal(
@@ -779,6 +856,7 @@ def score_callout(
     if social.available:
         social_points = Decimal(min(6, social.crypto_authors * 2))
         social_points += Decimal(min(6, social.credible_crypto_authors * 3))
+        social_points += Decimal(min(6, social.credible_contract_authors * 3))
         social_points += Decimal(min(5, social.promoter_posts))
         social_points += Decimal(min(4, social.contract_posts * 2))
         if social.posts_per_minute >= Decimal("1"):
@@ -795,47 +873,133 @@ def score_callout(
                 "X activity matched the verified name/ticker but not the contract address"
             )
         score += social_points
-        if social.contract_posts >= 3 and social.crypto_authors >= 3:
+        if social.contract_authors >= 3 and social.credible_contract_authors >= 2:
             positives.append(
-                f"{social.crypto_authors} crypto-native X authors are promoting the contract"
+                f"{social.contract_authors} crypto-native X authors posted the exact contract; "
+                f"{social.credible_contract_authors} passed account-quality checks"
             )
-        if social.duplicate_percent >= 50:
+        if social.duplicate_percent >= 35:
             score -= 8
             warnings.append(
                 f"{social.duplicate_percent:.0f}% duplicate X text suggests coordination"
             )
-        if social.unique_authors and social.suspicious_authors * 2 >= social.unique_authors:
+        if social.unique_authors and social.suspicious_authors * 3 >= social.unique_authors:
             score -= 6
-            warnings.append("at least half of X authors look newly created or low-quality")
+            warnings.append("at least one-third of X authors look newly created or low-quality")
     else:
         warnings.append("official X evidence is unavailable")
 
-    score = max(Decimal("0"), min(Decimal("100"), score)).quantize(Decimal("0.01"))
-    if blockers:
-        verdict = "BLOCKED"
-    elif score >= 70 and smart_count >= 2 and social.available and social.unique_authors >= 8:
-        verdict = "STRONG WATCH"
-    elif (
-        score >= 60
-        and dex.available
-        and social.contract_posts >= 3
-        and social.crypto_authors >= 3
-        and social.credible_crypto_authors >= 2
-        and social.promoter_posts >= 3
-    ):
-        verdict = "TRENDING COIN — VERIFY ENTRY"
-    elif score >= 55 and smart_count >= 1:
-        verdict = "WATCH"
-    elif score >= 40:
-        verdict = "EARLY — NEEDS CONFIRMATION"
+    quote_verified = False
+    if executable_quote is not None:
+        if executable_quote.price_impact_percent <= Decimal("2"):
+            quote_verified = True
+            score += 8
+            positives.append(
+                f"$5 Jupiter route is executable at "
+                f"{executable_quote.price_impact_percent:.2f}% price impact"
+            )
+        else:
+            blockers.append(
+                f"$5 Jupiter route has {executable_quote.price_impact_percent:.2f}% "
+                "price impact"
+            )
     else:
-        verdict = "AVOID / TOO WEAK"
-    source_count = 1 + int(dex.available) + int(social.available)
+        warnings.append(
+            "executable $5 Jupiter route is unavailable"
+            + (f": {quote_error}" if quote_error else "")
+        )
+
+    tracker_complete = bool(
+        tracker_risk.available
+        and tracker_risk.score is not None
+        and tracker_risk.bundlers_percent is not None
+        and tracker_risk.insiders_percent is not None
+        and tracker_risk.snipers_percent is not None
+    )
+    token_safety_complete = bool(
+        token_info
+        and token_info.holder_count is not None
+        and token_info.top_holders_percent is not None
+        and token_info.dev_balance_percent is not None
+        and token_info.mint_authority_disabled is True
+        and token_info.freeze_authority_disabled is True
+    )
+    market_flow_ready = bool(
+        dex.available
+        and dex.liquidity_usd is not None
+        and dex.liquidity_usd >= Decimal("5000")
+        and token_info
+        and token_info.liquidity_usd is not None
+        and token_info.liquidity_usd >= Decimal("5000")
+        and dex.buys_5m + dex.sells_5m >= 10
+        and dex.buys_5m >= dex.sells_5m
+        and dex.volume_5m_usd >= Decimal("1000")
+    )
+    authentic_x_push = bool(
+        social.available
+        and social.contract_posts >= 3
+        and social.contract_authors >= 3
+        and social.unique_authors >= 4
+        and social.credible_contract_authors >= 2
+        and social.crypto_authors >= 3
+        and social.promoter_posts >= 3
+        and social.duplicate_percent < Decimal("35")
+        and (
+            not social.unique_authors
+            or social.suspicious_authors * 3 < social.unique_authors
+        )
+        and (
+            social.posts_per_minute >= Decimal("0.10")
+            or social.engagements >= 50
+        )
+        and (
+            social.trusted_crypto_authors >= 1
+            or social.million_follower_authors >= 1
+            or social.credible_contract_authors >= 3
+            or smart_count >= 2
+        )
+    )
+    public_alert_eligible = bool(
+        not blockers
+        and token_safety_complete
+        and tracker_complete
+        and liquidity_cross_checked
+        and market_flow_ready
+        and authentic_x_push
+        and quote_verified
+    )
+
+    if not token_safety_complete:
+        warnings.append(
+            "complete authority, holder, concentration, and developer proof is required"
+        )
+    if not tracker_complete:
+        warnings.append("complete Tracker risk, bundler, insider, and sniper proof is required")
+    if not market_flow_ready:
+        warnings.append(
+            "verified liquidity and active buy/volume flow are below the public-alert gate"
+        )
+    if not authentic_x_push:
+        warnings.append(
+            "exact-contract promotion by multiple credible crypto accounts is below the "
+            "public-alert gate"
+        )
+
+    score = max(Decimal("0"), min(Decimal("100"), score)).quantize(Decimal("0.01"))
+    if public_alert_eligible:
+        verdict = "VERIFIED TREND"
+    elif blockers:
+        verdict = "BLOCKED"
+    elif score >= 60:
+        verdict = "DEVELOPING — NOT PUBLIC"
+    else:
+        verdict = "INCOMPLETE — NOT PUBLIC"
+    source_count = 1 + int(dex.available) + int(social.available) + int(tracker_risk.available)
     confidence = (
         "HIGH"
-        if source_count == 3 and smart_count >= 2
+        if public_alert_eligible
         else "MEDIUM"
-        if source_count >= 2
+        if source_count >= 3
         else "LOW"
     )
     return CoinCallout(
@@ -854,4 +1018,21 @@ def score_callout(
         warnings=tuple(warnings),
         hard_blockers=tuple(blockers),
         generated_at=int(time.time()),
+        executable_quote=executable_quote,
+        quote_error=quote_error,
+        public_alert_eligible=public_alert_eligible,
+    )
+
+
+def should_publish_coin_callout(
+    callout: CoinCallout,
+    *,
+    configured_score_floor: Decimal,
+) -> bool:
+    """Keep blocked, incomplete, and low-confidence research out of public Discord."""
+
+    return bool(
+        callout.public_alert_eligible
+        and callout.verdict == "VERIFIED TREND"
+        and callout.score >= max(configured_score_floor, Decimal("70"))
     )

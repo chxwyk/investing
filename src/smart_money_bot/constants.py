@@ -1,6 +1,6 @@
 """Chain constants used by the monitor and executor."""
 
-BOT_VERSION = "2.23.0"
+BOT_VERSION = "2.24.0"
 PAPER_DEMO_MINT = "PAPER-DEMO-ONLY"
 PAPER_DEMO_ENTRY_PRICE_USD = "1"
 

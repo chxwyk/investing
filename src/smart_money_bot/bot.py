@@ -245,7 +245,7 @@ class NewsOpportunityView(discord.ui.View):
             opportunity.verdict != "LAUNCH READY" or not bot.engine.pump_launcher.configured
         )
         if opportunity.verdict != "LAUNCH READY":
-            self.launch_button.label = "Launch unavailable — WATCH"
+            self.launch_button.label = "Internal research only"
         elif not bot.engine.pump_launcher.configured:
             self.launch_button.label = "One-click launch locked"
 
@@ -322,19 +322,18 @@ def _discovery_lines(candidates: tuple[DiscoveryCandidate, ...] | list[Discovery
 
 def _coin_callout_embed(callout: CoinCallout) -> discord.Embed:
     colors = {
-        "STRONG WATCH": 0x00D084,
-        "TRENDING COIN — VERIFY ENTRY": 0x00D084,
-        "WATCH": 0x2ECC71,
-        "EARLY — NEEDS CONFIRMATION": 0xF1C40F,
+        "VERIFIED TREND": 0x00D084,
+        "DEVELOPING — NOT PUBLIC": 0xF1C40F,
+        "INCOMPLETE — NOT PUBLIC": 0x95A5A6,
         "BLOCKED": 0xE74C3C,
-        "AVOID / TOO WEAK": 0x95A5A6,
     }
     label = callout.symbol or _short(callout.mint)
     embed = discord.Embed(
         title=f"COIN CALLOUT • {callout.verdict} • {label}",
         description=(
             f"Evidence score **{callout.score}/100** • confidence **{callout.confidence}**\n"
-            "A watch score is research evidence—not a promise or an automatic live buy."
+            "Published automatic callouts passed the exact-contract, market, X-account, "
+            "rug-risk, and executable-route gates. This is evidence—not a profit promise."
         ),
         color=colors.get(callout.verdict, 0x95A5A6),
         timestamp=datetime.fromtimestamp(callout.generated_at, tz=UTC),
@@ -354,12 +353,14 @@ def _coin_callout_embed(callout: CoinCallout) -> discord.Embed:
             dex.price_change_5m_percent if dex.price_change_5m_percent is not None else "unknown"
         )
         embed.add_field(
-            name="DEX flow",
+            name="Verified market activity",
             value=(
-                f"Liquidity `{_money(dex.liquidity_usd)}` • MC `{_money(dex.market_cap_usd)}`\n"
+                f"Reported liquidity `{_money(dex.liquidity_usd)}` • market cap "
+                f"`{_money(dex.market_cap_usd)}`\n"
                 f"5m buys/sells `{dex.buys_5m}/{dex.sells_5m}` ({total_5m} tx) • "
-                f"volume `{_money(dex.volume_5m_usd)}`\n"
-                f"5m price `{price_change}%`"
+                f"trading volume `{_money(dex.volume_5m_usd)}`\n"
+                f"5m price `{price_change}%`\n"
+                "Market cap/volume are **not** dollars invested; liquidity can still move."
             ),
             inline=False,
         )
@@ -376,11 +377,21 @@ def _coin_callout_embed(callout: CoinCallout) -> discord.Embed:
                 f"established `{social.established_authors}` • "
                 f"crypto-native `{social.crypto_authors}` • credible crypto "
                 f"`{social.credible_crypto_authors}`\n"
+                f"Exact-contract authors `{social.contract_authors}` • credible exact-contract "
+                f"authors `{social.credible_contract_authors}` • trusted crypto "
+                f"`{social.trusted_crypto_authors}` • million-follower "
+                f"`{social.million_follower_authors}`\n"
                 f"Velocity `{social.posts_per_minute}/min` • engagements `{social.engagements}` • "
                 f"duplicate text `{social.duplicate_percent}%`"
             ),
             inline=False,
         )
+        if social.notable_accounts:
+            embed.add_field(
+                name="Notable crypto accounts pushing it",
+                value=" • ".join(f"`{item}`" for item in social.notable_accounts)[:1024],
+                inline=False,
+            )
     else:
         error = social.error or "not configured or no response"
         embed.add_field(
@@ -410,6 +421,16 @@ def _coin_callout_embed(callout: CoinCallout) -> discord.Embed:
             value=f"Solana Tracker `{risk_error[:180]}`.",
             inline=False,
         )
+    if callout.executable_quote is not None:
+        quote = callout.executable_quote
+        embed.add_field(
+            name="$5 executable route check",
+            value=(
+                f"Jupiter route `{quote.router}` • price impact "
+                f"`{quote.price_impact_percent:.2f}%` • quoted output `{quote.output_amount}`"
+            ),
+            inline=False,
+        )
     if callout.positives:
         embed.add_field(
             name="Positive evidence",
@@ -425,7 +446,10 @@ def _coin_callout_embed(callout: CoinCallout) -> discord.Embed:
         )
     embed.add_field(name="Contract", value=f"`{callout.mint}`", inline=False)
     embed.set_footer(
-        text="Contract + DEX-listed identity X search • duplicate/bot penalty • DEX/on-chain check"
+        text=(
+            "Automatic channel posts VERIFIED TREND only • exact mint, cross-source liquidity, "
+            "Tracker safety, authentic X promotion, and executable route required"
+        )
     )
     return embed
 
@@ -451,8 +475,8 @@ def _news_alert_embed(
                 "A Solana contract is already in the source. Use the direct research/buy "
                 "links; this alert cannot launch a duplicate coin."
                 if alert.token_mints
-                else "No source contract was found. `LAUNCH READY` means the idea passed "
-                "the crypto-attention gate; `WATCH` means demand evidence is still short."
+                else "No source contract was found. This public alert passed the crypto-demand, "
+                "source, competition, and launch-identity gates."
             )
         ),
         color=colors.get(opportunity.verdict, 0x95A5A6),
@@ -512,11 +536,19 @@ def _news_alert_embed(
                 f"Crypto-native authors `{x.crypto_authors}` • credible crypto authors "
                 f"`{x.credible_crypto_authors}` • promotion posts `{x.promoter_posts}` • "
                 f"exact-contract posts `{x.contract_posts}`\n"
+                f"Trusted crypto `{x.trusted_crypto_authors}` • million-follower "
+                f"`{x.million_follower_authors}`\n"
                 f"Velocity `{x.posts_per_minute}/min` • engagements `{x.engagements}` • "
                 f"duplicate text `{x.duplicate_percent}%`"
             ),
             inline=False,
         )
+        if x.notable_accounts:
+            embed.add_field(
+                name="Notable crypto accounts discussing it",
+                value=" • ".join(f"`{item}`" for item in x.notable_accounts)[:1024],
+                inline=False,
+            )
     if opportunity.positives:
         embed.add_field(
             name="Positive evidence",
@@ -1298,7 +1330,7 @@ class SmartMoneyBot(commands.Bot):
         await self._send_alert(
             _coin_callout_embed(callout),
             token_mint=callout.mint,
-            ping_user=callout.verdict in {"STRONG WATCH", "WATCH"},
+            ping_user=callout.public_alert_eligible,
         )
 
     async def on_news_alert(
@@ -2286,14 +2318,15 @@ class SmartMoneyCommands(
             f"{'ready' if self.bot.settings.discord_alert_user_id else 'user ID not set'}\n"
             f"**Coin callouts:** "
             f"{'enabled' if status['coin_callouts_enabled'] else 'disabled'} • "
-            "DEX/on-chain cross-check • "
+            "VERIFIED TREND only • exact-contract X promotion • cross-source liquidity • "
+            "$5 executable route • complete Tracker/holder proof • "
             f"X {x_callout_health} • "
-            f"minimum alert score {s.coin_callout_min_alert_score}/100\n"
+            f"minimum final score {max(s.coin_callout_min_alert_score, Decimal('70'))}/100\n"
             f"**News radar:** {'enabled' if status['news_radar_enabled'] else 'disabled'} • "
             "crypto-first • exceptional U.S. events require broad crypto pickup • "
             f"X stream {x_news_health} • RSS {rss_health}\n"
-            f"**Crypto-demand launch score:** WATCH {s.news_min_score}+ • LAUNCH READY "
-            f"{s.news_launch_ready_score}+ plus crypto-account promotion gate • "
+            f"**Crypto-demand launch score:** public alerts are LAUNCH READY only • "
+            f"{s.news_launch_ready_score}+ plus authentic crypto-account promotion gate • "
             "source/speed/meme/X/confirmation/competition/identity\n"
             f"**One-click Pump launch:** "
             f"{'unlocked' if status['pump_launch_unlocked'] else 'locked'} • "
