@@ -1566,6 +1566,61 @@ def _runner_embed(
     return embed
 
 
+def _runner_digest_embed(
+    candidates: tuple[RunnerCandidate, ...],
+    public_floor: Decimal,
+) -> discord.Embed:
+    embed = discord.Embed(
+        title="FOMO RUNNER RADAR — RESEARCH",
+        description=(
+            "Changed existing-token observations from the shadow runner. This is a "
+            f"non-pinging digest below the `{public_floor}/100` public-alert floor."
+        ),
+        color=0xF1C40F,
+        timestamp=discord.utils.utcnow(),
+    )
+    for index, candidate in enumerate(candidates, start=1):
+        current = candidate.current
+        graduation_age = (
+            max(0, candidate.generated_at - candidate.graduated_at) // 60
+            if candidate.graduated_at
+            else None
+        )
+        blockers = "; ".join(candidate.hard_blockers[:3]) or "none recorded"
+        x_status = "verified" if candidate.x_evidence.available else "not verified"
+        embed.add_field(
+            name=(
+                f"#{index} {candidate.name or 'Unknown'} "
+                f"${candidate.symbol or 'UNKNOWN'} — {candidate.score}/100"
+            )[:256],
+            value=(
+                f"Age proxy `{f'{graduation_age}m' if graduation_age is not None else 'unknown'}` "
+                f"• mint `{_short(candidate.mint)}`\n"
+                f"MC `{_money(candidate.first.market_cap_usd)}` → "
+                f"`{_money(current.market_cap_usd)}` "
+                f"(`{_percent_change(current.market_cap_usd, candidate.first.market_cap_usd)}`)\n"
+                "Price since first seen "
+                f"`{_percent_change(current.price_usd, candidate.first.price_usd)}` "
+                f"• 5m buys/sells `{current.buys_5m}/{current.sells_5m}`\n"
+                f"Volume `{_money(current.volume_5m_usd)}` • liquidity "
+                f"`{_money(current.liquidity_usd)}` • holders "
+                f"`{current.holder_count if current.holder_count is not None else 'unknown'}`\n"
+                f"Smart-wallet overlap `{len(candidate.smart_wallets)}` • risk "
+                f"`{current.risk_score if current.risk_score is not None else 'unknown'}/10` "
+                f"• X `{x_status}`\n"
+                f"Blockers: {blockers}"
+            )[:1024],
+            inline=False,
+        )
+    embed.set_footer(
+        text=(
+            f"RESEARCH ONLY — BELOW {public_floor}/100 PUBLIC ALERT FLOOR • "
+            "no buy, SOL spend, X lookup, or J7 call"
+        )
+    )
+    return embed
+
+
 def _news_alert_embed(
     alert: NewsAlert,
     opportunity: LaunchOpportunity,
@@ -2549,6 +2604,16 @@ class SmartMoneyBot(commands.Bot):
             ping_user=True,
         )
 
+    async def on_runner_digest(
+        self,
+        candidates: tuple[RunnerCandidate, ...],
+        public_floor: Decimal,
+    ) -> None:
+        await self._send_alert(
+            _runner_digest_embed(candidates, public_floor),
+            ping_user=False,
+        )
+
     async def on_news_alert(
         self,
         alert: NewsAlert,
@@ -3047,6 +3112,7 @@ class SmartMoneyCommands(
             f"{'shadow research enabled' if status['fomo_runner_enabled'] else 'disabled'} • "
             f"two-stage broad discovery + {status['fomo_runner_fast_watch_seconds']}s "
             f"temporary fast watch • {status['fomo_runner_observations']} persisted candidates • "
+            f"digest {'enabled' if status['fomo_runner_digest_enabled'] else 'disabled'} • "
             "no auto-buy\n"
             f"**X near-realtime news stream:** {news_stream_status} • configured account/news "
             "rule • crypto-first filtering • exceptional U.S. event lane\n"
@@ -3783,6 +3849,8 @@ class SmartMoneyCommands(
             f"fast-watch `{status['fomo_runner_fast_watch_active']}` • observations "
             f"`{status['fomo_runner_observations']}` • last evaluation "
             f"{runner_last} • "
+            f"research digest "
+            f"{'enabled' if status['fomo_runner_digest_enabled'] else 'disabled'} • "
             "no automatic buys\n"
             f"**News radar:** {'enabled' if status['news_radar_enabled'] else 'disabled'} • "
             "crypto-first • exceptional U.S. events require independent confirmation • "
@@ -3986,12 +4054,35 @@ class FomoCommands(
     ) -> None:
         if not await self._require_admin(interaction):
             return
+        await interaction.response.defer(thinking=True, ephemeral=True)
         research_test = mode == "test"
         if research_test:
-            cached = await self.bot.engine.runner_lab_cached_candidates(
-                research_test=True,
-                max_age_seconds=86_400,
-            )
+            try:
+                async with asyncio.timeout(5):
+                    cached = await self.bot.engine.runner_lab_cached_candidates(
+                        research_test=True,
+                        max_age_seconds=86_400,
+                    )
+            except TimeoutError:
+                await interaction.edit_original_response(
+                    content=(
+                        "Fomo Runner Lab could not read the saved runner pool within "
+                        "five seconds. No provider, X, buy, SOL, or J7 action was used."
+                    ),
+                    embed=None,
+                    view=None,
+                )
+                return
+            except Exception as exc:
+                await interaction.edit_original_response(
+                    content=(
+                        "Fomo Runner Lab could not read the saved runner pool: "
+                        f"`{type(exc).__name__}`. No buy or launch was attempted."
+                    ),
+                    embed=None,
+                    view=None,
+                )
+                return
             if cached:
                 view = FomoRunnerLabView(
                     self.bot,
@@ -3999,19 +4090,17 @@ class FomoCommands(
                     owner_id=interaction.user.id,
                     research_test=True,
                 )
-                await interaction.response.send_message(
+                await interaction.edit_original_response(
+                    content=None,
                     embed=view.embed(),
                     view=view,
-                    ephemeral=True,
                 )
                 return
-            await interaction.response.send_message(
-                "No saved runner observation is available yet. Running one bounded "
-                "public-data refresh now; this message will update when it finishes.",
-                ephemeral=True,
+            await interaction.edit_original_response(
+                content="Refreshing one real public candidate...",
+                embed=None,
+                view=None,
             )
-        else:
-            await interaction.response.defer(thinking=True, ephemeral=True)
         try:
             async with asyncio.timeout(40):
                 candidates = await self.bot.engine.runner_lab_candidates(
@@ -4151,6 +4240,60 @@ class FomoCommands(
         embed.add_field(
             name="Baseline comparison",
             value=str(result["baseline_status"]),
+            inline=False,
+        )
+        distribution = result["score_distribution"]
+        assert isinstance(distribution, dict)
+
+        def score_text(value: object) -> str:
+            return f"{value:.2f}" if isinstance(value, Decimal) else "pending"
+
+        embed.add_field(
+            name="Current score distribution",
+            value=(
+                f"max `{score_text(distribution['max'])}` • "
+                f"median `{score_text(distribution['median'])}` • "
+                f"p90 `{score_text(distribution['p90'])}` • "
+                f"p95 `{score_text(distribution['p95'])}`\n"
+                f"35+ `{distribution['gte_35']}` • 50+ `{distribution['gte_50']}` • "
+                f"60+ `{distribution['gte_60']}` • 70+ `{distribution['gte_70']}`"
+            ),
+            inline=False,
+        )
+        best = result["best_current_candidates"]
+        assert isinstance(best, tuple)
+        best_lines = [
+            f"`{item.score}` • **{item.name or 'Unknown'}** "
+            f"`${item.symbol or 'UNKNOWN'}` • `{_short(item.mint)}`"
+            for item in best
+            if isinstance(item, RunnerCandidate)
+        ]
+        embed.add_field(
+            name="Best current research candidates",
+            value="\n".join(best_lines) or "No persisted runner candidates yet.",
+            inline=False,
+        )
+
+        def relative_timestamp(value: object) -> str:
+            return f"<t:{value}:R>" if isinstance(value, int) else "none yet"
+
+        radar_visibility = (
+            f"Last strong alert: {relative_timestamp(result['last_strong_alert_at'])}\n"
+            f"Last digest: {relative_timestamp(result['last_digest_at'])}\n"
+            "Last fast-watch token: none yet"
+        )
+        if result["last_fast_watch_mint"]:
+            radar_visibility = (
+                f"Last strong alert: "
+                f"{relative_timestamp(result['last_strong_alert_at'])}\n"
+                f"Last digest: {relative_timestamp(result['last_digest_at'])}\n"
+                f"Last fast-watch token: "
+                f"`{_short(str(result['last_fast_watch_mint']))}` "
+                f"({relative_timestamp(result['last_fast_watch_at'])})"
+            )
+        embed.add_field(
+            name="Radar visibility",
+            value=radar_visibility,
             inline=False,
         )
         embed.set_footer(

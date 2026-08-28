@@ -143,6 +143,10 @@ class Settings:
     fomo_runner_lab_candidates: int
     fomo_runner_max_graduation_age_minutes: int
     fomo_runner_outcome_poll_seconds: int
+    fomo_runner_digest_enabled: bool
+    fomo_runner_digest_seconds: int
+    fomo_runner_digest_min_score: Decimal
+    fomo_runner_digest_max_candidates: int
 
     news_radar_enabled: bool
     x_news_stream_enabled: bool
@@ -368,6 +372,12 @@ class Settings:
                 "FOMO_RUNNER_MAX_GRADUATION_AGE_MINUTES", 60
             ),
             fomo_runner_outcome_poll_seconds=_int("FOMO_RUNNER_OUTCOME_POLL_SECONDS", 60),
+            fomo_runner_digest_enabled=_bool("FOMO_RUNNER_DIGEST_ENABLED", True),
+            fomo_runner_digest_seconds=_int("FOMO_RUNNER_DIGEST_SECONDS", 900),
+            fomo_runner_digest_min_score=_decimal("FOMO_RUNNER_DIGEST_MIN_SCORE", "35"),
+            fomo_runner_digest_max_candidates=_int(
+                "FOMO_RUNNER_DIGEST_MAX_CANDIDATES", 3
+            ),
             news_radar_enabled=_bool("NEWS_RADAR_ENABLED", True),
             x_news_stream_enabled=_bool("X_NEWS_STREAM_ENABLED", False),
             x_news_stream_rule=os.getenv("X_NEWS_STREAM_RULE", DEFAULT_X_NEWS_RULE).strip(),
@@ -657,6 +667,12 @@ class Settings:
             raise ValueError("FOMO_RUNNER_MAX_GRADUATION_AGE_MINUTES must be between 5 and 1440")
         if not 30 <= self.fomo_runner_outcome_poll_seconds <= 3600:
             raise ValueError("FOMO_RUNNER_OUTCOME_POLL_SECONDS must be between 30 and 3600")
+        if not 60 <= self.fomo_runner_digest_seconds <= 86400:
+            raise ValueError("FOMO_RUNNER_DIGEST_SECONDS must be between 60 and 86400")
+        if not 0 <= self.fomo_runner_digest_min_score <= 100:
+            raise ValueError("FOMO_RUNNER_DIGEST_MIN_SCORE must be between 0 and 100")
+        if not 1 <= self.fomo_runner_digest_max_candidates <= 10:
+            raise ValueError("FOMO_RUNNER_DIGEST_MAX_CANDIDATES must be between 1 and 10")
         if len(self.x_news_stream_rule) > 1024:
             raise ValueError("X_NEWS_STREAM_RULE cannot exceed 1024 characters")
         if not 15 <= self.news_poll_seconds <= 3600:

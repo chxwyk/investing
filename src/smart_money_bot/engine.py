@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import time
 from collections import deque
@@ -147,6 +149,12 @@ class Notifier(Protocol):
 
     async def on_runner_alert(self, candidate: RunnerCandidate) -> None: ...
 
+    async def on_runner_digest(
+        self,
+        candidates: tuple[RunnerCandidate, ...],
+        public_floor: Decimal,
+    ) -> None: ...
+
     async def on_news_alert(
         self,
         alert: NewsAlert,
@@ -185,6 +193,13 @@ class NullNotifier:
         return None
 
     async def on_runner_alert(self, candidate: RunnerCandidate) -> None:
+        return None
+
+    async def on_runner_digest(
+        self,
+        candidates: tuple[RunnerCandidate, ...],
+        public_floor: Decimal,
+    ) -> None:
         return None
 
     async def on_news_alert(
@@ -286,6 +301,7 @@ class SmartMoneyEngine:
         self._x_radar_task: asyncio.Task[None] | None = None
         self._fomo_radar_task: asyncio.Task[None] | None = None
         self._runner_outcome_task: asyncio.Task[None] | None = None
+        self._runner_digest_task: asyncio.Task[None] | None = None
         self._runner_fast_watch_tasks: dict[str, asyncio.Task[None]] = {}
         self._news_match_tasks: set[asyncio.Task[None]] = set()
         self._news_alert_times: deque[int] = deque()
@@ -307,6 +323,8 @@ class SmartMoneyEngine:
         self._runner_last_alert: dict[str, tuple[int, Decimal]] = {}
         self.runner_last_evaluated_at: int | None = None
         self.runner_last_candidate_mint: str | None = None
+        self.runner_last_fast_watch_mint: str | None = None
+        self.runner_last_fast_watch_at: int | None = None
         self._scan_lock = asyncio.Lock()
         self._discovery_lock = asyncio.Lock()
         self._daily_profit_lock = asyncio.Lock()
@@ -437,6 +455,11 @@ class SmartMoneyEngine:
                 self._run_runner_outcomes(),
                 name="smart-money-runner-outcomes",
             )
+            if self.settings.fomo_runner_digest_enabled:
+                self._runner_digest_task = asyncio.create_task(
+                    self._run_runner_digest(),
+                    name="smart-money-runner-digest",
+                )
 
     async def close(self) -> None:
         for task in self._news_match_tasks:
@@ -450,6 +473,7 @@ class SmartMoneyEngine:
             self._x_radar_task,
             self._fomo_radar_task,
             self._runner_outcome_task,
+            self._runner_digest_task,
         ):
             if task:
                 task.cancel()
@@ -459,6 +483,7 @@ class SmartMoneyEngine:
             self._x_radar_task,
             self._fomo_radar_task,
             self._runner_outcome_task,
+            self._runner_digest_task,
         ):
             if task:
                 with suppress(asyncio.CancelledError):
@@ -468,6 +493,7 @@ class SmartMoneyEngine:
         self._x_radar_task = None
         self._fomo_radar_task = None
         self._runner_outcome_task = None
+        self._runner_digest_task = None
         for task in self._runner_fast_watch_tasks.values():
             task.cancel()
         if self._runner_fast_watch_tasks:
@@ -1410,6 +1436,8 @@ class SmartMoneyEngine:
             return
         self._runner_last_alert[candidate.mint] = (now, candidate.score)
         await self.notifier.on_runner_alert(candidate)
+        await self.database.set_setting("runner_last_strong_alert_at", str(now))
+        await self.database.set_setting("runner_last_strong_alert_mint", candidate.mint)
 
     def _start_runner_fast_watch(self, candidate: RunnerCandidate) -> None:
         if candidate.mint in self._runner_fast_watch_tasks:
@@ -1431,11 +1459,16 @@ class SmartMoneyEngine:
             name=f"runner-fast-{candidate.mint[:8]}",
         )
         self._runner_fast_watch_tasks[candidate.mint] = task
+        self.runner_last_fast_watch_mint = candidate.mint
+        self.runner_last_fast_watch_at = int(time.time())
         task.add_done_callback(
             lambda _task, mint=candidate.mint: self._runner_fast_watch_tasks.pop(mint, None)
         )
 
     async def _fast_watch_runner(self, mint: str) -> None:
+        started_at = int(time.time())
+        await self.database.set_setting("runner_last_fast_watch_mint", mint)
+        await self.database.set_setting("runner_last_fast_watch_at", str(started_at))
         stop_at = time.monotonic() + self.settings.fomo_runner_fast_watch_minutes * 60
         while time.monotonic() < stop_at:
             await asyncio.sleep(self.settings.fomo_runner_fast_watch_seconds)
@@ -1457,6 +1490,77 @@ class SmartMoneyEngine:
             except Exception as exc:
                 await self.notifier.on_error("Runner outcome tracking", exc)
             await asyncio.sleep(self.settings.fomo_runner_outcome_poll_seconds)
+
+    async def _run_runner_digest(self) -> None:
+        """Publish a persisted, non-pinging research summary on a slow cadence."""
+
+        while True:
+            await asyncio.sleep(self.settings.fomo_runner_digest_seconds)
+            try:
+                await self._publish_runner_digest()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await self.notifier.on_error("Runner research digest", exc)
+
+    @staticmethod
+    def _runner_digest_fingerprint(candidates: tuple[RunnerCandidate, ...]) -> str:
+        """Bucket volatile values so minor market noise does not resend a digest."""
+
+        rows: list[dict[str, object]] = []
+        for item in candidates:
+            price_change = forward_return_percent(
+                item.current.price_usd,
+                item.first.price_usd,
+            )
+            cap_change = forward_return_percent(
+                item.current.market_cap_usd,
+                item.first.market_cap_usd,
+            )
+            rows.append(
+                {
+                    "mint": item.mint,
+                    "score_bucket": int(item.score // 5),
+                    "price_bucket": int((price_change or Decimal("0")) // 10),
+                    "cap_bucket": int((cap_change or Decimal("0")) // 10),
+                    "blockers": item.hard_blockers,
+                }
+            )
+        raw = json.dumps(rows, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(raw.encode()).hexdigest()
+
+    async def _publish_runner_digest(self) -> bool:
+        """Send changed below-floor research from SQLite without provider or X calls."""
+
+        candidates = await self.runner_lab_cached_candidates(
+            research_test=True,
+            max_age_seconds=86_400,
+        )
+        selected = tuple(
+            item
+            for item in candidates
+            if self.settings.fomo_runner_digest_min_score
+            <= item.score
+            < self.settings.fomo_runner_public_alert_min_score
+        )[: self.settings.fomo_runner_digest_max_candidates]
+        if not selected:
+            return False
+        fingerprint = self._runner_digest_fingerprint(selected)
+        previous = await self.database.get_setting("runner_digest_fingerprint")
+        if fingerprint == previous:
+            return False
+        await self.notifier.on_runner_digest(
+            selected,
+            self.settings.fomo_runner_public_alert_min_score,
+        )
+        now = int(time.time())
+        await self.database.set_setting("runner_digest_fingerprint", fingerprint)
+        await self.database.set_setting("runner_last_digest_at", str(now))
+        await self.database.set_setting(
+            "runner_last_digest_mints",
+            ",".join(item.mint for item in selected),
+        )
+        return True
 
     async def _record_runner_outcomes(self, candidate: RunnerCandidate) -> None:
         snapshots = [
@@ -1756,6 +1860,45 @@ class SmartMoneyEngine:
                 )[:sample]
             ),
         }
+        score_values = sorted(
+            Decimal(str(row["latest_score"])) for row in candidates.values()
+        )
+
+        def percentile(values: list[Decimal], quantile: Decimal) -> Decimal | None:
+            if not values:
+                return None
+            if len(values) == 1:
+                return values[0]
+            position = Decimal(len(values) - 1) * quantile
+            lower = int(position)
+            upper = min(lower + 1, len(values) - 1)
+            fraction = position - Decimal(lower)
+            return values[lower] + (values[upper] - values[lower]) * fraction
+
+        score_distribution = {
+            "max": max(score_values) if score_values else None,
+            "median": percentile(score_values, Decimal("0.50")),
+            "p90": percentile(score_values, Decimal("0.90")),
+            "p95": percentile(score_values, Decimal("0.95")),
+            "gte_35": sum(value >= 35 for value in score_values),
+            "gte_50": sum(value >= 50 for value in score_values),
+            "gte_60": sum(value >= 60 for value in score_values),
+            "gte_70": sum(value >= 70 for value in score_values),
+        }
+        best_current = tuple(
+            sorted(
+                candidate_objects.values(),
+                key=lambda item: (item.score, item.current.captured_at),
+                reverse=True,
+            )[:3]
+        )
+        last_strong_alert = await self.database.get_setting("runner_last_strong_alert_at")
+        last_strong_mint = await self.database.get_setting("runner_last_strong_alert_mint")
+        last_digest = await self.database.get_setting("runner_last_digest_at")
+        stored_fast_watch_mint = await self.database.get_setting(
+            "runner_last_fast_watch_mint"
+        )
+        stored_fast_watch_at = await self.database.get_setting("runner_last_fast_watch_at")
         return {
             "candidates": len(candidates),
             "outcomes": len(outcomes),
@@ -1765,6 +1908,20 @@ class SmartMoneyEngine:
             "excursions": excursions,
             "breakdowns": breakdowns,
             "baselines": baselines,
+            "score_distribution": score_distribution,
+            "best_current_candidates": best_current,
+            "last_strong_alert_at": (
+                int(last_strong_alert) if last_strong_alert else None
+            ),
+            "last_strong_alert_mint": last_strong_mint,
+            "last_digest_at": int(last_digest) if last_digest else None,
+            "last_fast_watch_mint": (
+                self.runner_last_fast_watch_mint or stored_fast_watch_mint
+            ),
+            "last_fast_watch_at": (
+                self.runner_last_fast_watch_at
+                or (int(stored_fast_watch_at) if stored_fast_watch_at else None)
+            ),
             "average_detection_delay_seconds": (
                 sum(detection_delays) // len(detection_delays) if detection_delays else None
             ),
@@ -3697,6 +3854,11 @@ class SmartMoneyEngine:
             "fomo_runner_observations": await self.database.runner_observation_count(),
             "fomo_runner_last_evaluated": self.runner_last_evaluated_at,
             "fomo_runner_last_mint": self.runner_last_candidate_mint,
+            "fomo_runner_digest_enabled": self.settings.fomo_runner_digest_enabled,
+            "fomo_runner_digest_seconds": self.settings.fomo_runner_digest_seconds,
+            "fomo_runner_last_digest": (
+                await self.database.get_setting("runner_last_digest_at")
+            ),
             "trade_activity_alerts_enabled": self.settings.trade_activity_alerts_enabled,
             "news_radar_enabled": self.settings.news_radar_enabled,
             "news_source_image_enabled": self.settings.news_source_image_enabled,

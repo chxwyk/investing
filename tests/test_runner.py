@@ -9,7 +9,12 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from smart_money_bot.bot import FomoCommands, FomoRunnerLabView, RunnerXVerificationConfirmationView
+from smart_money_bot.bot import (
+    FomoCommands,
+    FomoRunnerLabView,
+    RunnerXVerificationConfirmationView,
+    SmartMoneyBot,
+)
 from smart_money_bot.callouts import parse_dex_snapshot
 from smart_money_bot.database import Database
 from smart_money_bot.engine import SmartMoneyEngine
@@ -761,9 +766,48 @@ async def test_fomo_lab_command_resolves_deferred_original_response(settings) ->
 @pytest.mark.asyncio
 async def test_fomo_lab_test_answers_immediately_from_persisted_observation(settings) -> None:
     candidate = _candidate()
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(id=1),
+        response=SimpleNamespace(send_message=AsyncMock(), defer=AsyncMock()),
+        edit_original_response=AsyncMock(),
+    )
+
+    async def cached_after_defer(**_kwargs):
+        interaction.response.defer.assert_awaited_once_with(
+            thinking=True,
+            ephemeral=True,
+        )
+        return (candidate,)
+
     engine = SimpleNamespace(
-        runner_lab_cached_candidates=AsyncMock(return_value=(candidate,)),
+        runner_lab_cached_candidates=AsyncMock(side_effect=cached_after_defer),
         runner_lab_candidates=AsyncMock(),
+    )
+    bot = SimpleNamespace(settings=settings, engine=engine)
+    commands = FomoCommands(bot)
+    commands._require_admin = AsyncMock(return_value=True)
+
+    await FomoCommands.lab.callback(commands, interaction, mode="test")
+
+    engine.runner_lab_cached_candidates.assert_awaited_once_with(
+        research_test=True,
+        max_age_seconds=86_400,
+    )
+    engine.runner_lab_candidates.assert_not_awaited()
+    interaction.response.defer.assert_awaited_once_with(thinking=True, ephemeral=True)
+    interaction.response.send_message.assert_not_awaited()
+    interaction.edit_original_response.assert_awaited_once()
+    kwargs = interaction.edit_original_response.await_args.kwargs
+    assert MINT in kwargs["embed"].description
+    assert isinstance(kwargs["view"], FomoRunnerLabView)
+
+
+@pytest.mark.asyncio
+async def test_fomo_lab_empty_cache_shows_refresh_then_candidate(settings) -> None:
+    candidate = _candidate()
+    engine = SimpleNamespace(
+        runner_lab_cached_candidates=AsyncMock(return_value=()),
+        runner_lab_candidates=AsyncMock(return_value=(candidate,)),
     )
     bot = SimpleNamespace(settings=settings, engine=engine)
     commands = FomoCommands(bot)
@@ -776,17 +820,37 @@ async def test_fomo_lab_test_answers_immediately_from_persisted_observation(sett
 
     await FomoCommands.lab.callback(commands, interaction, mode="test")
 
-    engine.runner_lab_cached_candidates.assert_awaited_once_with(
-        research_test=True,
-        max_age_seconds=86_400,
+    interaction.response.defer.assert_awaited_once()
+    interaction.response.send_message.assert_not_awaited()
+    assert interaction.edit_original_response.await_count == 2
+    loading = interaction.edit_original_response.await_args_list[0].kwargs
+    assert loading["content"] == "Refreshing one real public candidate..."
+    final = interaction.edit_original_response.await_args_list[1].kwargs
+    assert isinstance(final["view"], FomoRunnerLabView)
+
+
+@pytest.mark.asyncio
+async def test_fomo_lab_provider_timeout_is_visible_after_defer(settings) -> None:
+    engine = SimpleNamespace(
+        runner_lab_cached_candidates=AsyncMock(return_value=()),
+        runner_lab_candidates=AsyncMock(side_effect=TimeoutError),
     )
-    engine.runner_lab_candidates.assert_not_awaited()
-    interaction.response.defer.assert_not_awaited()
-    interaction.response.send_message.assert_awaited_once()
-    kwargs = interaction.response.send_message.await_args.kwargs
-    assert MINT in kwargs["embed"].description
-    assert isinstance(kwargs["view"], FomoRunnerLabView)
-    interaction.edit_original_response.assert_not_awaited()
+    bot = SimpleNamespace(settings=settings, engine=engine)
+    commands = FomoCommands(bot)
+    commands._require_admin = AsyncMock(return_value=True)
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(id=1),
+        response=SimpleNamespace(send_message=AsyncMock(), defer=AsyncMock()),
+        edit_original_response=AsyncMock(),
+    )
+
+    await FomoCommands.lab.callback(commands, interaction, mode="test")
+
+    interaction.response.defer.assert_awaited_once()
+    interaction.response.send_message.assert_not_awaited()
+    error = interaction.edit_original_response.await_args.kwargs["content"]
+    assert "timed out" in error
+    assert "no X credits, SOL, buy, or J7" in error
 
 
 @pytest.mark.asyncio
@@ -919,3 +983,108 @@ def test_runner_defaults_do_not_change_launch_or_x_production_thresholds(setting
     assert settings.fomo_runner_enabled is True
     assert settings.fomo_runner_fast_watch_seconds == 20
     assert settings.fomo_runner_public_alert_min_score == Decimal("70")
+    assert settings.fomo_runner_digest_enabled is True
+    assert settings.fomo_runner_digest_seconds == 900
+    assert settings.fomo_runner_digest_min_score == Decimal("35")
+    assert settings.fomo_runner_digest_max_candidates == 3
+
+
+@pytest.mark.asyncio
+async def test_runner_digest_is_cached_deduplicated_and_never_buys(settings, tmp_path) -> None:
+    configured = replace(settings, database_path=str(tmp_path / "digest.db"))
+    notifier = SimpleNamespace(on_runner_digest=AsyncMock(), on_error=AsyncMock())
+    engine = SmartMoneyEngine(configured, notifier=notifier)
+    engine.x_social.snapshot = AsyncMock()
+    engine.pump_launcher.j7.launch = AsyncMock()
+    engine.executor.execute = AsyncMock()
+    candidate = replace(_candidate(), score=Decimal("48"), research_only=True)
+    await engine.initialize()
+    try:
+        await engine.database.store_runner_candidate(
+            candidate,
+            payload_json=runner_candidate_to_json(candidate),
+            snapshot_json=runner_snapshot_to_json(candidate.current),
+        )
+
+        assert await engine._publish_runner_digest() is True
+        assert await engine._publish_runner_digest() is False
+
+        notifier.on_runner_digest.assert_awaited_once()
+        sent, floor = notifier.on_runner_digest.await_args.args
+        assert sent == (candidate,)
+        assert floor == Decimal("70")
+        assert await engine.database.get_setting("runner_digest_fingerprint")
+        assert await engine.database.get_setting("runner_last_digest_at")
+        engine.x_social.snapshot.assert_not_awaited()
+        engine.pump_launcher.j7.launch.assert_not_awaited()
+        engine.executor.execute.assert_not_awaited()
+    finally:
+        await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_runner_digest_excludes_strong_public_alerts(settings, tmp_path) -> None:
+    configured = replace(settings, database_path=str(tmp_path / "strong-digest.db"))
+    notifier = SimpleNamespace(on_runner_digest=AsyncMock(), on_error=AsyncMock())
+    engine = SmartMoneyEngine(configured, notifier=notifier)
+    candidate = replace(_candidate(), score=Decimal("72"), research_only=False)
+    await engine.initialize()
+    try:
+        await engine.database.store_runner_candidate(
+            candidate,
+            payload_json=runner_candidate_to_json(candidate),
+            snapshot_json=runner_snapshot_to_json(candidate.current),
+        )
+        assert await engine._publish_runner_digest() is False
+        notifier.on_runner_digest.assert_not_awaited()
+    finally:
+        await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_runner_digest_discord_delivery_never_pings(settings) -> None:
+    candidate = replace(_candidate(), score=Decimal("48"), research_only=True)
+    fake_bot = SimpleNamespace(_send_alert=AsyncMock())
+
+    await SmartMoneyBot.on_runner_digest(fake_bot, (candidate,), Decimal("70"))
+
+    fake_bot._send_alert.assert_awaited_once()
+    kwargs = fake_bot._send_alert.await_args.kwargs
+    assert kwargs["ping_user"] is False
+    assert "RESEARCH" in fake_bot._send_alert.await_args.args[0].title
+
+
+@pytest.mark.asyncio
+async def test_runner_results_exposes_empirical_score_distribution(settings, tmp_path) -> None:
+    configured = replace(settings, database_path=str(tmp_path / "distribution.db"))
+    engine = SmartMoneyEngine(configured)
+    await engine.initialize()
+    scores = (Decimal("20"), Decimal("40"), Decimal("55"), Decimal("65"), Decimal("75"))
+    try:
+        for index, score in enumerate(scores):
+            item = replace(
+                _candidate(now=1_800_000_600 + index),
+                mint=f"score-mint-{index}",
+                score=score,
+                research_only=score < 70,
+            )
+            await engine.database.store_runner_candidate(
+                item,
+                payload_json=runner_candidate_to_json(item),
+                snapshot_json=runner_snapshot_to_json(item.current),
+            )
+
+        result = await engine.runner_results()
+    finally:
+        await engine.close()
+
+    distribution = result["score_distribution"]
+    assert distribution["max"] == Decimal("75")
+    assert distribution["median"] == Decimal("55")
+    assert distribution["p90"] == Decimal("71.0")
+    assert distribution["p95"] == Decimal("73.00")
+    assert distribution["gte_35"] == 4
+    assert distribution["gte_50"] == 3
+    assert distribution["gte_60"] == 2
+    assert distribution["gte_70"] == 1
+    assert len(result["best_current_candidates"]) == 3

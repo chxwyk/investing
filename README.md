@@ -7,6 +7,15 @@ transactions, and mirrors every newly detected hot-wallet swap in PAPER mode. PA
 as either a forced source-price observation ledger or an executable Jupiter quote-shadow
 trial; the two answer different questions and are labeled separately.
 
+Version 2.33.3 immediately acknowledges every `/fomo lab` invocation before any database or
+provider work. Test mode renders a real cached runner observation without contacting live
+providers, while empty-cache refreshes and timeouts visibly replace the original ephemeral
+response. A persisted, deduplicated, non-pinging research digest now summarizes changed 35+
+candidates below the unchanged 70-point public-alert floor every 15 minutes. `/fomo results`
+also reports current score distribution, threshold counts, best research candidates, and the
+last strong alert/digest/fast-watch activity. No automatic buy, SOL, J7, X, or scoring threshold
+changed.
+
 Version 2.33.2 makes `/fomo lab mode:test` provider-independent after the radar has captured a
 real observation. It reads the persisted real-token pool and sends the Discord card immediately,
 without deferring or contacting DEX/Jupiter/Tracker again. When the pool is genuinely empty it
@@ -472,6 +481,10 @@ FOMO_RUNNER_MAX_FAST_WATCH=5
 FOMO_RUNNER_LAB_CANDIDATES=6
 FOMO_RUNNER_MAX_GRADUATION_AGE_MINUTES=60
 FOMO_RUNNER_OUTCOME_POLL_SECONDS=60
+FOMO_RUNNER_DIGEST_ENABLED=true
+FOMO_RUNNER_DIGEST_SECONDS=900
+FOMO_RUNNER_DIGEST_MIN_SCORE=35
+FOMO_RUNNER_DIGEST_MAX_CANDIDATES=3
 FOMO_WATCH_MIN_SCORE=50
 TRADE_ACTIVITY_ALERTS_ENABLED=false
 NEWS_DEX_MATCH_ENABLED=true
@@ -755,6 +768,10 @@ FOMO_RUNNER_MAX_FAST_WATCH=5
 FOMO_RUNNER_LAB_CANDIDATES=6
 FOMO_RUNNER_MAX_GRADUATION_AGE_MINUTES=60
 FOMO_RUNNER_OUTCOME_POLL_SECONDS=60
+FOMO_RUNNER_DIGEST_ENABLED=true
+FOMO_RUNNER_DIGEST_SECONDS=900
+FOMO_RUNNER_DIGEST_MIN_SCORE=35
+FOMO_RUNNER_DIGEST_MAX_CANDIDATES=3
 ```
 
 These defaults are shadow-research hypotheses, not proven trading thresholds. The runner never
