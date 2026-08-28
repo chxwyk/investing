@@ -1303,6 +1303,18 @@ class SmartMoneyEngine:
 
         await self.initialize()
         now = int(time.time())
+        cached = list(
+            await self.runner_lab_cached_candidates(
+                research_test=research_test,
+                max_age_seconds=86_400,
+            )
+        )
+        fresh_cached = [
+            item for item in cached if now - item.current.captured_at <= 120
+        ]
+        if fresh_cached:
+            return tuple(fresh_cached[: self.settings.fomo_runner_lab_candidates])
+
         try:
             async with asyncio.timeout(15):
                 discovered = await self.dex_screener.trending_mints()
@@ -1314,33 +1326,6 @@ class SmartMoneyEngine:
         observed = await self.database.recent_observed_token_mints(
             limit=self.settings.fomo_runner_lab_candidates * 2,
         )
-        cached = [
-            runner_candidate_from_json(raw)
-            for raw in await self.database.recent_runner_candidate_payloads(
-                now=now,
-                max_age_seconds=86_400,
-                limit=self.settings.fomo_runner_lab_candidates * 2,
-            )
-        ]
-        displayable_cached = [
-            item
-            for item in cached
-            if (item.current.market_cap_usd or item.current.price_usd)
-            and (research_test or (
-                item.score >= self.settings.fomo_runner_fast_watch_min_score
-                and not item.hard_blockers
-            ))
-        ]
-        fresh_cached = [
-            item for item in displayable_cached if now - item.current.captured_at <= 120
-        ]
-        if fresh_cached:
-            fresh_cached.sort(
-                key=lambda item: (item.score, item.current.captured_at),
-                reverse=True,
-            )
-            return tuple(fresh_cached[: self.settings.fomo_runner_lab_candidates])
-
         mints = list(
             dict.fromkeys(
                 (*discovered, *(item.mint for item in cached), *observed)
@@ -1362,7 +1347,7 @@ class SmartMoneyEngine:
         refreshed = await asyncio.gather(*(evaluate(mint) for mint in mints[:analysis_limit]))
         by_mint = {
             item.mint: item
-            for item in displayable_cached
+            for item in cached
             if now - item.current.captured_at <= 900
         }
         for item in refreshed:
@@ -1376,6 +1361,40 @@ class SmartMoneyEngine:
             ):
                 by_mint[item.mint] = item
         candidates = list(by_mint.values())
+        candidates.sort(
+            key=lambda item: (item.score, item.current.captured_at),
+            reverse=True,
+        )
+        return tuple(candidates[: self.settings.fomo_runner_lab_candidates])
+
+    async def runner_lab_cached_candidates(
+        self,
+        *,
+        research_test: bool,
+        max_age_seconds: int = 86_400,
+    ) -> tuple[RunnerCandidate, ...]:
+        """Read real persisted runner observations without touching a network provider."""
+
+        await self.initialize()
+        now = int(time.time())
+        candidates: list[RunnerCandidate] = []
+        rows = await self.database.recent_runner_candidate_payloads(
+            now=now,
+            max_age_seconds=max_age_seconds,
+            limit=self.settings.fomo_runner_lab_candidates * 2,
+        )
+        for raw in rows:
+            try:
+                item = runner_candidate_from_json(raw)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not item.current.market_cap_usd and not item.current.price_usd:
+                continue
+            if research_test or (
+                item.score >= self.settings.fomo_runner_fast_watch_min_score
+                and not item.hard_blockers
+            ):
+                candidates.append(item)
         candidates.sort(
             key=lambda item: (item.score, item.current.captured_at),
             reverse=True,

@@ -748,7 +748,7 @@ async def test_fomo_lab_command_resolves_deferred_original_response(settings) ->
         edit_original_response=AsyncMock(),
     )
 
-    await FomoCommands.lab.callback(commands, interaction, mode="test")
+    await FomoCommands.lab.callback(commands, interaction, mode="production")
 
     interaction.response.defer.assert_awaited_once_with(thinking=True, ephemeral=True)
     interaction.edit_original_response.assert_awaited_once()
@@ -756,6 +756,37 @@ async def test_fomo_lab_command_resolves_deferred_original_response(settings) ->
     assert kwargs["embed"] is not None, kwargs
     assert MINT in kwargs["embed"].description
     assert isinstance(kwargs["view"], FomoRunnerLabView)
+
+
+@pytest.mark.asyncio
+async def test_fomo_lab_test_answers_immediately_from_persisted_observation(settings) -> None:
+    candidate = _candidate()
+    engine = SimpleNamespace(
+        runner_lab_cached_candidates=AsyncMock(return_value=(candidate,)),
+        runner_lab_candidates=AsyncMock(),
+    )
+    bot = SimpleNamespace(settings=settings, engine=engine)
+    commands = FomoCommands(bot)
+    commands._require_admin = AsyncMock(return_value=True)
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(id=1),
+        response=SimpleNamespace(send_message=AsyncMock(), defer=AsyncMock()),
+        edit_original_response=AsyncMock(),
+    )
+
+    await FomoCommands.lab.callback(commands, interaction, mode="test")
+
+    engine.runner_lab_cached_candidates.assert_awaited_once_with(
+        research_test=True,
+        max_age_seconds=86_400,
+    )
+    engine.runner_lab_candidates.assert_not_awaited()
+    interaction.response.defer.assert_not_awaited()
+    interaction.response.send_message.assert_awaited_once()
+    kwargs = interaction.response.send_message.await_args.kwargs
+    assert MINT in kwargs["embed"].description
+    assert isinstance(kwargs["view"], FomoRunnerLabView)
+    interaction.edit_original_response.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -3986,8 +3986,32 @@ class FomoCommands(
     ) -> None:
         if not await self._require_admin(interaction):
             return
-        await interaction.response.defer(thinking=True, ephemeral=True)
         research_test = mode == "test"
+        if research_test:
+            cached = await self.bot.engine.runner_lab_cached_candidates(
+                research_test=True,
+                max_age_seconds=86_400,
+            )
+            if cached:
+                view = FomoRunnerLabView(
+                    self.bot,
+                    cached,
+                    owner_id=interaction.user.id,
+                    research_test=True,
+                )
+                await interaction.response.send_message(
+                    embed=view.embed(),
+                    view=view,
+                    ephemeral=True,
+                )
+                return
+            await interaction.response.send_message(
+                "No saved runner observation is available yet. Running one bounded "
+                "public-data refresh now; this message will update when it finishes.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.defer(thinking=True, ephemeral=True)
         try:
             async with asyncio.timeout(40):
                 candidates = await self.bot.engine.runner_lab_candidates(

@@ -7,6 +7,12 @@ transactions, and mirrors every newly detected hot-wallet swap in PAPER mode. PA
 as either a forced source-price observation ledger or an executable Jupiter quote-shadow
 trial; the two answer different questions and are labeled separately.
 
+Version 2.33.2 makes `/fomo lab mode:test` provider-independent after the radar has captured a
+real observation. It reads the persisted real-token pool and sends the Discord card immediately,
+without deferring or contacting DEX/Jupiter/Tracker again. When the pool is genuinely empty it
+posts a visible progress response before running one bounded refresh, so Discord never shows an
+unexplained permanent spinner.
+
 Version 2.33.1 fixes the live `/fomo lab` Discord response path. The command now resolves the
 original deferred ephemeral response, analyzes a bounded candidate set concurrently, returns a
 fresh background-radar snapshot immediately when available, and fails visibly within a hard
