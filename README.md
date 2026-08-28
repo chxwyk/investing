@@ -7,6 +7,16 @@ transactions, and mirrors every newly detected hot-wallet swap in PAPER mode. PA
 as either a forced source-price observation ledger or an executable Jupiter quote-shadow
 trial; the two answer different questions and are labeled separately.
 
+Version 2.32 adds a persistent, shared **official-X spend guard** without making X mandatory.
+Free RSS/Fomo/DEX/Tracker/on-chain evidence now completes every cheap blocker and preliminary
+score before one small targeted recent search can run. SQLite atomically caps targeted checks,
+HTTP requests, estimated daily spend, and estimated experiment spend across automatic news,
+Launch Lab, and coin callouts. Returned Post and optional User resources are counted separately,
+deduplicated for the configured usage day, and cached across restarts. Launch Lab adds an
+admin-only `X VERIFY` confirmation that updates the same candidate but cannot call J7 or spend
+SOL. `/smartmoney sources`, `/smartmoney status`, and `/smartmoney launch-check` label these
+figures as local estimates; the X Developer Console remains the billing source of truth.
+
 Version 2.31 adds an admin-only **J7 Launch Lab** and a read-only launch readiness check.
 `/smartmoney launch-check` verifies the configured J7 region, authenticated health endpoint,
 Pinata authentication, public launch-wallet SOL balance, daily limits, and persistent SQLite
@@ -326,7 +336,7 @@ when no prior public BUY exists
 inside the scanned history, no current baseline price is available, or the PAPER account lacks
 cash. Set `PAPER_MIRROR_RAW_SWAPS=false` to restore consensus-only paper behavior.
 
-The v2.31.0 discovery, zero-cost Fomo radar, optional X verification, crypto-first launch-radar,
+The v2.32.0 discovery, zero-cost Fomo radar, optional X verification, crypto-first launch-radar,
 verified-only
 callout, selective-entry, daily loss/profit
 locks, social nomination, quote, fallback, rotation, and exit controls are
@@ -396,13 +406,22 @@ NEWS_X_TREND_CACHE_SECONDS=3600
 NEWS_MAX_ALERTS_PER_HOUR=30
 NEWS_SOURCE_IMAGE_ENABLED=true
 X_SEARCH_MAX_RESULTS=10
-X_DAILY_SEARCH_LIMIT=25
+X_DAILY_SEARCH_LIMIT=10
 X_DAILY_SEARCH_TIMEZONE=America/Los_Angeles
 X_PAID_SEARCH_ENABLED=false
+X_BUDGET_GUARD_ENABLED=true
+X_ESTIMATED_TOTAL_BUDGET_USD=10
+X_ESTIMATED_DAILY_BUDGET_USD=0.50
+X_MAX_TARGETED_VERIFICATIONS_PER_DAY=10
+X_VERIFY_MAX_POSTS=10
+X_ESTIMATED_POST_READ_USD=0.005
+X_ESTIMATED_USER_READ_USD=0.010
+X_BUDGET_PERIOD_ID=experiment-1
+X_USER_CACHE_SECONDS=86400
 X_RADAR_ENABLED=false
 X_RADAR_POLL_SECONDS=1800
 X_RADAR_MAX_CONTRACTS_PER_SCAN=3
-COIN_X_PREFILTER_MIN_SCORE=35
+COIN_X_PREFILTER_MIN_SCORE=60
 COIN_WATCH_ALERTS_ENABLED=true
 COIN_WATCH_MIN_SCORE=55
 FOMO_RADAR_ENABLED=true
@@ -453,6 +472,29 @@ caps each radar and on-demand response. `/smartmoney sources` and `/smartmoney s
 proactive scan time, posts examined, new posts, extracted contracts, budget usage, last X error,
 stream state, RSS state, J7 feed state, narrative matcher state, scoring thresholds, and one-click
 launch lock.
+
+### Budgeted official-X verification
+
+Paid X is a precision layer after free discovery, not a firehose. The automatic news path may
+request X only after the free score reaches `NEWS_X_VERIFY_MIN_SCORE=70` and the source,
+freshness, existing-contract, duplicate, competition, and narrative-lane checks pass. Regular
+coin callouts use the stricter `COIN_X_PREFILTER_MIN_SCORE=60` plus executable-route and safety
+evidence. Launch Lab spends nothing until an administrator presses `X VERIFY` and confirms the
+displayed ceiling. None of these actions launches a token; J7 still requires the separate real
+launch confirmation.
+
+The initial local estimate uses the configurable published unit assumptions of `$0.005` per
+returned Post resource and `$0.010` per returned User resource. The bot requests Posts first and
+only batches User hydration after at least two independent Post authors exist. User payloads are
+cached for 24 hours and same-day resource IDs are counted once locally. Pricing, X-side billing
+deduplication, and actual charges can change; check the X Developer Console before and during the
+experiment. The bot does not purchase credits or enable auto-recharge.
+
+If the local daily/experiment cap, request backstop, or verification limit is reached, paid X
+fails closed with a readable reason. Missing credentials, timeouts, 429s, server errors, or X
+billing failures never disable free `LAUNCH CANDIDATE — NO X VERIFIED` analysis or Launch Lab.
+Keep `X_NEWS_STREAM_ENABLED=false` and `X_RADAR_ENABLED=false` for the controlled `$10`
+experiment.
 
 J7 documents regional token deploy and trade endpoints. This release uses only the documented
 external deploy request. J7 does not currently document a feed/webhook that exports its
@@ -655,23 +697,44 @@ No privileged Discord gateway intents are required.
 
 ## Railway deployment
 
-### v2.31 Railway changes
+### v2.32 Railway changes
 
 **ADD:**
 
 ```text
-J7_LAUNCH_WALLET_ADDRESS=<public Full Address shown by J7 Tracker>
+X_API_BEARER_TOKEN=<secret official X app-only bearer token>
+X_BUDGET_GUARD_ENABLED=true
+X_ESTIMATED_TOTAL_BUDGET_USD=10
+X_ESTIMATED_DAILY_BUDGET_USD=0.50
+X_MAX_TARGETED_VERIFICATIONS_PER_DAY=10
+X_VERIFY_MAX_POSTS=10
+X_ESTIMATED_POST_READ_USD=0.005
+X_ESTIMATED_USER_READ_USD=0.010
+X_BUDGET_PERIOD_ID=experiment-1
+X_USER_CACHE_SECONDS=86400
 ```
 
-**CHANGE:** none required. Optional Launch Lab defaults are already enabled (`60` manual-review
-floor, `3600` second maximum age, `8` candidates). These settings do not affect the automatic
-78+ no-X threshold.
+**CHANGE:**
+
+```text
+X_PAID_SEARCH_ENABLED=true
+X_SEARCH_MAX_RESULTS=10
+X_DAILY_SEARCH_LIMIT=10
+COIN_X_PREFILTER_MIN_SCORE=60
+```
+
+**KEEP OFF:**
+
+```text
+X_NEWS_STREAM_ENABLED=false
+X_RADAR_ENABLED=false
+```
 
 **REMOVE:** nothing.
 
-**UNCHANGED:** all existing J7 session/API-key/region, Pinata, launch acknowledgment, creator-buy,
-daily count/SOL caps, no-X, X, discovery, PAPER, and database variables. Do not reset or delete
-the SQLite database.
+**UNCHANGED:** `NEWS_X_VERIFY_MIN_SCORE=70`, the automatic no-X `78+` threshold, all existing
+J7 session/API-key/region/wallet, Pinata, launch acknowledgment, creator-buy, daily count/SOL
+caps, discovery, PAPER, and database variables. Do not reset or delete the SQLite database.
 
 1. Create a new GitHub repository and upload this project.
 2. Create a new Railway service from that repository.
@@ -695,7 +758,7 @@ RPC_REQUESTS_PER_SECOND=8
 RPC_MAX_RETRIES=4
 SOLANA_TRACKER_API_KEY=...
 JUPITER_API_KEY=...
-# Required for public coin callouts and LAUNCH READY crypto-demand verification.
+# Optional: enables budgeted official-X verification when X_PAID_SEARCH_ENABLED=true.
 X_API_BEARER_TOKEN=...
 DATABASE_PATH=/data/smart_money.db
 RAILWAY_RUN_UID=0

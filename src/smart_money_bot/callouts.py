@@ -24,6 +24,7 @@ from .models import (
     XSocialSnapshot,
 )
 from .news import extract_solana_mints
+from .x_budget import XBudgetManager, XBudgetReservation
 
 CRYPTO_PROFILE_TERMS = {
     "bitcoin",
@@ -65,6 +66,21 @@ COIN_PROMOTION_PHRASES = {
 
 CASHTAG_RE = re.compile(r"(?<![A-Za-z0-9])\$[A-Za-z][A-Za-z0-9_]{1,14}\b")
 
+TRUSTED_ACCOUNT_CATEGORIES = {
+    "watcherguru": "news",
+    "coindesk": "news",
+    "cointelegraph": "news",
+    "lookonchain": "investigator",
+    "arkhamintel": "investigator",
+    "bubblemaps": "investigator",
+    "rugcheckxyz": "investigator",
+    "solana": "official",
+    "pumpdotfun": "official",
+    "jupiterexchange": "official",
+    "phantom": "official",
+    "solanafloor": "market",
+}
+
 
 def _decimal(value: Any) -> Decimal | None:
     if value is None or value == "":
@@ -105,7 +121,7 @@ class DexScreenerClient:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
                 timeout=self.timeout,
-                headers={"User-Agent": "SmartMoneyCopyBot/2.31.0 coin-intelligence"},
+                headers={"User-Agent": "SmartMoneyCopyBot/2.32.0 coin-intelligence"},
             )
         return self._session
 
@@ -251,6 +267,7 @@ class XRecentSearchClient:
         cache_seconds: int = 60,
         trusted_crypto_accounts: tuple[str, ...] = (),
         budget_reserver: Callable[[], Awaitable[bool]] | None = None,
+        budget_manager: XBudgetManager | None = None,
         paid_search_enabled: bool = True,
     ) -> None:
         self.bearer_token = bearer_token
@@ -261,6 +278,7 @@ class XRecentSearchClient:
             item.casefold().lstrip("@") for item in trusted_crypto_accounts if item.strip()
         )
         self.budget_reserver = budget_reserver
+        self.budget_manager = budget_manager
         self.timeout = aiohttp.ClientTimeout(total=timeout_seconds)
         self._session: aiohttp.ClientSession | None = None
         self._cache: dict[str, tuple[float, XSocialSnapshot]] = {}
@@ -295,17 +313,36 @@ class XRecentSearchClient:
         if self._session and not self._session.closed:
             await self._session.close()
 
-    async def _reserve_request(self) -> bool:
+    async def _reserve_request(
+        self,
+        *,
+        query: str,
+        context: str,
+        free_score: int | None = None,
+    ) -> tuple[bool, XBudgetReservation | None]:
+        if self.budget_manager is not None:
+            decision = await self.budget_manager.reserve(
+                query=query,
+                context=context,
+                free_score=free_score,
+            )
+            if decision.allowed:
+                self.requests_attempted += 1
+                return True, decision.reservation
+            self.budget_rejections += 1
+            self.last_status_code = None
+            self.last_error = decision.reason or "X VERIFICATION SKIPPED — BUDGET UNAVAILABLE"
+            return False, None
         if self.budget_reserver is None:
             self.requests_attempted += 1
-            return True
+            return True, None
         if await self.budget_reserver():
             self.requests_attempted += 1
-            return True
+            return True, None
         self.budget_rejections += 1
         self.last_status_code = None
         self.last_error = "daily X search budget exhausted"
-        return False
+        return False, None
 
     async def snapshot(
         self,
@@ -313,131 +350,228 @@ class XRecentSearchClient:
         *,
         symbol: str | None = None,
         name: str | None = None,
+        context: str = "coin_callout",
+        free_score: int | None = None,
     ) -> XSocialSnapshot:
-        if not self.paid_search_enabled:
-            return XSocialSnapshot(available=False, error="paid X searches disabled")
-        if not self.bearer_token:
-            return XSocialSnapshot(available=False, error="X_API_BEARER_TOKEN not configured")
         query = build_x_query(mint, symbol=symbol, name=name)
-        cached = self._cache.get(query)
-        now = time.monotonic()
-        if cached and now - cached[0] <= self.cache_seconds:
-            return cached[1]
-        if not await self._reserve_request():
-            return XSocialSnapshot(
-                available=False,
-                query=query,
-                error=self.last_error,
-            )
-        session = await self._get_session()
-        params = {
-            "query": query,
-            "max_results": str(self.max_results),
-            "tweet.fields": "author_id,created_at,public_metrics,text",
-            "expansions": "author_id",
-            "user.fields": (
-                "username,description,location,created_at,public_metrics,verified,verified_type"
-            ),
-        }
-        try:
-            async with session.get(
-                f"{self.BASE_URL}/2/tweets/search/recent",
-                params=params,
-                headers={"Authorization": f"Bearer {self.bearer_token}"},
-            ) as response:
-                body = await response.json(content_type=None)
-                if response.status >= 400:
-                    detail = str(body.get("detail") or body.get("title") or response.status)
-                    self.last_status_code = response.status
-                    self.last_error = f"HTTP {response.status}: {detail[:120]}"
-                    return XSocialSnapshot(
-                        available=False,
-                        query=query,
-                        error=self.last_error,
-                    )
-        except (TimeoutError, aiohttp.ClientError, ValueError) as exc:
-            self.last_status_code = None
-            self.last_error = f"request failed: {str(exc)[:120]}"
-            return XSocialSnapshot(available=False, query=query, error=self.last_error)
-        snapshot = parse_x_snapshot(
-            body,
+        return await self._targeted_snapshot(
             query=query,
             contract=mint,
-            trusted_crypto_accounts=self.trusted_crypto_accounts,
+            context=context,
+            free_score=free_score,
         )
-        self.last_status_code = 200
-        self.last_error = None
-        self.last_success_at = int(time.time())
-        self._cache[query] = (now, snapshot)
-        return snapshot
 
-    async def narrative_snapshot(self, narrative: str) -> XSocialSnapshot:
+    async def narrative_snapshot(
+        self,
+        narrative: str,
+        *,
+        context: str = "automatic_news",
+        free_score: int | None = None,
+    ) -> XSocialSnapshot:
         """Measure public X activity for one narrative using the official recent-search API."""
 
         cleaned = re.sub(r"[\"\\]", "", narrative).strip()
         if not cleaned:
             return XSocialSnapshot(available=False, error="empty narrative")
+        query = build_x_narrative_query(cleaned)
+        return await self._targeted_snapshot(
+            query=query,
+            context=context,
+            free_score=free_score,
+        )
+
+    async def _targeted_snapshot(
+        self,
+        *,
+        query: str,
+        contract: str = "",
+        context: str,
+        free_score: int | None,
+    ) -> XSocialSnapshot:
         if not self.paid_search_enabled:
-            return XSocialSnapshot(available=False, error="paid X searches disabled")
+            return XSocialSnapshot(
+                available=False,
+                query=query,
+                error="paid X searches disabled",
+            )
         if not self.bearer_token:
             return XSocialSnapshot(
                 available=False,
-                error="X_API_BEARER_TOKEN not configured",
+                query=query,
+                error="X NOT VERIFIED — X_API_BEARER_TOKEN NOT CONFIGURED",
             )
-        query = build_x_narrative_query(cleaned)
         cached = self._cache.get(query)
         now = time.monotonic()
         if cached and now - cached[0] <= self.cache_seconds:
             return cached[1]
+        if self.budget_manager is not None:
+            persistent = await self.budget_manager.cached_snapshot(query)
+            if persistent is not None:
+                self._cache[query] = (now, persistent)
+                return persistent
 
-        if not await self._reserve_request():
+        allowed, reservation = await self._reserve_request(
+            query=query,
+            context=context,
+            free_score=free_score,
+        )
+        if not allowed:
             return XSocialSnapshot(
                 available=False,
                 query=query,
                 error=self.last_error,
             )
-
-        session = await self._get_session()
         params = {
             "query": query,
             "max_results": str(self.max_results),
             "tweet.fields": "author_id,created_at,public_metrics,text",
-            "expansions": "author_id",
-            "user.fields": (
-                "username,description,location,created_at,public_metrics,verified,verified_type"
-            ),
         }
-        try:
-            async with session.get(
-                f"{self.BASE_URL}/2/tweets/search/recent",
-                params=params,
-                headers={"Authorization": f"Bearer {self.bearer_token}"},
-            ) as response:
-                body = await response.json(content_type=None)
-                if response.status >= 400:
-                    detail = str(body.get("detail") or body.get("title") or response.status)
-                    self.last_status_code = response.status
-                    self.last_error = f"HTTP {response.status}: {detail[:120]}"
-                    return XSocialSnapshot(
-                        available=False,
-                        query=query,
-                        error=self.last_error,
-                    )
-        except (TimeoutError, aiohttp.ClientError, ValueError) as exc:
-            self.last_status_code = None
-            self.last_error = f"request failed: {str(exc)[:120]}"
-            return XSocialSnapshot(available=False, query=query, error=self.last_error)
+        if self.budget_manager is None:
+            params["expansions"] = "author_id"
+            params["user.fields"] = (
+                "username,description,location,created_at,public_metrics,verified,verified_type"
+            )
+        body, status, error, search_requests = await self._request_json(
+            "/2/tweets/search/recent",
+            params=params,
+            retry_server_errors=True,
+        )
+        if error:
+            if reservation is not None and self.budget_manager is not None:
+                await self.budget_manager.fail(
+                    reservation,
+                    status_code=status,
+                    error_category=error,
+                    http_requests=search_requests,
+                )
+            self.last_status_code = status
+            self.last_error = error
+            return XSocialSnapshot(available=False, query=query, error=error)
+        if not isinstance(body, dict) or not isinstance(body.get("data") or [], list):
+            error = "X MALFORMED RESPONSE"
+            if reservation is not None and self.budget_manager is not None:
+                await self.budget_manager.fail(
+                    reservation,
+                    status_code=status,
+                    error_category=error,
+                    http_requests=search_requests,
+                )
+            self.last_status_code = status
+            self.last_error = error
+            return XSocialSnapshot(available=False, query=query, error=error)
 
+        posts = tuple(item for item in (body.get("data") or []) if isinstance(item, dict))
+        users = tuple(
+            item
+            for item in ((body.get("includes") or {}).get("users") or [])
+            if isinstance(item, dict)
+        )
+        hydration_error: str | None = None
+        http_requests = search_requests
+        if reservation is not None and self.budget_manager is not None:
+            await self.budget_manager.record_posts(
+                reservation,
+                tuple(str(item.get("id") or "") for item in posts),
+            )
+            author_ids = tuple(
+                dict.fromkeys(str(item.get("author_id") or "") for item in posts)
+            )
+            author_ids = tuple(item for item in author_ids if item)
+            cached_users = await self.budget_manager.cached_users(author_ids)
+            users = tuple(cached_users.values())
+            missing = tuple(item for item in author_ids if item not in cached_users)
+            if _should_hydrate_x_users(posts) and missing:
+                billable, hydration_error = await self.budget_manager.reserve_users(
+                    reservation,
+                    missing,
+                )
+                if billable:
+                    user_body, user_status, user_error, user_requests = await self._request_json(
+                        "/2/users",
+                        params={
+                            "ids": ",".join(billable),
+                            "user.fields": (
+                                "username,description,location,created_at,public_metrics,"
+                                "verified,verified_type"
+                            ),
+                        },
+                        retry_server_errors=True,
+                    )
+                    http_requests += user_requests
+                    if user_error:
+                        hydration_error = user_error
+                    elif isinstance(user_body, dict) and isinstance(
+                        user_body.get("data") or [], list
+                    ):
+                        fetched_users = tuple(
+                            item
+                            for item in (user_body.get("data") or [])
+                            if isinstance(item, dict)
+                        )
+                        await self.budget_manager.record_users(reservation, fetched_users)
+                        users = users + fetched_users
+                    else:
+                        hydration_error = "X USER HYDRATION MALFORMED RESPONSE"
+            await self.budget_manager.finish(
+                reservation,
+                status_code=status or 200,
+                http_requests=http_requests,
+            )
+
+        payload = {"data": list(posts), "includes": {"users": list(users)}}
         snapshot = parse_x_snapshot(
-            body,
+            payload,
             query=query,
+            contract=contract,
             trusted_crypto_accounts=self.trusted_crypto_accounts,
         )
+        snapshot = replace(
+            snapshot,
+            error=hydration_error,
+            verification_id=reservation.id if reservation is not None else None,
+            verification_state="CHECKED",
+            checked_at=int(time.time()),
+        )
         self.last_status_code = 200
-        self.last_error = None
+        self.last_error = hydration_error
         self.last_success_at = int(time.time())
         self._cache[query] = (now, snapshot)
+        if self.budget_manager is not None:
+            await self.budget_manager.cache_snapshot(query, snapshot)
         return snapshot
+
+    async def _request_json(
+        self,
+        path: str,
+        *,
+        params: dict[str, str],
+        retry_server_errors: bool,
+    ) -> tuple[Any, int | None, str | None, int]:
+        session = await self._get_session()
+        attempts = 0
+        maximum_attempts = 2 if retry_server_errors else 1
+        while attempts < maximum_attempts:
+            attempts += 1
+            try:
+                async with session.get(
+                    f"{self.BASE_URL}{path}",
+                    params=params,
+                    headers={"Authorization": f"Bearer {self.bearer_token}"},
+                ) as response:
+                    try:
+                        body = await response.json(content_type=None)
+                    except ValueError:
+                        body = None
+                    if response.status < 400:
+                        return body, response.status, None, attempts
+                    error = _x_http_error(response.status, body)
+                    if response.status >= 500 and attempts < maximum_attempts:
+                        await asyncio.sleep(0.2)
+                        continue
+                    return body, response.status, error, attempts
+            except (TimeoutError, aiohttp.ClientError) as exc:
+                return None, None, f"X NETWORK FAILURE — {str(exc)[:100]}", attempts
+        return None, None, "X NETWORK FAILURE", attempts
 
     async def discover_contracts(self, query: str) -> tuple[str, ...]:
         """Proactively find exact Solana contracts in recent public X posts.
@@ -457,7 +591,11 @@ class XRecentSearchClient:
         if not cleaned:
             self.last_radar_error = "empty X radar query"
             return ()
-        if not await self._reserve_request():
+        allowed, reservation = await self._reserve_request(
+            query=cleaned,
+            context="x_radar",
+        )
+        if not allowed:
             self.last_radar_error = self.last_error
             return ()
 
@@ -466,10 +604,6 @@ class XRecentSearchClient:
             "query": cleaned,
             "max_results": str(self.max_results),
             "tweet.fields": "author_id,created_at,public_metrics,text",
-            "expansions": "author_id",
-            "user.fields": (
-                "username,description,location,created_at,public_metrics,verified,verified_type"
-            ),
         }
         try:
             async with session.get(
@@ -483,11 +617,23 @@ class XRecentSearchClient:
                     self.last_status_code = response.status
                     self.last_error = f"HTTP {response.status}: {detail[:120]}"
                     self.last_radar_error = self.last_error
+                    if reservation is not None and self.budget_manager is not None:
+                        await self.budget_manager.fail(
+                            reservation,
+                            status_code=response.status,
+                            error_category=self.last_error,
+                        )
                     return ()
         except (TimeoutError, aiohttp.ClientError, ValueError) as exc:
             self.last_status_code = None
             self.last_error = f"request failed: {str(exc)[:120]}"
             self.last_radar_error = self.last_error
+            if reservation is not None and self.budget_manager is not None:
+                await self.budget_manager.fail(
+                    reservation,
+                    status_code=None,
+                    error_category=self.last_error,
+                )
             return ()
 
         now = time.monotonic()
@@ -498,6 +644,20 @@ class XRecentSearchClient:
             posts = []
         if not isinstance(users, list):
             users = []
+        if reservation is not None and self.budget_manager is not None:
+            await self.budget_manager.record_posts(
+                reservation,
+                tuple(
+                    str(post.get("id") or "")
+                    for post in posts
+                    if isinstance(post, dict)
+                ),
+            )
+            await self.budget_manager.record_users(
+                reservation,
+                tuple(user for user in users if isinstance(user, dict)),
+            )
+            await self.budget_manager.finish(reservation, status_code=200)
 
         unseen_posts: list[dict[str, Any]] = []
         for post in posts:
@@ -564,14 +724,46 @@ def build_x_query(mint: str, *, symbol: str | None = None, name: str | None = No
 
 
 def build_x_narrative_query(narrative: str) -> str:
-    """Search one idea only where X users also use explicit crypto/coin language."""
+    """Build a compact high-signal query instead of paying for a whole headline."""
 
-    cleaned = re.sub(r"[\"\\]", "", narrative).strip()[:80]
+    cleaned = re.sub(r"[^A-Za-z0-9$#' -]", " ", narrative)
+    words = re.findall(r"[A-Za-z0-9$#']+", cleaned)
+    stop = {
+        "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "has",
+        "in", "is", "it", "of", "on", "or", "that", "the", "this", "to", "with",
+    }
+    selected = [word for word in words if word.casefold() not in stop][:6]
+    if not selected:
+        selected = words[:4]
+    phrase = " ".join(selected[:4])[:80]
     return (
-        f'"{cleaned}" (crypto OR memecoin OR "meme coin" OR solana OR pumpfun OR '
+        f'"{phrase}" (crypto OR memecoin OR "meme coin" OR solana OR pumpfun OR '
         '"pump.fun" OR token OR ticker OR "contract address" OR "CA:") '
-        "-is:retweet lang:en"
+        "-is:retweet -is:reply lang:en"
     )
+
+
+def _should_hydrate_x_users(posts: tuple[dict[str, Any], ...]) -> bool:
+    """Buy User resources only after Post-level evidence shows independent pickup."""
+
+    authors = {str(post.get("author_id") or "") for post in posts if post.get("author_id")}
+    return len(posts) >= 2 and len(authors) >= 2
+
+
+def _x_http_error(status: int, body: Any) -> str:
+    detail = ""
+    if isinstance(body, dict):
+        detail = str(body.get("detail") or body.get("title") or "")
+    lowered = detail.casefold()
+    if status == 429:
+        return "X RATE LIMITED — verification deferred"
+    if status == 402 or any(term in lowered for term in ("credit", "billing", "balance")):
+        return "X API CREDITS UNAVAILABLE"
+    if status in {401, 403}:
+        return "X AUTH FAILED"
+    if status >= 500:
+        return f"X SERVER ERROR — HTTP {status}"
+    return f"X REQUEST FAILED — HTTP {status}{f': {detail[:80]}' if detail else ''}"
 
 
 class SolanaTrackerTokenRiskClient:
@@ -672,6 +864,12 @@ def parse_x_snapshot(
     contract_authors: set[str] = set()
     credible_contract_authors: set[str] = set()
     trusted_crypto_authors: set[str] = set()
+    trusted_by_category: dict[str, set[str]] = {
+        "news": set(),
+        "investigator": set(),
+        "official": set(),
+        "market": set(),
+    }
     million_follower_authors: set[str] = set()
     notable_by_author: dict[str, tuple[int, str]] = {}
     notable_posts: list[tuple[int, int, str]] = []
@@ -736,6 +934,8 @@ def parse_x_snapshot(
                     notable_by_author[author_id] = (followers, username)
             if username in trusted_crypto_accounts:
                 trusted_crypto_authors.add(author_id)
+                category = TRUSTED_ACCOUNT_CATEGORIES.get(username, "market")
+                trusted_by_category[category].add(author_id)
             if followers >= 1_000_000:
                 million_follower_authors.add(author_id)
             credible_profile = username in trusted_crypto_accounts or (
@@ -788,6 +988,10 @@ def parse_x_snapshot(
         contract_authors=len(contract_authors),
         credible_contract_authors=len(credible_contract_authors),
         trusted_crypto_authors=len(trusted_crypto_authors),
+        trusted_news_authors=len(trusted_by_category["news"]),
+        trusted_investigator_authors=len(trusted_by_category["investigator"]),
+        trusted_official_authors=len(trusted_by_category["official"]),
+        trusted_market_authors=len(trusted_by_category["market"]),
         million_follower_authors=len(million_follower_authors),
         coin_intent_posts=coin_intent_posts,
         promoter_posts=promoter_posts,
@@ -905,19 +1109,25 @@ class CoinCalloutAnalyzer:
             prefilter,
             configured_score_floor=self.prefilter_min_score,
         )
-        if not allowed and not force_x_search:
+        if not allowed:
             return replace(
                 prefilter,
                 prefilter_score=prefilter.score,
                 x_search_attempted=False,
                 scan_stage="FREE_REJECTED",
-                scan_reason=reason,
+                scan_reason=(
+                    f"manual X check blocked by free gate: {reason}"
+                    if force_x_search
+                    else reason
+                ),
             )
 
         social = await self.social.snapshot(
             mint,
             symbol=token_info.symbol if token_info else None,
             name=token_info.name if token_info else None,
+            context="manual_coin" if force_x_search else "coin_callout",
+            free_score=int(prefilter.score),
         )
         final = score_callout(
             mint=mint,

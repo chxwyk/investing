@@ -632,9 +632,10 @@ async def test_free_prefilter_rejects_hard_risk_without_spending_x() -> None:
         smart_wallets=("Alpha",),
         force_x_search=True,
     )
-    assert social.calls == 1
-    assert forced.scan_stage == "X_CHECKED"
-    assert forced.x_search_attempted is True
+    assert social.calls == 0
+    assert forced.scan_stage == "FREE_REJECTED"
+    assert forced.x_search_attempted is False
+    assert "manual X check blocked by free gate" in forced.scan_reason
 
 
 def test_fomo_watch_requires_complete_free_market_and_risk_proof() -> None:

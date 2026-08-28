@@ -400,6 +400,7 @@ def score_launch_opportunity(
     launch_ready_score: int = 72,
     no_x_candidates_enabled: bool = True,
     no_x_launch_min_score: int = 78,
+    pre_x_score: int | None = None,
 ) -> LaunchOpportunity:
     now = now or int(time.time())
     x_evidence = x_evidence or XSocialSnapshot(available=False, error="not checked yet")
@@ -641,6 +642,11 @@ def score_launch_opportunity(
         warnings=tuple(dict.fromkeys(warnings)),
         blockers=tuple(dict.fromkeys(blockers)),
         generated_at=now,
+        pre_x_score=(
+            pre_x_score
+            if pre_x_score is not None
+            else score if not x_evidence.available else max(0, score - x_score)
+        ),
     )
 
 
@@ -846,6 +852,31 @@ def should_publish_news_opportunity(opportunity: LaunchOpportunity) -> bool:
     if opportunity.verdict == NO_X_LAUNCH_VERDICT:
         return opportunity.no_x_candidate_ready and not opportunity.x_verified
     return False
+
+
+def should_request_x_for_launch_opportunity(
+    opportunity: LaunchOpportunity,
+    *,
+    minimum_score: int,
+) -> tuple[bool, str]:
+    """Apply every cheap narrative blocker before one paid X verification."""
+
+    if opportunity.alert.token_mints:
+        return False, "an existing contract is already present"
+    if opportunity.blockers:
+        return False, opportunity.blockers[0]
+    if opportunity.score < minimum_score:
+        return False, (
+            f"free score {opportunity.score}/100 is below the "
+            f"{minimum_score}/100 X verification floor"
+        )
+    if opportunity.competition.error:
+        return False, "free existing-token competition check is incomplete"
+    if opportunity.competition_score < 4:
+        return False, "free competition evidence shows a strong existing concept"
+    if opportunity.lane == "GENERAL NEWS — NOT ELIGIBLE":
+        return False, "story does not qualify for a crypto or major-event lane"
+    return True, "free discovery and cheap blockers passed"
 
 
 def is_manual_launch_opportunity(opportunity: LaunchOpportunity) -> bool:

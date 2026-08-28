@@ -51,6 +51,7 @@ from .launch import (
     launch_opportunity_to_json,
     score_launch_opportunity,
     should_publish_news_opportunity,
+    should_request_x_for_launch_opportunity,
     validate_launch_draft,
 )
 from .market import JupiterClient
@@ -94,6 +95,7 @@ from .social import (
 )
 from .strategy import ConsensusStrategy
 from .stream import RealtimeWalletStream, StreamEvent
+from .x_budget import XBudgetManager
 
 logger = logging.getLogger(__name__)
 
@@ -195,6 +197,7 @@ class SmartMoneyEngine:
         self.settings = settings
         self.notifier: Notifier = notifier or NullNotifier()
         self.database = Database(settings.database_path, settings.paper_starting_usd)
+        self.x_budget = XBudgetManager(self.database, settings)
         self.rpc = SolanaRPC(
             settings.solana_rpc_url,
             max_requests_per_second=settings.rpc_requests_per_second,
@@ -204,10 +207,10 @@ class SmartMoneyEngine:
         self.dex_screener = DexScreenerClient()
         self.x_social = XRecentSearchClient(
             settings.x_api_bearer_token,
-            max_results=settings.x_search_max_results,
+            max_results=settings.x_verify_max_posts,
             cache_seconds=settings.news_x_trend_cache_seconds,
             trusted_crypto_accounts=settings.x_crypto_trusted_accounts,
-            budget_reserver=self._reserve_x_search,
+            budget_manager=self.x_budget,
             paid_search_enabled=settings.x_paid_search_enabled,
         )
         self.tracker_token_risk = SolanaTrackerTokenRiskClient(settings.solana_tracker_api_key)
@@ -1144,37 +1147,34 @@ class SmartMoneyEngine:
         ):
             return
 
-        x_task = None
-        if (
-            self.x_social.search_enabled
-            and preliminary.score >= self.settings.news_x_verify_min_score
-        ):
-            if alert.token_mints:
-                x_task = self.x_social.snapshot(
-                    alert.token_mints[0],
-                    symbol=preliminary.coin_symbol,
-                    name=preliminary.coin_name,
-                )
-            else:
-                x_task = self.x_social.narrative_snapshot(preliminary.primary_narrative)
-        competition_task = (
-            self.news_matcher.competition(preliminary.primary_narrative)
+        # Complete every free blocker before spending a paid X resource.
+        competition = (
+            await self.news_matcher.competition(preliminary.primary_narrative)
             if self.settings.news_dex_match_enabled
-            else None
+            else preliminary.competition
         )
-        if x_task is not None and competition_task is not None:
-            x_evidence, competition = await asyncio.gather(x_task, competition_task)
-        elif x_task is not None:
-            x_evidence = await x_task
-            competition = preliminary.competition
-        elif competition_task is not None:
-            x_evidence = preliminary.x_evidence
-            competition = await competition_task
-        else:
-            x_evidence = preliminary.x_evidence
-            competition = preliminary.competition
-
         cross_sources = self._cross_source_count(alert, now=now)
+        free_opportunity = score_launch_opportunity(
+            alert,
+            competition=competition,
+            cross_source_count=cross_sources,
+            now=now,
+            watch_score=self.settings.news_min_score,
+            launch_ready_score=self.settings.news_launch_ready_score,
+            no_x_candidates_enabled=self.settings.no_x_launch_candidates_enabled,
+            no_x_launch_min_score=self.settings.no_x_launch_min_score,
+        )
+        x_eligible, _x_reason = should_request_x_for_launch_opportunity(
+            free_opportunity,
+            minimum_score=self.settings.news_x_verify_min_score,
+        )
+        x_evidence = free_opportunity.x_evidence
+        if self.x_social.search_enabled and x_eligible:
+            x_evidence = await self.x_social.narrative_snapshot(
+                free_opportunity.primary_narrative,
+                context="automatic_news",
+                free_score=free_opportunity.score,
+            )
         opportunity = score_launch_opportunity(
             alert,
             x_evidence=x_evidence,
@@ -1185,7 +1185,16 @@ class SmartMoneyEngine:
             launch_ready_score=self.settings.news_launch_ready_score,
             no_x_candidates_enabled=self.settings.no_x_launch_candidates_enabled,
             no_x_launch_min_score=self.settings.no_x_launch_min_score,
+            pre_x_score=free_opportunity.score,
         )
+        if x_evidence.available:
+            outcome = "UPGRADED" if opportunity.x_verified else "WEAK"
+            await self.x_budget.record_outcome(
+                x_evidence.verification_id,
+                free_score=free_opportunity.score,
+                final_score=opportunity.score,
+                outcome=outcome,
+            )
         self._remember_news_event(alert, now=now)
         await self._cache_launch_candidate(opportunity, now=now)
         if not publish:
@@ -1300,9 +1309,56 @@ class SmartMoneyEngine:
             )
         return tuple(candidates)
 
+    async def verify_launch_lab_candidate(
+        self,
+        opportunity: LaunchOpportunity,
+    ) -> LaunchOpportunity:
+        """Run one admin-requested targeted X check; this never calls J7."""
+
+        eligible, reason = should_request_x_for_launch_opportunity(
+            opportunity,
+            minimum_score=self.settings.launch_lab_min_score,
+        )
+        if not eligible:
+            return replace(
+                opportunity,
+                x_evidence=replace(
+                    opportunity.x_evidence,
+                    available=False,
+                    error=f"X VERIFICATION SKIPPED — {reason}",
+                    verification_state="NOT_VERIFIED",
+                ),
+            )
+        x_evidence = await self.x_social.narrative_snapshot(
+            opportunity.primary_narrative,
+            context="launch_lab_manual",
+            free_score=opportunity.score,
+        )
+        updated = score_launch_opportunity(
+            opportunity.alert,
+            x_evidence=x_evidence,
+            competition=opportunity.competition,
+            cross_source_count=opportunity.cross_source_count,
+            watch_score=self.settings.news_min_score,
+            launch_ready_score=self.settings.news_launch_ready_score,
+            no_x_candidates_enabled=self.settings.no_x_launch_candidates_enabled,
+            no_x_launch_min_score=self.settings.no_x_launch_min_score,
+            pre_x_score=opportunity.score,
+        )
+        if x_evidence.available:
+            await self.x_budget.record_outcome(
+                x_evidence.verification_id,
+                free_score=opportunity.score,
+                final_score=updated.score,
+                outcome="UPGRADED" if updated.x_verified else "WEAK",
+            )
+            await self._cache_launch_candidate(updated, now=int(time.time()))
+        return updated
+
     async def launch_readiness(self) -> dict[str, object]:
         """Read-only J7/IPFS/wallet/database probe. This method cannot submit a launch."""
 
+        self.x_budget.database = self.database
         checked_at = int(time.time())
         j7 = self.pump_launcher.j7
         j7_healthy, j7_status = await j7.health_check()
@@ -1344,6 +1400,7 @@ class SmartMoneyEngine:
         if wallet_balance is not None:
             await self.database.set_setting("launch_last_wallet_balance_check", str(checked_at))
         stats = await self.database.launch_candidate_stats(start_at=start_at, end_at=end_at)
+        x_budget_status = await self.x_budget.status()
         last_lab_candidate = await self.database.get_setting("launch_last_lab_candidate")
         last_pinata_success = await self.database.get_setting("launch_last_pinata_success")
         last_launch_attempt = await self.database.get_setting("launch_last_attempt")
@@ -1371,6 +1428,7 @@ class SmartMoneyEngine:
             "pending_reservations": pending,
             "unknown_results": unknown,
             "candidate_stats": stats,
+            "x_budget": x_budget_status,
             "last_lab_candidate": int(last_lab_candidate) if last_lab_candidate else None,
             "last_pinata_success": int(last_pinata_success) if last_pinata_success else None,
             "last_launch_attempt": int(last_launch_attempt) if last_launch_attempt else None,
@@ -2776,6 +2834,7 @@ class SmartMoneyEngine:
         return result
 
     async def status(self) -> dict[str, object]:
+        self.x_budget.database = self.database
         try:
             rpc_health = await asyncio.wait_for(self.rpc.health(), timeout=8)
         except TimeoutError:
@@ -2783,7 +2842,7 @@ class SmartMoneyEngine:
         except RpcError as exc:
             rpc_health = f"error: {exc}"
         daily_lock = await self.paper_daily_lock_status()
-        x_search_usage = await self.x_search_usage_today()
+        x_budget_status = await self.x_budget.status()
         return {
             "rpc": rpc_health,
             "mode": (await self.execution_mode()).value,
@@ -2831,8 +2890,9 @@ class SmartMoneyEngine:
             "x_paid_search_enabled": self.settings.x_paid_search_enabled,
             "x_social_last_success": self.x_social.last_success_at,
             "x_social_last_error": self.x_social.last_error,
-            "x_search_usage_today": x_search_usage,
+            "x_search_usage_today": x_budget_status["verifications"],
             "x_search_daily_limit": self.settings.x_daily_search_limit,
+            "x_budget": x_budget_status,
             "x_radar_enabled": self.settings.x_radar_enabled,
             "x_radar_poll_seconds": self.settings.x_radar_poll_seconds,
             "x_radar_scans": self.x_social.radar_scans,

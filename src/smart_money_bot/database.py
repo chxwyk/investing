@@ -334,6 +334,61 @@ class Database:
                 PRIMARY KEY (provider, operation, usage_day)
             );
 
+            CREATE TABLE IF NOT EXISTS x_budget_verifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                usage_day TEXT NOT NULL,
+                period_id TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                context TEXT NOT NULL,
+                query TEXT NOT NULL,
+                state TEXT NOT NULL CHECK (
+                    state IN ('RESERVED', 'COMPLETED', 'FAILED')
+                ),
+                max_posts INTEGER NOT NULL,
+                reserved_estimate_usd REAL NOT NULL,
+                estimated_spend_usd REAL NOT NULL DEFAULT 0,
+                post_resources INTEGER NOT NULL DEFAULT 0,
+                user_resources INTEGER NOT NULL DEFAULT 0,
+                http_requests INTEGER NOT NULL DEFAULT 0,
+                free_score INTEGER,
+                final_score INTEGER,
+                outcome TEXT,
+                status_code INTEGER,
+                error_category TEXT,
+                started_at INTEGER NOT NULL,
+                completed_at INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_x_budget_day
+                ON x_budget_verifications(usage_day, started_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_x_budget_period
+                ON x_budget_verifications(period_id, started_at DESC);
+
+            CREATE TABLE IF NOT EXISTS x_budget_resources (
+                usage_day TEXT NOT NULL,
+                period_id TEXT NOT NULL,
+                resource_type TEXT NOT NULL CHECK (resource_type IN ('post', 'user')),
+                resource_id TEXT NOT NULL,
+                estimated_cost_usd REAL NOT NULL,
+                first_seen_at INTEGER NOT NULL,
+                PRIMARY KEY (usage_day, resource_type, resource_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_x_resources_period
+                ON x_budget_resources(period_id, first_seen_at DESC);
+
+            CREATE TABLE IF NOT EXISTS x_user_cache (
+                user_id TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL,
+                fetched_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS x_verification_cache (
+                fingerprint TEXT PRIMARY KEY,
+                query TEXT NOT NULL,
+                snapshot_json TEXT NOT NULL,
+                fetched_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -512,6 +567,486 @@ class Database:
         )
         row = await cursor.fetchone()
         return int(row["request_count"] if row else 0)
+
+    async def reserve_x_verification(
+        self,
+        *,
+        usage_day: str,
+        period_id: str,
+        fingerprint: str,
+        context: str,
+        query: str,
+        max_posts: int,
+        request_limit: int,
+        verification_limit: int,
+        daily_budget_usd: Decimal,
+        total_budget_usd: Decimal,
+        post_unit_cost_usd: Decimal,
+        guard_enabled: bool,
+    ) -> tuple[int | None, str | None]:
+        """Atomically reserve one targeted X search and its worst-case Post reads."""
+
+        now = int(time.time())
+        ceiling = Decimal(max_posts) * post_unit_cost_usd
+        async with self._write_lock:
+            await self.db.execute("BEGIN IMMEDIATE")
+            try:
+                await self.db.execute(
+                    """
+                    UPDATE x_budget_verifications
+                    SET state = 'FAILED', reserved_estimate_usd = 0,
+                        error_category = 'STALE LOCAL RESERVATION RECOVERED',
+                        completed_at = ?
+                    WHERE state = 'RESERVED' AND started_at < ?
+                    """,
+                    (now, now - 300),
+                )
+                duplicate_cursor = await self.db.execute(
+                    """
+                    SELECT 1 FROM x_budget_verifications
+                    WHERE usage_day = ? AND fingerprint = ? AND state = 'RESERVED'
+                    LIMIT 1
+                    """,
+                    (usage_day, fingerprint),
+                )
+                if await duplicate_cursor.fetchone() is not None:
+                    await self.db.rollback()
+                    return None, "X VERIFICATION SKIPPED — SAME QUERY ALREADY IN PROGRESS"
+                day_cursor = await self.db.execute(
+                    """
+                    SELECT COUNT(*) AS verifications,
+                           COALESCE(SUM(CASE WHEN http_requests > 0
+                                             THEN http_requests ELSE 1 END), 0) AS attempts,
+                           COALESCE(SUM(
+                               CASE WHEN state = 'RESERVED'
+                                    THEN reserved_estimate_usd
+                                    ELSE estimated_spend_usd END
+                           ), 0) AS guarded_spend
+                    FROM x_budget_verifications
+                    WHERE usage_day = ?
+                    """,
+                    (usage_day,),
+                )
+                day = await day_cursor.fetchone()
+                period_cursor = await self.db.execute(
+                    """
+                    SELECT COALESCE(SUM(
+                               CASE WHEN state = 'RESERVED'
+                                    THEN reserved_estimate_usd
+                                    ELSE estimated_spend_usd END
+                           ), 0) AS guarded_spend
+                    FROM x_budget_verifications
+                    WHERE period_id = ?
+                    """,
+                    (period_id,),
+                )
+                period = await period_cursor.fetchone()
+                attempts = int(day["attempts"] if day else 0)
+                verifications = int(day["verifications"] if day else 0)
+                day_spend = _d(day["guarded_spend"] if day else 0)
+                period_spend = _d(period["guarded_spend"] if period else 0)
+                reason: str | None = None
+                if attempts >= request_limit:
+                    reason = "X VERIFICATION SKIPPED — REQUEST BACKSTOP REACHED"
+                elif verifications >= verification_limit:
+                    reason = "X VERIFICATION SKIPPED — DAILY VERIFICATION CAP REACHED"
+                elif guard_enabled and day_spend + ceiling > daily_budget_usd:
+                    reason = "X VERIFICATION SKIPPED — DAILY BUDGET REACHED"
+                elif guard_enabled and period_spend + ceiling > total_budget_usd:
+                    reason = "X VERIFICATION SKIPPED — EXPERIMENT BUDGET REACHED"
+                if reason:
+                    await self.db.rollback()
+                    return None, reason
+                cursor = await self.db.execute(
+                    """
+                    INSERT INTO x_budget_verifications(
+                        usage_day, period_id, fingerprint, context, query, state,
+                        max_posts, reserved_estimate_usd, started_at
+                    ) VALUES (?, ?, ?, ?, ?, 'RESERVED', ?, ?, ?)
+                    """,
+                    (
+                        usage_day,
+                        period_id,
+                        fingerprint,
+                        context,
+                        query,
+                        max_posts,
+                        float(ceiling),
+                        now,
+                    ),
+                )
+                await self.db.commit()
+                return int(cursor.lastrowid), None
+            except Exception:
+                await self.db.rollback()
+                raise
+
+    async def reserve_x_user_resources(
+        self,
+        *,
+        verification_id: int,
+        user_ids: tuple[str, ...],
+        daily_budget_usd: Decimal,
+        total_budget_usd: Decimal,
+        user_unit_cost_usd: Decimal,
+        guard_enabled: bool,
+    ) -> tuple[tuple[str, ...], str | None]:
+        """Reserve only User resources not already counted locally for this UTC/local day."""
+
+        if not user_ids:
+            return (), None
+        async with self._write_lock:
+            await self.db.execute("BEGIN IMMEDIATE")
+            try:
+                row_cursor = await self.db.execute(
+                    """
+                    SELECT usage_day, period_id, state FROM x_budget_verifications
+                    WHERE id = ?
+                    """,
+                    (verification_id,),
+                )
+                row = await row_cursor.fetchone()
+                if row is None or row["state"] != "RESERVED":
+                    await self.db.rollback()
+                    return (), "X VERIFICATION RESERVATION IS NOT ACTIVE"
+                placeholders = ",".join("?" for _ in user_ids)
+                existing_cursor = await self.db.execute(
+                    f"""
+                    SELECT resource_id FROM x_budget_resources
+                    WHERE usage_day = ? AND resource_type = 'user'
+                      AND resource_id IN ({placeholders})
+                    """,
+                    (row["usage_day"], *user_ids),
+                )
+                existing = {str(item["resource_id"]) for item in await existing_cursor.fetchall()}
+                billable = tuple(item for item in user_ids if item not in existing)
+                ceiling = Decimal(len(billable)) * user_unit_cost_usd
+                day_cursor = await self.db.execute(
+                    """
+                    SELECT COALESCE(SUM(
+                               CASE WHEN state = 'RESERVED'
+                                    THEN reserved_estimate_usd
+                                    ELSE estimated_spend_usd END
+                           ), 0) AS guarded_spend
+                    FROM x_budget_verifications WHERE usage_day = ?
+                    """,
+                    (row["usage_day"],),
+                )
+                period_cursor = await self.db.execute(
+                    """
+                    SELECT COALESCE(SUM(
+                               CASE WHEN state = 'RESERVED'
+                                    THEN reserved_estimate_usd
+                                    ELSE estimated_spend_usd END
+                           ), 0) AS guarded_spend
+                    FROM x_budget_verifications WHERE period_id = ?
+                    """,
+                    (row["period_id"],),
+                )
+                day = await day_cursor.fetchone()
+                period = await period_cursor.fetchone()
+                day_spend = _d(day["guarded_spend"] if day else 0)
+                period_spend = _d(period["guarded_spend"] if period else 0)
+                if guard_enabled and day_spend + ceiling > daily_budget_usd:
+                    await self.db.rollback()
+                    return (), "X USER HYDRATION SKIPPED — DAILY BUDGET REACHED"
+                if guard_enabled and period_spend + ceiling > total_budget_usd:
+                    await self.db.rollback()
+                    return (), "X USER HYDRATION SKIPPED — EXPERIMENT BUDGET REACHED"
+                await self.db.execute(
+                    """
+                    UPDATE x_budget_verifications
+                    SET reserved_estimate_usd = reserved_estimate_usd + ?
+                    WHERE id = ?
+                    """,
+                    (float(ceiling), verification_id),
+                )
+                await self.db.commit()
+                return billable, None
+            except Exception:
+                await self.db.rollback()
+                raise
+
+    async def record_x_resources(
+        self,
+        *,
+        verification_id: int,
+        resource_type: str,
+        resource_ids: tuple[str, ...],
+        unit_cost_usd: Decimal,
+    ) -> int:
+        """Record unique daily resources and return the newly counted quantity."""
+
+        ids = tuple(dict.fromkeys(item for item in resource_ids if item))
+        now = int(time.time())
+        async with self._write_lock:
+            await self.db.execute("BEGIN IMMEDIATE")
+            try:
+                row_cursor = await self.db.execute(
+                    "SELECT usage_day, period_id FROM x_budget_verifications WHERE id = ?",
+                    (verification_id,),
+                )
+                row = await row_cursor.fetchone()
+                if row is None:
+                    raise ValueError("unknown X verification reservation")
+                added = 0
+                for resource_id in ids:
+                    cursor = await self.db.execute(
+                        """
+                        INSERT OR IGNORE INTO x_budget_resources(
+                            usage_day, period_id, resource_type, resource_id,
+                            estimated_cost_usd, first_seen_at
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            row["usage_day"],
+                            row["period_id"],
+                            resource_type,
+                            resource_id,
+                            float(unit_cost_usd),
+                            now,
+                        ),
+                    )
+                    added += max(0, cursor.rowcount)
+                column = "post_resources" if resource_type == "post" else "user_resources"
+                await self.db.execute(
+                    f"""
+                    UPDATE x_budget_verifications
+                    SET {column} = {column} + ?,
+                        estimated_spend_usd = estimated_spend_usd + ?
+                    WHERE id = ?
+                    """,
+                    (added, float(Decimal(added) * unit_cost_usd), verification_id),
+                )
+                await self.db.commit()
+                return added
+            except Exception:
+                await self.db.rollback()
+                raise
+
+    async def finish_x_verification(
+        self,
+        *,
+        verification_id: int,
+        status_code: int | None,
+        free_score: int | None = None,
+        final_score: int | None = None,
+        outcome: str | None = None,
+        http_requests: int = 1,
+    ) -> None:
+        async with self._write_lock:
+            await self.db.execute(
+                """
+                UPDATE x_budget_verifications
+                SET state = 'COMPLETED', reserved_estimate_usd = estimated_spend_usd,
+                    status_code = ?, free_score = COALESCE(?, free_score),
+                    final_score = COALESCE(?, final_score), outcome = COALESCE(?, outcome),
+                    http_requests = ?, completed_at = ?
+                WHERE id = ?
+                """,
+                (
+                    status_code,
+                    free_score,
+                    final_score,
+                    outcome,
+                    http_requests,
+                    int(time.time()),
+                    verification_id,
+                ),
+            )
+            await self.db.commit()
+
+    async def fail_x_verification(
+        self,
+        *,
+        verification_id: int,
+        status_code: int | None,
+        error_category: str,
+        http_requests: int = 1,
+    ) -> None:
+        async with self._write_lock:
+            await self.db.execute(
+                """
+                UPDATE x_budget_verifications
+                SET state = 'FAILED', reserved_estimate_usd = 0,
+                    estimated_spend_usd = 0, status_code = ?, error_category = ?,
+                    http_requests = ?, completed_at = ?
+                WHERE id = ?
+                """,
+                (
+                    status_code,
+                    error_category[:160],
+                    http_requests,
+                    int(time.time()),
+                    verification_id,
+                ),
+            )
+            await self.db.commit()
+
+    async def update_x_verification_outcome(
+        self,
+        *,
+        verification_id: int,
+        free_score: int,
+        final_score: int,
+        outcome: str,
+    ) -> None:
+        async with self._write_lock:
+            await self.db.execute(
+                """
+                UPDATE x_budget_verifications
+                SET free_score = ?, final_score = ?, outcome = ? WHERE id = ?
+                """,
+                (free_score, final_score, outcome[:80], verification_id),
+            )
+            await self.db.commit()
+
+    async def x_budget_status(self, *, usage_day: str, period_id: str) -> dict[str, Any]:
+        day_cursor = await self.db.execute(
+            """
+            SELECT COUNT(*) AS verifications,
+                   COALESCE(SUM(http_requests), 0) AS requests,
+                   MAX(CASE WHEN state = 'COMPLETED' THEN completed_at END) AS last_success,
+                   MAX(CASE WHEN state = 'FAILED' THEN completed_at END) AS last_failure,
+                   SUM(CASE WHEN outcome = 'UPGRADED' THEN 1 ELSE 0 END) AS upgraded,
+                   SUM(CASE WHEN outcome = 'WEAK' THEN 1 ELSE 0 END) AS weak,
+                   AVG(CASE WHEN free_score IS NOT NULL THEN free_score END) AS avg_free,
+                   AVG(CASE WHEN final_score IS NOT NULL THEN final_score END) AS avg_final
+            FROM x_budget_verifications WHERE usage_day = ?
+            """,
+            (usage_day,),
+        )
+        day = await day_cursor.fetchone()
+        resource_cursor = await self.db.execute(
+            """
+            SELECT resource_type, COUNT(*) AS resources,
+                   COALESCE(SUM(estimated_cost_usd), 0) AS spend
+            FROM x_budget_resources WHERE usage_day = ? GROUP BY resource_type
+            """,
+            (usage_day,),
+        )
+        resource_rows = await resource_cursor.fetchall()
+        period_cursor = await self.db.execute(
+            """
+            SELECT COALESCE(SUM(estimated_cost_usd), 0) AS spend
+            FROM x_budget_resources WHERE period_id = ?
+            """,
+            (period_id,),
+        )
+        period = await period_cursor.fetchone()
+        error_cursor = await self.db.execute(
+            """
+            SELECT error_category FROM x_budget_verifications
+            WHERE usage_day = ? AND error_category IS NOT NULL
+            ORDER BY completed_at DESC LIMIT 1
+            """,
+            (usage_day,),
+        )
+        error = await error_cursor.fetchone()
+        resources = {str(row["resource_type"]): row for row in resource_rows}
+        post_row = resources.get("post")
+        user_row = resources.get("user")
+        return {
+            "verifications": int(day["verifications"] or 0),
+            "requests": int(day["requests"] or 0),
+            "post_resources": int(post_row["resources"] if post_row else 0),
+            "user_resources": int(user_row["resources"] if user_row else 0),
+            "estimated_spend_today": sum(
+                (_d(row["spend"] or 0) for row in resource_rows),
+                start=Decimal("0"),
+            ),
+            "estimated_spend_period": _d(period["spend"] if period else 0),
+            "last_success": int(day["last_success"]) if day["last_success"] else None,
+            "last_failure": int(day["last_failure"]) if day["last_failure"] else None,
+            "last_error": str(error["error_category"]) if error else None,
+            "upgraded": int(day["upgraded"] or 0),
+            "weak": int(day["weak"] or 0),
+            "average_free_score": (
+                Decimal(str(day["avg_free"])).quantize(Decimal("0.01"))
+                if day["avg_free"] is not None else None
+            ),
+            "average_final_score": (
+                Decimal(str(day["avg_final"])).quantize(Decimal("0.01"))
+                if day["avg_final"] is not None else None
+            ),
+        }
+
+    async def cached_x_users(
+        self, *, user_ids: tuple[str, ...], minimum_fetched_at: int
+    ) -> dict[str, dict[str, Any]]:
+        if not user_ids:
+            return {}
+        placeholders = ",".join("?" for _ in user_ids)
+        cursor = await self.db.execute(
+            f"""
+            SELECT user_id, payload_json FROM x_user_cache
+            WHERE fetched_at >= ? AND user_id IN ({placeholders})
+            """,
+            (minimum_fetched_at, *user_ids),
+        )
+        result: dict[str, dict[str, Any]] = {}
+        for row in await cursor.fetchall():
+            try:
+                payload = json.loads(str(row["payload_json"]))
+            except (TypeError, ValueError):
+                continue
+            if isinstance(payload, dict):
+                result[str(row["user_id"])] = payload
+        return result
+
+    async def cache_x_users(self, users: tuple[dict[str, Any], ...], *, fetched_at: int) -> None:
+        async with self._write_lock:
+            for user in users:
+                user_id = str(user.get("id") or "")
+                if not user_id:
+                    continue
+                await self.db.execute(
+                    """
+                    INSERT INTO x_user_cache(user_id, payload_json, fetched_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(user_id) DO UPDATE SET
+                        payload_json = excluded.payload_json,
+                        fetched_at = excluded.fetched_at
+                    """,
+                    (user_id, json.dumps(user, separators=(",", ":")), fetched_at),
+                )
+            await self.db.commit()
+
+    async def cached_x_snapshot(self, *, fingerprint: str, now: int) -> str | None:
+        cursor = await self.db.execute(
+            """
+            SELECT snapshot_json FROM x_verification_cache
+            WHERE fingerprint = ? AND expires_at >= ?
+            """,
+            (fingerprint, now),
+        )
+        row = await cursor.fetchone()
+        return str(row["snapshot_json"]) if row else None
+
+    async def cache_x_snapshot(
+        self,
+        *,
+        fingerprint: str,
+        query: str,
+        snapshot_json: str,
+        fetched_at: int,
+        expires_at: int,
+    ) -> None:
+        async with self._write_lock:
+            await self.db.execute(
+                """
+                INSERT INTO x_verification_cache(
+                    fingerprint, query, snapshot_json, fetched_at, expires_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(fingerprint) DO UPDATE SET
+                    query = excluded.query,
+                    snapshot_json = excluded.snapshot_json,
+                    fetched_at = excluded.fetched_at,
+                    expires_at = excluded.expires_at
+                """,
+                (fingerprint, query, snapshot_json, fetched_at, expires_at),
+            )
+            await self.db.commit()
 
     async def _ensure_column(self, table: str, column: str, definition: str) -> None:
         cursor = await self.db.execute(f"PRAGMA table_info({table})")

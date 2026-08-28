@@ -158,6 +158,10 @@ class XSocialSnapshot:
     contract_authors: int = 0
     credible_contract_authors: int = 0
     trusted_crypto_authors: int = 0
+    trusted_news_authors: int = 0
+    trusted_investigator_authors: int = 0
+    trusted_official_authors: int = 0
+    trusted_market_authors: int = 0
     million_follower_authors: int = 0
     coin_intent_posts: int = 0
     promoter_posts: int = 0
@@ -168,6 +172,9 @@ class XSocialSnapshot:
     notable_posts: tuple[str, ...] = ()
     query: str = ""
     error: str | None = None
+    verification_id: int | None = None
+    verification_state: str = "NOT_VERIFIED"
+    checked_at: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,6 +254,7 @@ class LaunchOpportunity:
     warnings: tuple[str, ...] = ()
     blockers: tuple[str, ...] = ()
     generated_at: int = 0
+    pre_x_score: int = 0
 
 
 @dataclass(frozen=True, slots=True)

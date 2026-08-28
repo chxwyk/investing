@@ -117,6 +117,15 @@ class Settings:
     x_daily_search_limit: int
     x_daily_search_timezone: str
     x_paid_search_enabled: bool
+    x_budget_guard_enabled: bool
+    x_estimated_total_budget_usd: Decimal
+    x_estimated_daily_budget_usd: Decimal
+    x_max_targeted_verifications_per_day: int
+    x_verify_max_posts: int
+    x_estimated_post_read_usd: Decimal
+    x_estimated_user_read_usd: Decimal
+    x_budget_period_id: str
+    x_user_cache_seconds: int
     x_radar_enabled: bool
     x_radar_query: str
     x_radar_poll_seconds: int
@@ -311,17 +320,36 @@ class Settings:
             coin_callout_window_seconds=_int("COIN_CALLOUT_WINDOW_SECONDS", 300),
             coin_callout_cooldown_seconds=_int("COIN_CALLOUT_COOLDOWN_SECONDS", 3600),
             coin_callout_min_alert_score=_decimal("COIN_CALLOUT_MIN_ALERT_SCORE", "70"),
-            coin_x_prefilter_min_score=_decimal("COIN_X_PREFILTER_MIN_SCORE", "35"),
+            coin_x_prefilter_min_score=_decimal("COIN_X_PREFILTER_MIN_SCORE", "60"),
             coin_watch_alerts_enabled=_bool("COIN_WATCH_ALERTS_ENABLED", True),
             coin_watch_min_score=_decimal("COIN_WATCH_MIN_SCORE", "55"),
             fomo_watch_min_score=_decimal("FOMO_WATCH_MIN_SCORE", "50"),
             trade_activity_alerts_enabled=_bool("TRADE_ACTIVITY_ALERTS_ENABLED", False),
             x_search_max_results=_int("X_SEARCH_MAX_RESULTS", 10),
-            x_daily_search_limit=_int("X_DAILY_SEARCH_LIMIT", 25),
+            x_daily_search_limit=_int("X_DAILY_SEARCH_LIMIT", 10),
             x_daily_search_timezone=os.getenv(
                 "X_DAILY_SEARCH_TIMEZONE", "America/Los_Angeles"
             ).strip(),
             x_paid_search_enabled=_bool("X_PAID_SEARCH_ENABLED", False),
+            x_budget_guard_enabled=_bool("X_BUDGET_GUARD_ENABLED", True),
+            x_estimated_total_budget_usd=_decimal(
+                "X_ESTIMATED_TOTAL_BUDGET_USD", "10"
+            ),
+            x_estimated_daily_budget_usd=_decimal(
+                "X_ESTIMATED_DAILY_BUDGET_USD", "0.50"
+            ),
+            x_max_targeted_verifications_per_day=_int(
+                "X_MAX_TARGETED_VERIFICATIONS_PER_DAY", 10
+            ),
+            x_verify_max_posts=_int("X_VERIFY_MAX_POSTS", 10),
+            x_estimated_post_read_usd=_decimal(
+                "X_ESTIMATED_POST_READ_USD", "0.005"
+            ),
+            x_estimated_user_read_usd=_decimal(
+                "X_ESTIMATED_USER_READ_USD", "0.010"
+            ),
+            x_budget_period_id=os.getenv("X_BUDGET_PERIOD_ID", "experiment-1").strip(),
+            x_user_cache_seconds=_int("X_USER_CACHE_SECONDS", 86400),
             x_radar_enabled=_bool("X_RADAR_ENABLED", False),
             x_radar_query=os.getenv("X_RADAR_QUERY", DEFAULT_X_RADAR_QUERY).strip(),
             x_radar_poll_seconds=_int("X_RADAR_POLL_SECONDS", 1800),
@@ -589,6 +617,26 @@ class Settings:
             raise ValueError("X_SEARCH_MAX_RESULTS must be between 10 and 100")
         if not 1 <= self.x_daily_search_limit <= 500:
             raise ValueError("X_DAILY_SEARCH_LIMIT must be between 1 and 500")
+        if self.x_estimated_total_budget_usd <= 0:
+            raise ValueError("X_ESTIMATED_TOTAL_BUDGET_USD must be greater than zero")
+        if not Decimal("0.01") <= self.x_estimated_daily_budget_usd:
+            raise ValueError("X_ESTIMATED_DAILY_BUDGET_USD must be at least 0.01")
+        if self.x_estimated_daily_budget_usd > self.x_estimated_total_budget_usd:
+            raise ValueError(
+                "X_ESTIMATED_DAILY_BUDGET_USD cannot exceed the total X budget"
+            )
+        if not 1 <= self.x_max_targeted_verifications_per_day <= 100:
+            raise ValueError(
+                "X_MAX_TARGETED_VERIFICATIONS_PER_DAY must be between 1 and 100"
+            )
+        if not 10 <= self.x_verify_max_posts <= 100:
+            raise ValueError("X_VERIFY_MAX_POSTS must be between 10 and 100")
+        if self.x_estimated_post_read_usd <= 0 or self.x_estimated_user_read_usd <= 0:
+            raise ValueError("configured X resource prices must be greater than zero")
+        if not self.x_budget_period_id or len(self.x_budget_period_id) > 80:
+            raise ValueError("X_BUDGET_PERIOD_ID must contain 1 to 80 characters")
+        if not 300 <= self.x_user_cache_seconds <= 604800:
+            raise ValueError("X_USER_CACHE_SECONDS must be between 300 and 604800")
         try:
             ZoneInfo(self.x_daily_search_timezone)
         except ZoneInfoNotFoundError as exc:

@@ -249,6 +249,15 @@ def test_news_radar_defaults_to_fast_but_cost_bounded_sources(monkeypatch) -> No
         "X_DAILY_SEARCH_LIMIT",
         "X_DAILY_SEARCH_TIMEZONE",
         "X_PAID_SEARCH_ENABLED",
+        "X_BUDGET_GUARD_ENABLED",
+        "X_ESTIMATED_TOTAL_BUDGET_USD",
+        "X_ESTIMATED_DAILY_BUDGET_USD",
+        "X_MAX_TARGETED_VERIFICATIONS_PER_DAY",
+        "X_VERIFY_MAX_POSTS",
+        "X_ESTIMATED_POST_READ_USD",
+        "X_ESTIMATED_USER_READ_USD",
+        "X_BUDGET_PERIOD_ID",
+        "X_USER_CACHE_SECONDS",
         "X_RADAR_ENABLED",
         "X_RADAR_QUERY",
         "X_RADAR_POLL_SECONDS",
@@ -300,7 +309,14 @@ def test_news_radar_defaults_to_fast_but_cost_bounded_sources(monkeypatch) -> No
     assert settings.j7_launch_region == "na-east"
     assert settings.news_pair_recheck_seconds == (0, 30, 90, 180)
     assert settings.x_search_max_results == 10
-    assert settings.x_daily_search_limit == 25
+    assert settings.x_daily_search_limit == 10
+    assert settings.x_budget_guard_enabled is True
+    assert settings.x_estimated_total_budget_usd == Decimal("10")
+    assert settings.x_estimated_daily_budget_usd == Decimal("0.50")
+    assert settings.x_max_targeted_verifications_per_day == 10
+    assert settings.x_verify_max_posts == 10
+    assert settings.x_estimated_post_read_usd == Decimal("0.005")
+    assert settings.x_estimated_user_read_usd == Decimal("0.010")
     assert settings.x_daily_search_timezone == "America/Los_Angeles"
     assert settings.x_paid_search_enabled is False
     assert settings.x_radar_enabled is False
@@ -314,7 +330,7 @@ def test_news_radar_defaults_to_fast_but_cost_bounded_sources(monkeypatch) -> No
     assert settings.fomo_radar_recheck_seconds == 1800
     assert settings.fomo_watch_min_score == Decimal("50")
     assert settings.trade_activity_alerts_enabled is False
-    assert settings.coin_x_prefilter_min_score == Decimal("35")
+    assert settings.coin_x_prefilter_min_score == Decimal("60")
     assert settings.coin_watch_alerts_enabled is True
     assert settings.coin_watch_min_score == Decimal("55")
 

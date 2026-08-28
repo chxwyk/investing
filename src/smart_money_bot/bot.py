@@ -400,6 +400,21 @@ def _launch_readiness_embed(report: dict[str, object]) -> discord.Embed:
             ),
             inline=False,
         )
+    x_budget = report.get("x_budget")
+    if isinstance(x_budget, dict):
+        embed.add_field(
+            name="Targeted X budget",
+            value=(
+                f"{'READY' if x_budget.get('guard_enabled') else 'GUARD DISABLED'} • "
+                f"{x_budget.get('verifications', 0)}/{x_budget.get('verification_limit', 0)} "
+                f"checks • requests {x_budget.get('requests', 0)} • "
+                f"Posts {x_budget.get('post_resources', 0)} • "
+                f"Users {x_budget.get('user_resources', 0)} • local estimate "
+                f"${x_budget.get('estimated_spend_today', 0)}/"
+                f"${x_budget.get('daily_budget', 0)}"
+            ),
+            inline=False,
+        )
     last_lab = (
         f"<t:{report['last_lab_candidate']}:R>" if report["last_lab_candidate"] else "none"
     )
@@ -462,6 +477,27 @@ def _launch_lab_embed(
     weaknesses = tuple(
         item for item in opportunity.warnings if "stricter free" not in item
     )[:4] or ("No material weakness recorded by the current checks",)
+    x = opportunity.x_evidence
+    if x.available:
+        x_label = (
+            "X VERIFIED — STRONG SIGNAL"
+            if opportunity.x_verified and opportunity.crypto_attention_ready
+            else "X CHECKED — WEAK SIGNAL"
+        )
+        free_score = opportunity.pre_x_score or max(0, opportunity.score - opportunity.x_score)
+        impact = opportunity.score - free_score
+        notable = ", ".join(x.notable_accounts[:3]) or "none"
+        x_detail = (
+            f"**{x_label}**\nPosts: `{x.posts}` • unique authors: `{x.unique_authors}`\n"
+            f"Credible crypto accounts: `{x.credible_crypto_authors}` • "
+            f"trusted: `{x.trusted_crypto_authors}`\n"
+            f"Velocity: `{x.posts_per_minute}/min` • engagement: `{x.engagements}` • "
+            f"duplicate text: `{x.duplicate_percent}%`\n"
+            f"Notable accounts: {notable}\nConfidence impact: `{impact:+d}`"
+        )
+    else:
+        x_label = "X NOT VERIFIED"
+        x_detail = f"**{x_label}**\n{x.error or 'Targeted X verification has not run.'}"
     embed = discord.Embed(
         title="🔥 LIVE LAUNCH LAB",
         description=(
@@ -507,9 +543,13 @@ def _launch_lab_embed(
         inline=False,
     )
     embed.add_field(
+        name="X VERIFICATION",
+        value=x_detail,
+        inline=False,
+    )
+    embed.add_field(
         name="Launch controls",
         value=(
-            "**X Verification:** NOT VERIFIED — ZERO-COST MODE\n"
             "**Provider:** J7 Tracker\n"
             f"**Creator Buy:** {draft.creator_buy_sol} SOL\n"
             f"**Wallet:** `{_short(wallet or 'not configured')}`\n"
@@ -661,6 +701,49 @@ class LaunchConfirmationView(discord.ui.View):
         )
 
 
+class XVerificationConfirmationView(discord.ui.View):
+    def __init__(self, lab_view: LaunchLabView) -> None:
+        super().__init__(timeout=300)
+        self.lab_view = lab_view
+        self.running = False
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await self.lab_view.interaction_check(interaction)
+
+    @discord.ui.button(label="RUN X VERIFICATION", style=discord.ButtonStyle.success)
+    async def run(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        if self.running:
+            await interaction.response.send_message(
+                "X verification is already running.", ephemeral=True
+            )
+            return
+        self.running = True
+        button.disabled = True
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        updated = await self.lab_view.bot.engine.verify_launch_lab_candidate(
+            self.lab_view.draft.opportunity
+        )
+        self.lab_view.drafts[self.lab_view.index] = replace(
+            self.lab_view.draft,
+            opportunity=updated,
+        )
+        embed, file = await self.lab_view.preview()
+        if interaction.message:
+            await interaction.message.edit(embed=embed, attachments=[file], view=self.lab_view)
+
+    @discord.ui.button(label="CANCEL", style=discord.ButtonStyle.secondary)
+    async def cancel(
+        self,
+        interaction: discord.Interaction,
+        _button: discord.ui.Button,
+    ) -> None:
+        await self.lab_view.refresh_message(interaction)
+
+
 class LaunchLabView(discord.ui.View):
     def __init__(
         self,
@@ -754,6 +837,54 @@ class LaunchLabView(discord.ui.View):
             art_variant=self.draft.art_variant + 1,
         )
         await self.refresh_message(interaction)
+
+    @discord.ui.button(label="X VERIFY", style=discord.ButtonStyle.success, row=1)
+    async def verify_x(
+        self,
+        interaction: discord.Interaction,
+        _button: discord.ui.Button,
+    ) -> None:
+        if not self.bot.settings.x_paid_search_enabled:
+            await interaction.response.send_message(
+                "X verification is disabled. Free Launch Lab and J7 remain active.",
+                ephemeral=True,
+            )
+            return
+        if not self.bot.settings.x_api_bearer_token:
+            await interaction.response.send_message(
+                "X_API_BEARER_TOKEN is not configured. Free Launch Lab remains active.",
+                ephemeral=True,
+            )
+            return
+        budget = await self.bot.engine.x_budget.status()
+        ceiling = (
+            self.bot.settings.x_verify_max_posts
+            * self.bot.settings.x_estimated_post_read_usd
+        )
+        embed = discord.Embed(
+            title="X VERIFICATION",
+            description=(
+                f"**Candidate:** {self.draft.opportunity.alert.headline[:220]}\n"
+                f"**Free score:** {self.draft.opportunity.score}/100\n"
+                f"**Search limit:** up to {self.bot.settings.x_verify_max_posts} Posts\n"
+                f"**Estimated Post-read ceiling:** approximately ${ceiling:.3f}\n"
+                "User resources are separately estimated only if Post-level evidence "
+                "justifies author hydration.\n\n"
+                f"**Local estimate today:** ${budget['estimated_spend_today']} / "
+                f"${budget['daily_budget']}\n"
+                f"**Targeted verifications:** {budget['verifications']} / "
+                f"{budget['verification_limit']}"
+            ),
+            color=0x1DA1F2,
+        )
+        embed.set_footer(
+            text="Official X API • local estimate, not the X invoice • never calls J7"
+        )
+        await interaction.response.edit_message(
+            embed=embed,
+            attachments=[],
+            view=XVerificationConfirmationView(self),
+        )
 
     @discord.ui.button(label="NEXT CANDIDATE", style=discord.ButtonStyle.secondary, row=1)
     async def next_candidate(
@@ -2399,9 +2530,18 @@ class SmartMoneyCommands(
             "disabled—zero X API spend"
             if not status["x_paid_search_enabled"]
             else (
-                f"{status['x_search_usage_today']}/{status['x_search_daily_limit']} "
-                "used today"
+                f"{status['x_budget']['verifications']}/"
+                f"{status['x_budget']['verification_limit']} targeted checks • "
+                f"requests {status['x_budget']['requests']} • "
+                f"Posts {status['x_budget']['post_resources']} • "
+                f"Users {status['x_budget']['user_resources']} • local estimate "
+                f"${status['x_budget']['estimated_spend_today']}/"
+                f"${status['x_budget']['daily_budget']} today"
             )
+        )
+        x_budget_last_success = status["x_budget"]["last_success"]
+        x_budget_last_success_text = (
+            f"<t:{x_budget_last_success}:R>" if x_budget_last_success else "none"
         )
         text = (
             "**Solana Tracker:** connected for strict 24H + 7D general-trader screening\n"
@@ -2424,6 +2564,13 @@ class SmartMoneyCommands(
             f"**X/Twitter coin intelligence:** {x_status}"
             " • exact-contract promotion • crypto-author quality • duplicate-text checks\n"
             f"**Paid X search budget:** {x_budget_text}\n"
+            f"**X paid mode:** TARGETED VERIFICATION • max "
+            f"{status['x_budget']['max_posts']} Posts/check • experiment local estimate "
+            f"${status['x_budget']['estimated_spend_period']}/"
+            f"${status['x_budget']['total_budget']} • actual invoice: Developer Console\n"
+            f"**X outcomes today:** upgraded {status['x_budget']['upgraded']} • weak "
+            f"{status['x_budget']['weak']} • last success "
+            f"{x_budget_last_success_text}\n"
             f"**Proactive X radar:** "
             f"{'enabled' if status['x_radar_enabled'] else 'disabled'} • searches immediately "
             f"and every {status['x_radar_poll_seconds'] // 60}m • "
@@ -3051,7 +3198,14 @@ class SmartMoneyCommands(
         x_search_text = (
             "disabled—zero X API spend"
             if not status["x_paid_search_enabled"]
-            else f"{status['x_search_usage_today']}/{status['x_search_daily_limit']} today"
+            else (
+                f"targeted {status['x_budget']['verifications']}/"
+                f"{status['x_budget']['verification_limit']} • requests "
+                f"{status['x_budget']['requests']} • Posts "
+                f"{status['x_budget']['post_resources']} • local estimate "
+                f"${status['x_budget']['estimated_spend_today']}/"
+                f"${status['x_budget']['daily_budget']}"
+            )
         )
         rss_health = (
             f"ready • last refresh <t:{status['news_rss_last_refresh']}:R>"
