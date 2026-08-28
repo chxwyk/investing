@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
 import logging
@@ -3987,12 +3988,41 @@ class FomoCommands(
             return
         await interaction.response.defer(thinking=True, ephemeral=True)
         research_test = mode == "test"
-        candidates = await self.bot.engine.runner_lab_candidates(research_test=research_test)
+        try:
+            async with asyncio.timeout(40):
+                candidates = await self.bot.engine.runner_lab_candidates(
+                    research_test=research_test
+                )
+        except TimeoutError:
+            await interaction.edit_original_response(
+                content=(
+                    "Fomo Runner Lab timed out while live providers were responding. "
+                    "The command was safely cancelled; no X credits, SOL, buy, or J7 "
+                    "launch was used. Try again after the background radar caches a "
+                    "current candidate."
+                ),
+                embed=None,
+                view=None,
+            )
+            return
+        except Exception as exc:
+            await interaction.edit_original_response(
+                content=(
+                    "Fomo Runner Lab could not complete the current public-data refresh: "
+                    f"`{type(exc).__name__}`. No buy or launch was attempted."
+                ),
+                embed=None,
+                view=None,
+            )
+            return
         if not candidates:
-            await interaction.followup.send(
-                "No real public Solana token with usable current market data was returned. "
-                "Nothing was fabricated and no X request or buy was made.",
-                ephemeral=True,
+            await interaction.edit_original_response(
+                content=(
+                    "No real public Solana token with usable current market data was "
+                    "returned. Nothing was fabricated and no X request or buy was made."
+                ),
+                embed=None,
+                view=None,
             )
             return
         view = FomoRunnerLabView(
@@ -4001,11 +4031,10 @@ class FomoCommands(
             owner_id=interaction.user.id,
             research_test=research_test,
         )
-        await interaction.followup.send(
+        await interaction.edit_original_response(
+            content=None,
             embed=view.embed(),
             view=view,
-            ephemeral=True,
-            wait=True,
         )
 
     @app_commands.command(
@@ -4103,7 +4132,7 @@ class FomoCommands(
         embed.set_footer(
             text="No look-ahead scoring • shadow research only • no auto-buy or profit claim"
         )
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        await interaction.edit_original_response(content=None, embed=embed, view=None)
 
 
 def run_bot(settings: Settings) -> None:

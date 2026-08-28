@@ -1291,11 +1291,26 @@ class SmartMoneyEngine:
         *,
         research_test: bool,
     ) -> tuple[RunnerCandidate, ...]:
-        """Return current real existing tokens; test mode bypasses display floor only."""
+        """Return current real existing tokens without holding Discord open indefinitely.
+
+        Runner analysis includes several independent public providers.  Evaluating the
+        entire nomination list serially meant that a single slow Jupiter/Tracker request
+        could leave the deferred slash-command response spinning for minutes.  Prefer a
+        genuinely fresh persisted snapshot when the background radar already has one;
+        otherwise refresh a bounded set concurrently and enforce a per-token deadline.
+        Test mode still bypasses only the *display* floor.
+        """
 
         await self.initialize()
         now = int(time.time())
-        discovered = await self.dex_screener.trending_mints()
+        try:
+            async with asyncio.timeout(15):
+                discovered = await self.dex_screener.trending_mints()
+        except Exception:
+            # Cached/on-chain nominations below remain usable when DEX discovery has a
+            # transient outage.  Individual provider failures are already represented
+            # explicitly in each candidate's evidence.
+            discovered = ()
         observed = await self.database.recent_observed_token_mints(
             limit=self.settings.fomo_runner_lab_candidates * 2,
         )
@@ -1307,20 +1322,51 @@ class SmartMoneyEngine:
                 limit=self.settings.fomo_runner_lab_candidates * 2,
             )
         ]
+        displayable_cached = [
+            item
+            for item in cached
+            if (item.current.market_cap_usd or item.current.price_usd)
+            and (research_test or (
+                item.score >= self.settings.fomo_runner_fast_watch_min_score
+                and not item.hard_blockers
+            ))
+        ]
+        fresh_cached = [
+            item for item in displayable_cached if now - item.current.captured_at <= 120
+        ]
+        if fresh_cached:
+            fresh_cached.sort(
+                key=lambda item: (item.score, item.current.captured_at),
+                reverse=True,
+            )
+            return tuple(fresh_cached[: self.settings.fomo_runner_lab_candidates])
+
         mints = list(
             dict.fromkeys(
                 (*discovered, *(item.mint for item in cached), *observed)
             )
         )
-        candidates: list[RunnerCandidate] = []
-        for mint in mints[: self.settings.fomo_runner_lab_candidates * 2]:
+        analysis_limit = min(len(mints), self.settings.fomo_runner_lab_candidates)
+
+        async def evaluate(mint: str) -> RunnerCandidate | None:
             try:
-                item = await self.analyze_runner(
-                    mint,
-                    refresh_market=True,
-                    allow_automatic_x=False,
-                )
+                async with asyncio.timeout(22):
+                    return await self.analyze_runner(
+                        mint,
+                        refresh_market=True,
+                        allow_automatic_x=False,
+                    )
             except Exception:
+                return None
+
+        refreshed = await asyncio.gather(*(evaluate(mint) for mint in mints[:analysis_limit]))
+        by_mint = {
+            item.mint: item
+            for item in displayable_cached
+            if now - item.current.captured_at <= 900
+        }
+        for item in refreshed:
+            if item is None:
                 continue
             if not item.current.market_cap_usd and not item.current.price_usd:
                 continue
@@ -1328,7 +1374,8 @@ class SmartMoneyEngine:
                 item.score >= self.settings.fomo_runner_fast_watch_min_score
                 and not item.hard_blockers
             ):
-                candidates.append(item)
+                by_mint[item.mint] = item
+        candidates = list(by_mint.values())
         candidates.sort(
             key=lambda item: (item.score, item.current.captured_at),
             reverse=True,

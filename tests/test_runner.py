@@ -736,6 +736,81 @@ async def test_fomo_lab_test_bypasses_display_floor_only(settings) -> None:
 
 
 @pytest.mark.asyncio
+async def test_fomo_lab_command_resolves_deferred_original_response(settings) -> None:
+    candidate = _candidate()
+    engine = SimpleNamespace(runner_lab_candidates=AsyncMock(return_value=(candidate,)))
+    bot = SimpleNamespace(settings=settings, engine=engine)
+    commands = FomoCommands(bot)
+    commands._require_admin = AsyncMock(return_value=True)
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(id=1),
+        response=SimpleNamespace(defer=AsyncMock()),
+        edit_original_response=AsyncMock(),
+    )
+
+    await FomoCommands.lab.callback(commands, interaction, mode="test")
+
+    interaction.response.defer.assert_awaited_once_with(thinking=True, ephemeral=True)
+    interaction.edit_original_response.assert_awaited_once()
+    kwargs = interaction.edit_original_response.await_args.kwargs
+    assert kwargs["embed"] is not None, kwargs
+    assert MINT in kwargs["embed"].description
+    assert isinstance(kwargs["view"], FomoRunnerLabView)
+
+
+@pytest.mark.asyncio
+async def test_runner_lab_refreshes_bounded_candidates_concurrently(settings) -> None:
+    engine = SmartMoneyEngine(settings)
+    engine.initialize = AsyncMock()
+    engine.dex_screener.trending_mints = AsyncMock(return_value=(MINT, MINT_TWO))
+    engine.database.recent_observed_token_mints = AsyncMock(return_value=[])
+    engine.database.recent_runner_candidate_payloads = AsyncMock(return_value=[])
+    active = 0
+    peak = 0
+    both_started = asyncio.Event()
+
+    async def analyze(mint: str, **_kwargs):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        if peak >= 2:
+            both_started.set()
+        await asyncio.wait_for(both_started.wait(), timeout=1)
+        active -= 1
+        return replace(_candidate(), mint=mint)
+
+    engine.analyze_runner = AsyncMock(side_effect=analyze)
+
+    candidates = await engine.runner_lab_candidates(research_test=True)
+
+    assert peak == 2
+    assert {item.mint for item in candidates} == {MINT, MINT_TWO}
+
+
+@pytest.mark.asyncio
+async def test_runner_lab_uses_fresh_persisted_candidate_without_live_wait(settings) -> None:
+    now = int(time.time())
+    cached = replace(
+        _candidate(now=now, graduated_at=now - 60),
+        first_seen_at=now - 60,
+        generated_at=now,
+    )
+    engine = SmartMoneyEngine(settings)
+    engine.initialize = AsyncMock()
+    engine.dex_screener.trending_mints = AsyncMock(return_value=(MINT_TWO,))
+    engine.database.recent_observed_token_mints = AsyncMock(return_value=[])
+    engine.database.recent_runner_candidate_payloads = AsyncMock(
+        return_value=[runner_candidate_to_json(cached)]
+    )
+    engine.analyze_runner = AsyncMock()
+
+    candidates = await engine.runner_lab_candidates(research_test=True)
+
+    assert candidates == (cached,)
+    engine.analyze_runner.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_fomo_lab_next_refresh_x_and_close_never_buy_or_call_j7(settings) -> None:
     first = _candidate()
     second = replace(_candidate(now=1_800_000_700), mint=MINT_TWO, name="Second Real Token")

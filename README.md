@@ -7,6 +7,12 @@ transactions, and mirrors every newly detected hot-wallet swap in PAPER mode. PA
 as either a forced source-price observation ledger or an executable Jupiter quote-shadow
 trial; the two answer different questions and are labeled separately.
 
+Version 2.33.1 fixes the live `/fomo lab` Discord response path. The command now resolves the
+original deferred ephemeral response, analyzes a bounded candidate set concurrently, returns a
+fresh background-radar snapshot immediately when available, and fails visibly within a hard
+deadline instead of remaining on “Investing is thinking…”. No scoring, alert, X-budget, buy, or
+J7-launch threshold changed.
+
 Version 2.33 adds a separate, shadow-only **Fomo Runner Radar** for existing Solana tokens.
 Public DEX nominations remain the cheap broad-discovery stage; promising young pairs enter a
 temporary 20-second fast watch that records immutable price, market-cap, liquidity, rolling
