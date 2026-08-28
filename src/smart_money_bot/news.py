@@ -6,6 +6,7 @@ import ipaddress
 import json
 import logging
 import re
+import socket
 import time
 import xml.etree.ElementTree as ET
 from collections import deque
@@ -14,8 +15,9 @@ from contextlib import suppress
 from datetime import datetime
 from decimal import Decimal
 from email.utils import parsedate_to_datetime
+from html.parser import HTMLParser
 from typing import Any
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote_plus, urljoin, urlparse
 
 import aiohttp
 from solders.pubkey import Pubkey
@@ -477,7 +479,7 @@ class XFilteredNewsStream:
                 timeout=aiohttp.ClientTimeout(total=None, sock_connect=15, sock_read=90),
                 headers={
                     "Authorization": f"Bearer {self.bearer_token}",
-                    "User-Agent": "SmartMoneyCopyBot/2.32.0 news-radar",
+                    "User-Agent": "SmartMoneyCopyBot/2.32.1 news-radar",
                 },
             )
         return self._session
@@ -620,6 +622,83 @@ def _safe_image_url(value: str, *, base_url: str = "") -> str:
     return candidate
 
 
+def _safe_public_url(value: str) -> str:
+    """Accept only credential-free public HTTPS URLs before any article request."""
+
+    parsed = urlparse(value.strip())
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+        return ""
+    host = parsed.hostname.casefold().rstrip(".")
+    if host == "localhost" or host.endswith(".localhost"):
+        return ""
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        if not address.is_global:
+            return ""
+    return parsed.geturl()
+
+
+async def _public_hostname(host: str) -> bool:
+    """Reject DNS names that resolve to private, loopback, or reserved addresses."""
+
+    try:
+        rows = await asyncio.get_running_loop().getaddrinfo(
+            host,
+            443,
+            family=socket.AF_UNSPEC,
+            type=socket.SOCK_STREAM,
+        )
+    except OSError:
+        return False
+    addresses = {row[4][0].split("%", 1)[0] for row in rows if row[4]}
+    if not addresses:
+        return False
+    try:
+        return all(ipaddress.ip_address(value).is_global for value in addresses)
+    except ValueError:
+        return False
+
+
+class _ArticleMetaParser(HTMLParser):
+    """Small dependency-free OpenGraph/article metadata reader."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.meta: dict[str, str] = {}
+        self.canonical = ""
+        self.title_parts: list[str] = []
+        self._in_title = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        values = {key.casefold(): (value or "") for key, value in attrs}
+        if tag.casefold() == "title":
+            self._in_title = True
+            return
+        if tag.casefold() == "meta":
+            key = (values.get("property") or values.get("name") or "").casefold()
+            content = values.get("content", "").strip()
+            if key and content and key not in self.meta:
+                self.meta[key] = content
+            return
+        if tag.casefold() == "link" and "canonical" in values.get("rel", "").casefold():
+            self.canonical = values.get("href", "").strip()
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.casefold() == "title":
+            self._in_title = False
+
+    def handle_data(self, data: str) -> None:
+        if self._in_title and data.strip():
+            self.title_parts.append(data.strip())
+
+    @property
+    def title(self) -> str:
+        return " ".join(self.title_parts).strip()
+
+
 def _dedupe_image_urls(values: Iterable[str], *, base_url: str = "") -> tuple[str, ...]:
     urls: list[str] = []
     seen: set[str] = set()
@@ -743,7 +822,7 @@ class RssNewsPoller:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=15),
-                headers={"User-Agent": "SmartMoneyCopyBot/2.32.0 news-radar"},
+                headers={"User-Agent": "SmartMoneyCopyBot/2.32.1 news-radar"},
             )
         return self._session
 
@@ -839,6 +918,136 @@ class RssNewsPoller:
         self.ready = True
         return tuple(sorted(current, key=lambda item: item.created_at, reverse=True))
 
+    async def public_article(self, url: str) -> NewsAlert | None:
+        """Read one explicit admin-supplied public article without inventing metadata."""
+
+        current = _safe_public_url(url)
+        if not current:
+            return None
+        session = await self._get_session()
+        body = b""
+        content_type = ""
+        for _redirect in range(4):
+            parsed = urlparse(current)
+            if not parsed.hostname or not await _public_hostname(parsed.hostname):
+                return None
+            try:
+                async with session.get(current, allow_redirects=False) as response:
+                    if response.status in {301, 302, 303, 307, 308}:
+                        location = str(response.headers.get("Location") or "")
+                        current = _safe_public_url(urljoin(current, location))
+                        if not current:
+                            return None
+                        continue
+                    if response.status >= 400:
+                        return None
+                    content_type = str(response.headers.get("Content-Type") or "").casefold()
+                    body = await response.content.read(2_000_001)
+            except (TimeoutError, aiohttp.ClientError):
+                return None
+            break
+        else:
+            return None
+        if len(body) > 2_000_000 or "html" not in content_type:
+            return None
+        parser = _ArticleMetaParser()
+        try:
+            parser.feed(body.decode("utf-8", errors="ignore"))
+        except (ValueError, TypeError):
+            return None
+        headline = html.unescape(
+            parser.meta.get("og:title")
+            or parser.meta.get("twitter:title")
+            or parser.title
+        ).strip()
+        summary = html.unescape(
+            parser.meta.get("og:description")
+            or parser.meta.get("twitter:description")
+            or parser.meta.get("description")
+            or ""
+        ).strip()
+        if not headline:
+            return None
+        canonical_candidate = _safe_public_url(urljoin(current, parser.canonical))
+        canonical_host = urlparse(canonical_candidate).hostname if canonical_candidate else None
+        canonical = (
+            canonical_candidate
+            if canonical_host and await _public_hostname(canonical_host)
+            else current
+        )
+        source = html.unescape(parser.meta.get("og:site_name") or "").strip()
+        source = source or urlparse(canonical).netloc.removeprefix("www.")
+        published = (
+            parser.meta.get("article:published_time")
+            or parser.meta.get("datepublished")
+            or parser.meta.get("date")
+            or ""
+        )
+        image_urls = _dedupe_image_urls(
+            (
+                parser.meta.get("og:image", ""),
+                parser.meta.get("twitter:image", ""),
+            ),
+            base_url=canonical,
+        )
+        combined = f"{headline}\n{summary}"
+        mints = extract_solana_mints(combined)
+        terms = extract_narrative_terms(combined)
+        score, urgency = score_news(
+            combined,
+            token_mints=mints,
+            narrative_terms=terms,
+            trusted_source=True,
+        )
+        return NewsAlert(
+            source=source[:120],
+            headline=headline[:240],
+            summary=re.sub(r"\s+", " ", summary)[:1000],
+            url=canonical,
+            score=score,
+            urgency=urgency,
+            narrative_terms=terms,
+            token_mints=mints,
+            image_urls=image_urls,
+            created_at=_parse_iso_time(published),
+            received_at=int(time.time()),
+        )
+
+    async def topic_snapshot(
+        self,
+        topic: str,
+        *,
+        max_age_seconds: int,
+    ) -> tuple[NewsAlert, ...]:
+        """Use a public Google News RSS query for an explicit admin test topic."""
+
+        cleaned = re.sub(r"\s+", " ", topic).strip()
+        if not 2 <= len(cleaned) <= 160 or cleaned.casefold().startswith("http"):
+            return ()
+        url = (
+            "https://news.google.com/rss/search?q="
+            f"{quote_plus(cleaned)}&hl=en-US&gl=US&ceid=US:en"
+        )
+        session = await self._get_session()
+        try:
+            async with session.get(url) as response:
+                if response.status >= 400:
+                    self.feed_health[url] = f"HTTP {response.status}"
+                    return ()
+                raw = await response.text(errors="ignore")
+                self.feed_health[url] = "ok"
+        except (TimeoutError, aiohttp.ClientError) as exc:
+            self.feed_health[url] = str(exc)[:120] or type(exc).__name__
+            return ()
+        now = int(time.time())
+        current = [
+            alert
+            for alert in parse_feed(raw, source_url=url)
+            if alert.created_at
+            and 0 <= now - alert.created_at <= max_age_seconds
+        ]
+        return tuple(sorted(current, key=lambda item: item.created_at, reverse=True))
+
 
 class DexNarrativeMatcher:
     BASE_URL = "https://api.dexscreener.com"
@@ -857,7 +1066,7 @@ class DexNarrativeMatcher:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=12),
-                headers={"User-Agent": "SmartMoneyCopyBot/2.32.0 narrative-match"},
+                headers={"User-Agent": "SmartMoneyCopyBot/2.32.1 narrative-match"},
             )
         return self._session
 

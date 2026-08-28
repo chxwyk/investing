@@ -624,6 +624,132 @@ async def test_budget_exhaustion_does_not_break_launch_lab_or_call_j7(settings, 
         await engine.database.close()
 
 
+@pytest.mark.asyncio
+async def test_explicit_test_x_verify_bypasses_only_score_admission(settings) -> None:
+    engine = SmartMoneyEngine(_configured(settings))
+    opportunity = _free_opportunity(score=40)
+    snapshot = XSocialSnapshot(
+        available=True,
+        posts=3,
+        unique_authors=3,
+        verification_state="CHECKED",
+    )
+    engine.x_social.narrative_snapshot = AsyncMock(return_value=snapshot)
+    engine.x_budget.record_outcome = AsyncMock()
+    engine._cache_launch_candidate = AsyncMock()
+
+    normal = await engine.verify_launch_lab_candidate(opportunity)
+    tested = await engine.verify_launch_lab_candidate(opportunity, research_test=True)
+
+    assert normal.x_evidence.available is False
+    assert "below" in str(normal.x_evidence.error)
+    engine.x_social.narrative_snapshot.assert_awaited_once_with(
+        opportunity.primary_narrative,
+        context="launch_lab_test",
+        free_score=40,
+    )
+    assert tested.x_evidence.available is True
+    engine.pump_launcher.j7.launch = AsyncMock()
+    engine.pump_launcher.j7.launch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_test_x_verify_uses_max_posts_and_central_usage_accounting(
+    settings, tmp_path
+) -> None:
+    configured, database, budget = await _budget(settings, tmp_path)
+    client = XRecentSearchClient(
+        configured.x_api_bearer_token,
+        max_results=configured.x_verify_max_posts,
+        budget_manager=budget,
+        paid_search_enabled=True,
+    )
+    session = FakeSession(
+        FakeResponse(200, {"data": _posts(10)}),
+        FakeResponse(200, {"data": _users(10)}),
+    )
+    client._session = session
+    try:
+        snapshot = await client.narrative_snapshot(
+            "Kitchen Moment",
+            context="launch_lab_test",
+            free_score=40,
+        )
+        status = await budget.status()
+    finally:
+        await database.close()
+
+    assert snapshot.available is True
+    assert session.calls[0][1]["max_results"] == "10"
+    assert status["verifications"] == 1
+    assert status["requests"] == 2
+    assert status["post_resources"] == 10
+    assert status["user_resources"] == 10
+    assert status["estimated_spend_today"] == Decimal("0.15")
+
+
+@pytest.mark.asyncio
+async def test_test_x_failure_keeps_research_ui_usable_and_never_calls_j7(settings) -> None:
+    opportunity = _free_opportunity(score=40)
+    failed = replace(
+        opportunity,
+        x_evidence=XSocialSnapshot(
+            available=False,
+            error="X RATE LIMITED",
+            verification_state="NOT_VERIFIED",
+        ),
+    )
+    j7_launch = AsyncMock()
+    engine = SimpleNamespace(
+        verify_launch_lab_candidate=AsyncMock(return_value=failed),
+        x_budget=SimpleNamespace(
+            status=AsyncMock(
+                return_value={
+                    "estimated_spend_today": Decimal("0"),
+                    "daily_budget": Decimal("0.50"),
+                    "verifications": 1,
+                    "verification_limit": 10,
+                    "requests": 1,
+                    "request_limit": 10,
+                    "post_resources": 0,
+                    "user_resources": 0,
+                }
+            )
+        ),
+        pump_launcher=SimpleNamespace(
+            j7=SimpleNamespace(
+                wallet_address="So11111111111111111111111111111111111111112",
+                render_draft_art=AsyncMock(return_value=b"png"),
+                launch=j7_launch,
+            )
+        ),
+    )
+    view = LaunchLabView(
+        SimpleNamespace(settings=_configured(settings), engine=engine),
+        (opportunity,),
+        owner_id=1,
+        balance=Decimal("0.03"),
+        research_test=True,
+    )
+    confirmation = XVerificationConfirmationView(view)
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(id=1),
+        response=SimpleNamespace(defer=AsyncMock()),
+        message=SimpleNamespace(edit=AsyncMock()),
+    )
+
+    await confirmation.children[0].callback(interaction)
+
+    engine.verify_launch_lab_candidate.assert_awaited_once_with(
+        opportunity,
+        research_test=True,
+    )
+    interaction.message.edit.assert_awaited_once()
+    assert view.draft.opportunity.x_evidence.error == "X RATE LIMITED"
+    assert next(item for item in view.children if item.label == "TEST X VERIFY")
+    j7_launch.assert_not_awaited()
+
+
 def test_x_usage_status_structure_cannot_expose_bearer_token(settings, tmp_path) -> None:
     configured = _configured(settings, database_path=str(tmp_path / "safe.db"))
     public_settings = {

@@ -1309,9 +1309,138 @@ class SmartMoneyEngine:
             )
         return tuple(candidates)
 
+    async def launch_lab_test_candidates(
+        self,
+        *,
+        topic: str = "",
+    ) -> tuple[LaunchOpportunity, ...]:
+        """Analyze real current evidence while bypassing only the Lab display floor."""
+
+        if not self.settings.launch_lab_enabled:
+            return ()
+        research_age = max(self.settings.launch_lab_max_age_seconds, 21_600)
+        preferred_alert_key = ""
+        async with self._launch_lab_lock:
+            alerts = list(
+                await self.news_poller.snapshot(max_age_seconds=research_age)
+            )
+            requested = topic.strip()
+            if requested.casefold().startswith("https://"):
+                article = await self.news_poller.public_article(requested)
+                if article is not None:
+                    preferred_alert_key = alert_key(article)
+                    alerts.insert(0, article)
+            elif requested:
+                alerts = list(
+                    await self.news_poller.topic_snapshot(
+                        requested,
+                        max_age_seconds=research_age,
+                    )
+                ) + alerts
+        if not alerts:
+            return ()
+
+        # Analyze a bounded current set with the production scorer and DEX competition
+        # client. Nothing in this path publishes, launches, or reserves launch funds.
+        seen_alerts: set[str] = set()
+        current: list[NewsAlert] = []
+        for alert in alerts:
+            key = alert_key(alert)
+            if key in seen_alerts or not alert.headline or not alert.url.startswith("https://"):
+                continue
+            seen_alerts.add(key)
+            current.append(alert)
+            if len(current) >= max(12, self.settings.launch_lab_max_candidates * 3):
+                break
+
+        now = int(time.time())
+        preliminary = [
+            score_launch_opportunity(
+                alert,
+                now=now,
+                watch_score=self.settings.news_min_score,
+                launch_ready_score=self.settings.news_launch_ready_score,
+                no_x_candidates_enabled=self.settings.no_x_launch_candidates_enabled,
+                no_x_launch_min_score=self.settings.no_x_launch_min_score,
+            )
+            for alert in current
+        ]
+        competitions = await asyncio.gather(
+            *(
+                self.news_matcher.competition(item.primary_narrative)
+                if self.settings.news_dex_match_enabled
+                else asyncio.sleep(0, result=item.competition)
+                for item in preliminary
+            )
+        )
+
+        def cross_source_count(alert: NewsAlert) -> int:
+            terms = {value.casefold() for value in alert.narrative_terms}
+            if not terms:
+                return 0
+            source = (alert.author or alert.source).casefold()
+            sources = {
+                (other.author or other.source).casefold()
+                for other in current
+                if (other.author or other.source).casefold() != source
+                and terms.intersection(value.casefold() for value in other.narrative_terms)
+            }
+            return len(sources)
+
+        opportunities = [
+            score_launch_opportunity(
+                alert,
+                competition=competition,
+                cross_source_count=cross_source_count(alert),
+                now=now,
+                watch_score=self.settings.news_min_score,
+                launch_ready_score=self.settings.news_launch_ready_score,
+                no_x_candidates_enabled=self.settings.no_x_launch_candidates_enabled,
+                no_x_launch_min_score=self.settings.no_x_launch_min_score,
+            )
+            for alert, competition in zip(current, competitions, strict=True)
+        ]
+
+        # Keep one representative per narrative. A topic is a preference in test
+        # mode, not a hard filter, so the command remains deterministic on demand.
+        needle = "" if requested.casefold().startswith("https://") else requested.casefold()
+        clustered: dict[str, LaunchOpportunity] = {}
+        for opportunity in opportunities:
+            key = launch_cluster_key(opportunity)
+            existing = clustered.get(key)
+            if existing is None or (
+                opportunity.score,
+                opportunity.alert.created_at,
+            ) > (existing.score, existing.alert.created_at):
+                clustered[key] = opportunity
+        ordered = sorted(
+            clustered.values(),
+            key=lambda item: (
+                int(alert_key(item.alert) == preferred_alert_key),
+                int(
+                    bool(needle)
+                    and needle
+                    in (
+                        f"{item.alert.headline} {item.primary_narrative} "
+                        f"{item.alert.url}"
+                    ).casefold()
+                ),
+                item.alert.created_at,
+                item.score,
+            ),
+            reverse=True,
+        )[: self.settings.launch_lab_max_candidates]
+        for opportunity in ordered:
+            await self._cache_launch_candidate(opportunity, now=now)
+        if ordered:
+            await self.database.set_setting("launch_last_lab_candidate", str(now))
+        return tuple(ordered)
+
     async def verify_launch_lab_candidate(
         self,
         opportunity: LaunchOpportunity,
+        *,
+        research_test: bool = False,
     ) -> LaunchOpportunity:
         """Run one admin-requested targeted X check; this never calls J7."""
 
@@ -1319,7 +1448,7 @@ class SmartMoneyEngine:
             opportunity,
             minimum_score=self.settings.launch_lab_min_score,
         )
-        if not eligible:
+        if not eligible and not research_test:
             return replace(
                 opportunity,
                 x_evidence=replace(
@@ -1331,7 +1460,7 @@ class SmartMoneyEngine:
             )
         x_evidence = await self.x_social.narrative_snapshot(
             opportunity.primary_narrative,
-            context="launch_lab_manual",
+            context="launch_lab_test" if research_test else "launch_lab_manual",
             free_score=opportunity.score,
         )
         updated = score_launch_opportunity(

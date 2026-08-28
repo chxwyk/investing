@@ -24,6 +24,7 @@ from .launch import (
     NO_X_LAUNCH_VERDICT,
     X_VERIFIED_LAUNCH_VERDICT,
     default_launch_draft,
+    is_launch_lab_eligible,
     is_manual_launch_opportunity,
     validate_launch_draft,
 )
@@ -461,9 +462,13 @@ def _launch_lab_embed(
     settings: Settings,
     wallet: str | None,
     balance: Decimal | None,
+    research_test: bool = False,
+    production_eligible: bool = True,
+    x_budget: dict[str, object] | None = None,
 ) -> discord.Embed:
     opportunity = draft.opportunity
-    age = max(0, int(time.time()) - opportunity.alert.created_at)
+    now = int(time.time())
+    age = max(0, now - opportunity.alert.created_at) if opportunity.alert.created_at else None
     competition = opportunity.competition
     strongest = (
         "none"
@@ -474,9 +479,10 @@ def _launch_lab_embed(
         )
     )
     positives = opportunity.positives[:5] or ("credible current source",)
-    weaknesses = tuple(
-        item for item in opportunity.warnings if "stricter free" not in item
-    )[:4] or ("No material weakness recorded by the current checks",)
+    weaknesses = (
+        opportunity.blockers
+        + tuple(item for item in opportunity.warnings if "stricter free" not in item)
+    )[:6] or ("No material weakness recorded by the current checks",)
     x = opportunity.x_evidence
     if x.available:
         x_label = (
@@ -487,22 +493,49 @@ def _launch_lab_embed(
         free_score = opportunity.pre_x_score or max(0, opportunity.score - opportunity.x_score)
         impact = opportunity.score - free_score
         notable = ", ".join(x.notable_accounts[:3]) or "none"
+        post_links = (
+            " • ".join(
+                f"[post {index + 1}]({url})"
+                for index, url in enumerate(x.notable_posts[:3])
+            )
+            or "none"
+        )
         x_detail = (
             f"**{x_label}**\nPosts: `{x.posts}` • unique authors: `{x.unique_authors}`\n"
             f"Credible crypto accounts: `{x.credible_crypto_authors}` • "
             f"trusted: `{x.trusted_crypto_authors}`\n"
             f"Velocity: `{x.posts_per_minute}/min` • engagement: `{x.engagements}` • "
             f"duplicate text: `{x.duplicate_percent}%`\n"
-            f"Notable accounts: {notable}\nConfidence impact: `{impact:+d}`"
+            f"Notable accounts: {notable}\nNotable posts: {post_links}\n"
+            f"Confidence impact: `{impact:+d}`"
         )
     else:
         x_label = "X NOT VERIFIED"
         x_detail = f"**{x_label}**\n{x.error or 'Targeted X verification has not run.'}"
+    title = "🧪 CONTROLLED PIPELINE TEST" if research_test else "🔥 LIVE LAUNCH LAB"
+    publication = (
+        f"<t:{opportunity.alert.created_at}:F> • <t:{opportunity.alert.created_at}:R>"
+        if opportunity.alert.created_at
+        else "unavailable from source metadata"
+    )
+    detection_delay = (
+        max(0, opportunity.alert.received_at - opportunity.alert.created_at)
+        if opportunity.alert.received_at and opportunity.alert.created_at
+        else None
+    )
+    research_prefix = "**RESEARCH ONLY**\n\n" if research_test else ""
     embed = discord.Embed(
-        title="🔥 LIVE LAUNCH LAB",
+        title=title,
         description=(
-            f"**TOPIC**\n{opportunity.alert.headline}\n\n"
-            f"Candidate `{index + 1}/{total}` • detected `{age}s` after publication"
+            f"{research_prefix}**TOPIC**\n{opportunity.alert.headline}\n\n"
+            f"Candidate `{index + 1}/{total}` • age "
+            f"`{f'{age}s' if age is not None else 'unknown'}`\n"
+            f"**Published:** {publication}"
+            + (
+                f"\n**Detection delay:** `{detection_delay}s`"
+                if detection_delay is not None
+                else ""
+            )
         ),
         color=0xF39C12,
         timestamp=discord.utils.utcnow(),
@@ -512,9 +545,21 @@ def _launch_lab_embed(
     embed.add_field(
         name="Candidate Score",
         value=(
-            f"**{opportunity.score}/100**\nAutomatic alert threshold: "
-            f"**{settings.no_x_launch_min_score}/100**"
+            f"**Actual score: {opportunity.score}/100**\n"
+            f"Normal Launch Lab floor: **{settings.launch_lab_min_score}/100**\n"
+            f"Automatic NO-X floor: **{settings.no_x_launch_min_score}/100**"
         ),
+    )
+    embed.add_field(
+        name="SCORE BREAKDOWN",
+        value=(
+            f"Source `{opportunity.source_score}/15` • speed `{opportunity.speed_score}/15`\n"
+            f"Meme `{opportunity.viral_score}/25` • X `{opportunity.x_score}/15`\n"
+            f"Confirmation `{opportunity.confirmation_score}/10` • "
+            f"competition `{opportunity.competition_score}/10` • "
+            f"identity `{opportunity.identity_score}/10`"
+        ),
+        inline=False,
     )
     embed.add_field(
         name="WHY IT COULD WORK",
@@ -547,6 +592,21 @@ def _launch_lab_embed(
         value=x_detail,
         inline=False,
     )
+    if x_budget is not None:
+        embed.add_field(
+            name="X LOCAL BUDGET ACCOUNTING",
+            value=(
+                f"Checks: `{x_budget.get('verifications', 0)}` / "
+                f"`{x_budget.get('verification_limit', 0)}` • "
+                f"requests: `{x_budget.get('requests', 0)}` / "
+                f"`{x_budget.get('request_limit', 0)}`\n"
+                f"Posts recorded: `{x_budget.get('post_resources', 0)}` • "
+                f"users recorded: `{x_budget.get('user_resources', 0)}`\n"
+                f"Local estimate: `${x_budget.get('estimated_spend_today', 0)}` / "
+                f"`${x_budget.get('daily_budget', 0)}` today"
+            ),
+            inline=False,
+        )
     embed.add_field(
         name="Launch controls",
         value=(
@@ -555,7 +615,9 @@ def _launch_lab_embed(
             f"**Wallet:** `{_short(wallet or 'not configured')}`\n"
             f"**Balance:** {f'{balance:.6f} SOL' if balance is not None else 'unavailable'}\n"
             f"**Daily Launch Limit:** {settings.pump_launch_max_per_day}\n"
-            f"**Daily SOL Limit:** {settings.pump_launch_max_sol_per_day} SOL"
+            f"**Daily SOL Limit:** {settings.pump_launch_max_sol_per_day} SOL\n"
+            f"**Live eligibility:** "
+            f"{'QUALIFIED' if production_eligible else 'LOCKED — RESEARCH ONLY'}"
         ),
         inline=False,
     )
@@ -567,7 +629,11 @@ def _launch_lab_embed(
         )
     embed.set_image(url="attachment://launch-preview.png")
     embed.set_footer(
-        text="Preview only • no SOL spent until final confirmation • never promises profit"
+        text=(
+            "Research display only • no J7 submit • no reservation • no SOL spent"
+            if research_test and not production_eligible
+            else "Preview only • no SOL spent until final confirmation • never promises profit"
+        )
     )
     return embed
 
@@ -725,12 +791,14 @@ class XVerificationConfirmationView(discord.ui.View):
         button.disabled = True
         await interaction.response.defer(ephemeral=True, thinking=True)
         updated = await self.lab_view.bot.engine.verify_launch_lab_candidate(
-            self.lab_view.draft.opportunity
+            self.lab_view.draft.opportunity,
+            research_test=self.lab_view.research_test,
         )
         self.lab_view.drafts[self.lab_view.index] = replace(
             self.lab_view.draft,
             opportunity=updated,
         )
+        self.lab_view.sync_controls()
         embed, file = await self.lab_view.preview()
         if interaction.message:
             await interaction.message.edit(embed=embed, attachments=[file], view=self.lab_view)
@@ -752,21 +820,43 @@ class LaunchLabView(discord.ui.View):
         *,
         owner_id: int,
         balance: Decimal | None,
+        research_test: bool = False,
     ) -> None:
         super().__init__(timeout=900)
         self.bot = bot
         self.opportunities = opportunities
         self.owner_id = owner_id
         self.balance = balance
+        self.research_test = research_test
         self.index = 0
         self.drafts = [
             default_launch_draft(item, bot.settings.pump_launch_initial_buy_sol)
             for item in opportunities
         ]
+        self.sync_controls()
 
     @property
     def draft(self) -> LaunchDraft:
         return self.drafts[self.index]
+
+    @property
+    def production_eligible(self) -> bool:
+        return is_launch_lab_eligible(
+            self.draft.opportunity,
+            minimum_score=self.bot.settings.launch_lab_min_score,
+            max_age_seconds=self.bot.settings.launch_lab_max_age_seconds,
+        )
+
+    def sync_controls(self) -> None:
+        locked = self.research_test and not self.production_eligible
+        self.launch.disabled = locked
+        self.launch.label = (
+            "J7 LAUNCH LOCKED — RESEARCH ONLY" if locked else "LAUNCH VIA J7"
+        )
+        self.launch.style = (
+            discord.ButtonStyle.secondary if locked else discord.ButtonStyle.danger
+        )
+        self.verify_x.label = "TEST X VERIFY" if self.research_test else "X VERIFY"
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id == self.owner_id and _member_is_admin(
@@ -781,6 +871,10 @@ class LaunchLabView(discord.ui.View):
 
     async def preview(self) -> tuple[discord.Embed, discord.File]:
         art = await self.bot.engine.pump_launcher.j7.render_draft_art(self.draft)
+        try:
+            x_budget = await self.bot.engine.x_budget.status()
+        except (AttributeError, RuntimeError):
+            x_budget = None
         embed = _launch_lab_embed(
             self.draft,
             index=self.index,
@@ -788,6 +882,9 @@ class LaunchLabView(discord.ui.View):
             settings=self.bot.settings,
             wallet=self.bot.engine.pump_launcher.j7.wallet_address,
             balance=self.balance,
+            research_test=self.research_test,
+            production_eligible=self.production_eligible,
+            x_budget=x_budget,
         )
         return embed, discord.File(io.BytesIO(art), filename="launch-preview.png")
 
@@ -803,6 +900,13 @@ class LaunchLabView(discord.ui.View):
         interaction: discord.Interaction,
         _button: discord.ui.Button,
     ) -> None:
+        if not self.production_eligible:
+            await interaction.response.send_message(
+                "RESEARCH ONLY — this item does not satisfy the normal Launch Lab "
+                "rules. J7 was not called, no launch was reserved, and no SOL was spent.",
+                ephemeral=True,
+            )
+            return
         draft = self.draft
         embed = discord.Embed(
             title="THIS CREATES A REAL PUBLIC TOKEN AND SPENDS REAL SOL",
@@ -861,10 +965,17 @@ class LaunchLabView(discord.ui.View):
             self.bot.settings.x_verify_max_posts
             * self.bot.settings.x_estimated_post_read_usd
         )
+        test_prefix = (
+            "This is a manual test X lookup. "
+            f"Up to {self.bot.settings.x_verify_max_posts} Posts may be read.\n\n"
+            if self.research_test
+            else ""
+        )
         embed = discord.Embed(
-            title="X VERIFICATION",
+            title="TEST X VERIFICATION" if self.research_test else "X VERIFICATION",
             description=(
-                f"**Candidate:** {self.draft.opportunity.alert.headline[:220]}\n"
+                f"{test_prefix}**Candidate:** "
+                f"{self.draft.opportunity.alert.headline[:220]}\n"
                 f"**Free score:** {self.draft.opportunity.score}/100\n"
                 f"**Search limit:** up to {self.bot.settings.x_verify_max_posts} Posts\n"
                 f"**Estimated Post-read ceiling:** approximately ${ceiling:.3f}\n"
@@ -880,10 +991,13 @@ class LaunchLabView(discord.ui.View):
         embed.set_footer(
             text="Official X API • local estimate, not the X invoice • never calls J7"
         )
+        confirmation = XVerificationConfirmationView(self)
+        if self.research_test:
+            confirmation.children[0].label = "RUN TEST X VERIFY"
         await interaction.response.edit_message(
             embed=embed,
             attachments=[],
-            view=XVerificationConfirmationView(self),
+            view=confirmation,
         )
 
     @discord.ui.button(label="NEXT CANDIDATE", style=discord.ButtonStyle.secondary, row=1)
@@ -893,6 +1007,7 @@ class LaunchLabView(discord.ui.View):
         _button: discord.ui.Button,
     ) -> None:
         self.index = (self.index + 1) % len(self.drafts)
+        self.sync_controls()
         await self.refresh_message(interaction)
 
     @discord.ui.button(label="CANCEL", style=discord.ButtonStyle.secondary, row=1)
@@ -3076,17 +3191,34 @@ class SmartMoneyCommands(
         name="launch-lab",
         description="Browse and prepare the strongest current real narrative candidates.",
     )
-    @app_commands.describe(topic="Optional filter using a topic, headline phrase, or source URL")
+    @app_commands.describe(
+        mode="Production candidates or a deterministic research-only pipeline test",
+        topic="Optional topic preference or legitimate public HTTPS article URL",
+    )
     async def launch_lab(
         self,
         interaction: discord.Interaction,
+        mode: Literal["production", "test"] = "production",
         topic: str = "",
     ) -> None:
         if not await self._require_admin(interaction):
             return
         await interaction.response.defer(thinking=True, ephemeral=True)
-        candidates = await self.bot.engine.launch_lab_candidates(topic=topic)
+        research_test = mode == "test"
+        candidates = (
+            await self.bot.engine.launch_lab_test_candidates(topic=topic)
+            if research_test
+            else await self.bot.engine.launch_lab_candidates(topic=topic)
+        )
         if not candidates:
+            if research_test:
+                await interaction.followup.send(
+                    "No usable recent item was returned by the configured public RSS feeds. "
+                    "No candidate was fabricated. Retry with `/smartmoney launch-lab "
+                    "mode:test topic:https://legitimate-public-source/article`.",
+                    ephemeral=True,
+                )
+                return
             await interaction.followup.send(
                 "No recent candidate currently passes the Launch Lab floor. The automatic "
                 f"{self.bot.settings.no_x_launch_min_score}+ threshold was not lowered. "
@@ -3104,6 +3236,7 @@ class SmartMoneyCommands(
             candidates,
             owner_id=interaction.user.id,
             balance=balance,
+            research_test=research_test,
         )
         embed, file = await view.preview()
         await interaction.followup.send(

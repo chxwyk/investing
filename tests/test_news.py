@@ -1,7 +1,13 @@
 from datetime import UTC, datetime
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
+import pytest
+
+from smart_money_bot import news as news_module
 from smart_money_bot.models import NewsAlert
 from smart_money_bot.news import (
+    RssNewsPoller,
     extract_narrative_terms,
     extract_solana_mints,
     is_coin_actionable_news,
@@ -173,3 +179,42 @@ def test_x_payload_keeps_public_media_preview() -> None:
 
     assert alert is not None
     assert alert.image_urls == ("https://pbs.twimg.com/media/example.jpg",)
+
+
+@pytest.mark.asyncio
+async def test_public_article_fallback_uses_real_page_metadata(monkeypatch) -> None:
+    markup = b"""
+    <html><head>
+      <meta property="og:site_name" content="Real News">
+      <meta property="og:title" content="BREAKING: Moon Mascot is revealed">
+      <meta property="og:description" content="The official public reveal is live.">
+      <meta property="og:image" content="https://news.example/image.jpg">
+      <meta property="article:published_time" content="2026-08-28T10:00:00Z">
+      <link rel="canonical" href="https://news.example/moon-mascot">
+    </head></html>
+    """
+
+    class Response:
+        status = 200
+        headers = {"Content-Type": "text/html; charset=utf-8"}
+        content = SimpleNamespace(read=AsyncMock(return_value=markup))
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+    session = SimpleNamespace(get=lambda *_args, **_kwargs: Response())
+    poller = RssNewsPoller((), poll_seconds=60)
+    poller._get_session = AsyncMock(return_value=session)
+    monkeypatch.setattr(news_module, "_public_hostname", AsyncMock(return_value=True))
+
+    alert = await poller.public_article("https://news.example/original")
+
+    assert alert is not None
+    assert alert.source == "Real News"
+    assert alert.headline == "BREAKING: Moon Mascot is revealed"
+    assert alert.url == "https://news.example/moon-mascot"
+    assert alert.image_urls == ("https://news.example/image.jpg",)
+    assert alert.created_at > 0

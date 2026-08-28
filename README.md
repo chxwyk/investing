@@ -7,6 +7,18 @@ transactions, and mirrors every newly detected hot-wallet swap in PAPER mode. PA
 as either a forced source-price observation ledger or an executable Jupiter quote-shadow
 trial; the two answer different questions and are labeled separately.
 
+Version 2.32.1 makes the existing product testable on demand without weakening a production
+gate. `/smartmoney launch-lab mode:test` refreshes the authorized RSS feeds, analyzes the
+freshest legitimate current items through the production normalization, scoring, DEX
+competition, identity, and 1024x1024 artwork components, and displays them even below the
+normal 60-point Launch Lab floor. Below-floor test items are explicitly research-only: the J7
+button is disabled, the server rejects a launch attempt, no launch reservation is created, and
+no SOL can be spent. An administrator may deliberately run one budget-confirmed official-X
+test on the displayed item below the automatic X score floor; the existing 10-Post maximum,
+SQLite budget guard, deduplication, cache, and error handling remain authoritative. A test item
+that independently satisfies every normal production requirement may transition to the normal
+J7 confirmation flow.
+
 Version 2.32 adds a persistent, shared **official-X spend guard** without making X mandatory.
 Free RSS/Fomo/DEX/Tracker/on-chain evidence now completes every cheap blocker and preliminary
 score before one small targeted recent search can run. SQLite atomically caps targeted checks,
@@ -336,7 +348,7 @@ when no prior public BUY exists
 inside the scanned history, no current baseline price is available, or the PAPER account lacks
 cash. Set `PAPER_MIRROR_RAW_SWAPS=false` to restore consensus-only paper behavior.
 
-The v2.32.0 discovery, zero-cost Fomo radar, optional X verification, crypto-first launch-radar,
+The v2.32.1 discovery, zero-cost Fomo radar, optional X verification, crypto-first launch-radar,
 verified-only
 callout, selective-entry, daily loss/profit
 locks, social nomination, quote, fallback, rotation, and exit controls are
@@ -697,6 +709,23 @@ No privileged Discord gateway intents are required.
 
 ## Railway deployment
 
+### v2.32.1 Railway changes
+
+**ADD:** nothing.
+
+**CHANGE:** nothing.
+
+**REMOVE:** nothing.
+
+**UNCHANGED:** `NO_X_LAUNCH_MIN_SCORE=78`, `NEWS_X_VERIFY_MIN_SCORE=70`,
+`PUMP_LAUNCH_MIN_SCORE=72`, `LAUNCH_LAB_MIN_SCORE=60`, every J7/Pinata/public-wallet secret
+or setting, the creator buy, daily launch count/SOL caps, the X budget settings, all PAPER and
+wallet-discovery settings, and the existing SQLite database. Do not reset the database.
+
+After deploying, run `/smartmoney launch-check`, then `/smartmoney launch-lab mode:test`.
+The latter is research-only unless the displayed real item independently passes the normal
+production Launch Lab rules.
+
 ### v2.32 Railway changes
 
 **ADD:**
@@ -800,7 +829,8 @@ in that URL private. Helius documents the endpoint format as
 | `/smartmoney pause` | Pause/resume monitoring. |
 | `/smartmoney kill-switch` | Immediately pause discovery, scanning, and new paper actions. |
 | `/smartmoney launch-check` | Read-only J7/IPFS/public-wallet/limit/reservation readiness check. |
-| `/smartmoney launch-lab` | Browse, edit, re-art, and deliberately confirm a recent J7-only candidate. |
+| `/smartmoney launch-lab mode:production` | Browse, edit, re-art, and deliberately confirm a qualifying recent J7-only candidate. |
+| `/smartmoney launch-lab mode:test` | Immediately inspect real recent RSS evidence and test art/X without bypassing live J7 eligibility. |
 | `/smartmoney status` | Check RPC and scanner health. |
 | `/smartmoney limits` | Show active risk limits. |
 

@@ -13,6 +13,7 @@ import pytest
 from smart_money_bot.bot import (
     LaunchConfirmationView,
     LaunchLabView,
+    SmartMoneyCommands,
     _launch_result_view,
     _member_is_admin,
 )
@@ -87,6 +88,20 @@ def _configured(settings):
         j7_launch_api_key="secret-encrypted-wallet-key",
         j7_launch_wallet_address=PUBLIC_WALLET,
         pinata_jwt="secret-pinata-jwt",
+    )
+
+
+def _below_floor_opportunity(now: int | None = None):
+    opportunity = _opportunity(now)
+    return replace(
+        opportunity,
+        alert=replace(opportunity.alert, score=40),
+        score=40,
+        verdict="WATCH",
+        x_verified=False,
+        no_x_candidate_ready=False,
+        positives=("credible current source",),
+        warnings=("X/social velocity was not verified.",),
     )
 
 
@@ -653,3 +668,199 @@ async def test_launch_lab_reads_persistent_recent_candidate_pool(settings, tmp_p
 
     assert len(candidates) == 1
     assert candidates[0].primary_narrative == opportunity.primary_narrative
+
+
+@pytest.mark.asyncio
+async def test_launch_lab_test_displays_real_below_floor_rss_item(settings) -> None:
+    engine = SmartMoneyEngine(_configured(settings))
+    await engine.database.connect()
+    now = int(time.time())
+    alert = NewsAlert(
+        source="Associated Press",
+        headline="Museum reveals a new Moon Mascot for its summer exhibit",
+        summary="The public unveiling begins this weekend.",
+        url="https://apnews.com/article/moon-mascot",
+        narrative_terms=("Moon Mascot",),
+        created_at=now - 45,
+        received_at=now,
+    )
+    engine.news_poller.snapshot = AsyncMock(return_value=(alert,))
+    engine.news_matcher.competition = AsyncMock(
+        return_value=NarrativeCompetition(query="Moon Mascot")
+    )
+    try:
+        candidates = await engine.launch_lab_test_candidates()
+    finally:
+        await engine.close()
+
+    assert len(candidates) == 1
+    assert candidates[0].alert.headline == alert.headline
+    assert candidates[0].alert.url == alert.url
+    assert candidates[0].score < settings.launch_lab_min_score
+    assert settings.launch_lab_min_score == 60
+    assert settings.news_x_verify_min_score == 70
+    assert settings.pump_launch_min_score == 72
+    assert settings.no_x_launch_min_score == 78
+
+
+@pytest.mark.asyncio
+async def test_launch_lab_test_topic_uses_real_public_rss_fallback(settings) -> None:
+    engine = SmartMoneyEngine(_configured(settings))
+    await engine.database.connect()
+    now = int(time.time())
+    alert = NewsAlert(
+        source="Google News",
+        headline="Public report covers the Moon Mascot reveal",
+        summary="A current public article about the requested topic.",
+        url="https://news.google.com/rss/articles/real-item",
+        narrative_terms=("Moon Mascot",),
+        created_at=now - 90,
+        received_at=now,
+    )
+    engine.news_poller.snapshot = AsyncMock(return_value=())
+    engine.news_poller.topic_snapshot = AsyncMock(return_value=(alert,))
+    engine.news_matcher.competition = AsyncMock(
+        return_value=NarrativeCompetition(query="Moon Mascot")
+    )
+    try:
+        candidates = await engine.launch_lab_test_candidates(topic="Moon Mascot")
+    finally:
+        await engine.close()
+
+    engine.news_poller.topic_snapshot.assert_awaited_once_with(
+        "Moon Mascot",
+        max_age_seconds=21_600,
+    )
+    assert candidates[0].alert.url == alert.url
+
+
+@pytest.mark.asyncio
+async def test_research_candidate_hard_locks_j7_and_launch_reservation(settings) -> None:
+    launch = AsyncMock()
+    reserve = AsyncMock()
+    bot = SimpleNamespace(
+        settings=_configured(settings),
+        engine=SimpleNamespace(
+            launch_lab_draft=launch,
+            database=SimpleNamespace(reserve_pump_launch=reserve),
+            pump_launcher=SimpleNamespace(
+                j7=SimpleNamespace(wallet_address=PUBLIC_WALLET, launch=AsyncMock())
+            ),
+        ),
+    )
+    view = LaunchLabView(
+        bot,
+        (_below_floor_opportunity(),),
+        owner_id=1,
+        balance=Decimal("0.03"),
+        research_test=True,
+    )
+    button = next(item for item in view.children if item.label.startswith("J7 LAUNCH LOCKED"))
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(id=1),
+        response=SimpleNamespace(send_message=AsyncMock()),
+    )
+
+    await button.callback(interaction)
+
+    assert button.disabled is True
+    launch.assert_not_awaited()
+    reserve.assert_not_awaited()
+    bot.engine.pump_launcher.j7.launch.assert_not_awaited()
+    interaction.response.send_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_launch_lab_test_command_is_admin_only(settings) -> None:
+    engine = SimpleNamespace(
+        launch_lab_test_candidates=AsyncMock(),
+        launch_lab_candidates=AsyncMock(),
+    )
+    commands = SmartMoneyCommands(SimpleNamespace(settings=_configured(settings), engine=engine))
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(id=999),
+        response=SimpleNamespace(send_message=AsyncMock()),
+    )
+
+    await SmartMoneyCommands.launch_lab.callback(
+        commands,
+        interaction,
+        mode="test",
+        topic="",
+    )
+
+    engine.launch_lab_test_candidates.assert_not_awaited()
+    interaction.response.send_message.assert_awaited_once()
+
+
+def test_real_qualifying_test_candidate_unlocks_normal_j7_control(settings) -> None:
+    bot = SimpleNamespace(
+        settings=_configured(settings),
+        engine=SimpleNamespace(
+            pump_launcher=SimpleNamespace(
+                j7=SimpleNamespace(wallet_address=PUBLIC_WALLET, launch=AsyncMock())
+            )
+        ),
+    )
+    view = LaunchLabView(
+        bot,
+        (_opportunity(),),
+        owner_id=1,
+        balance=Decimal("0.03"),
+        research_test=True,
+    )
+
+    launch_button = next(item for item in view.children if item.label == "LAUNCH VIA J7")
+    assert view.production_eligible is True
+    assert launch_button.disabled is False
+
+
+@pytest.mark.asyncio
+async def test_research_edit_art_next_and_cancel_controls_never_launch(settings) -> None:
+    launch = AsyncMock()
+    render = AsyncMock(return_value=b"png")
+    bot = SimpleNamespace(
+        settings=_configured(settings),
+        engine=SimpleNamespace(
+            launch_lab_draft=launch,
+            pump_launcher=SimpleNamespace(
+                j7=SimpleNamespace(
+                    wallet_address=PUBLIC_WALLET,
+                    render_draft_art=render,
+                    launch=AsyncMock(),
+                )
+            ),
+        ),
+    )
+    view = LaunchLabView(
+        bot,
+        (_below_floor_opportunity(), _below_floor_opportunity(int(time.time()) - 1)),
+        owner_id=1,
+        balance=Decimal("0.03"),
+        research_test=True,
+    )
+    response = SimpleNamespace(
+        send_modal=AsyncMock(),
+        defer=AsyncMock(),
+        edit_message=AsyncMock(),
+    )
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(id=1),
+        response=response,
+        message=SimpleNamespace(edit=AsyncMock()),
+    )
+    edit = next(item for item in view.children if item.label == "EDIT")
+    regenerate = next(item for item in view.children if item.label == "REGENERATE ART")
+    next_candidate = next(item for item in view.children if item.label == "NEXT CANDIDATE")
+    cancel = next(item for item in view.children if item.label == "CANCEL")
+
+    await edit.callback(interaction)
+    await regenerate.callback(interaction)
+    await next_candidate.callback(interaction)
+    await cancel.callback(interaction)
+
+    assert view.drafts[0].art_variant == 1
+    assert view.index == 1
+    assert render.await_count == 2
+    launch.assert_not_awaited()
+    bot.engine.pump_launcher.j7.launch.assert_not_awaited()
