@@ -22,7 +22,7 @@ from .callouts import (
     should_publish_fomo_watch,
 )
 from .config import Settings
-from .constants import PAPER_DEMO_ENTRY_PRICE_USD, PAPER_DEMO_MINT
+from .constants import BOT_VERSION, PAPER_DEMO_ENTRY_PRICE_USD, PAPER_DEMO_MINT
 from .database import Database
 from .detector import SwapDetector
 from .discovery import (
@@ -31,14 +31,27 @@ from .discovery import (
     WindowCandidate,
     merge_verified_windows,
 )
-from .errors import DiscoveryError, JupiterError, RpcError
+from .errors import (
+    DiscoveryError,
+    JupiterError,
+    PumpLaunchError,
+    RpcError,
+    UnknownLaunchResultError,
+)
 from .executor import ExecutionManager
 from .launch import (
     OneClickLaunchClient,
     alert_key,
+    default_launch_draft,
+    is_launch_lab_eligible,
     is_manual_launch_opportunity,
+    launch_cluster_key,
+    launch_draft_key,
+    launch_opportunity_from_json,
+    launch_opportunity_to_json,
     score_launch_opportunity,
     should_publish_news_opportunity,
+    validate_launch_draft,
 )
 from .market import JupiterClient
 from .models import (
@@ -48,6 +61,7 @@ from .models import (
     DiscoveryRefresh,
     ExecutionMode,
     ExecutionResult,
+    LaunchDraft,
     LaunchOpportunity,
     NarrativePairMatch,
     NewsAlert,
@@ -82,6 +96,23 @@ from .strategy import ConsensusStrategy
 from .stream import RealtimeWalletStream, StreamEvent
 
 logger = logging.getLogger(__name__)
+
+
+def _launch_failure_status(message: str) -> str:
+    upper = message.upper()
+    for status in (
+        "J7 SESSION EXPIRED",
+        "J7 AUTH FAILED",
+        "J7 RATE LIMITED",
+        "PINATA UPLOAD FAILED",
+        "INSUFFICIENT SOL",
+        "NETWORK FAILURE",
+        "J7 RESPONSE MISSING MINT",
+        "UNKNOWN SUBMISSION STATE",
+    ):
+        if status in upper:
+            return status.replace(" ", "_").replace("/", "_")
+    return "FAILED"
 
 
 class Notifier(Protocol):
@@ -259,6 +290,7 @@ class SmartMoneyEngine:
         self._scan_lock = asyncio.Lock()
         self._discovery_lock = asyncio.Lock()
         self._daily_profit_lock = asyncio.Lock()
+        self._launch_lab_lock = asyncio.Lock()
         self._processing_signatures: set[str] = set()
         self._initialized = False
         self.last_scan_started_at: int | None = None
@@ -1077,6 +1109,9 @@ class SmartMoneyEngine:
             await asyncio.sleep(self.settings.fomo_radar_poll_seconds)
 
     async def _handle_news_alert(self, alert: NewsAlert) -> None:
+        await self._evaluate_news_alert(alert, publish=True)
+
+    async def _evaluate_news_alert(self, alert: NewsAlert, *, publish: bool) -> None:
         now = int(time.time())
         while self._news_alert_times and now - self._news_alert_times[0] >= 3600:
             self._news_alert_times.popleft()
@@ -1152,6 +1187,9 @@ class SmartMoneyEngine:
             no_x_launch_min_score=self.settings.no_x_launch_min_score,
         )
         self._remember_news_event(alert, now=now)
+        await self._cache_launch_candidate(opportunity, now=now)
+        if not publish:
+            return
         # Discord receives only something the user can actually launch. WATCH/SKIP
         # rows remain internal research evidence and no longer create dead buttons.
         if not should_publish_news_opportunity(opportunity):
@@ -1171,6 +1209,29 @@ class SmartMoneyEngine:
             )
             self._news_match_tasks.add(task)
             task.add_done_callback(self._news_match_tasks.discard)
+
+    async def _cache_launch_candidate(
+        self,
+        opportunity: LaunchOpportunity,
+        *,
+        now: int,
+    ) -> None:
+        if not hasattr(self, "database"):
+            return
+        if opportunity.score < self.settings.news_min_score or opportunity.alert.token_mints:
+            return
+        await self.database.cache_launch_candidate(
+            cluster_key=launch_cluster_key(opportunity),
+            alert_key=alert_key(opportunity.alert),
+            payload_json=launch_opportunity_to_json(opportunity),
+            headline=opportunity.alert.headline,
+            source_url=opportunity.alert.url,
+            category=opportunity.category,
+            score=opportunity.score,
+            verdict=opportunity.verdict,
+            evaluated_at=now,
+            expires_at=now + self.settings.launch_lab_max_age_seconds,
+        )
 
     def _cross_source_count(self, alert: NewsAlert, *, now: int) -> int:
         while self._recent_news_events and now - self._recent_news_events[0][0] > 600:
@@ -1193,6 +1254,316 @@ class SmartMoneyEngine:
                 (now, (alert.author or alert.source).casefold(), terms)
             )
 
+    async def launch_lab_candidates(self, *, topic: str = "") -> tuple[LaunchOpportunity, ...]:
+        """Refresh authorized feeds and return recent, clustered, manual-review candidates."""
+
+        if not self.settings.launch_lab_enabled:
+            return ()
+        async with self._launch_lab_lock:
+            alerts = await self.news_poller.snapshot(
+                max_age_seconds=self.settings.launch_lab_max_age_seconds
+            )
+            for alert in alerts:
+                await self._evaluate_news_alert(alert, publish=False)
+        now = int(time.time())
+        payloads = await self.database.recent_launch_candidate_payloads(
+            now=now,
+            limit=self.settings.launch_lab_max_candidates * 3,
+        )
+        needle = topic.strip().casefold()
+        candidates: list[LaunchOpportunity] = []
+        for payload in payloads:
+            try:
+                opportunity = launch_opportunity_from_json(payload)
+            except (TypeError, ValueError, KeyError):
+                continue
+            if not is_launch_lab_eligible(
+                opportunity,
+                minimum_score=self.settings.launch_lab_min_score,
+                max_age_seconds=self.settings.launch_lab_max_age_seconds,
+                now=now,
+            ):
+                continue
+            searchable = (
+                f"{opportunity.alert.headline} {opportunity.primary_narrative} "
+                f"{opportunity.alert.url}"
+            ).casefold()
+            if needle and needle not in searchable:
+                continue
+            candidates.append(opportunity)
+            if len(candidates) >= self.settings.launch_lab_max_candidates:
+                break
+        if candidates:
+            await self.database.set_setting(
+                "launch_last_lab_candidate",
+                str(int(time.time())),
+            )
+        return tuple(candidates)
+
+    async def launch_readiness(self) -> dict[str, object]:
+        """Read-only J7/IPFS/wallet/database probe. This method cannot submit a launch."""
+
+        checked_at = int(time.time())
+        j7 = self.pump_launcher.j7
+        j7_healthy, j7_status = await j7.health_check()
+        pinata_healthy, pinata_status = await j7.pinata_health()
+        wallet_balance: Decimal | None = None
+        wallet_error: str | None = None
+        try:
+            wallet_balance = await j7.wallet_balance()
+        except PumpLaunchError as exc:
+            wallet_error = str(exc)
+        reservation_healthy, pending, unknown = await self.database.launch_reservation_health()
+        start_at, end_at = self._launch_day_bounds()
+        launches, spent_sol = await self.database.pump_launch_daily_usage(
+            start_at=start_at,
+            end_at=end_at,
+        )
+        required_balance = (
+            self.settings.pump_launch_initial_buy_sol
+            + self.settings.j7_launch_min_balance_buffer_sol
+        )
+        failures: list[str] = []
+        if not self.settings.j7_launch_is_unlocked:
+            failures.append("J7 configuration is incomplete")
+        if not j7_healthy:
+            failures.append(j7_status)
+        if not pinata_healthy:
+            failures.append(pinata_status)
+        if wallet_error:
+            failures.append(wallet_error)
+        elif wallet_balance is not None and wallet_balance < required_balance:
+            failures.append(
+                f"INSUFFICIENT SOL — at least {required_balance} SOL is required"
+            )
+        if not reservation_healthy:
+            failures.append("launch reservations are unhealthy")
+        if unknown:
+            failures.append(f"{unknown} launch has an UNKNOWN_RESULT requiring reconciliation")
+        await self.database.set_setting("launch_last_j7_health_check", str(checked_at))
+        if wallet_balance is not None:
+            await self.database.set_setting("launch_last_wallet_balance_check", str(checked_at))
+        stats = await self.database.launch_candidate_stats(start_at=start_at, end_at=end_at)
+        last_lab_candidate = await self.database.get_setting("launch_last_lab_candidate")
+        last_pinata_success = await self.database.get_setting("launch_last_pinata_success")
+        last_launch_attempt = await self.database.get_setting("launch_last_attempt")
+        last_successful_mint = await self.database.get_setting("launch_last_successful_mint")
+        return {
+            "bot_version": BOT_VERSION,
+            "provider": "J7 Tracker",
+            "j7_configured": self.settings.j7_launch_is_unlocked,
+            "j7_api_key_configured": bool(self.settings.j7_launch_api_key),
+            "j7_session_configured": bool(self.settings.j7_launch_session_token),
+            "j7_region": self.settings.j7_launch_region,
+            "j7_endpoint": j7_status,
+            "pinata": pinata_status,
+            "wallet": j7.wallet_address,
+            "wallet_configured_value": bool(self.settings.j7_launch_wallet_address),
+            "wallet_balance": wallet_balance,
+            "creator_buy": self.settings.pump_launch_initial_buy_sol,
+            "required_balance": required_balance,
+            "launches_today": launches,
+            "launches_limit": self.settings.pump_launch_max_per_day,
+            "sol_today": spent_sol,
+            "sol_limit": self.settings.pump_launch_max_sol_per_day,
+            "duplicate_protection": "READY",
+            "reservations": "HEALTHY" if reservation_healthy else "UNHEALTHY",
+            "pending_reservations": pending,
+            "unknown_results": unknown,
+            "candidate_stats": stats,
+            "last_lab_candidate": int(last_lab_candidate) if last_lab_candidate else None,
+            "last_pinata_success": int(last_pinata_success) if last_pinata_success else None,
+            "last_launch_attempt": int(last_launch_attempt) if last_launch_attempt else None,
+            "last_successful_mint": last_successful_mint,
+            "overall_ready": not failures,
+            "failures": tuple(dict.fromkeys(failures)),
+            "checked_at": checked_at,
+        }
+
+    def _launch_day_bounds(self) -> tuple[int, int]:
+        timezone = ZoneInfo(self.settings.pump_launch_timezone)
+        local_now = datetime.now(timezone)
+        day_start = datetime.combine(local_now.date(), datetime_time.min, tzinfo=timezone)
+        return int(day_start.timestamp()), int((day_start + timedelta(days=1)).timestamp())
+
+    async def launch_lab_draft(
+        self,
+        draft: LaunchDraft,
+        *,
+        requested_by: str,
+    ) -> PumpLaunchResult:
+        """Submit one confirmed Launch Lab draft through J7 only."""
+
+        now = int(time.time())
+        opportunity = draft.opportunity
+        key = launch_draft_key(draft)
+        try:
+            draft = validate_launch_draft(
+                draft,
+                maximum_buy_sol=self.settings.pump_launch_initial_buy_sol,
+            )
+        except PumpLaunchError as exc:
+            return PumpLaunchResult(
+                success=False,
+                status="BLOCKED",
+                message=str(exc),
+                alert_key=key,
+                name=draft.name,
+                symbol=draft.symbol,
+                created_at=now,
+                provider="J7 Tracker",
+            )
+        if not is_launch_lab_eligible(
+            opportunity,
+            minimum_score=self.settings.launch_lab_min_score,
+            max_age_seconds=self.settings.launch_lab_max_age_seconds,
+            now=now,
+        ):
+            return PumpLaunchResult(
+                success=False,
+                status="BLOCKED",
+                message="Candidate is weak, stale, blocked, or no longer competition-safe.",
+                alert_key=key,
+                name=draft.name,
+                symbol=draft.symbol,
+                created_at=now,
+                provider="J7 Tracker",
+            )
+        if not self.pump_launcher.j7.configured:
+            return PumpLaunchResult(
+                success=False,
+                status="J7_NOT_READY",
+                message="J7 configuration is incomplete; direct Pump fallback was not used.",
+                alert_key=key,
+                name=draft.name,
+                symbol=draft.symbol,
+                created_at=now,
+                provider="J7 Tracker",
+            )
+        try:
+            balance = await self.pump_launcher.j7.wallet_balance()
+        except PumpLaunchError as exc:
+            return PumpLaunchResult(
+                success=False,
+                status="BALANCE_CHECK_FAILED",
+                message=str(exc),
+                alert_key=key,
+                name=draft.name,
+                symbol=draft.symbol,
+                created_at=now,
+                provider="J7 Tracker",
+            )
+        required_balance = draft.creator_buy_sol + self.settings.j7_launch_min_balance_buffer_sol
+        if balance < required_balance:
+            return PumpLaunchResult(
+                success=False,
+                status="INSUFFICIENT_SOL",
+                message=(
+                    f"INSUFFICIENT SOL — wallet has {balance} SOL; controlled launch "
+                    f"requires at least {required_balance} SOL. J7 was not called."
+                ),
+                alert_key=key,
+                name=draft.name,
+                symbol=draft.symbol,
+                created_at=now,
+                provider="J7 Tracker",
+            )
+        start_at, end_at = self._launch_day_bounds()
+        launches, spent_sol = await self.database.pump_launch_daily_usage(
+            start_at=start_at,
+            end_at=end_at,
+        )
+        if launches >= self.settings.pump_launch_max_per_day:
+            return self._launch_block_result(
+                draft,
+                key,
+                "DAILY_LIMIT",
+                "Daily launch-count limit reached.",
+            )
+        if spent_sol + draft.creator_buy_sol > self.settings.pump_launch_max_sol_per_day:
+            return self._launch_block_result(
+                draft,
+                key,
+                "DAILY_LIMIT",
+                "Daily launch initial-buy SOL limit reached.",
+            )
+        if hasattr(self.database, "pump_launch_identity_exists") and (
+            await self.database.pump_launch_identity_exists(
+                name=draft.name,
+                symbol=draft.symbol,
+            )
+        ):
+            return self._launch_block_result(
+                draft,
+                key,
+                "DUPLICATE",
+                "This coin name or ticker already has a persistent launch record.",
+            )
+        reserved = await self.database.reserve_pump_launch(
+            alert_key=key,
+            source_url=opportunity.alert.url,
+            headline=opportunity.alert.headline,
+            name=draft.name,
+            symbol=draft.symbol,
+            score=opportunity.score,
+            initial_buy_sol=draft.creator_buy_sol,
+            requested_by=requested_by,
+        )
+        if not reserved:
+            return self._launch_block_result(
+                draft,
+                key,
+                "DUPLICATE",
+                "This narrative already has a persistent launch record; retry was blocked.",
+            )
+        await self.database.set_setting("launch_last_attempt", str(now))
+        try:
+            result = await self.pump_launcher.j7.launch(
+                opportunity,
+                draft=draft,
+                allow_launch_lab=True,
+            )
+            await self.database.complete_pump_launch(
+                alert_key=key,
+                status=result.status,
+                mint=result.mint,
+                signature=result.signature,
+                metadata_uri=result.metadata_uri,
+            )
+            await self.database.set_setting("launch_last_successful_mint", result.mint)
+            await self.database.set_setting("launch_last_pinata_success", str(int(time.time())))
+            return result
+        except UnknownLaunchResultError as exc:
+            await self.database.mark_pump_launch_unknown(key, str(exc))
+            return self._launch_block_result(draft, key, "UNKNOWN_RESULT", str(exc))
+        except Exception as exc:
+            message = str(exc)[:500]
+            await self.database.fail_pump_launch(key, message)
+            return self._launch_block_result(
+                draft,
+                key,
+                _launch_failure_status(message),
+                message,
+            )
+
+    def _launch_block_result(
+        self,
+        draft: LaunchDraft,
+        key: str,
+        status: str,
+        message: str,
+    ) -> PumpLaunchResult:
+        return PumpLaunchResult(
+            success=False,
+            status=status,
+            message=message,
+            alert_key=key,
+            name=draft.name,
+            symbol=draft.symbol,
+            created_at=int(time.time()),
+            provider="J7 Tracker",
+        )
+
     async def launch_news_opportunity(
         self,
         opportunity: LaunchOpportunity,
@@ -1210,6 +1581,15 @@ class SmartMoneyEngine:
                 name=opportunity.coin_name,
                 symbol=opportunity.coin_symbol,
                 created_at=now,
+            )
+        j7 = getattr(self.pump_launcher, "j7", None)
+        if j7 is not None and j7.configured:
+            return await self.launch_lab_draft(
+                default_launch_draft(
+                    opportunity,
+                    self.settings.pump_launch_initial_buy_sol,
+                ),
+                requested_by=requested_by,
             )
         if not self.pump_launcher.configured:
             return PumpLaunchResult(
@@ -2496,4 +2876,7 @@ class SmartMoneyEngine:
             "pump_launch_unlocked": self.pump_launcher.configured,
             "pump_launch_wallet": self.pump_launcher.wallet_address,
             "launch_provider": self.pump_launcher.provider,
+            "launch_lab_enabled": self.settings.launch_lab_enabled,
+            "launch_lab_min_score": self.settings.launch_lab_min_score,
+            "j7_public_wallet_configured": bool(self.pump_launcher.j7.wallet_address),
         }

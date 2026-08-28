@@ -477,7 +477,7 @@ class XFilteredNewsStream:
                 timeout=aiohttp.ClientTimeout(total=None, sock_connect=15, sock_read=90),
                 headers={
                     "Authorization": f"Bearer {self.bearer_token}",
-                    "User-Agent": "SmartMoneyCopyBot/2.30.0 news-radar",
+                    "User-Agent": "SmartMoneyCopyBot/2.31.0 news-radar",
                 },
             )
         return self._session
@@ -743,7 +743,7 @@ class RssNewsPoller:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=15),
-                headers={"User-Agent": "SmartMoneyCopyBot/2.30.0 news-radar"},
+                headers={"User-Agent": "SmartMoneyCopyBot/2.31.0 news-radar"},
             )
         return self._session
 
@@ -803,6 +803,42 @@ class RssNewsPoller:
                     continue
                 await callback(alert)
 
+    async def snapshot(self, *, max_age_seconds: int) -> tuple[NewsAlert, ...]:
+        """Read the current authorized feeds without publishing or spending launch funds."""
+
+        if not self.configured:
+            return ()
+        session = await self._get_session()
+        now = int(time.time())
+
+        async def fetch(url: str) -> list[NewsAlert]:
+            try:
+                async with session.get(url) as response:
+                    if response.status >= 400:
+                        self.feed_health[url] = f"HTTP {response.status}"
+                        return []
+                    text = await response.text(errors="ignore")
+                    self.feed_health[url] = "ok"
+            except (TimeoutError, aiohttp.ClientError) as exc:
+                self.feed_health[url] = str(exc)[:120] or type(exc).__name__
+                return []
+            return parse_feed(text, source_url=url)
+
+        batches = await asyncio.gather(*(fetch(url) for url in self.urls))
+        current: list[NewsAlert] = []
+        seen: set[str] = set()
+        for alert in (item for batch in batches for item in batch):
+            key = alert.url or f"{alert.source}:{alert.headline}"
+            age = now - alert.created_at if alert.created_at else max_age_seconds + 1
+            if key in seen or age < 0 or age > max_age_seconds:
+                continue
+            seen.add(key)
+            current.append(alert)
+        self.last_refresh_at = now
+        self.last_error = None
+        self.ready = True
+        return tuple(sorted(current, key=lambda item: item.created_at, reverse=True))
+
 
 class DexNarrativeMatcher:
     BASE_URL = "https://api.dexscreener.com"
@@ -821,7 +857,7 @@ class DexNarrativeMatcher:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=12),
-                headers={"User-Agent": "SmartMoneyCopyBot/2.30.0 narrative-match"},
+                headers={"User-Agent": "SmartMoneyCopyBot/2.31.0 narrative-match"},
             )
         return self._session
 

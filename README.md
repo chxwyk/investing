@@ -7,6 +7,17 @@ transactions, and mirrors every newly detected hot-wallet swap in PAPER mode. PA
 as either a forced source-price observation ledger or an executable Jupiter quote-shadow
 trial; the two answer different questions and are labeled separately.
 
+Version 2.31 adds an admin-only **J7 Launch Lab** and a read-only launch readiness check.
+`/smartmoney launch-check` verifies the configured J7 region, authenticated health endpoint,
+Pinata authentication, public launch-wallet SOL balance, daily limits, and persistent SQLite
+reservations without calling J7's submit route or spending SOL. `/smartmoney launch-lab`
+refreshes the authorized RSS feeds, ranks and persists recent legitimate narratives, collapses
+same-story articles, previews source-led 1024x1024 art, and lets an administrator browse, edit,
+regenerate, cancel, or deliberately confirm one real J7 launch. Launch Lab uses J7 only and
+never silently falls back to direct Pump signing. Its manual 60+ review floor does not lower the
+automatic 78+ no-X alert gate. A timed-out J7 submission is persisted as `UNKNOWN_RESULT` and
+cannot be blindly retried.
+
 Version 2.30 adds a strict **free/no-X manual launch-candidate lane**. With paid X disabled,
 an authorized RSS/Atom story can now become `LAUNCH CANDIDATE — NO X VERIFIED` only at 78+
 with a credible publisher, fast detection, strong meme identity, completed low-competition
@@ -315,7 +326,7 @@ when no prior public BUY exists
 inside the scanned history, no current baseline price is available, or the PAPER account lacks
 cash. Set `PAPER_MIRROR_RAW_SWAPS=false` to restore consensus-only paper behavior.
 
-The v2.30.0 discovery, zero-cost Fomo radar, optional X verification, crypto-first launch-radar,
+The v2.31.0 discovery, zero-cost Fomo radar, optional X verification, crypto-first launch-radar,
 verified-only
 callout, selective-entry, daily loss/profit
 locks, social nomination, quote, fallback, rotation, and exit controls are
@@ -376,6 +387,10 @@ NEWS_MIN_SCORE=45
 NEWS_LAUNCH_READY_SCORE=72
 NO_X_LAUNCH_CANDIDATES_ENABLED=true
 NO_X_LAUNCH_MIN_SCORE=78
+LAUNCH_LAB_ENABLED=true
+LAUNCH_LAB_MIN_SCORE=60
+LAUNCH_LAB_MAX_AGE_SECONDS=3600
+LAUNCH_LAB_MAX_CANDIDATES=8
 NEWS_X_VERIFY_MIN_SCORE=70
 NEWS_X_TREND_CACHE_SECONDS=3600
 NEWS_MAX_ALERTS_PER_HOUR=30
@@ -457,6 +472,8 @@ J7_LAUNCH_ENABLED=true
 J7_LAUNCH_SESSION_TOKEN=<official J7 JWT>
 J7_LAUNCH_API_KEY=<encrypted Solana wallet key copied from J7>
 J7_LAUNCH_REGION=na-east
+J7_LAUNCH_WALLET_ADDRESS=<public Full Address from J7 Deploy Settings>
+J7_LAUNCH_MIN_BALANCE_BUFFER_SOL=0.002
 PUMP_LAUNCH_ACK=I_UNDERSTAND_PUMP_LAUNCHES_SPEND_REAL_SOL
 PINATA_JWT=<server-side Pinata JWT>
 PUMP_LAUNCH_INITIAL_BUY_SOL=0.01
@@ -470,11 +487,11 @@ The old direct Pump.fun signer remains available as a fallback by setting
 `PUMP_ONE_CLICK_LAUNCH_ENABLED=true` and `PUMP_LAUNCH_PRIVATE_KEY` to a separate capped launch
 wallet. If both paths are fully configured, J7 is preferred. Never use a recovery phrase.
 
-The launch button is shown only on `LAUNCH CANDIDATE — NO X VERIFIED` or
+The automatic-alert launch button is shown only on `LAUNCH CANDIDATE — NO X VERIFIED` or
 `LAUNCH READY — X VERIFIED` alerts and only Discord administrators or configured
-`DISCORD_ADMIN_ROLE_IDS` can press it. No alert ever launches automatically. One click creates
-and submits the transaction;
-there is no per-launch confirmation dialog. SQLite reserves the source alert before any upload
+`DISCORD_ADMIN_ROLE_IDS` can press it. No alert ever launches automatically. Launch Lab adds one
+concise `CONFIRM REAL LAUNCH` screen after its preview; preview, edit, regenerate, next, and cancel
+never call J7. SQLite reserves the narrative before any upload
 or signature so double clicks and restarts cannot produce a second coin from the same alert.
 Metadata labels the asset as a community meme and explicitly says it is not official or
 affiliated with the people, brands, publisher, or event in the source. The generated image is
@@ -484,6 +501,11 @@ When `NEWS_SOURCE_IMAGE_ENABLED=true`, source-provided lead images take priority
 category art. The bot never guesses a private J7 image endpoint. If an authorized J7 feed later
 includes its recommended image as RSS media/thumbnail/enclosure content, the same parser will use
 that exact recommendation automatically. Review the source's image rights before commercial use.
+
+`J7_LAUNCH_WALLET_ADDRESS` is a public Solana address only. Copy the Full Address from J7 Tracker
+→ Deploy Settings → Wallets. It is used only for `getBalance`, readiness display, and the
+pre-launch balance guard. The encrypted J7 API key is not a raw private key, and this project
+never derives a signer from it. Never provide a recovery phrase or private key for the J7 path.
 
 ## Official PAPER readiness trial
 
@@ -633,6 +655,24 @@ No privileged Discord gateway intents are required.
 
 ## Railway deployment
 
+### v2.31 Railway changes
+
+**ADD:**
+
+```text
+J7_LAUNCH_WALLET_ADDRESS=<public Full Address shown by J7 Tracker>
+```
+
+**CHANGE:** none required. Optional Launch Lab defaults are already enabled (`60` manual-review
+floor, `3600` second maximum age, `8` candidates). These settings do not affect the automatic
+78+ no-X threshold.
+
+**REMOVE:** nothing.
+
+**UNCHANGED:** all existing J7 session/API-key/region, Pinata, launch acknowledgment, creator-buy,
+daily count/SOL caps, no-X, X, discovery, PAPER, and database variables. Do not reset or delete
+the SQLite database.
+
 1. Create a new GitHub repository and upload this project.
 2. Create a new Railway service from that repository.
 3. Add a persistent volume mounted at `/data`.
@@ -686,17 +726,18 @@ in that URL private. Helius documents the endpoint format as
 | `/smartmoney trader-import` | Optionally bulk import `alias,wallet,weight` CSV rows. |
 | `/smartmoney trader-remove` | Remove a tracked wallet. |
 | `/smartmoney traders` | List monitored wallets. |
-| `/smartmoney scan` | Run a scan immediately. |
+| `/smartmoney scan` | Run a wallet scan immediately. |
 | `/smartmoney leaderboard` | Show the 24-hour or 7-day risk-adjusted ranking. |
 | `/smartmoney paper` | Show P&L, drawdown, profit factor, expectancy, and 24H progress. |
 | `/smartmoney positions` | Browse open positions with page, refresh, token-link, and confirmed manual PAPER-sell buttons. |
 | `/smartmoney paper-trades` | Browse every fill, realized ROI, quote details, and exit reasons with page buttons. |
 | `/smartmoney readiness` | Show the 14-day, sample-size, expectancy, drawdown, and quote gates. |
-| `/smartmoney paper-demo` | Instantly create and close a clearly labeled fake paper trade. |
 | `/smartmoney paper-reset` | Reset the paper challenge after exact confirmation. |
 | `/smartmoney mode` | Show or set alerts, paper, or live mode. |
 | `/smartmoney pause` | Pause/resume monitoring. |
 | `/smartmoney kill-switch` | Immediately pause discovery, scanning, and new paper actions. |
+| `/smartmoney launch-check` | Read-only J7/IPFS/public-wallet/limit/reservation readiness check. |
+| `/smartmoney launch-lab` | Browse, edit, re-art, and deliberately confirm a recent J7-only candidate. |
 | `/smartmoney status` | Check RPC and scanner health. |
 | `/smartmoney limits` | Show active risk limits. |
 

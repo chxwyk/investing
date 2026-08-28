@@ -162,6 +162,12 @@ class Settings:
     j7_launch_session_token: str | None
     j7_launch_api_key: str | None
     j7_launch_region: str
+    j7_launch_wallet_address: str | None
+    j7_launch_min_balance_buffer_sol: Decimal
+    launch_lab_enabled: bool
+    launch_lab_min_score: int
+    launch_lab_max_age_seconds: int
+    launch_lab_max_candidates: int
 
     auto_discovery_enabled: bool
     discovery_refresh_seconds: int
@@ -375,6 +381,16 @@ class Settings:
             ),
             j7_launch_api_key=os.getenv("J7_LAUNCH_API_KEY", "").strip() or None,
             j7_launch_region=os.getenv("J7_LAUNCH_REGION", "na-east").strip().lower(),
+            j7_launch_wallet_address=(
+                os.getenv("J7_LAUNCH_WALLET_ADDRESS", "").strip() or None
+            ),
+            j7_launch_min_balance_buffer_sol=_decimal(
+                "J7_LAUNCH_MIN_BALANCE_BUFFER_SOL", "0.002"
+            ),
+            launch_lab_enabled=_bool("LAUNCH_LAB_ENABLED", True),
+            launch_lab_min_score=_int("LAUNCH_LAB_MIN_SCORE", 60),
+            launch_lab_max_age_seconds=_int("LAUNCH_LAB_MAX_AGE_SECONDS", 3600),
+            launch_lab_max_candidates=_int("LAUNCH_LAB_MAX_CANDIDATES", 8),
             auto_discovery_enabled=_bool("AUTO_DISCOVERY_ENABLED", True),
             discovery_refresh_seconds=_int("DISCOVERY_REFRESH_SECONDS", 1200),
             discovery_7d_refresh_seconds=_int("DISCOVERY_7D_REFRESH_SECONDS", 21600),
@@ -645,6 +661,14 @@ class Settings:
             raise ValueError(
                 "J7_LAUNCH_REGION must be na-east, na-west, europe, asia, or australia"
             )
+        if self.j7_launch_min_balance_buffer_sol < 0:
+            raise ValueError("J7_LAUNCH_MIN_BALANCE_BUFFER_SOL cannot be negative")
+        if not self.news_min_score <= self.launch_lab_min_score <= 100:
+            raise ValueError("LAUNCH_LAB_MIN_SCORE must be between NEWS_MIN_SCORE and 100")
+        if not 300 <= self.launch_lab_max_age_seconds <= 86_400:
+            raise ValueError("LAUNCH_LAB_MAX_AGE_SECONDS must be between 300 and 86400")
+        if not 1 <= self.launch_lab_max_candidates <= 20:
+            raise ValueError("LAUNCH_LAB_MAX_CANDIDATES must be between 1 and 20")
         if not 1 <= self.rpc_requests_per_second <= 100:
             raise ValueError("RPC_REQUESTS_PER_SECOND must be between 1 and 100")
         if not 0 <= self.rpc_max_retries <= 10:

@@ -296,7 +296,9 @@ class Database:
                 initial_buy_sol REAL NOT NULL,
                 requested_by TEXT NOT NULL,
                 status TEXT NOT NULL CHECK (
-                    status IN ('RESERVED', 'SUBMITTED', 'CONFIRMED', 'FAILED')
+                    status IN (
+                        'RESERVED', 'SUBMITTED', 'CONFIRMED', 'FAILED', 'UNKNOWN_RESULT'
+                    )
                 ),
                 mint TEXT,
                 signature TEXT,
@@ -307,6 +309,21 @@ class Database:
             );
             CREATE INDEX IF NOT EXISTS idx_pump_launches_time
                 ON pump_launches(created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS launch_candidates (
+                cluster_key TEXT PRIMARY KEY,
+                alert_key TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                headline TEXT NOT NULL,
+                source_url TEXT NOT NULL,
+                category TEXT NOT NULL,
+                score INTEGER NOT NULL,
+                verdict TEXT NOT NULL,
+                evaluated_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_launch_candidates_rank
+                ON launch_candidates(score DESC, evaluated_at DESC);
 
             CREATE TABLE IF NOT EXISTS api_usage_daily (
                 provider TEXT NOT NULL,
@@ -323,6 +340,7 @@ class Database:
             );
             """
         )
+        await self._migrate_pump_launch_status_constraint()
         await self._ensure_column("tracked_traders", "source", "TEXT NOT NULL DEFAULT 'manual'")
         await self._ensure_column("discovery_wallets", "realized_pnl_7d", "REAL NOT NULL DEFAULT 0")
         await self._ensure_column("discovery_wallets", "roi_7d_percent", "REAL NOT NULL DEFAULT 0")
@@ -390,6 +408,47 @@ class Database:
             (str(now),),
         )
         await self.db.commit()
+
+    async def _migrate_pump_launch_status_constraint(self) -> None:
+        """Expand the old CHECK constraint without deleting any launch history."""
+
+        cursor = await self.db.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'pump_launches'"
+        )
+        row = await cursor.fetchone()
+        sql = str(row["sql"] or "") if row else ""
+        if not sql or "UNKNOWN_RESULT" in sql:
+            return
+        await self.db.executescript(
+            """
+            ALTER TABLE pump_launches RENAME TO pump_launches_v230;
+            CREATE TABLE pump_launches (
+                alert_key TEXT PRIMARY KEY,
+                source_url TEXT NOT NULL,
+                headline TEXT NOT NULL,
+                name TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                score INTEGER NOT NULL,
+                initial_buy_sol REAL NOT NULL,
+                requested_by TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (
+                    status IN (
+                        'RESERVED', 'SUBMITTED', 'CONFIRMED', 'FAILED', 'UNKNOWN_RESULT'
+                    )
+                ),
+                mint TEXT,
+                signature TEXT,
+                metadata_uri TEXT,
+                error TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            INSERT INTO pump_launches SELECT * FROM pump_launches_v230;
+            DROP TABLE pump_launches_v230;
+            CREATE INDEX IF NOT EXISTS idx_pump_launches_time
+                ON pump_launches(created_at DESC);
+            """
+        )
 
     async def reserve_daily_api_request(
         self,
@@ -2504,6 +2563,19 @@ class Database:
         )
         await self.db.commit()
 
+    async def mark_pump_launch_unknown(self, alert_key: str, error: str) -> None:
+        """Keep the reservation locked when the external submission result is unknown."""
+
+        await self.db.execute(
+            """
+            UPDATE pump_launches
+            SET status = 'UNKNOWN_RESULT', error = ?, updated_at = ?
+            WHERE alert_key = ?
+            """,
+            (error[:1000], int(time.time()), alert_key),
+        )
+        await self.db.commit()
+
     async def pump_launch_daily_usage(
         self,
         *,
@@ -2515,7 +2587,7 @@ class Database:
             SELECT COUNT(*) AS launches, COALESCE(SUM(initial_buy_sol), 0) AS sol
             FROM pump_launches
             WHERE created_at >= ? AND created_at < ?
-              AND status IN ('RESERVED', 'SUBMITTED', 'CONFIRMED')
+              AND status IN ('RESERVED', 'SUBMITTED', 'CONFIRMED', 'UNKNOWN_RESULT')
             """,
             (start_at, end_at),
         )
@@ -2528,6 +2600,124 @@ class Database:
             (max(1, min(50, limit)),),
         )
         return [dict(row) for row in await cursor.fetchall()]
+
+    async def launch_reservation_health(self) -> tuple[bool, int, int]:
+        cursor = await self.db.execute(
+            """
+            SELECT
+                SUM(CASE WHEN status = 'RESERVED' THEN 1 ELSE 0 END) AS pending,
+                SUM(CASE WHEN status = 'UNKNOWN_RESULT' THEN 1 ELSE 0 END) AS unknown
+            FROM pump_launches
+            """
+        )
+        row = await cursor.fetchone()
+        return True, int(row["pending"] or 0), int(row["unknown"] or 0)
+
+    async def pump_launch_identity_exists(self, *, name: str, symbol: str) -> bool:
+        cursor = await self.db.execute(
+            """
+            SELECT 1 FROM pump_launches
+            WHERE name = ? COLLATE NOCASE OR symbol = ? COLLATE NOCASE
+            LIMIT 1
+            """,
+            (name, symbol),
+        )
+        return await cursor.fetchone() is not None
+
+    async def cache_launch_candidate(
+        self,
+        *,
+        cluster_key: str,
+        alert_key: str,
+        payload_json: str,
+        headline: str,
+        source_url: str,
+        category: str,
+        score: int,
+        verdict: str,
+        evaluated_at: int,
+        expires_at: int,
+    ) -> None:
+        """Persist the strongest recent version of one narrative cluster."""
+
+        await self.db.execute(
+            """
+            INSERT INTO launch_candidates(
+                cluster_key, alert_key, payload_json, headline, source_url,
+                category, score, verdict, evaluated_at, expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(cluster_key) DO UPDATE SET
+                alert_key = CASE
+                    WHEN excluded.score >= launch_candidates.score
+                    THEN excluded.alert_key ELSE launch_candidates.alert_key END,
+                payload_json = CASE
+                    WHEN excluded.score >= launch_candidates.score
+                    THEN excluded.payload_json ELSE launch_candidates.payload_json END,
+                headline = CASE
+                    WHEN excluded.score >= launch_candidates.score
+                    THEN excluded.headline ELSE launch_candidates.headline END,
+                source_url = CASE
+                    WHEN excluded.score >= launch_candidates.score
+                    THEN excluded.source_url ELSE launch_candidates.source_url END,
+                category = CASE
+                    WHEN excluded.score >= launch_candidates.score
+                    THEN excluded.category ELSE launch_candidates.category END,
+                score = MAX(launch_candidates.score, excluded.score),
+                verdict = CASE
+                    WHEN excluded.score >= launch_candidates.score
+                    THEN excluded.verdict ELSE launch_candidates.verdict END,
+                evaluated_at = MAX(launch_candidates.evaluated_at, excluded.evaluated_at),
+                expires_at = MAX(launch_candidates.expires_at, excluded.expires_at)
+            """,
+            (
+                cluster_key,
+                alert_key,
+                payload_json,
+                headline[:1000],
+                source_url[:1000],
+                category[:80],
+                score,
+                verdict[:80],
+                evaluated_at,
+                expires_at,
+            ),
+        )
+        await self.db.execute("DELETE FROM launch_candidates WHERE expires_at < ?", (evaluated_at,))
+        await self.db.commit()
+
+    async def recent_launch_candidate_payloads(
+        self,
+        *,
+        now: int,
+        limit: int,
+    ) -> list[str]:
+        cursor = await self.db.execute(
+            """
+            SELECT payload_json FROM launch_candidates
+            WHERE expires_at >= ?
+            ORDER BY score DESC, evaluated_at DESC
+            LIMIT ?
+            """,
+            (now, max(1, min(50, limit))),
+        )
+        return [str(row["payload_json"]) for row in await cursor.fetchall()]
+
+    async def launch_candidate_stats(self, *, start_at: int, end_at: int) -> dict[str, Any]:
+        cursor = await self.db.execute(
+            """
+            SELECT COUNT(*) AS evaluated, MAX(score) AS highest,
+                   MAX(evaluated_at) AS last_evaluated
+            FROM launch_candidates
+            WHERE evaluated_at >= ? AND evaluated_at < ?
+            """,
+            (start_at, end_at),
+        )
+        row = await cursor.fetchone()
+        return {
+            "evaluated": int(row["evaluated"] or 0),
+            "highest": int(row["highest"] or 0),
+            "last_evaluated": int(row["last_evaluated"] or 0) or None,
+        }
 
     async def get_setting(self, key: str, default: str | None = None) -> str | None:
         cursor = await self.db.execute("SELECT value FROM settings WHERE key = ?", (key,))

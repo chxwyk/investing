@@ -5,6 +5,7 @@ import io
 import logging
 import time
 from contextlib import suppress
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Literal
@@ -18,11 +19,13 @@ from solders.pubkey import Pubkey
 from .config import Settings
 from .constants import BOT_VERSION, PAPER_DEMO_ENTRY_PRICE_USD, PAPER_DEMO_MINT
 from .engine import SmartMoneyEngine
-from .errors import DiscoveryError, JupiterError
+from .errors import DiscoveryError, JupiterError, PumpLaunchError
 from .launch import (
     NO_X_LAUNCH_VERDICT,
     X_VERIFIED_LAUNCH_VERDICT,
+    default_launch_draft,
     is_manual_launch_opportunity,
+    validate_launch_draft,
 )
 from .models import (
     CoinCallout,
@@ -31,6 +34,7 @@ from .models import (
     DiscoveryRefresh,
     ExecutionMode,
     ExecutionResult,
+    LaunchDraft,
     LaunchOpportunity,
     NarrativePairMatch,
     NewsAlert,
@@ -335,6 +339,443 @@ class NewsOpportunityView(discord.ui.View):
         if interaction.message:
             with suppress(discord.HTTPException):
                 await interaction.message.edit(view=self)
+
+
+def _launch_readiness_embed(report: dict[str, object]) -> discord.Embed:
+    ready = bool(report["overall_ready"])
+    wallet = str(report["wallet"] or "NOT CONFIGURED / INVALID")
+    balance = report["wallet_balance"]
+    balance_text = (
+        f"{Decimal(str(balance)):.6f} SOL" if balance is not None else "UNAVAILABLE"
+    )
+    embed = discord.Embed(
+        title="J7 LAUNCH READINESS",
+        color=0x2ECC71 if ready else 0xE74C3C,
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(name="Bot", value=f"v{report['bot_version']}")
+    embed.add_field(name="Provider", value="J7 Tracker")
+    embed.add_field(
+        name="J7 configuration",
+        value="READY" if report["j7_configured"] else "NOT READY",
+    )
+    embed.add_field(
+        name="J7 API key",
+        value="CONFIGURED" if report["j7_api_key_configured"] else "MISSING",
+    )
+    embed.add_field(
+        name="J7 session",
+        value="CONFIGURED" if report["j7_session_configured"] else "MISSING",
+    )
+    embed.add_field(name="J7 region", value=str(report["j7_region"]))
+    embed.add_field(name="J7 endpoint", value=str(report["j7_endpoint"]))
+    embed.add_field(name="Pinata/IPFS", value=str(report["pinata"]))
+    embed.add_field(name="Launch wallet", value=f"`{_short(wallet)}`")
+    embed.add_field(name="Wallet SOL", value=balance_text)
+    embed.add_field(name="Creator buy", value=f"{report['creator_buy']} SOL")
+    embed.add_field(
+        name="Launches today",
+        value=f"{report['launches_today']} / {report['launches_limit']}",
+    )
+    embed.add_field(
+        name="SOL used today",
+        value=f"{report['sol_today']} / {report['sol_limit']}",
+    )
+    embed.add_field(name="Duplicate protection", value=str(report["duplicate_protection"]))
+    embed.add_field(
+        name="Launch reservations",
+        value=(
+            f"{report['reservations']} • pending {report['pending_reservations']} • "
+            f"unknown {report['unknown_results']}"
+        ),
+        inline=False,
+    )
+    stats = report["candidate_stats"]
+    if isinstance(stats, dict):
+        embed.add_field(
+            name="Launch Lab observations today",
+            value=(
+                f"evaluated `{stats.get('evaluated', 0)}` • highest "
+                f"`{stats.get('highest', 0)}/100`"
+            ),
+            inline=False,
+        )
+    last_lab = (
+        f"<t:{report['last_lab_candidate']}:R>" if report["last_lab_candidate"] else "none"
+    )
+    last_pinata = (
+        f"<t:{report['last_pinata_success']}:R>" if report["last_pinata_success"] else "none"
+    )
+    last_attempt = (
+        f"<t:{report['last_launch_attempt']}:R>" if report["last_launch_attempt"] else "none"
+    )
+    last_mint = (
+        f"`{_short(str(report['last_successful_mint']))}`"
+        if report["last_successful_mint"]
+        else "none"
+    )
+    embed.add_field(
+        name="Recent launch state",
+        value=(
+            f"Last Lab candidate: {last_lab}\n"
+            f"Last Pinata success: {last_pinata}\n"
+            f"Last launch attempt: {last_attempt}\n"
+            f"Last successful mint: {last_mint}"
+        ),
+        inline=False,
+    )
+    failures = tuple(report["failures"])
+    embed.add_field(
+        name="Overall",
+        value=(
+            "**READY FOR CONTROLLED LIVE LAUNCH**"
+            if ready
+            else "**NOT READY**\n" + "\n".join(f"• {item}" for item in failures)
+        ),
+        inline=False,
+    )
+    embed.set_footer(text="Read-only check • no J7 submit call • no SOL spent • secrets hidden")
+    return embed
+
+
+def _launch_lab_embed(
+    draft: LaunchDraft,
+    *,
+    index: int,
+    total: int,
+    settings: Settings,
+    wallet: str | None,
+    balance: Decimal | None,
+) -> discord.Embed:
+    opportunity = draft.opportunity
+    age = max(0, int(time.time()) - opportunity.alert.created_at)
+    competition = opportunity.competition
+    strongest = (
+        "none"
+        if competition.matching_pairs == 0
+        else (
+            f"{competition.strongest_symbol or 'unknown'} • "
+            f"{_money(competition.strongest_liquidity_usd)} liquidity"
+        )
+    )
+    positives = opportunity.positives[:5] or ("credible current source",)
+    weaknesses = tuple(
+        item for item in opportunity.warnings if "stricter free" not in item
+    )[:4] or ("No material weakness recorded by the current checks",)
+    embed = discord.Embed(
+        title="🔥 LIVE LAUNCH LAB",
+        description=(
+            f"**TOPIC**\n{opportunity.alert.headline}\n\n"
+            f"Candidate `{index + 1}/{total}` • detected `{age}s` after publication"
+        ),
+        color=0xF39C12,
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(name="Category", value=opportunity.category)
+    embed.add_field(name="Source", value=opportunity.alert.source or "unknown")
+    embed.add_field(
+        name="Candidate Score",
+        value=(
+            f"**{opportunity.score}/100**\nAutomatic alert threshold: "
+            f"**{settings.no_x_launch_min_score}/100**"
+        ),
+    )
+    embed.add_field(
+        name="WHY IT COULD WORK",
+        value="\n".join(f"• {item}" for item in positives),
+        inline=False,
+    )
+    embed.add_field(
+        name="WEAKNESSES",
+        value="\n".join(f"• {item}" for item in weaknesses),
+        inline=False,
+    )
+    embed.add_field(
+        name="COMPETITION",
+        value=(
+            f"Matching concepts: `{competition.matching_pairs}`\n"
+            f"Strong competing token: {strongest}"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="COIN IDEA",
+        value=(
+            f"**Name:** {draft.name}\n**Ticker:** `${draft.symbol}`\n"
+            f"**Description:** {draft.description[:500]}"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Launch controls",
+        value=(
+            "**X Verification:** NOT VERIFIED — ZERO-COST MODE\n"
+            "**Provider:** J7 Tracker\n"
+            f"**Creator Buy:** {draft.creator_buy_sol} SOL\n"
+            f"**Wallet:** `{_short(wallet or 'not configured')}`\n"
+            f"**Balance:** {f'{balance:.6f} SOL' if balance is not None else 'unavailable'}\n"
+            f"**Daily Launch Limit:** {settings.pump_launch_max_per_day}\n"
+            f"**Daily SOL Limit:** {settings.pump_launch_max_sol_per_day} SOL"
+        ),
+        inline=False,
+    )
+    if opportunity.alert.url:
+        embed.add_field(
+            name="Original evidence",
+            value=f"[Open legitimate source]({opportunity.alert.url})",
+            inline=False,
+        )
+    embed.set_image(url="attachment://launch-preview.png")
+    embed.set_footer(
+        text="Preview only • no SOL spent until final confirmation • never promises profit"
+    )
+    return embed
+
+
+class LaunchLabEditModal(discord.ui.Modal, title="Edit J7 launch draft"):
+    def __init__(self, view: LaunchLabView) -> None:
+        super().__init__(timeout=300)
+        self.lab_view = view
+        draft = view.draft
+        self.name_input = discord.ui.TextInput(label="Name", default=draft.name, max_length=32)
+        self.symbol_input = discord.ui.TextInput(
+            label="Ticker", default=draft.symbol, min_length=2, max_length=10
+        )
+        self.description_input = discord.ui.TextInput(
+            label="Description",
+            default=draft.description[:500],
+            style=discord.TextStyle.paragraph,
+            max_length=500,
+        )
+        self.buy_input = discord.ui.TextInput(
+            label="Creator buy (SOL)",
+            default=str(draft.creator_buy_sol),
+            max_length=16,
+        )
+        links = " | ".join(item for item in (draft.website_url, draft.x_url) if item)
+        self.links_input = discord.ui.TextInput(
+            label="Website | X URL",
+            default=links[:400],
+            required=False,
+            max_length=400,
+        )
+        for item in (
+            self.name_input,
+            self.symbol_input,
+            self.description_input,
+            self.buy_input,
+            self.links_input,
+        ):
+            self.add_item(item)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        links = [item.strip() for item in str(self.links_input).split("|") if item.strip()]
+        website = next(
+            (item for item in links if "x.com/" not in item and "twitter.com/" not in item),
+            "",
+        )
+        x_url = next(
+            (item for item in links if "x.com/" in item or "twitter.com/" in item),
+            "",
+        )
+        try:
+            updated = validate_launch_draft(
+                replace(
+                    self.lab_view.draft,
+                    name=str(self.name_input),
+                    symbol=str(self.symbol_input),
+                    description=str(self.description_input),
+                    creator_buy_sol=Decimal(str(self.buy_input)),
+                    website_url=website,
+                    x_url=x_url,
+                ),
+                maximum_buy_sol=self.lab_view.bot.settings.pump_launch_initial_buy_sol,
+            )
+        except (PumpLaunchError, ArithmeticError) as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+        self.lab_view.drafts[self.lab_view.index] = updated
+        await self.lab_view.refresh_message(interaction)
+
+
+class LaunchConfirmationView(discord.ui.View):
+    def __init__(self, lab_view: LaunchLabView) -> None:
+        super().__init__(timeout=300)
+        self.lab_view = lab_view
+        self.submitting = False
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await self.lab_view.interaction_check(interaction)
+
+    @discord.ui.button(label="CONFIRM REAL LAUNCH", style=discord.ButtonStyle.danger)
+    async def confirm(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        if self.submitting:
+            await interaction.response.send_message(
+                "Launch is already being submitted.", ephemeral=True
+            )
+            return
+        self.submitting = True
+        button.disabled = True
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if interaction.message:
+            await interaction.message.edit(view=self)
+        result = await self.lab_view.bot.engine.launch_lab_draft(
+            self.lab_view.draft,
+            requested_by=str(interaction.user.id),
+        )
+        result_embed = _pump_launch_result_embed(
+            result,
+            self.lab_view.bot.settings.fomo_referral_code,
+        )
+        if interaction.message:
+            await interaction.message.edit(
+                embed=result_embed,
+                attachments=[],
+                view=_launch_result_view(
+                    result,
+                    self.lab_view.bot.settings.fomo_referral_code,
+                ),
+            )
+        if result.success:
+            await self.lab_view.bot._send_alert(
+                result_embed,
+                token_mint=result.mint,
+                ping_user=True,
+            )
+
+    @discord.ui.button(label="CANCEL", style=discord.ButtonStyle.secondary)
+    async def cancel(
+        self,
+        interaction: discord.Interaction,
+        _button: discord.ui.Button,
+    ) -> None:
+        await interaction.response.edit_message(
+            content="Real launch canceled. No SOL was spent.",
+            embed=None,
+            attachments=[],
+            view=None,
+        )
+
+
+class LaunchLabView(discord.ui.View):
+    def __init__(
+        self,
+        bot: SmartMoneyBot,
+        opportunities: tuple[LaunchOpportunity, ...],
+        *,
+        owner_id: int,
+        balance: Decimal | None,
+    ) -> None:
+        super().__init__(timeout=900)
+        self.bot = bot
+        self.opportunities = opportunities
+        self.owner_id = owner_id
+        self.balance = balance
+        self.index = 0
+        self.drafts = [
+            default_launch_draft(item, bot.settings.pump_launch_initial_buy_sol)
+            for item in opportunities
+        ]
+
+    @property
+    def draft(self) -> LaunchDraft:
+        return self.drafts[self.index]
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.owner_id and _member_is_admin(
+            interaction.user, self.bot.settings
+        ):
+            return True
+        await interaction.response.send_message(
+            "Only the administrator who opened this Launch Lab can use these controls.",
+            ephemeral=True,
+        )
+        return False
+
+    async def preview(self) -> tuple[discord.Embed, discord.File]:
+        art = await self.bot.engine.pump_launcher.j7.render_draft_art(self.draft)
+        embed = _launch_lab_embed(
+            self.draft,
+            index=self.index,
+            total=len(self.drafts),
+            settings=self.bot.settings,
+            wallet=self.bot.engine.pump_launcher.j7.wallet_address,
+            balance=self.balance,
+        )
+        return embed, discord.File(io.BytesIO(art), filename="launch-preview.png")
+
+    async def refresh_message(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer()
+        embed, file = await self.preview()
+        if interaction.message:
+            await interaction.message.edit(embed=embed, attachments=[file], view=self)
+
+    @discord.ui.button(label="LAUNCH VIA J7", style=discord.ButtonStyle.danger, row=0)
+    async def launch(
+        self,
+        interaction: discord.Interaction,
+        _button: discord.ui.Button,
+    ) -> None:
+        draft = self.draft
+        embed = discord.Embed(
+            title="THIS CREATES A REAL PUBLIC TOKEN AND SPENDS REAL SOL",
+            description=(
+                f"**Name:** {draft.name}\n**Ticker:** `${draft.symbol}`\n"
+                f"**Creator buy:** {draft.creator_buy_sol} SOL\n**Provider:** J7 Tracker"
+            ),
+            color=0xE74C3C,
+        )
+        await interaction.response.edit_message(
+            embed=embed,
+            attachments=[],
+            view=LaunchConfirmationView(self),
+        )
+
+    @discord.ui.button(label="EDIT", style=discord.ButtonStyle.primary, row=0)
+    async def edit(
+        self,
+        interaction: discord.Interaction,
+        _button: discord.ui.Button,
+    ) -> None:
+        await interaction.response.send_modal(LaunchLabEditModal(self))
+
+    @discord.ui.button(label="REGENERATE ART", style=discord.ButtonStyle.primary, row=0)
+    async def regenerate(
+        self,
+        interaction: discord.Interaction,
+        _button: discord.ui.Button,
+    ) -> None:
+        self.drafts[self.index] = replace(
+            self.draft,
+            art_variant=self.draft.art_variant + 1,
+        )
+        await self.refresh_message(interaction)
+
+    @discord.ui.button(label="NEXT CANDIDATE", style=discord.ButtonStyle.secondary, row=1)
+    async def next_candidate(
+        self,
+        interaction: discord.Interaction,
+        _button: discord.ui.Button,
+    ) -> None:
+        self.index = (self.index + 1) % len(self.drafts)
+        await self.refresh_message(interaction)
+
+    @discord.ui.button(label="CANCEL", style=discord.ButtonStyle.secondary, row=1)
+    async def cancel(
+        self,
+        interaction: discord.Interaction,
+        _button: discord.ui.Button,
+    ) -> None:
+        await interaction.response.edit_message(
+            content="Launch Lab closed. No SOL was spent.",
+            embed=None,
+            attachments=[],
+            view=None,
+        )
 
 
 def _discovery_lines(candidates: tuple[DiscoveryCandidate, ...] | list[DiscoveryCandidate]) -> str:
@@ -715,9 +1156,9 @@ def _pump_launch_result_embed(
 ) -> discord.Embed:
     embed = discord.Embed(
         title=(
-            f"TOKEN LAUNCH • {result.status} • ${result.symbol}"
+            f"✅ J7 LAUNCH SUCCESS • ${result.symbol}"
             if result.success
-            else f"TOKEN LAUNCH • {result.status}"
+            else f"J7 LAUNCH • {result.status.replace('_', ' ')}"
         ),
         description=result.message,
         color=0x2ECC71 if result.success else 0xE74C3C,
@@ -725,6 +1166,7 @@ def _pump_launch_result_embed(
     )
     embed.add_field(name="Name", value=result.name or "unknown")
     embed.add_field(name="Symbol", value=f"`${result.symbol}`" if result.symbol else "unknown")
+    embed.add_field(name="Provider", value=result.provider or "configured launch provider")
     if result.mint:
         embed.add_field(name="Mint", value=f"`{result.mint}`", inline=False)
         embed.add_field(
@@ -748,6 +1190,38 @@ def _pump_launch_result_embed(
         )
     )
     return embed
+
+
+def _launch_result_view(
+    result: PumpLaunchResult,
+    fomo_referral_code: str | None,
+) -> discord.ui.View | None:
+    if not result.success or not result.mint:
+        return None
+    view = discord.ui.View(timeout=None)
+    view.add_item(
+        discord.ui.Button(
+            label="OPEN PUMP.FUN",
+            style=discord.ButtonStyle.link,
+            url=f"https://pump.fun/coin/{result.mint}",
+        )
+    )
+    view.add_item(
+        discord.ui.Button(
+            label="OPEN FOMO",
+            style=discord.ButtonStyle.link,
+            url=_fomo_coin_url(result.mint, fomo_referral_code),
+        )
+    )
+    if result.signature:
+        view.add_item(
+            discord.ui.Button(
+                label="SOLSCAN",
+                style=discord.ButtonStyle.link,
+                url=f"https://solscan.io/tx/{result.signature}",
+            )
+        )
+    return view
 
 
 def _narrative_match_embed(alert: NewsAlert, match: NarrativePairMatch) -> discord.Embed:
@@ -2248,11 +2722,6 @@ class SmartMoneyCommands(
             ephemeral=True,
         )
 
-    @app_commands.command(
-        name="paper-demo",
-        description="Instantly test a fake paper buy and a winning or losing paper sell.",
-    )
-    @app_commands.describe(action="Open a fake position, or close it with a simulated win/loss.")
     async def paper_demo(
         self,
         interaction: discord.Interaction,
@@ -2442,6 +2911,58 @@ class SmartMoneyCommands(
         await interaction.response.send_message(
             "Kill switch engaged. Monitoring is paused; existing PAPER data is preserved. "
             "Resume with `/smartmoney pause action:resume`.",
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="launch-check",
+        description="Verify J7, IPFS, wallet balance, and launch guards without spending SOL.",
+    )
+    async def launch_check(self, interaction: discord.Interaction) -> None:
+        if not await self._require_admin(interaction):
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        report = await self.bot.engine.launch_readiness()
+        await interaction.followup.send(embed=_launch_readiness_embed(report), ephemeral=True)
+
+    @app_commands.command(
+        name="launch-lab",
+        description="Browse and prepare the strongest current real narrative candidates.",
+    )
+    @app_commands.describe(topic="Optional filter using a topic, headline phrase, or source URL")
+    async def launch_lab(
+        self,
+        interaction: discord.Interaction,
+        topic: str = "",
+    ) -> None:
+        if not await self._require_admin(interaction):
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        candidates = await self.bot.engine.launch_lab_candidates(topic=topic)
+        if not candidates:
+            await interaction.followup.send(
+                "No recent candidate currently passes the Launch Lab floor. The automatic "
+                f"{self.bot.settings.no_x_launch_min_score}+ threshold was not lowered. "
+                "The bot refreshed authorized RSS feeds; try again after the next real event"
+                + (f" matching `{topic[:100]}`." if topic else "."),
+                ephemeral=True,
+            )
+            return
+        try:
+            balance = await self.bot.engine.pump_launcher.j7.wallet_balance()
+        except PumpLaunchError:
+            balance = None
+        view = LaunchLabView(
+            self.bot,
+            candidates,
+            owner_id=interaction.user.id,
+            balance=balance,
+        )
+        embed, file = await view.preview()
+        await interaction.followup.send(
+            embed=embed,
+            file=file,
+            view=view,
             ephemeral=True,
         )
 
@@ -2636,6 +3157,10 @@ class SmartMoneyCommands(
             f"minimum {status['no_x_launch_min_score']}/100 • manual launch only\n"
             f"**X verified launch lane:** {x_verified_lane_status}\n"
             f"**J7 launch provider:** {j7_launch_status}\n"
+            f"**Manual Launch Lab:** "
+            f"{'enabled' if status['launch_lab_enabled'] else 'disabled'} • recent candidates "
+            f"{status['launch_lab_min_score']}+ • J7-only • public wallet "
+            f"{'configured' if status['j7_public_wallet_configured'] else 'needed'}\n"
             f"**Launch artwork:** "
             f"{'source-led' if status['news_source_image_enabled'] else 'fallback only'} • "
             "three ranked candidates • 1024x1024 IPFS PNG\n"
@@ -2777,7 +3302,6 @@ class SmartMoneyCommands(
         )
         await interaction.response.send_message(text, ephemeral=True)
 
-    @app_commands.command(name="help", description="Show the fastest setup order.")
     async def help(self, interaction: discord.Interaction) -> None:
         text = (
             "1. `/smartmoney setup` — choose the alert channel\n"

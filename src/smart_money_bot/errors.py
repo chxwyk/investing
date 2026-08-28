@@ -12,3 +12,9 @@ class DiscoveryError(RuntimeError):
 
 class PumpLaunchError(RuntimeError):
     pass
+
+
+class UnknownLaunchResultError(PumpLaunchError):
+    """The provider may have accepted a real launch, so retrying is unsafe."""
+
+    pass

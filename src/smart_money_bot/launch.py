@@ -8,18 +8,20 @@ import math
 import re
 import textwrap
 import time
-from dataclasses import replace
+from dataclasses import asdict, replace
 from decimal import Decimal
 from typing import Any
 from urllib.parse import urlparse
 
 import aiohttp
 from PIL import Image, ImageDraw, ImageFont, ImageOps, UnidentifiedImageError
+from solders.pubkey import Pubkey
 
 from .config import Settings
-from .errors import PumpLaunchError
+from .errors import PumpLaunchError, UnknownLaunchResultError
 from .market import load_keypair, sign_versioned_transaction
 from .models import (
+    LaunchDraft,
     LaunchOpportunity,
     NarrativeCompetition,
     NewsAlert,
@@ -312,6 +314,20 @@ IDENTITY_STOP = {
 def alert_key(alert: NewsAlert) -> str:
     stable = alert.url or f"{alert.source}\n{alert.headline}\n{alert.created_at}"
     return hashlib.sha256(stable.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def launch_cluster_key(opportunity: LaunchOpportunity) -> str:
+    """Stable narrative key used to collapse same-story articles and launch retries."""
+
+    normalized = re.sub(
+        r"[^a-z0-9]+", " ", opportunity.primary_narrative.casefold()
+    ).strip()
+    stable = normalized or opportunity.alert.headline.casefold()
+    return hashlib.sha256(stable.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def launch_draft_key(draft: LaunchDraft) -> str:
+    return launch_cluster_key(draft.opportunity)
 
 
 def classify_event(text: str) -> str:
@@ -841,6 +857,131 @@ def is_manual_launch_opportunity(opportunity: LaunchOpportunity) -> bool:
     )
 
 
+def is_launch_lab_eligible(
+    opportunity: LaunchOpportunity,
+    *,
+    minimum_score: int,
+    max_age_seconds: int,
+    now: int | None = None,
+) -> bool:
+    """Keep manual browsing separate from the stricter automatic alert threshold."""
+
+    now = now or int(time.time())
+    age = max(0, now - (opportunity.alert.created_at or opportunity.generated_at or now))
+    return bool(
+        opportunity.score >= minimum_score
+        and age <= max_age_seconds
+        and not opportunity.alert.token_mints
+        and not opportunity.blockers
+        and opportunity.source_score >= 8
+        and opportunity.speed_score >= 5
+        and opportunity.viral_score >= 13
+        and opportunity.identity_score >= 6
+        and opportunity.competition.error is None
+        and opportunity.competition_score >= 4
+        and opportunity.alert.url.startswith("https://")
+    )
+
+
+def default_launch_draft(opportunity: LaunchOpportunity, creator_buy_sol: Decimal) -> LaunchDraft:
+    source_url = opportunity.alert.url
+    return LaunchDraft(
+        opportunity=opportunity,
+        name=opportunity.coin_name,
+        symbol=opportunity.coin_symbol,
+        description=(
+            f"Community-created meme inspired by public news: "
+            f"{opportunity.alert.headline[:280]}. Not official or affiliated with the "
+            "people, brands, publisher, or event named in the source."
+        ),
+        creator_buy_sol=creator_buy_sol,
+        website_url=(
+            "" if "x.com/" in source_url or "twitter.com/" in source_url else source_url
+        ),
+        x_url=(source_url if "x.com/" in source_url or "twitter.com/" in source_url else ""),
+    )
+
+
+def validate_launch_draft(draft: LaunchDraft, *, maximum_buy_sol: Decimal) -> LaunchDraft:
+    name = re.sub(r"\s+", " ", draft.name).strip()
+    symbol = re.sub(r"[^A-Za-z0-9]", "", draft.symbol).upper()
+    description = re.sub(r"\s+", " ", draft.description).strip()
+    if not 2 <= len(name) <= 32:
+        raise PumpLaunchError("Name must contain 2 to 32 characters.")
+    if not 2 <= len(symbol) <= 10:
+        raise PumpLaunchError("Ticker must contain 2 to 10 letters or numbers.")
+    if not 10 <= len(description) <= 500:
+        raise PumpLaunchError("Description must contain 10 to 500 characters.")
+    if draft.creator_buy_sol <= 0 or draft.creator_buy_sol > maximum_buy_sol:
+        raise PumpLaunchError(
+            f"Creator buy must be above 0 and no more than {maximum_buy_sol} SOL."
+        )
+    website_url = _validated_optional_public_url(draft.website_url, field="Website")
+    x_url = _validated_optional_public_url(draft.x_url, field="X/social URL")
+    if x_url and urlparse(x_url).netloc.casefold().removeprefix("www.") not in {
+        "x.com",
+        "twitter.com",
+    }:
+        raise PumpLaunchError("X/social URL must use x.com or twitter.com.")
+    return replace(
+        draft,
+        name=name,
+        symbol=symbol,
+        description=description,
+        website_url=website_url,
+        x_url=x_url,
+        art_variant=max(0, draft.art_variant),
+    )
+
+
+def _validated_optional_public_url(value: str, *, field: str) -> str:
+    value = value.strip()
+    if not value:
+        return ""
+    if not is_safe_launch_image_url(value):
+        raise PumpLaunchError(f"{field} must be a public HTTPS URL.")
+    return value
+
+
+def launch_opportunity_to_json(opportunity: LaunchOpportunity) -> str:
+    return json.dumps(asdict(opportunity), default=str, separators=(",", ":"))
+
+
+def launch_opportunity_from_json(payload_json: str) -> LaunchOpportunity:
+    payload = json.loads(payload_json)
+    alert_data = dict(payload.pop("alert"))
+    for key in ("narrative_terms", "token_mints", "image_urls"):
+        alert_data[key] = tuple(alert_data.get(key) or ())
+    competition_data = dict(payload.pop("competition"))
+    for key in (
+        "strongest_liquidity_usd",
+        "strongest_market_cap_usd",
+    ):
+        value = competition_data.get(key)
+        competition_data[key] = Decimal(str(value)) if value is not None else None
+    x_data = dict(payload.pop("x_evidence"))
+    for key in ("duplicate_percent", "posts_per_minute"):
+        x_data[key] = Decimal(str(x_data.get(key) or 0))
+    for key in ("notable_accounts", "notable_posts"):
+        x_data[key] = tuple(x_data.get(key) or ())
+    for key in ("positives", "warnings", "blockers"):
+        payload[key] = tuple(payload.get(key) or ())
+    return LaunchOpportunity(
+        alert=NewsAlert(**alert_data),
+        competition=NarrativeCompetition(**competition_data),
+        x_evidence=XSocialSnapshot(**x_data),
+        **payload,
+    )
+
+
+def opportunity_with_draft(draft: LaunchDraft) -> LaunchOpportunity:
+    return replace(
+        draft.opportunity,
+        coin_name=draft.name,
+        coin_symbol=draft.symbol,
+    )
+
+
 def render_opportunity_image(
     opportunity: LaunchOpportunity,
     source_image: bytes | None = None,
@@ -1014,12 +1155,14 @@ def is_safe_launch_image_url(value: str) -> bool:
 class PumpLaunchClient:
     BUILD_URL = "https://fun-block.pump.fun/agents/create-coin"
     PINATA_UPLOAD_URL = "https://uploads.pinata.cloud/v3/files"
+    PINATA_TEST_URL = "https://api.pinata.cloud/data/testAuthentication"
     MAX_SOURCE_IMAGE_BYTES = 8 * 1024 * 1024
 
     def __init__(self, settings: Settings, rpc: SolanaRPC) -> None:
         self.settings = settings
         self.rpc = rpc
         self._session: aiohttp.ClientSession | None = None
+        self.last_pinata_success_at: int | None = None
 
     @property
     def configured(self) -> bool:
@@ -1043,14 +1186,22 @@ class PumpLaunchClient:
         if self._session and not self._session.closed:
             await self._session.close()
 
-    async def _render_launch_art(self, opportunity: LaunchOpportunity) -> bytes:
+    async def _render_launch_art(
+        self,
+        opportunity: LaunchOpportunity,
+        *,
+        variant: int = 0,
+    ) -> bytes:
         session = await self._get_session()
         candidates = (
             opportunity.alert.image_urls[:3]
             if self.settings.news_source_image_enabled
             else ()
         )
-        for image_url in candidates:
+        ordered_candidates = candidates[variant:] + candidates[:variant] if candidates else ()
+        if variant >= len(candidates):
+            ordered_candidates = ()
+        for image_url in ordered_candidates:
             if not is_safe_launch_image_url(image_url):
                 continue
             try:
@@ -1077,7 +1228,39 @@ class PumpLaunchClient:
                         return render_opportunity_image(opportunity, b"".join(chunks))
             except (TimeoutError, aiohttp.ClientError, ValueError):
                 continue
-        return render_opportunity_image(opportunity)
+        fallback_opportunity = (
+            replace(
+                opportunity,
+                primary_narrative=f"{opportunity.primary_narrative} art variant {variant}",
+            )
+            if variant
+            else opportunity
+        )
+        return render_opportunity_image(fallback_opportunity)
+
+    async def render_draft_art(self, draft: LaunchDraft) -> bytes:
+        return await self._render_launch_art(
+            opportunity_with_draft(draft),
+            variant=draft.art_variant,
+        )
+
+    async def pinata_health(self) -> tuple[bool, str]:
+        if not self.settings.pinata_jwt:
+            return False, "PINATA_JWT is not configured"
+        session = await self._get_session()
+        try:
+            async with session.get(
+                self.PINATA_TEST_URL,
+                headers={"Authorization": f"Bearer {self.settings.pinata_jwt}"},
+            ) as response:
+                await response.read()
+                if response.status == 200:
+                    return True, "READY"
+                if response.status in {401, 403}:
+                    return False, "PINATA AUTH FAILED"
+                return False, f"PINATA HEALTH HTTP {response.status}"
+        except (TimeoutError, aiohttp.ClientError):
+            return False, "PINATA HEALTH NETWORK FAILURE"
 
     async def launch(self, opportunity: LaunchOpportunity) -> PumpLaunchResult:
         created_at = int(time.time())
@@ -1222,18 +1405,16 @@ class PumpLaunchClient:
             ) as response:
                 body = await response.json(content_type=None)
                 if response.status >= 400:
-                    detail = _error_detail(body)
-                    raise PumpLaunchError(
-                        f"Pinata upload HTTP {response.status}: {detail or 'request rejected'}"
-                    )
+                    raise PumpLaunchError(f"PINATA UPLOAD FAILED — HTTP {response.status}")
         except PumpLaunchError:
             raise
         except (TimeoutError, aiohttp.ClientError, ValueError) as exc:
-            raise PumpLaunchError(f"Pinata upload failed: {exc}") from exc
+            raise PumpLaunchError("PINATA UPLOAD FAILED — network failure") from exc
         data = body.get("data") if isinstance(body, dict) else None
         cid = str((data or {}).get("cid") or "") if isinstance(data, dict) else ""
         if not cid:
-            raise PumpLaunchError("Pinata upload response omitted a CID")
+            raise PumpLaunchError("PINATA UPLOAD FAILED — response omitted a CID")
+        self.last_pinata_success_at = int(time.time())
         return cid
 
 
@@ -1251,37 +1432,39 @@ def build_j7_launch_payload(
     settings: Settings,
     *,
     image_url: str,
+    draft: LaunchDraft | None = None,
 ) -> dict[str, Any]:
     """Build only documented J7 external-deploy fields; credentials stay in headers/body."""
 
-    source_url = opportunity.alert.url
+    draft = draft or default_launch_draft(
+        opportunity,
+        settings.pump_launch_initial_buy_sol,
+    )
+    source_url = draft.website_url or draft.x_url or opportunity.alert.url
     payload: dict[str, Any] = {
         "type": "create_token",
         "external": True,
         "api_key": settings.j7_launch_api_key or "",
         "mode": "pump",
-        "name": opportunity.coin_name,
-        "ticker": opportunity.coin_symbol,
-        "buy_amount": float(settings.pump_launch_initial_buy_sol),
+        "name": draft.name,
+        "ticker": draft.symbol,
+        "buy_amount": float(draft.creator_buy_sol),
         "image_url": image_url,
         "image_type": "url",
         "sell_panel_enabled": True,
         "private_desc": False,
-        "description": (
-            f"Community-created meme inspired by public news: "
-            f"{opportunity.alert.headline[:280]}. Not official or affiliated with the "
-            "people, brands, publisher, or event named in the source."
-        ),
+        "description": draft.description,
         "mayhem_mode": settings.pump_launch_mayhem_mode,
         "cashback_mode": settings.pump_launch_cashback,
         "agent_mode": settings.pump_launch_tokenized_agent,
         "buyback_bps": settings.pump_launch_buyback_bps,
     }
-    if source_url:
-        if "x.com/" in source_url or "twitter.com/" in source_url:
-            payload["twitter"] = source_url
-        else:
-            payload["website"] = source_url
+    if draft.website_url:
+        payload["website"] = draft.website_url
+    if draft.x_url:
+        payload["twitter"] = draft.x_url
+    if source_url and "website" not in payload and "twitter" not in payload:
+        payload["website"] = source_url
     return payload
 
 
@@ -1294,28 +1477,90 @@ class J7LaunchClient(PumpLaunchClient):
 
     @property
     def wallet_address(self) -> str | None:
-        # J7 intentionally exposes an encrypted wallet key, not the raw signer address.
-        return None
+        value = self.settings.j7_launch_wallet_address
+        if not value:
+            return None
+        try:
+            return str(Pubkey.from_string(value))
+        except ValueError:
+            return None
 
-    async def launch(self, opportunity: LaunchOpportunity) -> PumpLaunchResult:
+    async def health_check(self) -> tuple[bool, str]:
+        if not self.configured:
+            return False, "J7 configuration is incomplete"
+        base_url = J7_REGION_BASES[self.settings.j7_launch_region]
+        session = await self._get_session()
+        try:
+            async with session.get(
+                f"{base_url}/ping",
+                headers={"Authorization": f"Bearer {self.settings.j7_launch_session_token}"},
+            ) as response:
+                await response.read()
+                if 200 <= response.status < 300:
+                    return True, "HEALTHY"
+                return False, _j7_http_error(response.status, health=True)
+        except (TimeoutError, aiohttp.ClientError):
+            return False, "NETWORK FAILURE"
+
+    async def wallet_balance(self) -> Decimal:
+        wallet = self.wallet_address
+        if not self.settings.j7_launch_wallet_address:
+            raise PumpLaunchError("J7_LAUNCH_WALLET_ADDRESS is not configured")
+        if wallet is None:
+            raise PumpLaunchError("J7_LAUNCH_WALLET_ADDRESS is not a valid Solana address")
+        try:
+            result = await self.rpc.call("getBalance", [wallet, {"commitment": "confirmed"}])
+        except Exception as exc:
+            raise PumpLaunchError("PUBLIC WALLET BALANCE LOOKUP FAILED") from exc
+        lamports = result.get("value") if isinstance(result, dict) else None
+        if not isinstance(lamports, int) or lamports < 0:
+            raise PumpLaunchError("PUBLIC WALLET BALANCE LOOKUP RETURNED INVALID DATA")
+        return Decimal(lamports) / Decimal("1000000000")
+
+    async def launch(
+        self,
+        opportunity: LaunchOpportunity,
+        *,
+        draft: LaunchDraft | None = None,
+        allow_launch_lab: bool = False,
+    ) -> PumpLaunchResult:
         created_at = int(time.time())
         key = alert_key(opportunity.alert)
         if not self.configured:
             raise PumpLaunchError("J7 launch is locked or missing required credentials")
-        if not is_manual_launch_opportunity(opportunity):
+        draft = validate_launch_draft(
+            draft or default_launch_draft(
+                opportunity,
+                self.settings.pump_launch_initial_buy_sol,
+            ),
+            maximum_buy_sol=self.settings.pump_launch_initial_buy_sol,
+        )
+        lab_eligible = allow_launch_lab and is_launch_lab_eligible(
+            opportunity,
+            minimum_score=self.settings.launch_lab_min_score,
+            max_age_seconds=self.settings.launch_lab_max_age_seconds,
+        )
+        if not is_manual_launch_opportunity(opportunity) and not lab_eligible:
             raise PumpLaunchError("only a manual launch candidate or X-verified alert can launch")
-        if opportunity.score < self.settings.pump_launch_min_score:
+        if not lab_eligible and opportunity.score < self.settings.pump_launch_min_score:
             raise PumpLaunchError("opportunity score is below PUMP_LAUNCH_MIN_SCORE")
         if opportunity.alert.token_mints:
             raise PumpLaunchError("a source contract already exists; launch was blocked")
+        if lab_eligible:
+            key = launch_draft_key(draft)
 
         image_cid = await self._pin_file(
-            filename=f"{opportunity.coin_symbol.lower()}-launch.png",
-            content=await self._render_launch_art(opportunity),
+            filename=f"{draft.symbol.lower()}-launch.png",
+            content=await self.render_draft_art(draft),
             content_type="image/png",
         )
         image_url = f"https://ipfs.io/ipfs/{image_cid}"
-        payload = build_j7_launch_payload(opportunity, self.settings, image_url=image_url)
+        payload = build_j7_launch_payload(
+            opportunity,
+            self.settings,
+            image_url=image_url,
+            draft=draft,
+        )
         base_url = J7_REGION_BASES[self.settings.j7_launch_region]
         session = await self._get_session()
 
@@ -1337,31 +1582,36 @@ class J7LaunchClient(PumpLaunchClient):
             ) as response:
                 body = await response.json(content_type=None)
                 if response.status >= 400:
-                    detail = _error_detail(body)
-                    raise PumpLaunchError(
-                        f"J7 launch HTTP {response.status}: {detail or 'request rejected'}"
-                    )
+                    raise PumpLaunchError(_j7_http_error(response.status))
         except PumpLaunchError:
             raise
-        except (TimeoutError, aiohttp.ClientError, ValueError) as exc:
-            raise PumpLaunchError(f"J7 launch request failed: {exc}") from exc
+        except TimeoutError as exc:
+            raise UnknownLaunchResultError(
+                "UNKNOWN SUBMISSION STATE — J7 timed out after submission; do not retry"
+            ) from exc
+        except aiohttp.ClientError as exc:
+            raise UnknownLaunchResultError(
+                "UNKNOWN SUBMISSION STATE — network failed after submission; do not retry"
+            ) from exc
+        except ValueError as exc:
+            raise PumpLaunchError("J7 REQUEST REJECTED — invalid response") from exc
 
         if not isinstance(body, dict):
-            raise PumpLaunchError("J7 launch returned an invalid response")
+            raise UnknownLaunchResultError("J7 RESPONSE MALFORMED — submission state unknown")
         if body.get("type") != "token_create_success":
             detail = _error_detail(body)
-            raise PumpLaunchError(f"J7 launch failed: {detail or 'request rejected'}")
+            raise PumpLaunchError(f"J7 REQUEST REJECTED — {detail or 'provider rejected it'}")
         mint = str(body.get("mint_address") or body.get("address") or "")
         signature = str(body.get("signature") or body.get("tx_hash") or "")
         if not mint:
-            raise PumpLaunchError("J7 launch response omitted the mint address")
+            raise UnknownLaunchResultError("J7 RESPONSE MISSING MINT — submission state unknown")
         return PumpLaunchResult(
             success=True,
             status="SUBMITTED",
             message="J7 Tracker created the Pump.fun coin and submitted the initial buy",
             alert_key=key,
-            name=opportunity.coin_name,
-            symbol=opportunity.coin_symbol,
+            name=draft.name,
+            symbol=draft.symbol,
             mint=mint,
             signature=signature,
             metadata_uri=image_url,
@@ -1371,6 +1621,7 @@ class J7LaunchClient(PumpLaunchClient):
                 else f"https://pump.fun/coin/{mint}"
             ),
             created_at=created_at,
+            provider="J7 Tracker",
         )
 
 
@@ -1395,6 +1646,8 @@ class OneClickLaunchClient:
 
     @property
     def wallet_address(self) -> str | None:
+        if self.j7.configured:
+            return self.j7.wallet_address
         return self.pump.wallet_address if self.pump.configured else None
 
     async def launch(self, opportunity: LaunchOpportunity) -> PumpLaunchResult:
@@ -1417,3 +1670,15 @@ def _error_detail(body: Any) -> str:
         or body.get("errors")
         or ""
     )[:200]
+
+
+def _j7_http_error(status: int, *, health: bool = False) -> str:
+    if status == 401:
+        return "J7 SESSION EXPIRED / AUTH FAILED"
+    if status == 403:
+        return "J7 AUTH FAILED"
+    if status == 429:
+        return "J7 RATE LIMITED"
+    if status >= 500:
+        return "J7 ENDPOINT UNHEALTHY" if health else "J7 SERVER ERROR"
+    return f"J7 REQUEST REJECTED — HTTP {status}"

@@ -250,6 +250,20 @@ class LaunchOpportunity:
 
 
 @dataclass(frozen=True, slots=True)
+class LaunchDraft:
+    """Admin-reviewed metadata for one Launch Lab submission."""
+
+    opportunity: LaunchOpportunity
+    name: str
+    symbol: str
+    description: str
+    creator_buy_sol: Decimal
+    website_url: str = ""
+    x_url: str = ""
+    art_variant: int = 0
+
+
+@dataclass(frozen=True, slots=True)
 class PumpLaunchResult:
     success: bool
     status: str
@@ -262,6 +276,7 @@ class PumpLaunchResult:
     metadata_uri: str = ""
     explorer_url: str = ""
     created_at: int = 0
+    provider: str = ""
 
 
 @dataclass(frozen=True, slots=True)
