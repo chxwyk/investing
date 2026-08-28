@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import sqlite3
 import time
 from dataclasses import replace
@@ -9,9 +10,11 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from PIL import Image
 
 from smart_money_bot.bot import (
     LaunchConfirmationView,
+    LaunchLabEditModal,
     LaunchLabView,
     SmartMoneyCommands,
     _launch_result_view,
@@ -537,12 +540,15 @@ async def test_only_final_confirmation_calls_launch(settings) -> None:
     interaction = SimpleNamespace(
         user=SimpleNamespace(id=1),
         response=SimpleNamespace(defer=AsyncMock()),
+        edit_original_response=AsyncMock(),
         message=SimpleNamespace(edit=AsyncMock()),
     )
 
     await button.callback(interaction)
 
     launch.assert_awaited_once()
+    assert interaction.edit_original_response.await_count == 2
+    interaction.message.edit.assert_not_awaited()
 
 
 def test_success_links_are_exact_pump_fomo_and_solscan() -> None:
@@ -818,7 +824,11 @@ def test_real_qualifying_test_candidate_unlocks_normal_j7_control(settings) -> N
 @pytest.mark.asyncio
 async def test_research_edit_art_next_and_cancel_controls_never_launch(settings) -> None:
     launch = AsyncMock()
-    render = AsyncMock(return_value=b"png")
+    render = AsyncMock(
+        side_effect=lambda draft: (
+            f"{draft.opportunity.alert.headline}:{draft.art_variant}".encode()
+        )
+    )
     bot = SimpleNamespace(
         settings=_configured(settings),
         engine=SimpleNamespace(
@@ -832,9 +842,22 @@ async def test_research_edit_art_next_and_cancel_controls_never_launch(settings)
             ),
         ),
     )
+    first = _below_floor_opportunity()
+    second = replace(
+        _below_floor_opportunity(int(time.time()) - 1),
+        alert=replace(
+            _below_floor_opportunity(int(time.time()) - 1).alert,
+            headline="Real second current story",
+            source="Reuters",
+            url="https://reuters.com/second-current-story",
+        ),
+        coin_name="Second Story",
+        coin_symbol="SECOND",
+        score=43,
+    )
     view = LaunchLabView(
         bot,
-        (_below_floor_opportunity(), _below_floor_opportunity(int(time.time()) - 1)),
+        (first, second),
         owner_id=1,
         balance=Decimal("0.03"),
         research_test=True,
@@ -847,6 +870,7 @@ async def test_research_edit_art_next_and_cancel_controls_never_launch(settings)
     interaction = SimpleNamespace(
         user=SimpleNamespace(id=1),
         response=response,
+        edit_original_response=AsyncMock(),
         message=SimpleNamespace(edit=AsyncMock()),
     )
     edit = next(item for item in view.children if item.label == "EDIT")
@@ -856,11 +880,90 @@ async def test_research_edit_art_next_and_cancel_controls_never_launch(settings)
 
     await edit.callback(interaction)
     await regenerate.callback(interaction)
+    regenerated_call = interaction.edit_original_response.await_args_list[-1]
+    regenerated_file = regenerated_call.kwargs["attachments"][0]
+    assert regenerated_file.fp.getvalue().endswith(b":1")
     await next_candidate.callback(interaction)
+    next_call = interaction.edit_original_response.await_args_list[-1]
+    next_embed = next_call.kwargs["embed"]
+    next_file = next_call.kwargs["attachments"][0]
     await cancel.callback(interaction)
 
     assert view.drafts[0].art_variant == 1
     assert view.index == 1
     assert render.await_count == 2
+    assert "Candidate `2/2`" in (next_embed.description or "")
+    assert "Real second current story" in (next_embed.description or "")
+    assert next_file.fp.getvalue().startswith(b"Real second current story")
+    assert interaction.edit_original_response.await_count == 2
+    interaction.message.edit.assert_not_awaited()
     launch.assert_not_awaited()
     bot.engine.pump_launcher.j7.launch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_launch_lab_edit_modal_updates_ephemeral_original_response(settings) -> None:
+    render = AsyncMock(return_value=b"edited-art")
+    launch = AsyncMock()
+    bot = SimpleNamespace(
+        settings=_configured(settings),
+        engine=SimpleNamespace(
+            pump_launcher=SimpleNamespace(
+                j7=SimpleNamespace(
+                    wallet_address=PUBLIC_WALLET,
+                    render_draft_art=render,
+                    launch=launch,
+                )
+            )
+        ),
+    )
+    view = LaunchLabView(
+        bot,
+        (_below_floor_opportunity(),),
+        owner_id=1,
+        balance=Decimal("0.03"),
+        research_test=True,
+    )
+    modal = LaunchLabEditModal(view)
+    modal.name_input._value = "Edited Real Story"
+    modal.symbol_input._value = "EDIT"
+    modal.description_input._value = "Edited research description"
+    modal.buy_input._value = "0.01"
+    modal.links_input._value = "https://example.com/source"
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(id=1),
+        response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
+        edit_original_response=AsyncMock(),
+        message=SimpleNamespace(edit=AsyncMock()),
+    )
+
+    await modal.on_submit(interaction)
+
+    assert view.draft.name == "Edited Real Story"
+    assert view.draft.symbol == "EDIT"
+    interaction.edit_original_response.assert_awaited_once()
+    interaction.message.edit.assert_not_awaited()
+    launch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_fallback_art_regeneration_is_a_real_distinct_1024_png(settings) -> None:
+    client = J7LaunchClient(_configured(settings), SimpleNamespace())
+    opportunity = replace(
+        _below_floor_opportunity(),
+        alert=replace(_below_floor_opportunity().alert, image_urls=()),
+    )
+    first_draft = default_launch_draft(opportunity, Decimal("0.01"))
+    try:
+        first = await client.render_draft_art(first_draft)
+        second = await client.render_draft_art(replace(first_draft, art_variant=1))
+    finally:
+        await client.close()
+
+    assert first != second
+    with Image.open(io.BytesIO(first)) as first_image:
+        assert first_image.size == (1024, 1024)
+        assert first_image.format == "PNG"
+    with Image.open(io.BytesIO(second)) as second_image:
+        assert second_image.size == (1024, 1024)
+        assert second_image.format == "PNG"

@@ -30,8 +30,8 @@ DEFAULT_X_NEWS_RULE = (
     "from:Rugcheckxyz OR from:SolanaFloor OR from:JupiterExchange OR from:phantom) OR "
     "((from:realDonaldTrump OR from:elonmusk OR from:WhiteHouse OR from:AP OR "
     "from:Reuters) (breaking OR emergency OR arrested OR resigns OR dies OR attack OR "
-    "shutdown OR \"supreme court\")) OR ((\"pump.fun\" OR \"contract address\" OR "
-    "\"CA:\") (solana OR memecoin OR token))) lang:en -is:retweet -is:reply"
+    'shutdown OR "supreme court")) OR (("pump.fun" OR "contract address" OR '
+    '"CA:") (solana OR memecoin OR token))) lang:en -is:retweet -is:reply'
 )
 
 DEFAULT_X_RADAR_QUERY = (
@@ -134,6 +134,15 @@ class Settings:
     fomo_radar_poll_seconds: int
     fomo_radar_max_candidates_per_scan: int
     fomo_radar_recheck_seconds: int
+    fomo_runner_enabled: bool
+    fomo_runner_fast_watch_seconds: int
+    fomo_runner_fast_watch_minutes: int
+    fomo_runner_fast_watch_min_score: Decimal
+    fomo_runner_public_alert_min_score: Decimal
+    fomo_runner_max_fast_watch: int
+    fomo_runner_lab_candidates: int
+    fomo_runner_max_graduation_age_minutes: int
+    fomo_runner_outcome_poll_seconds: int
 
     news_radar_enabled: bool
     x_news_stream_enabled: bool
@@ -332,22 +341,12 @@ class Settings:
             ).strip(),
             x_paid_search_enabled=_bool("X_PAID_SEARCH_ENABLED", False),
             x_budget_guard_enabled=_bool("X_BUDGET_GUARD_ENABLED", True),
-            x_estimated_total_budget_usd=_decimal(
-                "X_ESTIMATED_TOTAL_BUDGET_USD", "10"
-            ),
-            x_estimated_daily_budget_usd=_decimal(
-                "X_ESTIMATED_DAILY_BUDGET_USD", "0.50"
-            ),
-            x_max_targeted_verifications_per_day=_int(
-                "X_MAX_TARGETED_VERIFICATIONS_PER_DAY", 10
-            ),
+            x_estimated_total_budget_usd=_decimal("X_ESTIMATED_TOTAL_BUDGET_USD", "10"),
+            x_estimated_daily_budget_usd=_decimal("X_ESTIMATED_DAILY_BUDGET_USD", "0.50"),
+            x_max_targeted_verifications_per_day=_int("X_MAX_TARGETED_VERIFICATIONS_PER_DAY", 10),
             x_verify_max_posts=_int("X_VERIFY_MAX_POSTS", 10),
-            x_estimated_post_read_usd=_decimal(
-                "X_ESTIMATED_POST_READ_USD", "0.005"
-            ),
-            x_estimated_user_read_usd=_decimal(
-                "X_ESTIMATED_USER_READ_USD", "0.010"
-            ),
+            x_estimated_post_read_usd=_decimal("X_ESTIMATED_POST_READ_USD", "0.005"),
+            x_estimated_user_read_usd=_decimal("X_ESTIMATED_USER_READ_USD", "0.010"),
             x_budget_period_id=os.getenv("X_BUDGET_PERIOD_ID", "experiment-1").strip(),
             x_user_cache_seconds=_int("X_USER_CACHE_SECONDS", 86400),
             x_radar_enabled=_bool("X_RADAR_ENABLED", False),
@@ -356,65 +355,56 @@ class Settings:
             x_radar_max_contracts_per_scan=_int("X_RADAR_MAX_CONTRACTS_PER_SCAN", 3),
             fomo_radar_enabled=_bool("FOMO_RADAR_ENABLED", True),
             fomo_radar_poll_seconds=_int("FOMO_RADAR_POLL_SECONDS", 300),
-            fomo_radar_max_candidates_per_scan=_int(
-                "FOMO_RADAR_MAX_CANDIDATES_PER_SCAN", 5
-            ),
+            fomo_radar_max_candidates_per_scan=_int("FOMO_RADAR_MAX_CANDIDATES_PER_SCAN", 5),
             fomo_radar_recheck_seconds=_int("FOMO_RADAR_RECHECK_SECONDS", 1800),
+            fomo_runner_enabled=_bool("FOMO_RUNNER_ENABLED", True),
+            fomo_runner_fast_watch_seconds=_int("FOMO_RUNNER_FAST_WATCH_SECONDS", 20),
+            fomo_runner_fast_watch_minutes=_int("FOMO_RUNNER_FAST_WATCH_MINUTES", 15),
+            fomo_runner_fast_watch_min_score=_decimal("FOMO_RUNNER_FAST_WATCH_MIN_SCORE", "35"),
+            fomo_runner_public_alert_min_score=_decimal("FOMO_RUNNER_PUBLIC_ALERT_MIN_SCORE", "70"),
+            fomo_runner_max_fast_watch=_int("FOMO_RUNNER_MAX_FAST_WATCH", 5),
+            fomo_runner_lab_candidates=_int("FOMO_RUNNER_LAB_CANDIDATES", 6),
+            fomo_runner_max_graduation_age_minutes=_int(
+                "FOMO_RUNNER_MAX_GRADUATION_AGE_MINUTES", 60
+            ),
+            fomo_runner_outcome_poll_seconds=_int("FOMO_RUNNER_OUTCOME_POLL_SECONDS", 60),
             news_radar_enabled=_bool("NEWS_RADAR_ENABLED", True),
             x_news_stream_enabled=_bool("X_NEWS_STREAM_ENABLED", False),
             x_news_stream_rule=os.getenv("X_NEWS_STREAM_RULE", DEFAULT_X_NEWS_RULE).strip(),
             news_rss_feeds=_str_tuple("NEWS_RSS_FEEDS", DEFAULT_NEWS_RSS_FEEDS),
-            j7_authorized_feed_url=(
-                os.getenv("J7_AUTHORIZED_FEED_URL", "").strip() or None
-            ),
+            j7_authorized_feed_url=(os.getenv("J7_AUTHORIZED_FEED_URL", "").strip() or None),
             news_poll_seconds=_int("NEWS_POLL_SECONDS", 30),
             news_min_score=_int("NEWS_MIN_SCORE", 45),
             news_launch_ready_score=_int("NEWS_LAUNCH_READY_SCORE", 72),
-            no_x_launch_candidates_enabled=_bool(
-                "NO_X_LAUNCH_CANDIDATES_ENABLED", True
-            ),
+            no_x_launch_candidates_enabled=_bool("NO_X_LAUNCH_CANDIDATES_ENABLED", True),
             no_x_launch_min_score=_int("NO_X_LAUNCH_MIN_SCORE", 78),
             news_x_verify_min_score=_int("NEWS_X_VERIFY_MIN_SCORE", 70),
             news_x_trend_cache_seconds=_int("NEWS_X_TREND_CACHE_SECONDS", 3600),
             news_max_alerts_per_hour=_int("NEWS_MAX_ALERTS_PER_HOUR", 30),
             news_source_image_enabled=_bool("NEWS_SOURCE_IMAGE_ENABLED", True),
             news_dex_match_enabled=_bool("NEWS_DEX_MATCH_ENABLED", True),
-            news_dex_match_min_liquidity_usd=_decimal(
-                "NEWS_DEX_MATCH_MIN_LIQUIDITY_USD", "2000"
-            ),
+            news_dex_match_min_liquidity_usd=_decimal("NEWS_DEX_MATCH_MIN_LIQUIDITY_USD", "2000"),
             news_dex_match_max_age_minutes=_int("NEWS_DEX_MATCH_MAX_AGE_MINUTES", 60),
-            news_pair_recheck_seconds=_int_tuple(
-                "NEWS_PAIR_RECHECK_SECONDS", "0,30,90,180"
-            ),
+            news_pair_recheck_seconds=_int_tuple("NEWS_PAIR_RECHECK_SECONDS", "0,30,90,180"),
             pump_one_click_launch_enabled=_bool("PUMP_ONE_CLICK_LAUNCH_ENABLED", False),
             pump_launch_ack=os.getenv("PUMP_LAUNCH_ACK", "").strip(),
-            pump_launch_private_key=(
-                os.getenv("PUMP_LAUNCH_PRIVATE_KEY", "").strip() or None
-            ),
+            pump_launch_private_key=(os.getenv("PUMP_LAUNCH_PRIVATE_KEY", "").strip() or None),
             pinata_jwt=os.getenv("PINATA_JWT", "").strip() or None,
             pump_launch_initial_buy_sol=_decimal("PUMP_LAUNCH_INITIAL_BUY_SOL", "0.01"),
             pump_launch_min_score=_int("PUMP_LAUNCH_MIN_SCORE", 72),
             pump_launch_max_per_day=_int("PUMP_LAUNCH_MAX_PER_DAY", 3),
             pump_launch_max_sol_per_day=_decimal("PUMP_LAUNCH_MAX_SOL_PER_DAY", "0.05"),
-            pump_launch_timezone=os.getenv(
-                "PUMP_LAUNCH_TIMEZONE", "America/Los_Angeles"
-            ).strip(),
+            pump_launch_timezone=os.getenv("PUMP_LAUNCH_TIMEZONE", "America/Los_Angeles").strip(),
             pump_launch_cashback=_bool("PUMP_LAUNCH_CASHBACK", False),
             pump_launch_mayhem_mode=_bool("PUMP_LAUNCH_MAYHEM_MODE", False),
             pump_launch_tokenized_agent=_bool("PUMP_LAUNCH_TOKENIZED_AGENT", False),
             pump_launch_buyback_bps=_int("PUMP_LAUNCH_BUYBACK_BPS", 5000),
             j7_launch_enabled=_bool("J7_LAUNCH_ENABLED", False),
-            j7_launch_session_token=(
-                os.getenv("J7_LAUNCH_SESSION_TOKEN", "").strip() or None
-            ),
+            j7_launch_session_token=(os.getenv("J7_LAUNCH_SESSION_TOKEN", "").strip() or None),
             j7_launch_api_key=os.getenv("J7_LAUNCH_API_KEY", "").strip() or None,
             j7_launch_region=os.getenv("J7_LAUNCH_REGION", "na-east").strip().lower(),
-            j7_launch_wallet_address=(
-                os.getenv("J7_LAUNCH_WALLET_ADDRESS", "").strip() or None
-            ),
-            j7_launch_min_balance_buffer_sol=_decimal(
-                "J7_LAUNCH_MIN_BALANCE_BUFFER_SOL", "0.002"
-            ),
+            j7_launch_wallet_address=(os.getenv("J7_LAUNCH_WALLET_ADDRESS", "").strip() or None),
+            j7_launch_min_balance_buffer_sol=_decimal("J7_LAUNCH_MIN_BALANCE_BUFFER_SOL", "0.002"),
             launch_lab_enabled=_bool("LAUNCH_LAB_ENABLED", True),
             launch_lab_min_score=_int("LAUNCH_LAB_MIN_SCORE", 60),
             launch_lab_max_age_seconds=_int("LAUNCH_LAB_MAX_AGE_SECONDS", 3600),
@@ -622,13 +612,9 @@ class Settings:
         if not Decimal("0.01") <= self.x_estimated_daily_budget_usd:
             raise ValueError("X_ESTIMATED_DAILY_BUDGET_USD must be at least 0.01")
         if self.x_estimated_daily_budget_usd > self.x_estimated_total_budget_usd:
-            raise ValueError(
-                "X_ESTIMATED_DAILY_BUDGET_USD cannot exceed the total X budget"
-            )
+            raise ValueError("X_ESTIMATED_DAILY_BUDGET_USD cannot exceed the total X budget")
         if not 1 <= self.x_max_targeted_verifications_per_day <= 100:
-            raise ValueError(
-                "X_MAX_TARGETED_VERIFICATIONS_PER_DAY must be between 1 and 100"
-            )
+            raise ValueError("X_MAX_TARGETED_VERIFICATIONS_PER_DAY must be between 1 and 100")
         if not 10 <= self.x_verify_max_posts <= 100:
             raise ValueError("X_VERIFY_MAX_POSTS must be between 10 and 100")
         if self.x_estimated_post_read_usd <= 0 or self.x_estimated_user_read_usd <= 0:
@@ -655,6 +641,22 @@ class Settings:
             raise ValueError("FOMO_RADAR_MAX_CANDIDATES_PER_SCAN must be between 1 and 20")
         if not 300 <= self.fomo_radar_recheck_seconds <= 86400:
             raise ValueError("FOMO_RADAR_RECHECK_SECONDS must be between 300 and 86400")
+        if not 15 <= self.fomo_runner_fast_watch_seconds <= 300:
+            raise ValueError("FOMO_RUNNER_FAST_WATCH_SECONDS must be between 15 and 300")
+        if not 5 <= self.fomo_runner_fast_watch_minutes <= 60:
+            raise ValueError("FOMO_RUNNER_FAST_WATCH_MINUTES must be between 5 and 60")
+        if not 0 <= self.fomo_runner_fast_watch_min_score <= 100:
+            raise ValueError("FOMO_RUNNER_FAST_WATCH_MIN_SCORE must be between 0 and 100")
+        if not 0 <= self.fomo_runner_public_alert_min_score <= 100:
+            raise ValueError("FOMO_RUNNER_PUBLIC_ALERT_MIN_SCORE must be between 0 and 100")
+        if not 1 <= self.fomo_runner_max_fast_watch <= 20:
+            raise ValueError("FOMO_RUNNER_MAX_FAST_WATCH must be between 1 and 20")
+        if not 1 <= self.fomo_runner_lab_candidates <= 10:
+            raise ValueError("FOMO_RUNNER_LAB_CANDIDATES must be between 1 and 10")
+        if not 5 <= self.fomo_runner_max_graduation_age_minutes <= 1440:
+            raise ValueError("FOMO_RUNNER_MAX_GRADUATION_AGE_MINUTES must be between 5 and 1440")
+        if not 30 <= self.fomo_runner_outcome_poll_seconds <= 3600:
+            raise ValueError("FOMO_RUNNER_OUTCOME_POLL_SECONDS must be between 30 and 3600")
         if len(self.x_news_stream_rule) > 1024:
             raise ValueError("X_NEWS_STREAM_RULE cannot exceed 1024 characters")
         if not 15 <= self.news_poll_seconds <= 3600:
@@ -662,13 +664,9 @@ class Settings:
         if not 0 <= self.news_min_score <= 100:
             raise ValueError("NEWS_MIN_SCORE must be between 0 and 100")
         if not self.news_min_score <= self.news_launch_ready_score <= 100:
-            raise ValueError(
-                "NEWS_LAUNCH_READY_SCORE must be between NEWS_MIN_SCORE and 100"
-            )
+            raise ValueError("NEWS_LAUNCH_READY_SCORE must be between NEWS_MIN_SCORE and 100")
         if not self.news_min_score <= self.no_x_launch_min_score <= 100:
-            raise ValueError(
-                "NO_X_LAUNCH_MIN_SCORE must be between NEWS_MIN_SCORE and 100"
-            )
+            raise ValueError("NO_X_LAUNCH_MIN_SCORE must be between NEWS_MIN_SCORE and 100")
         if not 0 <= self.news_x_verify_min_score <= 100:
             raise ValueError("NEWS_X_VERIFY_MIN_SCORE must be between 0 and 100")
         if not 30 <= self.news_x_trend_cache_seconds <= 3600:

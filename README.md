@@ -7,6 +7,17 @@ transactions, and mirrors every newly detected hot-wallet swap in PAPER mode. PA
 as either a forced source-price observation ledger or an executable Jupiter quote-shadow
 trial; the two answer different questions and are labeled separately.
 
+Version 2.33 adds a separate, shadow-only **Fomo Runner Radar** for existing Solana tokens.
+Public DEX nominations remain the cheap broad-discovery stage; promising young pairs enter a
+temporary 20-second fast watch that records immutable price, market-cap, liquidity, rolling
+volume/transaction flow, holders, Tracker risk, Jupiter route, and financially verified
+smart-wallet evidence. Pair creation time is explicitly labeled as a DEX proxy—not an exact
+Pump/Fomo graduation claim. `/fomo lab mode:test` deterministically displays real current
+existing-token research below the public alert floor, while `/fomo results` measures forward
+1m/5m/15m/30m/1h/4h/24h outcomes and simple baselines. The runner has no buy/J7 code path.
+Launch Lab's deferred ephemeral Next, Regenerate, Edit, X, and J7 confirmation callbacks now
+edit Discord's original webhook response so the visible card and attachment actually change.
+
 Version 2.32.1 makes the existing product testable on demand without weakening a production
 gate. `/smartmoney launch-lab mode:test` refreshes the authorized RSS feeds, analyzes the
 freshest legitimate current items through the production normalization, scoring, DEX
@@ -440,6 +451,15 @@ FOMO_RADAR_ENABLED=true
 FOMO_RADAR_POLL_SECONDS=300
 FOMO_RADAR_MAX_CANDIDATES_PER_SCAN=5
 FOMO_RADAR_RECHECK_SECONDS=1800
+FOMO_RUNNER_ENABLED=true
+FOMO_RUNNER_FAST_WATCH_SECONDS=20
+FOMO_RUNNER_FAST_WATCH_MINUTES=15
+FOMO_RUNNER_FAST_WATCH_MIN_SCORE=35
+FOMO_RUNNER_PUBLIC_ALERT_MIN_SCORE=70
+FOMO_RUNNER_MAX_FAST_WATCH=5
+FOMO_RUNNER_LAB_CANDIDATES=6
+FOMO_RUNNER_MAX_GRADUATION_AGE_MINUTES=60
+FOMO_RUNNER_OUTCOME_POLL_SECONDS=60
 FOMO_WATCH_MIN_SCORE=50
 TRADE_ACTIVITY_ALERTS_ENABLED=false
 NEWS_DEX_MATCH_ENABLED=true
@@ -708,6 +728,50 @@ The bot needs these Discord application permissions:
 No privileged Discord gateway intents are required.
 
 ## Railway deployment
+
+### v2.33 Railway changes
+
+**ADD:**
+
+```text
+FOMO_RUNNER_ENABLED=true
+FOMO_RUNNER_FAST_WATCH_SECONDS=20
+FOMO_RUNNER_FAST_WATCH_MINUTES=15
+FOMO_RUNNER_FAST_WATCH_MIN_SCORE=35
+FOMO_RUNNER_PUBLIC_ALERT_MIN_SCORE=70
+FOMO_RUNNER_MAX_FAST_WATCH=5
+FOMO_RUNNER_LAB_CANDIDATES=6
+FOMO_RUNNER_MAX_GRADUATION_AGE_MINUTES=60
+FOMO_RUNNER_OUTCOME_POLL_SECONDS=60
+```
+
+These defaults are shadow-research hypotheses, not proven trading thresholds. The runner never
+buys and never calls J7.
+
+**CHANGE:** nothing.
+
+**RESTORE:**
+
+```text
+LAUNCH_LAB_MIN_SCORE=60
+```
+
+The deterministic Launch Lab test mode no longer requires the temporary 50-point production
+floor.
+
+**KEEP:** `NO_X_LAUNCH_MIN_SCORE=78`, `NEWS_X_VERIFY_MIN_SCORE=70`,
+`PUMP_LAUNCH_MIN_SCORE=72`, all J7/Pinata/public-wallet settings, creator-buy and daily launch
+caps, shared X budget limits, PAPER/discovery variables, and the existing persistent SQLite
+volume. Do not reset the database.
+
+**KEEP OFF:** `ENABLE_LIVE_TRADING=false`. Keep `X_PAID_SEARCH_ENABLED=false` if zero-cost mode
+is desired. Runner research still works; `VERIFY ON X` stays unavailable until official X is
+deliberately re-enabled.
+
+After Railway deploys, run `/smartmoney launch-check`, then verify the repaired Launch Lab with
+`/smartmoney launch-lab mode:test`. Existing `/smartmoney` already uses Discord's 25-child
+command limit, so the separate existing-token product is exposed without removing any command:
+run `/fomo lab mode:test`, test Next/Refresh, and use `/fomo results` as observations mature.
 
 ### v2.32.1 Railway changes
 

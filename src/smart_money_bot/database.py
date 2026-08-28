@@ -20,6 +20,7 @@ from .models import (
     ExecutionMode,
     PaperReadiness,
     PaperSummary,
+    RunnerCandidate,
     Side,
     Signal,
     TrackedTrader,
@@ -324,6 +325,51 @@ class Database:
             );
             CREATE INDEX IF NOT EXISTS idx_launch_candidates_rank
                 ON launch_candidates(score DESC, evaluated_at DESC);
+
+            CREATE TABLE IF NOT EXISTS runner_candidates (
+                mint TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL,
+                first_seen_at INTEGER NOT NULL,
+                graduated_at INTEGER,
+                graduation_source TEXT NOT NULL,
+                first_price_usd REAL,
+                first_market_cap_usd REAL,
+                first_liquidity_usd REAL,
+                first_score REAL NOT NULL,
+                latest_score REAL NOT NULL,
+                tier TEXT NOT NULL,
+                x_verified INTEGER NOT NULL DEFAULT 0,
+                last_seen_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_runner_candidates_rank
+                ON runner_candidates(latest_score DESC, last_seen_at DESC);
+
+            CREATE TABLE IF NOT EXISTS runner_snapshots (
+                mint TEXT NOT NULL,
+                captured_at INTEGER NOT NULL,
+                snapshot_json TEXT NOT NULL,
+                score REAL NOT NULL,
+                PRIMARY KEY (mint, captured_at),
+                FOREIGN KEY (mint) REFERENCES runner_candidates(mint) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_runner_snapshots_time
+                ON runner_snapshots(captured_at DESC);
+
+            CREATE TABLE IF NOT EXISTS runner_outcomes (
+                mint TEXT NOT NULL,
+                horizon_seconds INTEGER NOT NULL,
+                observed_at INTEGER NOT NULL,
+                price_return_percent REAL,
+                market_cap_return_percent REAL,
+                liquidity_return_percent REAL,
+                liquidity_disappeared INTEGER NOT NULL DEFAULT 0,
+                rugged INTEGER NOT NULL DEFAULT 0,
+                route_available INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (mint, horizon_seconds),
+                FOREIGN KEY (mint) REFERENCES runner_candidates(mint) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_runner_outcomes_horizon
+                ON runner_outcomes(horizon_seconds, observed_at DESC);
 
             CREATE TABLE IF NOT EXISTS api_usage_daily (
                 provider TEXT NOT NULL,
@@ -963,11 +1009,13 @@ class Database:
             "weak": int(day["weak"] or 0),
             "average_free_score": (
                 Decimal(str(day["avg_free"])).quantize(Decimal("0.01"))
-                if day["avg_free"] is not None else None
+                if day["avg_free"] is not None
+                else None
             ),
             "average_final_score": (
                 Decimal(str(day["avg_final"])).quantize(Decimal("0.01"))
-                if day["avg_final"] is not None else None
+                if day["avg_final"] is not None
+                else None
             ),
         }
 
@@ -1956,6 +2004,42 @@ class Database:
         )
         rows = await cursor.fetchall()
         return [(str(row["trader_address"]), str(row["alias"])) for row in rows]
+
+    async def recent_verified_token_buy_evidence(
+        self,
+        token_mint: str,
+        cutoff: int,
+    ) -> dict[str, Any]:
+        """Summarize only the bot's financially verified tracked-wallet buys."""
+
+        cursor = await self.db.execute(
+            """
+            SELECT
+                s.trader_address,
+                t.alias,
+                MIN(s.block_time) AS earliest_buy,
+                SUM(COALESCE(s.usd_value, 0)) AS buy_value
+            FROM swaps AS s
+            JOIN tracked_traders AS t ON t.address = s.trader_address
+            JOIN discovery_wallets AS d ON d.address = s.trader_address
+            WHERE s.token_mint = ? AND s.side = 'BUY' AND s.block_time >= ?
+              AND t.enabled = 1 AND d.qualified = 1
+            GROUP BY s.trader_address, t.alias
+            ORDER BY earliest_buy ASC
+            """,
+            (token_mint, cutoff),
+        )
+        rows = await cursor.fetchall()
+        values = [_d(row["buy_value"]) for row in rows]
+        total = sum(values, Decimal("0"))
+        largest_percent = max(values) / total * Decimal("100") if values and total > 0 else None
+        return {
+            "wallets": tuple(str(row["alias"]) for row in rows),
+            "unique_buyers": len(rows),
+            "earliest_buy_at": (min(int(row["earliest_buy"]) for row in rows) if rows else None),
+            "largest_buyer_percent": largest_percent,
+            "scope": "financially verified tracked wallets only",
+        }
 
     async def paper_execute(
         self,
@@ -3253,6 +3337,256 @@ class Database:
             "highest": int(row["highest"] or 0),
             "last_evaluated": int(row["last_evaluated"] or 0) or None,
         }
+
+    async def store_runner_candidate(
+        self,
+        candidate: RunnerCandidate,
+        *,
+        payload_json: str,
+        snapshot_json: str,
+    ) -> bool:
+        """Persist an immutable first-seen row plus one time-T evidence snapshot."""
+
+        async with self._write_lock:
+            await self.db.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await self.db.execute(
+                    "SELECT payload_json FROM runner_candidates WHERE mint = ?",
+                    (candidate.mint,),
+                )
+                existing = await cursor.fetchone()
+                is_new = existing is None
+                if existing is not None:
+                    # The immutable time-T baseline is database-owned. Even if a
+                    # caller accidentally supplies a newly constructed ``first``
+                    # snapshot during refresh, never let future evidence rewrite
+                    # the original detection inputs used for outcome measurement.
+                    existing_payload = json.loads(str(existing["payload_json"]))
+                    updated_payload = json.loads(payload_json)
+                    for key in (
+                        "first_seen_at",
+                        "graduated_at",
+                        "graduation_source",
+                        "first",
+                    ):
+                        updated_payload[key] = existing_payload.get(key)
+                    payload_json = json.dumps(updated_payload, separators=(",", ":"))
+                await self.db.execute(
+                    """
+                    INSERT INTO runner_candidates(
+                        mint, payload_json, first_seen_at, graduated_at,
+                        graduation_source, first_price_usd, first_market_cap_usd,
+                        first_liquidity_usd, first_score, latest_score, tier,
+                        x_verified, last_seen_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(mint) DO UPDATE SET
+                        payload_json = excluded.payload_json,
+                        latest_score = excluded.latest_score,
+                        tier = excluded.tier,
+                        x_verified = MAX(runner_candidates.x_verified, excluded.x_verified),
+                        last_seen_at = MAX(runner_candidates.last_seen_at, excluded.last_seen_at)
+                    """,
+                    (
+                        candidate.mint,
+                        payload_json,
+                        candidate.first_seen_at,
+                        candidate.graduated_at,
+                        candidate.graduation_source[:80],
+                        (
+                            float(candidate.first.price_usd)
+                            if candidate.first.price_usd is not None
+                            else None
+                        ),
+                        (
+                            float(candidate.first.market_cap_usd)
+                            if candidate.first.market_cap_usd is not None
+                            else None
+                        ),
+                        (
+                            float(candidate.first.liquidity_usd)
+                            if candidate.first.liquidity_usd is not None
+                            else None
+                        ),
+                        float(candidate.score),
+                        float(candidate.score),
+                        candidate.tier[:80],
+                        int(candidate.x_evidence.available),
+                        candidate.generated_at,
+                    ),
+                )
+                await self.db.execute(
+                    """
+                    INSERT OR IGNORE INTO runner_snapshots(
+                        mint, captured_at, snapshot_json, score
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        candidate.mint,
+                        candidate.current.captured_at,
+                        snapshot_json,
+                        float(candidate.score),
+                    ),
+                )
+                await self.db.commit()
+                return is_new
+            except Exception:
+                await self.db.rollback()
+                raise
+
+    async def recent_runner_candidate_payloads(
+        self,
+        *,
+        now: int,
+        max_age_seconds: int,
+        limit: int,
+    ) -> list[str]:
+        cursor = await self.db.execute(
+            """
+            SELECT payload_json FROM runner_candidates
+            WHERE last_seen_at >= ?
+            ORDER BY latest_score DESC, last_seen_at DESC
+            LIMIT ?
+            """,
+            (now - max_age_seconds, max(1, min(50, limit))),
+        )
+        return [str(row["payload_json"]) for row in await cursor.fetchall()]
+
+    async def runner_candidate_payload(self, mint: str) -> str | None:
+        cursor = await self.db.execute(
+            "SELECT payload_json FROM runner_candidates WHERE mint = ?",
+            (mint,),
+        )
+        row = await cursor.fetchone()
+        return str(row["payload_json"]) if row else None
+
+    async def runner_snapshot_payloads(
+        self,
+        mint: str,
+        *,
+        before_at: int | None = None,
+        limit: int = 30,
+    ) -> list[str]:
+        if before_at is None:
+            cursor = await self.db.execute(
+                """
+                SELECT snapshot_json FROM runner_snapshots
+                WHERE mint = ? ORDER BY captured_at DESC LIMIT ?
+                """,
+                (mint, max(1, min(200, limit))),
+            )
+        else:
+            cursor = await self.db.execute(
+                """
+                SELECT snapshot_json FROM runner_snapshots
+                WHERE mint = ? AND captured_at < ?
+                ORDER BY captured_at DESC LIMIT ?
+                """,
+                (mint, before_at, max(1, min(200, limit))),
+            )
+        rows = await cursor.fetchall()
+        return [str(row["snapshot_json"]) for row in reversed(rows)]
+
+    async def runner_due_mints(
+        self,
+        *,
+        now: int,
+        maximum_age_seconds: int = 86_400,
+        limit: int = 20,
+    ) -> list[str]:
+        cursor = await self.db.execute(
+            """
+            SELECT mint FROM runner_candidates
+            WHERE first_seen_at >= ? AND last_seen_at < ?
+            ORDER BY last_seen_at ASC LIMIT ?
+            """,
+            (now - maximum_age_seconds, now - 45, max(1, min(100, limit))),
+        )
+        return [str(row["mint"]) for row in await cursor.fetchall()]
+
+    async def record_runner_outcome(
+        self,
+        *,
+        mint: str,
+        horizon_seconds: int,
+        observed_at: int,
+        price_return_percent: Decimal | None,
+        market_cap_return_percent: Decimal | None,
+        liquidity_return_percent: Decimal | None,
+        liquidity_disappeared: bool,
+        rugged: bool,
+        route_available: bool,
+    ) -> bool:
+        cursor = await self.db.execute(
+            """
+            INSERT OR IGNORE INTO runner_outcomes(
+                mint, horizon_seconds, observed_at, price_return_percent,
+                market_cap_return_percent, liquidity_return_percent,
+                liquidity_disappeared, rugged, route_available
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                mint,
+                horizon_seconds,
+                observed_at,
+                float(price_return_percent) if price_return_percent is not None else None,
+                (
+                    float(market_cap_return_percent)
+                    if market_cap_return_percent is not None
+                    else None
+                ),
+                (float(liquidity_return_percent) if liquidity_return_percent is not None else None),
+                int(liquidity_disappeared),
+                int(rugged),
+                int(route_available),
+            ),
+        )
+        await self.db.commit()
+        return cursor.rowcount > 0
+
+    async def runner_results_rows(self) -> list[dict[str, Any]]:
+        cursor = await self.db.execute(
+            """
+            SELECT
+                c.mint, c.first_seen_at, c.graduated_at, c.first_market_cap_usd,
+                c.first_score, c.latest_score, c.x_verified,
+                o.horizon_seconds, o.observed_at, o.price_return_percent,
+                o.market_cap_return_percent, o.liquidity_disappeared,
+                o.rugged, o.route_available
+            FROM runner_candidates AS c
+            LEFT JOIN runner_outcomes AS o ON o.mint = c.mint
+            ORDER BY c.first_seen_at DESC, o.horizon_seconds ASC
+            """
+        )
+        return [dict(row) for row in await cursor.fetchall()]
+
+    async def runner_all_snapshot_rows(self) -> list[dict[str, Any]]:
+        cursor = await self.db.execute(
+            """
+            SELECT mint, captured_at, snapshot_json, score
+            FROM runner_snapshots ORDER BY mint, captured_at
+            """
+        )
+        return [dict(row) for row in await cursor.fetchall()]
+
+    async def runner_observation_count(self) -> int:
+        cursor = await self.db.execute("SELECT COUNT(*) AS count FROM runner_candidates")
+        row = await cursor.fetchone()
+        return int(row["count"] or 0)
+
+    async def recent_observed_token_mints(self, *, limit: int = 20) -> list[str]:
+        """Return real token mints seen in public tracked-wallet swaps, newest first."""
+
+        cursor = await self.db.execute(
+            """
+            SELECT token_mint, MAX(block_time) AS latest
+            FROM swaps
+            GROUP BY token_mint
+            ORDER BY latest DESC
+            LIMIT ?
+            """,
+            (max(1, min(100, limit)),),
+        )
+        return [str(row["token_mint"]) for row in await cursor.fetchall()]
 
     async def get_setting(self, key: str, default: str | None = None) -> str | None:
         cursor = await self.db.execute("SELECT value FROM settings WHERE key = ?", (key,))

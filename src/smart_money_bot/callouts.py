@@ -121,7 +121,7 @@ class DexScreenerClient:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
                 timeout=self.timeout,
-                headers={"User-Agent": "SmartMoneyCopyBot/2.32.1 coin-intelligence"},
+                headers={"User-Agent": "SmartMoneyCopyBot/2.33.0 coin-intelligence"},
             )
         return self._session
 
@@ -129,10 +129,10 @@ class DexScreenerClient:
         if self._session and not self._session.closed:
             await self._session.close()
 
-    async def snapshot(self, mint: str) -> DexSnapshot:
+    async def snapshot(self, mint: str, *, refresh: bool = False) -> DexSnapshot:
         cached = self._cache.get(mint)
         now = time.monotonic()
-        if cached and now - cached[0] <= 20:
+        if not refresh and cached and now - cached[0] <= 20:
             return cached[1]
         session = await self._get_session()
         try:
@@ -217,8 +217,7 @@ def parse_dex_snapshot(payload: Any, *, mint: str) -> DexSnapshot:
         (
             str(item.get("url") or "")
             for item in socials
-            if isinstance(item, dict)
-            and str(item.get("type") or "").lower() in {"twitter", "x"}
+            if isinstance(item, dict) and str(item.get("type") or "").lower() in {"twitter", "x"}
         ),
         "",
     )
@@ -473,9 +472,7 @@ class XRecentSearchClient:
                 reservation,
                 tuple(str(item.get("id") or "") for item in posts),
             )
-            author_ids = tuple(
-                dict.fromkeys(str(item.get("author_id") or "") for item in posts)
-            )
+            author_ids = tuple(dict.fromkeys(str(item.get("author_id") or "") for item in posts))
             author_ids = tuple(item for item in author_ids if item)
             cached_users = await self.budget_manager.cached_users(author_ids)
             users = tuple(cached_users.values())
@@ -504,9 +501,7 @@ class XRecentSearchClient:
                         user_body.get("data") or [], list
                     ):
                         fetched_users = tuple(
-                            item
-                            for item in (user_body.get("data") or [])
-                            if isinstance(item, dict)
+                            item for item in (user_body.get("data") or []) if isinstance(item, dict)
                         )
                         await self.budget_manager.record_users(reservation, fetched_users)
                         users = users + fetched_users
@@ -647,11 +642,7 @@ class XRecentSearchClient:
         if reservation is not None and self.budget_manager is not None:
             await self.budget_manager.record_posts(
                 reservation,
-                tuple(
-                    str(post.get("id") or "")
-                    for post in posts
-                    if isinstance(post, dict)
-                ),
+                tuple(str(post.get("id") or "") for post in posts if isinstance(post, dict)),
             )
             await self.budget_manager.record_users(
                 reservation,
@@ -729,8 +720,28 @@ def build_x_narrative_query(narrative: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9$#' -]", " ", narrative)
     words = re.findall(r"[A-Za-z0-9$#']+", cleaned)
     stop = {
-        "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "has",
-        "in", "is", "it", "of", "on", "or", "that", "the", "this", "to", "with",
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "by",
+        "for",
+        "from",
+        "has",
+        "in",
+        "is",
+        "it",
+        "of",
+        "on",
+        "or",
+        "that",
+        "the",
+        "this",
+        "to",
+        "with",
     }
     selected = [word for word in words if word.casefold() not in stop][:6]
     if not selected:
@@ -905,9 +916,7 @@ def parse_x_snapshot(
             timestamps.append(created)
         user = by_id.get(author_id) or {}
         username = str(user.get("username") or "").casefold().lstrip("@")
-        profile_text = (
-            f"{user.get('description') or ''} {user.get('location') or ''}"
-        ).casefold()
+        profile_text = (f"{user.get('description') or ''} {user.get('location') or ''}").casefold()
         user_metrics = user.get("public_metrics") or {}
         followers = _integer(user_metrics.get("followers_count"))
         following = _integer(user_metrics.get("following_count"))
@@ -1077,9 +1086,16 @@ class CoinCalloutAnalyzer:
         token_info: TokenInfo | None,
         smart_wallets: tuple[str, ...],
         force_x_search: bool = False,
+        allow_x_search: bool = True,
+        refresh_market: bool = False,
     ) -> CoinCallout:
+        dex_snapshot = (
+            self.dex.snapshot(mint, refresh=True)
+            if refresh_market
+            else self.dex.snapshot(mint)
+        )
         dex, tracker_risk, quote_result = await asyncio.gather(
-            self.dex.snapshot(mint),
+            dex_snapshot,
             self.tracker_risk.snapshot(mint),
             self._executable_quote(token_info),
         )
@@ -1097,13 +1113,17 @@ class CoinCalloutAnalyzer:
             executable_quote=executable_quote,
             quote_error=quote_error,
         )
-        if not self.social.search_enabled:
+        if not allow_x_search or not self.social.search_enabled:
             return replace(
                 prefilter,
                 prefilter_score=prefilter.score,
                 x_search_attempted=False,
                 scan_stage="FREE_CHECKED",
-                scan_reason="paid X disabled; free on-chain and market evidence only",
+                scan_reason=(
+                    "paid X deferred for runner research; free on-chain and market evidence only"
+                    if not allow_x_search
+                    else "paid X disabled; free on-chain and market evidence only"
+                ),
             )
         allowed, reason = should_request_x_search(
             prefilter,
@@ -1116,9 +1136,7 @@ class CoinCalloutAnalyzer:
                 x_search_attempted=False,
                 scan_stage="FREE_REJECTED",
                 scan_reason=(
-                    f"manual X check blocked by free gate: {reason}"
-                    if force_x_search
-                    else reason
+                    f"manual X check blocked by free gate: {reason}" if force_x_search else reason
                 ),
             )
 
@@ -1380,8 +1398,7 @@ def score_callout(
             )
         else:
             blockers.append(
-                f"$5 Jupiter route has {executable_quote.price_impact_percent:.2f}% "
-                "price impact"
+                f"$5 Jupiter route has {executable_quote.price_impact_percent:.2f}% price impact"
             )
     else:
         warnings.append(
@@ -1424,14 +1441,8 @@ def score_callout(
         and social.crypto_authors >= 3
         and social.promoter_posts >= 3
         and social.duplicate_percent < Decimal("35")
-        and (
-            not social.unique_authors
-            or social.suspicious_authors * 3 < social.unique_authors
-        )
-        and (
-            social.posts_per_minute >= Decimal("0.10")
-            or social.engagements >= 50
-        )
+        and (not social.unique_authors or social.suspicious_authors * 3 < social.unique_authors)
+        and (social.posts_per_minute >= Decimal("0.10") or social.engagements >= 50)
         and (
             social.trusted_crypto_authors >= 1
             or social.million_follower_authors >= 1
@@ -1475,13 +1486,7 @@ def score_callout(
     else:
         verdict = "INCOMPLETE — NOT PUBLIC"
     source_count = 1 + int(dex.available) + int(social.available) + int(tracker_risk.available)
-    confidence = (
-        "HIGH"
-        if public_alert_eligible
-        else "MEDIUM"
-        if source_count >= 3
-        else "LOW"
-    )
+    confidence = "HIGH" if public_alert_eligible else "MEDIUM" if source_count >= 3 else "LOW"
     return CoinCallout(
         mint=mint,
         symbol=token_info.symbol if token_info else None,

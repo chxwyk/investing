@@ -42,6 +42,7 @@ from .models import (
     PaperDailyLockStatus,
     PumpLaunchResult,
     RiskDecision,
+    RunnerCandidate,
     Side,
     Signal,
     TokenInfo,
@@ -291,7 +292,7 @@ class NewsOpportunityView(discord.ui.View):
         interaction: discord.Interaction,
         button: discord.ui.Button,
     ) -> None:
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        await interaction.response.defer()
         button.disabled = True
         button.label = "Launch submitted…"
         if interaction.message:
@@ -346,9 +347,7 @@ def _launch_readiness_embed(report: dict[str, object]) -> discord.Embed:
     ready = bool(report["overall_ready"])
     wallet = str(report["wallet"] or "NOT CONFIGURED / INVALID")
     balance = report["wallet_balance"]
-    balance_text = (
-        f"{Decimal(str(balance)):.6f} SOL" if balance is not None else "UNAVAILABLE"
-    )
+    balance_text = f"{Decimal(str(balance)):.6f} SOL" if balance is not None else "UNAVAILABLE"
     embed = discord.Embed(
         title="J7 LAUNCH READINESS",
         color=0x2ECC71 if ready else 0xE74C3C,
@@ -396,8 +395,7 @@ def _launch_readiness_embed(report: dict[str, object]) -> discord.Embed:
         embed.add_field(
             name="Launch Lab observations today",
             value=(
-                f"evaluated `{stats.get('evaluated', 0)}` • highest "
-                f"`{stats.get('highest', 0)}/100`"
+                f"evaluated `{stats.get('evaluated', 0)}` • highest `{stats.get('highest', 0)}/100`"
             ),
             inline=False,
         )
@@ -416,9 +414,7 @@ def _launch_readiness_embed(report: dict[str, object]) -> discord.Embed:
             ),
             inline=False,
         )
-    last_lab = (
-        f"<t:{report['last_lab_candidate']}:R>" if report["last_lab_candidate"] else "none"
-    )
+    last_lab = f"<t:{report['last_lab_candidate']}:R>" if report["last_lab_candidate"] else "none"
     last_pinata = (
         f"<t:{report['last_pinata_success']}:R>" if report["last_pinata_success"] else "none"
     )
@@ -495,8 +491,7 @@ def _launch_lab_embed(
         notable = ", ".join(x.notable_accounts[:3]) or "none"
         post_links = (
             " • ".join(
-                f"[post {index + 1}]({url})"
-                for index, url in enumerate(x.notable_posts[:3])
+                f"[post {index + 1}]({url})" for index, url in enumerate(x.notable_posts[:3])
             )
             or "none"
         )
@@ -726,9 +721,8 @@ class LaunchConfirmationView(discord.ui.View):
             return
         self.submitting = True
         button.disabled = True
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        if interaction.message:
-            await interaction.message.edit(view=self)
+        await interaction.response.defer()
+        await interaction.edit_original_response(view=self)
         result = await self.lab_view.bot.engine.launch_lab_draft(
             self.lab_view.draft,
             requested_by=str(interaction.user.id),
@@ -737,15 +731,14 @@ class LaunchConfirmationView(discord.ui.View):
             result,
             self.lab_view.bot.settings.fomo_referral_code,
         )
-        if interaction.message:
-            await interaction.message.edit(
-                embed=result_embed,
-                attachments=[],
-                view=_launch_result_view(
-                    result,
-                    self.lab_view.bot.settings.fomo_referral_code,
-                ),
-            )
+        await interaction.edit_original_response(
+            embed=result_embed,
+            attachments=[],
+            view=_launch_result_view(
+                result,
+                self.lab_view.bot.settings.fomo_referral_code,
+            ),
+        )
         if result.success:
             await self.lab_view.bot._send_alert(
                 result_embed,
@@ -789,7 +782,7 @@ class XVerificationConfirmationView(discord.ui.View):
             return
         self.running = True
         button.disabled = True
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        await interaction.response.defer()
         updated = await self.lab_view.bot.engine.verify_launch_lab_candidate(
             self.lab_view.draft.opportunity,
             research_test=self.lab_view.research_test,
@@ -800,8 +793,11 @@ class XVerificationConfirmationView(discord.ui.View):
         )
         self.lab_view.sync_controls()
         embed, file = await self.lab_view.preview()
-        if interaction.message:
-            await interaction.message.edit(embed=embed, attachments=[file], view=self.lab_view)
+        await interaction.edit_original_response(
+            embed=embed,
+            attachments=[file],
+            view=self.lab_view,
+        )
 
     @discord.ui.button(label="CANCEL", style=discord.ButtonStyle.secondary)
     async def cancel(
@@ -850,12 +846,8 @@ class LaunchLabView(discord.ui.View):
     def sync_controls(self) -> None:
         locked = self.research_test and not self.production_eligible
         self.launch.disabled = locked
-        self.launch.label = (
-            "J7 LAUNCH LOCKED — RESEARCH ONLY" if locked else "LAUNCH VIA J7"
-        )
-        self.launch.style = (
-            discord.ButtonStyle.secondary if locked else discord.ButtonStyle.danger
-        )
+        self.launch.label = "J7 LAUNCH LOCKED — RESEARCH ONLY" if locked else "LAUNCH VIA J7"
+        self.launch.style = discord.ButtonStyle.secondary if locked else discord.ButtonStyle.danger
         self.verify_x.label = "TEST X VERIFY" if self.research_test else "X VERIFY"
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -891,8 +883,14 @@ class LaunchLabView(discord.ui.View):
     async def refresh_message(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer()
         embed, file = await self.preview()
-        if interaction.message:
-            await interaction.message.edit(embed=embed, attachments=[file], view=self)
+        # Ephemeral component responses do not expose an editable channel message.
+        # After a deferred component/modal response, Discord requires editing the
+        # interaction's original webhook response.
+        await interaction.edit_original_response(
+            embed=embed,
+            attachments=[file],
+            view=self,
+        )
 
     @discord.ui.button(label="LAUNCH VIA J7", style=discord.ButtonStyle.danger, row=0)
     async def launch(
@@ -961,10 +959,7 @@ class LaunchLabView(discord.ui.View):
             )
             return
         budget = await self.bot.engine.x_budget.status()
-        ceiling = (
-            self.bot.settings.x_verify_max_posts
-            * self.bot.settings.x_estimated_post_read_usd
-        )
+        ceiling = self.bot.settings.x_verify_max_posts * self.bot.settings.x_estimated_post_read_usd
         test_prefix = (
             "This is a manual test X lookup. "
             f"Up to {self.bot.settings.x_verify_max_posts} Posts may be read.\n\n"
@@ -988,9 +983,7 @@ class LaunchLabView(discord.ui.View):
             ),
             color=0x1DA1F2,
         )
-        embed.set_footer(
-            text="Official X API • local estimate, not the X invoice • never calls J7"
-        )
+        embed.set_footer(text="Official X API • local estimate, not the X invoice • never calls J7")
         confirmation = XVerificationConfirmationView(self)
         if self.research_test:
             confirmation.children[0].label = "RUN TEST X VERIFY"
@@ -1020,6 +1013,187 @@ class LaunchLabView(discord.ui.View):
             content="Launch Lab closed. No SOL was spent.",
             embed=None,
             attachments=[],
+            view=None,
+        )
+
+
+class RunnerXVerificationConfirmationView(discord.ui.View):
+    def __init__(self, lab_view: FomoRunnerLabView) -> None:
+        super().__init__(timeout=300)
+        self.lab_view = lab_view
+        self.running = False
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await self.lab_view.interaction_check(interaction)
+
+    @discord.ui.button(label="RUN TARGETED X VERIFY", style=discord.ButtonStyle.success)
+    async def run(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        if self.running:
+            await interaction.response.send_message(
+                "Runner X verification is already running.", ephemeral=True
+            )
+            return
+        self.running = True
+        button.disabled = True
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        updated = await self.lab_view.bot.engine.verify_runner_x(self.lab_view.candidate)
+        self.lab_view.candidates[self.lab_view.index] = updated
+        self.lab_view.sync_links()
+        await interaction.edit_original_response(embed=self.lab_view.embed(), view=self.lab_view)
+
+    @discord.ui.button(label="CANCEL", style=discord.ButtonStyle.secondary)
+    async def cancel(
+        self,
+        interaction: discord.Interaction,
+        _button: discord.ui.Button,
+    ) -> None:
+        await self.lab_view.refresh_message(interaction, fetch=False)
+
+
+class FomoRunnerLabView(discord.ui.View):
+    """Existing-token shadow research controls; no control can buy or call J7."""
+
+    def __init__(
+        self,
+        bot: SmartMoneyBot,
+        candidates: tuple[RunnerCandidate, ...],
+        *,
+        owner_id: int,
+        research_test: bool,
+    ) -> None:
+        super().__init__(timeout=900)
+        self.bot = bot
+        self.candidates = list(candidates)
+        self.owner_id = owner_id
+        self.research_test = research_test
+        self.index = 0
+        self.fomo_link = discord.ui.Button(label="OPEN FOMO", style=discord.ButtonStyle.link, row=1)
+        self.pump_link = discord.ui.Button(label="OPEN PUMP", style=discord.ButtonStyle.link, row=1)
+        self.dex_link = discord.ui.Button(
+            label="DEXSCREENER", style=discord.ButtonStyle.link, row=1
+        )
+        self.solscan_link = discord.ui.Button(
+            label="SOLSCAN", style=discord.ButtonStyle.link, row=1
+        )
+        for item in (self.fomo_link, self.pump_link, self.dex_link, self.solscan_link):
+            self.add_item(item)
+        self.sync_links()
+
+    @property
+    def candidate(self) -> RunnerCandidate:
+        return self.candidates[self.index]
+
+    def sync_links(self) -> None:
+        mint = self.candidate.mint
+        self.fomo_link.url = _fomo_coin_url(mint, self.bot.settings.fomo_referral_code)
+        self.pump_link.url = f"https://pump.fun/coin/{mint}"
+        self.dex_link.url = self.candidate.pair_url or f"https://dexscreener.com/solana/{mint}"
+        self.solscan_link.url = f"https://solscan.io/token/{mint}"
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.owner_id and _member_is_admin(
+            interaction.user, self.bot.settings
+        ):
+            return True
+        await interaction.response.send_message(
+            "Only the administrator who opened this Fomo Runner Lab can use it.",
+            ephemeral=True,
+        )
+        return False
+
+    def embed(self) -> discord.Embed:
+        return _runner_embed(
+            self.candidate,
+            index=self.index,
+            total=len(self.candidates),
+            research_test=self.research_test,
+        )
+
+    async def refresh_message(
+        self,
+        interaction: discord.Interaction,
+        *,
+        fetch: bool,
+    ) -> None:
+        await interaction.response.defer()
+        if fetch:
+            self.candidates[self.index] = await self.bot.engine.analyze_runner(
+                self.candidate.mint,
+                refresh_market=True,
+                allow_automatic_x=False,
+            )
+        self.sync_links()
+        await interaction.edit_original_response(embed=self.embed(), view=self)
+
+    @discord.ui.button(label="NEXT CANDIDATE", style=discord.ButtonStyle.primary, row=0)
+    async def next_candidate(
+        self,
+        interaction: discord.Interaction,
+        _button: discord.ui.Button,
+    ) -> None:
+        self.index = (self.index + 1) % len(self.candidates)
+        self.sync_links()
+        await self.refresh_message(interaction, fetch=False)
+
+    @discord.ui.button(label="REFRESH", style=discord.ButtonStyle.primary, row=0)
+    async def refresh(
+        self,
+        interaction: discord.Interaction,
+        _button: discord.ui.Button,
+    ) -> None:
+        await self.refresh_message(interaction, fetch=True)
+
+    @discord.ui.button(label="VERIFY ON X", style=discord.ButtonStyle.success, row=0)
+    async def verify_x(
+        self,
+        interaction: discord.Interaction,
+        _button: discord.ui.Button,
+    ) -> None:
+        if not self.bot.settings.x_paid_search_enabled:
+            await interaction.response.send_message(
+                "Official X verification is disabled; free runner research remains active.",
+                ephemeral=True,
+            )
+            return
+        if not self.bot.settings.x_api_bearer_token:
+            await interaction.response.send_message(
+                "X_API_BEARER_TOKEN is not configured; no request was made.",
+                ephemeral=True,
+            )
+            return
+        budget = await self.bot.engine.x_budget.status()
+        ceiling = self.bot.settings.x_verify_max_posts * self.bot.settings.x_estimated_post_read_usd
+        embed = discord.Embed(
+            title="TARGETED FOMO RUNNER X VERIFICATION",
+            description=(
+                f"Exact contract: `{self.candidate.mint}`\n"
+                f"Up to `{self.bot.settings.x_verify_max_posts}` Posts may be read.\n"
+                f"Estimated Post-read ceiling: approximately `${ceiling:.3f}`.\n"
+                f"Local estimate today: `${budget['estimated_spend_today']}` / "
+                f"`${budget['daily_budget']}`.\n\n"
+                "This uses the same central Launch Lab/manual-X budget. It never buys "
+                "the token and never calls J7."
+            ),
+            color=0x1DA1F2,
+        )
+        await interaction.response.edit_message(
+            embed=embed,
+            view=RunnerXVerificationConfirmationView(self),
+        )
+
+    @discord.ui.button(label="CLOSE", style=discord.ButtonStyle.secondary, row=0)
+    async def close_lab(
+        self,
+        interaction: discord.Interaction,
+        _button: discord.ui.Button,
+    ) -> None:
+        await interaction.response.edit_message(
+            content="Fomo Runner Lab closed. No SOL was spent and no token was bought.",
+            embed=None,
             view=None,
         )
 
@@ -1230,6 +1404,163 @@ def _fomo_watch_embed(callout: CoinCallout) -> discord.Embed:
     embed.color = 0x5865F2
     embed.set_footer(
         text="FOMO WATCH • public on-chain/DEX evidence • research alert, not a profit promise"
+    )
+    return embed
+
+
+def _percent_change(current: Decimal | None, first: Decimal | None) -> str:
+    if current is None or first is None or first <= 0:
+        return "unavailable"
+    value = ((current / first) - Decimal("1")) * Decimal("100")
+    return f"{value:+.2f}%"
+
+
+def _runner_embed(
+    candidate: RunnerCandidate,
+    *,
+    index: int = 0,
+    total: int = 1,
+    research_test: bool = False,
+) -> discord.Embed:
+    current = candidate.current
+    first = candidate.first
+    title = "🧪 FOMO RUNNER PIPELINE TEST — RESEARCH ONLY" if research_test else f"{candidate.tier}"
+    graduation = f"<t:{candidate.graduated_at}:R>" if candidate.graduated_at else "unavailable"
+    x = candidate.x_evidence
+    x_text = (
+        f"CHECKED • exact-contract posts `{x.contract_posts}` • authors "
+        f"`{x.contract_authors}` • credible `{x.credible_contract_authors}` • "
+        f"velocity `{x.posts_per_minute}/min` • duplicate `{x.duplicate_percent}%`"
+        if x.available
+        else f"NOT VERIFIED • {x.error or 'zero-cost/manual-check state'}"
+    )
+    total_5m = current.buys_5m + current.sells_5m
+    holder_count = current.holder_count if current.holder_count is not None else "unavailable"
+    holder_growth = (
+        current.holder_count - first.holder_count
+        if current.holder_count is not None and first.holder_count is not None
+        else "unavailable"
+    )
+    earliest_entry = (
+        candidate.earliest_smart_entry_age_seconds
+        if candidate.earliest_smart_entry_age_seconds is not None
+        else "unavailable"
+    )
+
+    def evidence(value: Decimal | None) -> Decimal | str:
+        return value if value is not None else "unavailable"
+
+    embed = discord.Embed(
+        title=title[:256],
+        description=(
+            f"**{candidate.name or 'Unknown token'}** "
+            f"`${candidate.symbol or 'UNKNOWN'}`\n`{candidate.mint}`\n\n"
+            f"Candidate `{index + 1}/{total}` • Runner score "
+            f"**{candidate.score}/100** • no automatic buying"
+        ),
+        color=(0xE74C3C if candidate.hard_blockers else 0xF1C40F if research_test else 0x5865F2),
+        timestamp=datetime.fromtimestamp(candidate.generated_at, tz=UTC),
+    )
+    embed.add_field(
+        name="Graduation / timing",
+        value=(
+            f"Graduation-age proxy: {graduation}\n"
+            f"Source: `{candidate.graduation_source}`\n"
+            f"First seen: <t:{candidate.first_seen_at}:R>"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Market since first seen",
+        value=(
+            f"Price `{_price(first.price_usd)}` → `{_price(current.price_usd)}` "
+            f"(`{_percent_change(current.price_usd, first.price_usd)}`)\n"
+            f"MC `{_money(first.market_cap_usd)}` → `{_money(current.market_cap_usd)}` "
+            f"(`{_percent_change(current.market_cap_usd, first.market_cap_usd)}`)\n"
+            f"Liquidity `{_money(current.liquidity_usd)}` • "
+            f"5m volume `{_money(current.volume_5m_usd)}`"
+        ),
+        inline=False,
+    )
+    if candidate.momentum_windows:
+        window_lines: list[str] = []
+        for window in candidate.momentum_windows:
+            label = f"{window.seconds}s" if window.seconds < 60 else f"{window.seconds // 60}m"
+            window_lines.append(
+                f"**{label}:** price `{evidence(window.price_change_percent)}%` • "
+                f"MC `{evidence(window.market_cap_change_percent)}%` • "
+                f"rolling-5m volume `{evidence(window.rolling_volume_change_percent)}%` • "
+                f"transactions `{evidence(window.rolling_transactions_change_percent)}%`"
+            )
+        embed.add_field(
+            name="Short-interval momentum / acceleration",
+            value="\n".join(window_lines)[:1024],
+            inline=False,
+        )
+    embed.add_field(
+        name="Flow / holder evidence",
+        value=(
+            f"5m buys/sells `{current.buys_5m}/{current.sells_5m}` "
+            f"(`{total_5m}` transactions)\n"
+            f"Holders `{holder_count}` • growth `{holder_growth}`\n"
+            f"Verified smart-wallet buyers `{current.verified_unique_buyers}` • "
+            "scope: tracked financially verified wallets only"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Wallet overlap",
+        value=(
+            f"Smart wallets `{len(candidate.smart_wallets)}` • "
+            f"{', '.join(candidate.smart_wallets[:5]) or 'none yet'}\n"
+            f"Earliest smart entry after proxy graduation: `{earliest_entry}s`\n"
+            "Public Fomo top-trader overlap: `not available through an authorized API`"
+        ),
+        inline=False,
+    )
+    risk = current
+    embed.add_field(
+        name="Risk / route",
+        value=(
+            f"Tracker risk `{evidence(risk.risk_score)}/10` • "
+            f"bundlers `{evidence(risk.bundlers_percent)}%` • "
+            f"insiders `{evidence(risk.insiders_percent)}%`\n"
+            f"snipers `{evidence(risk.snipers_percent)}%` • "
+            f"dev `{evidence(risk.dev_percent)}%` • "
+            f"top holders `{evidence(risk.top10_percent)}%`\n"
+            f"Jupiter `$5` route `{'available' if risk.route_available else 'unavailable'}`"
+        ),
+        inline=False,
+    )
+    breakdown = candidate.breakdown
+    embed.add_field(
+        name="Runner score breakdown",
+        value=(
+            f"recency `{breakdown.graduation_recency}` • momentum `{breakdown.momentum}` • "
+            f"acceleration `{breakdown.acceleration}` • buy quality `{breakdown.buy_quality}`\n"
+            f"liquidity `{breakdown.liquidity}` • holders `{breakdown.holders}` • "
+            f"smart wallets `{breakdown.smart_wallets}` • safety/route "
+            f"`{breakdown.safety_route}` • X `{breakdown.x_social}` • "
+            f"penalties `{breakdown.penalties}`"
+        ),
+        inline=False,
+    )
+    embed.add_field(name="X exact-contract verification", value=x_text[:1024], inline=False)
+    if candidate.positives:
+        embed.add_field(
+            name="Why it is being measured",
+            value="\n".join(f"• {item}" for item in candidate.positives)[:1024],
+            inline=False,
+        )
+    risks = candidate.hard_blockers + candidate.warnings
+    if risks:
+        embed.add_field(
+            name="Warnings / hard blockers",
+            value="\n".join(f"• {item}" for item in risks)[:1024],
+            inline=False,
+        )
+    embed.set_footer(
+        text=("SHADOW RESEARCH • existing token • no J7 • no auto-buy • no profit promise")
     )
     return embed
 
@@ -1982,6 +2313,7 @@ class SmartMoneyBot(commands.Bot):
     async def setup_hook(self) -> None:
         await self.engine.initialize()
         await self.add_cog(SmartMoneyCommands(self))
+        await self.add_cog(FomoCommands(self))
         if self.settings.discord_guild_id:
             guild = discord.Object(id=self.settings.discord_guild_id)
             # Testing uses guild-scoped commands so updates appear immediately. Clear the
@@ -2209,6 +2541,13 @@ class SmartMoneyBot(commands.Bot):
             ping_user=True,
         )
 
+    async def on_runner_alert(self, candidate: RunnerCandidate) -> None:
+        await self._send_alert(
+            _runner_embed(candidate),
+            token_mint=candidate.mint,
+            ping_user=True,
+        )
+
     async def on_news_alert(
         self,
         alert: NewsAlert,
@@ -2223,9 +2562,7 @@ class SmartMoneyBot(commands.Bot):
             view=None if mint else NewsOpportunityView(self, opportunity),
         )
 
-    async def on_narrative_match(
-        self, alert: NewsAlert, match: NarrativePairMatch
-    ) -> None:
+    async def on_narrative_match(self, alert: NewsAlert, match: NarrativePairMatch) -> None:
         await self._send_alert(
             _narrative_match_embed(alert, match),
             token_mint=match.mint,
@@ -2632,14 +2969,10 @@ class SmartMoneyCommands(
             else "not completed"
         )
         radar_error_text = (
-            f" • error: {status['x_radar_last_error']}"
-            if status["x_radar_last_error"]
-            else ""
+            f" • error: {status['x_radar_last_error']}" if status["x_radar_last_error"] else ""
         )
         fomo_radar_error_text = (
-            f" • {status['fomo_radar_last_error']}"
-            if status["fomo_radar_last_error"]
-            else ""
+            f" • {status['fomo_radar_last_error']}" if status["fomo_radar_last_error"] else ""
         )
         x_budget_text = (
             "disabled—zero X API spend"
@@ -2703,13 +3036,17 @@ class SmartMoneyCommands(
             f"{scan_counts.get('verified', 0)} VERIFIED TREND alerts • "
             f"{scan_counts.get('fomo_watch', 0)} FOMO WATCH alerts\n"
             + recent_scan_text
-            +
-            f"**Free Fomo radar:** "
+            + f"**Free Fomo radar:** "
             f"{'enabled' if status['fomo_radar_enabled'] else 'disabled'} • public DEX/Pump "
             f"profiles and trending nominations every {status['fomo_radar_poll_seconds'] // 60}m"
             f" • {status['fomo_radar_scans']} scans • last batch "
             f"{len(status['fomo_radar_last_candidates'])} Solana candidates"
             f"{fomo_radar_error_text}\n"
+            f"**Fomo Runner Radar:** "
+            f"{'shadow research enabled' if status['fomo_runner_enabled'] else 'disabled'} • "
+            f"two-stage broad discovery + {status['fomo_runner_fast_watch_seconds']}s "
+            f"temporary fast watch • {status['fomo_runner_observations']} persisted candidates • "
+            "no auto-buy\n"
             f"**X near-realtime news stream:** {news_stream_status} • configured account/news "
             "rule • crypto-first filtering • exceptional U.S. event lane\n"
             f"**RSS/news radar:** {'ready' if status['news_rss_ready'] else 'starting'} • "
@@ -2732,8 +3069,7 @@ class SmartMoneyCommands(
                 if status["j7_feed_configured"]
                 else "deploy API supported; social-feed API not publicly documented\n"
             )
-            +
-            "**Fomo:** the official app exposes leaderboards, profiles, follows, and alerts, "
+            + "**Fomo:** the official app exposes leaderboards, profiles, follows, and alerts, "
             "but no documented public API/webhook was found. The bot will not claim a "
             "private endpoint is authorized; Fomo candidates require an official feed or a "
             "public wallet identity before the same full verification can run."
@@ -3244,6 +3580,7 @@ class SmartMoneyCommands(
             file=file,
             view=view,
             ephemeral=True,
+            wait=True,
         )
 
     @app_commands.command(name="status", description="Check bot, RPC, and monitor health.")
@@ -3308,8 +3645,7 @@ class SmartMoneyCommands(
         )
         j7_launch_status = (
             "ready"
-            if status["pump_launch_unlocked"]
-            and status["launch_provider"] == "J7 Tracker"
+            if status["pump_launch_unlocked"] and status["launch_provider"] == "J7 Tracker"
             else "not selected"
             if status["pump_launch_unlocked"]
             else "locked"
@@ -3348,6 +3684,11 @@ class SmartMoneyCommands(
                 if status["news_rss_last_error"]
                 else "starting"
             )
+        )
+        runner_last = (
+            f"<t:{status['fomo_runner_last_evaluated']}:R>"
+            if status["fomo_runner_last_evaluated"]
+            else "not completed yet"
         )
         stream_status = (
             f"connected • {status['stream_subscriptions']} wallet subscriptions"
@@ -3436,6 +3777,12 @@ class SmartMoneyCommands(
             f"{status['fomo_radar_poll_seconds'] // 60}m • "
             f"{status['fomo_radar_scans']} scans • latest public candidate batch "
             f"{len(status['fomo_radar_last_candidates'])}\n"
+            f"**Fomo Runner Radar:** "
+            f"{'SHADOW / RESEARCH' if status['fomo_runner_enabled'] else 'disabled'} • "
+            f"fast-watch `{status['fomo_runner_fast_watch_active']}` • observations "
+            f"`{status['fomo_runner_observations']}` • last evaluation "
+            f"{runner_last} • "
+            "no automatic buys\n"
             f"**News radar:** {'enabled' if status['news_radar_enabled'] else 'disabled'} • "
             "crypto-first • exceptional U.S. events require independent confirmation • "
             f"X stream {x_news_health} • RSS {rss_health}\n"
@@ -3605,6 +3952,158 @@ class SmartMoneyCommands(
             "Manual `trader-add` and CSV import remain optional overrides."
         )
         await interaction.response.send_message(text, ephemeral=True)
+
+
+class FomoCommands(
+    commands.GroupCog,
+    group_name="fomo",
+    group_description="Research existing-token runner candidates without buying.",
+):
+    """Separate existing-token product; avoids Discord's 25-child smartmoney limit."""
+
+    def __init__(self, bot: SmartMoneyBot) -> None:
+        self.bot = bot
+
+    async def _require_admin(self, interaction: discord.Interaction) -> bool:
+        if _member_is_admin(interaction.user, self.bot.settings):
+            return True
+        await interaction.response.send_message(
+            "You need Administrator or a configured bot-admin role for Fomo Runner Lab.",
+            ephemeral=True,
+        )
+        return False
+
+    @app_commands.command(
+        name="lab",
+        description="Browse real current existing-token runner research candidates.",
+    )
+    @app_commands.describe(mode="Production research floor or deterministic real-token test")
+    async def lab(
+        self,
+        interaction: discord.Interaction,
+        mode: Literal["production", "test"] = "production",
+    ) -> None:
+        if not await self._require_admin(interaction):
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        research_test = mode == "test"
+        candidates = await self.bot.engine.runner_lab_candidates(research_test=research_test)
+        if not candidates:
+            await interaction.followup.send(
+                "No real public Solana token with usable current market data was returned. "
+                "Nothing was fabricated and no X request or buy was made.",
+                ephemeral=True,
+            )
+            return
+        view = FomoRunnerLabView(
+            self.bot,
+            candidates,
+            owner_id=interaction.user.id,
+            research_test=research_test,
+        )
+        await interaction.followup.send(
+            embed=view.embed(),
+            view=view,
+            ephemeral=True,
+            wait=True,
+        )
+
+    @app_commands.command(
+        name="results",
+        description="Show forward runner outcomes and hit rates without profit claims.",
+    )
+    async def results(self, interaction: discord.Interaction) -> None:
+        if not await self._require_admin(interaction):
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        result = await self.bot.engine.runner_results()
+        horizon_names = {
+            60: "1m",
+            300: "5m",
+            900: "15m",
+            1_800: "30m",
+            3_600: "1h",
+            14_400: "4h",
+            86_400: "24h",
+        }
+        lines: list[str] = []
+        by_horizon = result["by_horizon"]
+        assert isinstance(by_horizon, dict)
+        for horizon, name in horizon_names.items():
+            row = by_horizon[horizon]
+            assert isinstance(row, dict)
+            average = row["average"]
+            lines.append(
+                f"**{name}:** `{row['count']}` outcomes • avg "
+                f"`{f'{average:+.2f}%' if isinstance(average, Decimal) else 'pending'}` • "
+                f"hits +10/+25/+50/+100 `"
+                f"{row['hit_10']}/{row['hit_25']}/{row['hit_50']}/{row['hit_100']}` • "
+                f"rug/liquidity failures `{row['failures']}`"
+            )
+        embed = discord.Embed(
+            title="FOMO RUNNER SHADOW RESULTS",
+            description=(
+                f"Candidates tracked: **{result['candidates']}**\n"
+                f"Forward observations: **{result['outcomes']}**\n"
+                f"All-horizon average: `{result['average_return']:+.2f}%` • "
+                f"median: `{result['median_return']:+.2f}%`\n\n" + "\n".join(lines)
+            ),
+            color=0x5865F2,
+            timestamp=discord.utils.utcnow(),
+        )
+        embed.add_field(
+            name="Are we early?",
+            value=(
+                "Average detection delay from DEX pair creation proxy: "
+                f"`{result['average_detection_delay_seconds']}s`"
+                if result["average_detection_delay_seconds"] is not None
+                else "Pair-creation timing evidence is still collecting."
+            ),
+            inline=False,
+        )
+        breakdowns = result["breakdowns"]
+        assert isinstance(breakdowns, dict)
+
+        def bucket_lines(group: str) -> str:
+            rows = breakdowns.get(group, {})
+            assert isinstance(rows, dict)
+            values: list[str] = []
+            for label, row in rows.items():
+                assert isinstance(row, dict)
+                average = row["average"]
+                average_text = f"{average:+.2f}%" if isinstance(average, Decimal) else "pending"
+                hit_rate = row["hit_25_percent"]
+                failure_rate = row["failure_rate_percent"]
+                values.append(
+                    f"`{label}` n={row['count']} • avg `{average_text}` • "
+                    f"+25 hit `"
+                    f"{f'{hit_rate:.2f}%' if isinstance(hit_rate, Decimal) else 'pending'}` • "
+                    f"failure `"
+                    f"{f'{failure_rate:.2f}%' if isinstance(failure_rate, Decimal) else 'pending'}`"
+                )
+            return "\n".join(values) or "Collecting outcomes."
+
+        embed.add_field(name="By score bucket", value=bucket_lines("score"), inline=False)
+        embed.add_field(
+            name="By graduation-age proxy",
+            value=bucket_lines("graduation_age"),
+            inline=False,
+        )
+        embed.add_field(
+            name="By smart-wallet overlap",
+            value=bucket_lines("smart_wallets"),
+            inline=False,
+        )
+        embed.add_field(name="By X status", value=bucket_lines("x"), inline=False)
+        embed.add_field(
+            name="Baseline comparison",
+            value=str(result["baseline_status"]),
+            inline=False,
+        )
+        embed.set_footer(
+            text="No look-ahead scoring • shadow research only • no auto-buy or profit claim"
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 def run_bot(settings: Settings) -> None:

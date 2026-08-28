@@ -578,10 +578,13 @@ async def test_launch_lab_x_preview_and_verification_never_call_j7(settings) -> 
     run_interaction = SimpleNamespace(
         user=SimpleNamespace(id=1),
         response=SimpleNamespace(defer=AsyncMock()),
+        edit_original_response=AsyncMock(),
         message=SimpleNamespace(edit=AsyncMock()),
     )
     await run_button.callback(run_interaction)
     engine.verify_launch_lab_candidate.assert_awaited_once()
+    run_interaction.edit_original_response.assert_awaited_once()
+    run_interaction.message.edit.assert_not_awaited()
     j7_launch.assert_not_awaited()
 
 
@@ -735,6 +738,7 @@ async def test_test_x_failure_keeps_research_ui_usable_and_never_calls_j7(settin
     interaction = SimpleNamespace(
         user=SimpleNamespace(id=1),
         response=SimpleNamespace(defer=AsyncMock()),
+        edit_original_response=AsyncMock(),
         message=SimpleNamespace(edit=AsyncMock()),
     )
 
@@ -744,7 +748,8 @@ async def test_test_x_failure_keeps_research_ui_usable_and_never_calls_j7(settin
         opportunity,
         research_test=True,
     )
-    interaction.message.edit.assert_awaited_once()
+    interaction.edit_original_response.assert_awaited_once()
+    interaction.message.edit.assert_not_awaited()
     assert view.draft.opportunity.x_evidence.error == "X RATE LIMITED"
     assert next(item for item in view.children if item.label == "TEST X VERIFY")
     j7_launch.assert_not_awaited()

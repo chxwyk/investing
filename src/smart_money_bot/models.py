@@ -329,6 +329,90 @@ class CoinCallout:
 
 
 @dataclass(frozen=True, slots=True)
+class RunnerMarketSnapshot:
+    """Immutable market evidence captured at one runner-evaluation time."""
+
+    mint: str
+    captured_at: int
+    price_usd: Decimal | None = None
+    market_cap_usd: Decimal | None = None
+    liquidity_usd: Decimal | None = None
+    volume_5m_usd: Decimal = Decimal("0")
+    dex_price_change_5m_percent: Decimal | None = None
+    buys_5m: int = 0
+    sells_5m: int = 0
+    holder_count: int | None = None
+    verified_unique_buyers: int = 0
+    largest_verified_buyer_percent: Decimal | None = None
+    smart_wallet_count: int = 0
+    top10_percent: Decimal | None = None
+    dev_percent: Decimal | None = None
+    bundlers_percent: Decimal | None = None
+    insiders_percent: Decimal | None = None
+    snipers_percent: Decimal | None = None
+    risk_score: Decimal | None = None
+    rugged: bool = False
+    route_available: bool = False
+    route_price_impact_percent: Decimal | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RunnerScoreBreakdown:
+    graduation_recency: int = 0
+    momentum: int = 0
+    acceleration: int = 0
+    buy_quality: int = 0
+    liquidity: int = 0
+    holders: int = 0
+    smart_wallets: int = 0
+    safety_route: int = 0
+    x_social: int = 0
+    penalties: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class RunnerMomentumWindow:
+    """Change between two immutable snapshots near one requested lookback."""
+
+    seconds: int
+    price_change_percent: Decimal | None = None
+    market_cap_change_percent: Decimal | None = None
+    rolling_volume_change_percent: Decimal | None = None
+    rolling_transactions_change_percent: Decimal | None = None
+    holder_growth: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RunnerCandidate:
+    """Existing-token research candidate; never a launch or automatic buy order."""
+
+    mint: str
+    symbol: str | None
+    name: str | None
+    first_seen_at: int
+    graduated_at: int | None
+    graduation_source: str
+    first: RunnerMarketSnapshot
+    current: RunnerMarketSnapshot
+    score: Decimal
+    tier: str
+    breakdown: RunnerScoreBreakdown
+    momentum_windows: tuple[RunnerMomentumWindow, ...] = ()
+    smart_wallets: tuple[str, ...] = ()
+    earliest_smart_entry_at: int | None = None
+    earliest_smart_entry_age_seconds: int | None = None
+    top_trader_overlap: int | None = None
+    x_evidence: XSocialSnapshot = field(default_factory=lambda: XSocialSnapshot(available=False))
+    positives: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
+    hard_blockers: tuple[str, ...] = ()
+    overextended: bool = False
+    research_only: bool = True
+    pair_url: str = ""
+    generated_at: int = 0
+
+
+@dataclass(frozen=True, slots=True)
 class SwapQuote:
     """A quote-only Jupiter Swap V2 order normalized for paper execution."""
 

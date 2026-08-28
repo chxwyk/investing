@@ -71,6 +71,7 @@ from .models import (
     PaperSummary,
     PumpLaunchResult,
     RiskDecision,
+    RunnerCandidate,
     ScoredTrader,
     Side,
     Signal,
@@ -87,6 +88,16 @@ from .news import (
 from .risk import RiskEngine
 from .rotation import CandidateRotator, RotationResult, is_pump_mint
 from .rpc import SolanaRPC
+from .runner import (
+    RUNNER_HORIZONS_SECONDS,
+    forward_return_percent,
+    runner_candidate_from_json,
+    runner_candidate_to_json,
+    runner_snapshot_from_callout,
+    runner_snapshot_from_json,
+    runner_snapshot_to_json,
+    score_runner_candidate,
+)
 from .scoring import rank_traders
 from .social import (
     PumpProfileDiscovery,
@@ -134,15 +145,15 @@ class Notifier(Protocol):
 
     async def on_fomo_watch(self, callout: CoinCallout) -> None: ...
 
+    async def on_runner_alert(self, candidate: RunnerCandidate) -> None: ...
+
     async def on_news_alert(
         self,
         alert: NewsAlert,
         opportunity: LaunchOpportunity,
     ) -> None: ...
 
-    async def on_narrative_match(
-        self, alert: NewsAlert, match: NarrativePairMatch
-    ) -> None: ...
+    async def on_narrative_match(self, alert: NewsAlert, match: NarrativePairMatch) -> None: ...
 
     async def on_daily_profit_lock(self, status: PaperDailyLockStatus) -> None: ...
 
@@ -173,6 +184,9 @@ class NullNotifier:
     async def on_fomo_watch(self, callout: CoinCallout) -> None:
         return None
 
+    async def on_runner_alert(self, candidate: RunnerCandidate) -> None:
+        return None
+
     async def on_news_alert(
         self,
         alert: NewsAlert,
@@ -180,9 +194,7 @@ class NullNotifier:
     ) -> None:
         return None
 
-    async def on_narrative_match(
-        self, alert: NewsAlert, match: NarrativePairMatch
-    ) -> None:
+    async def on_narrative_match(self, alert: NewsAlert, match: NarrativePairMatch) -> None:
         return None
 
     async def on_daily_profit_lock(self, status: PaperDailyLockStatus) -> None:
@@ -273,6 +285,8 @@ class SmartMoneyEngine:
         self._news_rss_task: asyncio.Task[None] | None = None
         self._x_radar_task: asyncio.Task[None] | None = None
         self._fomo_radar_task: asyncio.Task[None] | None = None
+        self._runner_outcome_task: asyncio.Task[None] | None = None
+        self._runner_fast_watch_tasks: dict[str, asyncio.Task[None]] = {}
         self._news_match_tasks: set[asyncio.Task[None]] = set()
         self._news_alert_times: deque[int] = deque()
         self._recent_news_events: deque[tuple[int, str, frozenset[str]]] = deque()
@@ -290,6 +304,9 @@ class SmartMoneyEngine:
             "fomo_watch": 0,
         }
         self._fomo_radar_seen: dict[str, int] = {}
+        self._runner_last_alert: dict[str, tuple[int, Decimal]] = {}
+        self.runner_last_evaluated_at: int | None = None
+        self.runner_last_candidate_mint: str | None = None
         self._scan_lock = asyncio.Lock()
         self._discovery_lock = asyncio.Lock()
         self._daily_profit_lock = asyncio.Lock()
@@ -408,10 +425,17 @@ class SmartMoneyEngine:
                 self._run_x_radar(),
                 name="smart-money-x-radar",
             )
-        if self.settings.fomo_radar_enabled and self.settings.coin_callouts_enabled:
+        if self.settings.fomo_radar_enabled and (
+            self.settings.coin_callouts_enabled or self.settings.fomo_runner_enabled
+        ):
             self._fomo_radar_task = asyncio.create_task(
                 self._run_fomo_radar(),
                 name="smart-money-fomo-radar",
+            )
+        if self.settings.fomo_runner_enabled:
+            self._runner_outcome_task = asyncio.create_task(
+                self._run_runner_outcomes(),
+                name="smart-money-runner-outcomes",
             )
 
     async def close(self) -> None:
@@ -425,6 +449,7 @@ class SmartMoneyEngine:
             self._news_rss_task,
             self._x_radar_task,
             self._fomo_radar_task,
+            self._runner_outcome_task,
         ):
             if task:
                 task.cancel()
@@ -433,6 +458,7 @@ class SmartMoneyEngine:
             self._news_rss_task,
             self._x_radar_task,
             self._fomo_radar_task,
+            self._runner_outcome_task,
         ):
             if task:
                 with suppress(asyncio.CancelledError):
@@ -441,6 +467,15 @@ class SmartMoneyEngine:
         self._news_rss_task = None
         self._x_radar_task = None
         self._fomo_radar_task = None
+        self._runner_outcome_task = None
+        for task in self._runner_fast_watch_tasks.values():
+            task.cancel()
+        if self._runner_fast_watch_tasks:
+            await asyncio.gather(
+                *self._runner_fast_watch_tasks.values(),
+                return_exceptions=True,
+            )
+        self._runner_fast_watch_tasks.clear()
         for task in self._callout_tasks:
             task.cancel()
         if self._callout_tasks:
@@ -1067,9 +1102,7 @@ class SmartMoneyEngine:
 
         while True:
             try:
-                mints = await self.x_social.discover_contracts(
-                    self.settings.x_radar_query
-                )
+                mints = await self.x_social.discover_contracts(self.settings.x_radar_query)
                 for mint in mints[: self.settings.x_radar_max_contracts_per_scan]:
                     # discover_contracts cached the matching exact-contract X posts,
                     # so this forced analysis does not spend another paid X request.
@@ -1082,7 +1115,7 @@ class SmartMoneyEngine:
             await asyncio.sleep(self.settings.x_radar_poll_seconds)
 
     async def _run_fomo_radar(self) -> None:
-        """Nominate active public DEX/Pump coins without any paid X requests."""
+        """Broad, cheap discovery feeding legacy callouts and runner shadow research."""
 
         while True:
             try:
@@ -1096,7 +1129,12 @@ class SmartMoneyEngine:
                 ]
                 for mint in due[: self.settings.fomo_radar_max_candidates_per_scan]:
                     self._fomo_radar_seen[mint] = now
-                    self._queue_coin_callout(mint)
+                    if self.settings.coin_callouts_enabled:
+                        self._queue_coin_callout(mint)
+                    if self.settings.fomo_runner_enabled:
+                        candidate = await self.analyze_runner(mint)
+                        await self._maybe_publish_runner(candidate)
+                        self._start_runner_fast_watch(candidate)
                 if len(self._fomo_radar_seen) > 1000:
                     cutoff = now - self.settings.fomo_radar_recheck_seconds * 2
                     self._fomo_radar_seen = {
@@ -1110,6 +1148,566 @@ class SmartMoneyEngine:
                 self.dex_screener.last_radar_error = str(exc)[:200]
                 await self.notifier.on_error("Fomo public-data radar", exc)
             await asyncio.sleep(self.settings.fomo_radar_poll_seconds)
+
+    async def analyze_runner(
+        self,
+        mint: str,
+        *,
+        refresh_market: bool = True,
+        x_evidence=None,
+        allow_automatic_x: bool = True,
+    ) -> RunnerCandidate:
+        """Capture and persist one time-T existing-token runner evaluation."""
+
+        await self.initialize()
+        now = int(time.time())
+        buyer_evidence = await self.database.recent_verified_token_buy_evidence(
+            mint,
+            now - max(3_600, self.settings.coin_callout_window_seconds),
+        )
+        buyers = await self.database.recent_verified_token_buyers(
+            mint,
+            now - max(3_600, self.settings.coin_callout_window_seconds),
+        )
+        callout = await self.analyze_coin(
+            mint,
+            buyers=buyers,
+            allow_x_search=False,
+            refresh_market=refresh_market,
+        )
+        if x_evidence is not None:
+            callout = replace(callout, social=x_evidence)
+        current = runner_snapshot_from_callout(
+            callout,
+            captured_at=now,
+            verified_unique_buyers=int(buyer_evidence["unique_buyers"]),
+            largest_verified_buyer_percent=buyer_evidence["largest_buyer_percent"],
+        )
+        prior_raw = await self.database.runner_candidate_payload(mint)
+        if prior_raw:
+            prior_candidate = runner_candidate_from_json(prior_raw)
+            first = prior_candidate.first
+            graduated_at = prior_candidate.graduated_at
+            graduation_source = prior_candidate.graduation_source
+        else:
+            first = current
+            pair_age = callout.dex.pair_age_minutes
+            graduated_at = now - pair_age * 60 if pair_age is not None else None
+            graduation_source = (
+                "DEX_PAIR_CREATED_PROXY — not exact Pump graduation"
+                if pair_age is not None
+                else "UNAVAILABLE"
+            )
+        history = tuple(
+            runner_snapshot_from_json(item)
+            for item in await self.database.runner_snapshot_payloads(
+                mint,
+                before_at=now,
+                limit=30,
+            )
+        )
+        candidate = score_runner_candidate(
+            callout,
+            first=first,
+            current=current,
+            history=history,
+            graduated_at=graduated_at,
+            graduation_source=graduation_source,
+            earliest_smart_entry_at=buyer_evidence["earliest_buy_at"],
+            smart_wallets=tuple(buyer_evidence["wallets"]),
+            now=now,
+        )
+        public_ready = bool(
+            candidate.score >= self.settings.fomo_runner_public_alert_min_score
+            and not candidate.hard_blockers
+            and not candidate.overextended
+        )
+        candidate = replace(candidate, research_only=not public_ready)
+
+        if (
+            allow_automatic_x
+            and public_ready
+            and self.x_social.search_enabled
+            and not candidate.x_evidence.available
+        ):
+            social = await self.x_social.snapshot(
+                mint,
+                symbol=candidate.symbol,
+                name=candidate.name,
+                context="fomo_runner_automatic",
+                free_score=int(candidate.score),
+            )
+            if social.available:
+                callout = replace(callout, social=social)
+                candidate = score_runner_candidate(
+                    callout,
+                    first=first,
+                    current=current,
+                    history=history,
+                    graduated_at=graduated_at,
+                    graduation_source=graduation_source,
+                    earliest_smart_entry_at=buyer_evidence["earliest_buy_at"],
+                    smart_wallets=tuple(buyer_evidence["wallets"]),
+                    now=now,
+                )
+                candidate = replace(
+                    candidate,
+                    research_only=bool(
+                        candidate.score < self.settings.fomo_runner_public_alert_min_score
+                        or candidate.hard_blockers
+                        or candidate.overextended
+                    ),
+                )
+
+        await self.database.store_runner_candidate(
+            candidate,
+            payload_json=runner_candidate_to_json(candidate),
+            snapshot_json=runner_snapshot_to_json(candidate.current),
+        )
+        await self._record_runner_outcomes(candidate)
+        self.runner_last_evaluated_at = now
+        self.runner_last_candidate_mint = mint
+        return candidate
+
+    async def verify_runner_x(self, candidate: RunnerCandidate) -> RunnerCandidate:
+        """Run one exact-contract official-X lookup through the shared budget guard."""
+
+        social = await self.x_social.snapshot(
+            candidate.mint,
+            symbol=candidate.symbol,
+            name=candidate.name,
+            context="fomo_runner_manual",
+            free_score=int(candidate.score),
+        )
+        return await self.analyze_runner(
+            candidate.mint,
+            refresh_market=False,
+            x_evidence=social,
+            allow_automatic_x=False,
+        )
+
+    async def runner_lab_candidates(
+        self,
+        *,
+        research_test: bool,
+    ) -> tuple[RunnerCandidate, ...]:
+        """Return current real existing tokens; test mode bypasses display floor only."""
+
+        await self.initialize()
+        now = int(time.time())
+        discovered = await self.dex_screener.trending_mints()
+        observed = await self.database.recent_observed_token_mints(
+            limit=self.settings.fomo_runner_lab_candidates * 2,
+        )
+        cached = [
+            runner_candidate_from_json(raw)
+            for raw in await self.database.recent_runner_candidate_payloads(
+                now=now,
+                max_age_seconds=86_400,
+                limit=self.settings.fomo_runner_lab_candidates * 2,
+            )
+        ]
+        mints = list(
+            dict.fromkeys(
+                (*discovered, *(item.mint for item in cached), *observed)
+            )
+        )
+        candidates: list[RunnerCandidate] = []
+        for mint in mints[: self.settings.fomo_runner_lab_candidates * 2]:
+            try:
+                item = await self.analyze_runner(
+                    mint,
+                    refresh_market=True,
+                    allow_automatic_x=False,
+                )
+            except Exception:
+                continue
+            if not item.current.market_cap_usd and not item.current.price_usd:
+                continue
+            if research_test or (
+                item.score >= self.settings.fomo_runner_fast_watch_min_score
+                and not item.hard_blockers
+            ):
+                candidates.append(item)
+        candidates.sort(
+            key=lambda item: (item.score, item.current.captured_at),
+            reverse=True,
+        )
+        return tuple(candidates[: self.settings.fomo_runner_lab_candidates])
+
+    async def _maybe_publish_runner(self, candidate: RunnerCandidate) -> None:
+        if candidate.research_only:
+            return
+        now = int(time.time())
+        previous = self._runner_last_alert.get(candidate.mint)
+        if previous and now - previous[0] < 300 and candidate.score < previous[1] + 5:
+            return
+        self._runner_last_alert[candidate.mint] = (now, candidate.score)
+        await self.notifier.on_runner_alert(candidate)
+
+    def _start_runner_fast_watch(self, candidate: RunnerCandidate) -> None:
+        if candidate.mint in self._runner_fast_watch_tasks:
+            return
+        age_minutes = (
+            max(0, candidate.generated_at - candidate.graduated_at) // 60
+            if candidate.graduated_at
+            else None
+        )
+        if (
+            candidate.score < self.settings.fomo_runner_fast_watch_min_score
+            or age_minutes is None
+            or age_minutes > self.settings.fomo_runner_max_graduation_age_minutes
+            or len(self._runner_fast_watch_tasks) >= self.settings.fomo_runner_max_fast_watch
+        ):
+            return
+        task = asyncio.create_task(
+            self._fast_watch_runner(candidate.mint),
+            name=f"runner-fast-{candidate.mint[:8]}",
+        )
+        self._runner_fast_watch_tasks[candidate.mint] = task
+        task.add_done_callback(
+            lambda _task, mint=candidate.mint: self._runner_fast_watch_tasks.pop(mint, None)
+        )
+
+    async def _fast_watch_runner(self, mint: str) -> None:
+        stop_at = time.monotonic() + self.settings.fomo_runner_fast_watch_minutes * 60
+        while time.monotonic() < stop_at:
+            await asyncio.sleep(self.settings.fomo_runner_fast_watch_seconds)
+            candidate = await self.analyze_runner(mint, refresh_market=True)
+            await self._maybe_publish_runner(candidate)
+
+    async def _run_runner_outcomes(self) -> None:
+        while True:
+            try:
+                now = int(time.time())
+                for mint in await self.database.runner_due_mints(now=now, limit=10):
+                    await self.analyze_runner(
+                        mint,
+                        refresh_market=True,
+                        allow_automatic_x=False,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await self.notifier.on_error("Runner outcome tracking", exc)
+            await asyncio.sleep(self.settings.fomo_runner_outcome_poll_seconds)
+
+    async def _record_runner_outcomes(self, candidate: RunnerCandidate) -> None:
+        snapshots = [
+            runner_snapshot_from_json(raw)
+            for raw in await self.database.runner_snapshot_payloads(
+                candidate.mint,
+                limit=200,
+            )
+        ]
+        tolerance = max(90, self.settings.fomo_runner_outcome_poll_seconds * 2)
+        for horizon in RUNNER_HORIZONS_SECONDS:
+            eligible = [
+                snapshot
+                for snapshot in snapshots
+                if snapshot.captured_at - candidate.first_seen_at >= horizon
+            ]
+            if not eligible:
+                continue
+            observed = min(eligible, key=lambda item: item.captured_at)
+            observed_age = observed.captured_at - candidate.first_seen_at
+            # A restart after a long outage must not relabel a future price as a
+            # historical 1m/5m outcome. Missing windows remain honestly pending.
+            if observed_age > horizon + tolerance:
+                continue
+            liquidity_return = forward_return_percent(
+                observed.liquidity_usd,
+                candidate.first.liquidity_usd,
+            )
+            liquidity_disappeared = bool(
+                observed.liquidity_usd is None
+                or observed.liquidity_usd < Decimal("500")
+                or (
+                    candidate.first.liquidity_usd
+                    and observed.liquidity_usd
+                    < candidate.first.liquidity_usd * Decimal("0.10")
+                )
+            )
+            await self.database.record_runner_outcome(
+                mint=candidate.mint,
+                horizon_seconds=horizon,
+                observed_at=observed.captured_at,
+                price_return_percent=forward_return_percent(
+                    observed.price_usd,
+                    candidate.first.price_usd,
+                ),
+                market_cap_return_percent=forward_return_percent(
+                    observed.market_cap_usd,
+                    candidate.first.market_cap_usd,
+                ),
+                liquidity_return_percent=liquidity_return,
+                liquidity_disappeared=liquidity_disappeared,
+                rugged=observed.rugged,
+                route_available=observed.route_available,
+            )
+
+    async def runner_results(self) -> dict[str, object]:
+        rows = await self.database.runner_results_rows()
+        snapshots = await self.database.runner_all_snapshot_rows()
+        candidates: dict[str, dict[str, object]] = {}
+        candidate_objects: dict[str, RunnerCandidate] = {}
+        outcomes: list[dict[str, object]] = []
+        for row in rows:
+            mint = str(row["mint"])
+            candidates.setdefault(mint, row)
+            if row["horizon_seconds"] is not None:
+                outcomes.append(row)
+        returns = [
+            Decimal(str(row["price_return_percent"]))
+            if row["price_return_percent"] is not None
+            else Decimal(str(row["market_cap_return_percent"]))
+            for row in outcomes
+            if row["price_return_percent"] is not None
+            or row["market_cap_return_percent"] is not None
+        ]
+        ordered = sorted(returns)
+        median = ordered[len(ordered) // 2] if ordered else Decimal("0")
+        average = sum(returns, Decimal("0")) / len(returns) if returns else Decimal("0")
+        by_horizon: dict[int, dict[str, object]] = {}
+        for horizon in RUNNER_HORIZONS_SECONDS:
+            horizon_rows = [row for row in outcomes if int(row["horizon_seconds"]) == horizon]
+            horizon_returns = [
+                Decimal(str(row["price_return_percent"]))
+                if row["price_return_percent"] is not None
+                else Decimal(str(row["market_cap_return_percent"]))
+                for row in horizon_rows
+                if row["price_return_percent"] is not None
+                or row["market_cap_return_percent"] is not None
+            ]
+            by_horizon[horizon] = {
+                "count": len(horizon_rows),
+                "average": (
+                    sum(horizon_returns, Decimal("0")) / len(horizon_returns)
+                    if horizon_returns
+                    else None
+                ),
+                "hit_10": sum(value >= 10 for value in horizon_returns),
+                "hit_25": sum(value >= 25 for value in horizon_returns),
+                "hit_50": sum(value >= 50 for value in horizon_returns),
+                "hit_100": sum(value >= 100 for value in horizon_returns),
+                "failures": sum(
+                    bool(row["rugged"] or row["liquidity_disappeared"]) for row in horizon_rows
+                ),
+            }
+        excursions: dict[str, dict[str, object]] = {}
+        for mint in candidates:
+            first_payload = await self.database.runner_candidate_payload(mint)
+            if not first_payload:
+                continue
+            candidate = runner_candidate_from_json(first_payload)
+            candidate_objects[mint] = candidate
+            first = candidate.first
+            series = [
+                runner_snapshot_from_json(str(row["snapshot_json"]))
+                for row in snapshots
+                if str(row["mint"]) == mint
+            ]
+            timed_changes = [
+                (item.captured_at, value)
+                for item in series
+                if (value := forward_return_percent(item.price_usd, first.price_usd))
+                is not None
+            ]
+            peak = max(timed_changes, key=lambda item: item[1]) if timed_changes else None
+            excursions[mint] = {
+                "maximum_favorable": peak[1] if peak else None,
+                "maximum_drawdown": (
+                    min(value for _captured, value in timed_changes)
+                    if timed_changes
+                    else None
+                ),
+                "time_to_peak_seconds": peak[0] - first.captured_at if peak else None,
+            }
+
+        latest_outcome: dict[str, dict[str, object]] = {}
+        for row in outcomes:
+            mint = str(row["mint"])
+            prior = latest_outcome.get(mint)
+            if prior is None or int(row["horizon_seconds"]) > int(prior["horizon_seconds"]):
+                latest_outcome[mint] = row
+
+        def row_return(row: dict[str, object]) -> Decimal | None:
+            value = row["price_return_percent"]
+            if value is None:
+                value = row["market_cap_return_percent"]
+            return Decimal(str(value)) if value is not None else None
+
+        def aggregate(mints: list[str]) -> dict[str, object]:
+            selected = [latest_outcome[mint] for mint in mints if mint in latest_outcome]
+            values = [value for row in selected if (value := row_return(row)) is not None]
+            return {
+                "count": len(selected),
+                "average": (
+                    (sum(values, Decimal("0")) / len(values)).quantize(Decimal("0.01"))
+                    if values
+                    else None
+                ),
+                "hit_25_percent": (
+                    (Decimal(sum(value >= 25 for value in values)) / Decimal(len(values)) * 100)
+                    .quantize(Decimal("0.01"))
+                    if values
+                    else None
+                ),
+                "failure_rate_percent": (
+                    (
+                        Decimal(
+                            sum(
+                                bool(row["rugged"] or row["liquidity_disappeared"])
+                                for row in selected
+                            )
+                        )
+                        / Decimal(len(selected))
+                        * 100
+                    ).quantize(Decimal("0.01"))
+                    if selected
+                    else None
+                ),
+            }
+
+        bucket_mints: dict[str, dict[str, list[str]]] = {
+            "score": {},
+            "graduation_age": {},
+            "market_cap": {},
+            "smart_wallets": {},
+            "holder_quality": {},
+            "x": {},
+        }
+        detection_delays: list[int] = []
+        for mint, item in candidate_objects.items():
+            score_label = (
+                "0-49"
+                if item.score < 50
+                else "50-69"
+                if item.score < 70
+                else "70-84"
+                if item.score < 85
+                else "85-100"
+            )
+            age = (
+                max(0, item.first_seen_at - item.graduated_at)
+                if item.graduated_at
+                else None
+            )
+            if age is not None:
+                detection_delays.append(age)
+            age_label = (
+                "unknown"
+                if age is None
+                else "0-5m"
+                if age <= 300
+                else "5-15m"
+                if age <= 900
+                else "15-30m"
+                if age <= 1_800
+                else "30m+"
+            )
+            cap = item.first.market_cap_usd
+            cap_label = (
+                "unknown"
+                if cap is None
+                else "under-50k"
+                if cap < 50_000
+                else "50k-150k"
+                if cap < 150_000
+                else "150k+"
+            )
+            smart_label = (
+                "0" if not item.smart_wallets else "1" if len(item.smart_wallets) == 1 else "2+"
+            )
+            holder_label = (
+                "unknown"
+                if item.first.holder_count is None or item.first.top10_percent is None
+                else "healthy"
+                if item.first.holder_count >= 100 and item.first.top10_percent <= 35
+                else "thin/concentrated"
+            )
+            labels = {
+                "score": score_label,
+                "graduation_age": age_label,
+                "market_cap": cap_label,
+                "smart_wallets": smart_label,
+                "holder_quality": holder_label,
+                "x": "verified" if item.x_evidence.available else "not-verified",
+            }
+            for group, label in labels.items():
+                bucket_mints[group].setdefault(label, []).append(mint)
+        breakdowns = {
+            group: {label: aggregate(mints) for label, mints in labels.items()}
+            for group, labels in bucket_mints.items()
+        }
+
+        all_mints = list(candidate_objects)
+        sample = max(1, len(all_mints) // 4) if all_mints else 0
+        baselines = {
+            "all_new_candidates": aggregate(all_mints),
+            "random_newly_graduated": aggregate(
+                sorted(
+                    all_mints,
+                    key=lambda mint: sum(
+                        (index + 1) * ord(character)
+                        for index, character in enumerate(mint)
+                    ),
+                )[:sample]
+            ),
+            "lowest_age": aggregate(
+                sorted(
+                    all_mints,
+                    key=lambda mint: (
+                        candidate_objects[mint].first_seen_at
+                        - (candidate_objects[mint].graduated_at or 0)
+                    ),
+                )[:sample]
+            ),
+            "highest_5m_volume": aggregate(
+                sorted(
+                    all_mints,
+                    key=lambda mint: candidate_objects[mint].first.volume_5m_usd,
+                    reverse=True,
+                )[:sample]
+            ),
+            "highest_5m_price_gain": aggregate(
+                sorted(
+                    all_mints,
+                    key=lambda mint: (
+                        candidate_objects[mint].first.dex_price_change_5m_percent
+                        or Decimal("-999")
+                    ),
+                    reverse=True,
+                )[:sample]
+            ),
+            "highest_market_cap": aggregate(
+                sorted(
+                    all_mints,
+                    key=lambda mint: (
+                        candidate_objects[mint].first.market_cap_usd or Decimal("0")
+                    ),
+                    reverse=True,
+                )[:sample]
+            ),
+        }
+        return {
+            "candidates": len(candidates),
+            "outcomes": len(outcomes),
+            "average_return": average.quantize(Decimal("0.01")),
+            "median_return": median.quantize(Decimal("0.01")),
+            "by_horizon": by_horizon,
+            "excursions": excursions,
+            "breakdowns": breakdowns,
+            "baselines": baselines,
+            "average_detection_delay_seconds": (
+                sum(detection_delays) // len(detection_delays) if detection_delays else None
+            ),
+            "shadow_mode": True,
+            "baseline_status": (
+                "collecting — compare RunnerScore with age/volume/price-gain baselines "
+                "after at least 30 completed 1h observations"
+            ),
+        }
 
     async def _handle_news_alert(self, alert: NewsAlert) -> None:
         await self._evaluate_news_alert(alert, publish=True)
@@ -1141,10 +1739,7 @@ class SmartMoneyEngine:
             if self.settings.no_x_launch_candidates_enabled
             else self.settings.news_x_verify_min_score
         )
-        if (
-            preliminary.score < preliminary_floor
-            and not alert.token_mints
-        ):
+        if preliminary.score < preliminary_floor and not alert.token_mints:
             return
 
         # Complete every free blocker before spending a paid X resource.
@@ -1207,11 +1802,7 @@ class SmartMoneyEngine:
             return
         self._news_alert_times.append(now)
         await self.notifier.on_news_alert(opportunity.alert, opportunity)
-        if (
-            self.settings.news_dex_match_enabled
-            and not alert.token_mints
-            and alert.narrative_terms
-        ):
+        if self.settings.news_dex_match_enabled and not alert.token_mints and alert.narrative_terms:
             task = asyncio.create_task(
                 self._run_narrative_match(alert),
                 name=f"news-narrative-match-{now}",
@@ -1259,9 +1850,7 @@ class SmartMoneyEngine:
     def _remember_news_event(self, alert: NewsAlert, *, now: int) -> None:
         terms = frozenset(item.casefold() for item in alert.narrative_terms)
         if terms:
-            self._recent_news_events.append(
-                (now, (alert.author or alert.source).casefold(), terms)
-            )
+            self._recent_news_events.append((now, (alert.author or alert.source).casefold(), terms))
 
     async def launch_lab_candidates(self, *, topic: str = "") -> tuple[LaunchOpportunity, ...]:
         """Refresh authorized feeds and return recent, clustered, manual-review candidates."""
@@ -1321,9 +1910,7 @@ class SmartMoneyEngine:
         research_age = max(self.settings.launch_lab_max_age_seconds, 21_600)
         preferred_alert_key = ""
         async with self._launch_lab_lock:
-            alerts = list(
-                await self.news_poller.snapshot(max_age_seconds=research_age)
-            )
+            alerts = list(await self.news_poller.snapshot(max_age_seconds=research_age))
             requested = topic.strip()
             if requested.casefold().startswith("https://"):
                 article = await self.news_poller.public_article(requested)
@@ -1331,12 +1918,15 @@ class SmartMoneyEngine:
                     preferred_alert_key = alert_key(article)
                     alerts.insert(0, article)
             elif requested:
-                alerts = list(
-                    await self.news_poller.topic_snapshot(
-                        requested,
-                        max_age_seconds=research_age,
+                alerts = (
+                    list(
+                        await self.news_poller.topic_snapshot(
+                            requested,
+                            max_age_seconds=research_age,
+                        )
                     )
-                ) + alerts
+                    + alerts
+                )
         if not alerts:
             return ()
 
@@ -1421,8 +2011,7 @@ class SmartMoneyEngine:
                     bool(needle)
                     and needle
                     in (
-                        f"{item.alert.headline} {item.primary_narrative} "
-                        f"{item.alert.url}"
+                        f"{item.alert.headline} {item.primary_narrative} {item.alert.url}"
                     ).casefold()
                 ),
                 item.alert.created_at,
@@ -1518,9 +2107,7 @@ class SmartMoneyEngine:
         if wallet_error:
             failures.append(wallet_error)
         elif wallet_balance is not None and wallet_balance < required_balance:
-            failures.append(
-                f"INSUFFICIENT SOL — at least {required_balance} SOL is required"
-            )
+            failures.append(f"INSUFFICIENT SOL — at least {required_balance} SOL is required")
         if not reservation_healthy:
             failures.append("launch reservations are unhealthy")
         if unknown:
@@ -1917,12 +2504,9 @@ class SmartMoneyEngine:
                 configured_score_floor=self.settings.coin_callout_min_alert_score,
             ):
                 await self.notifier.on_coin_callout(callout)
-            elif (
-                self.settings.coin_watch_alerts_enabled
-                and should_publish_coin_watch(
-                    callout,
-                    configured_score_floor=self.settings.coin_watch_min_score,
-                )
+            elif self.settings.coin_watch_alerts_enabled and should_publish_coin_watch(
+                callout,
+                configured_score_floor=self.settings.coin_watch_min_score,
             ):
                 self._coin_scan_counts["watch"] += 1
                 await self.notifier.on_coin_watch(callout)
@@ -1941,6 +2525,8 @@ class SmartMoneyEngine:
         *,
         buyers: list[tuple[str, str]] | None = None,
         force_x_search: bool = False,
+        allow_x_search: bool = True,
+        refresh_market: bool = False,
     ) -> CoinCallout:
         if buyers is None:
             buyers = await self.database.recent_verified_token_buyers(
@@ -1957,6 +2543,8 @@ class SmartMoneyEngine:
             token_info=token_info,
             smart_wallets=aliases,
             force_x_search=force_x_search,
+            allow_x_search=allow_x_search,
+            refresh_market=refresh_market,
         )
         self._record_coin_scan(callout)
         return callout
@@ -3036,12 +3624,17 @@ class SmartMoneyEngine:
             "fomo_radar_last_scan": self.dex_screener.last_radar_at,
             "fomo_radar_last_candidates": self.dex_screener.last_radar_candidates,
             "fomo_radar_last_error": self.dex_screener.last_radar_error,
+            "fomo_runner_enabled": self.settings.fomo_runner_enabled,
+            "fomo_runner_shadow_mode": True,
+            "fomo_runner_fast_watch_seconds": (self.settings.fomo_runner_fast_watch_seconds),
+            "fomo_runner_fast_watch_active": len(self._runner_fast_watch_tasks),
+            "fomo_runner_observations": await self.database.runner_observation_count(),
+            "fomo_runner_last_evaluated": self.runner_last_evaluated_at,
+            "fomo_runner_last_mint": self.runner_last_candidate_mint,
             "trade_activity_alerts_enabled": self.settings.trade_activity_alerts_enabled,
             "news_radar_enabled": self.settings.news_radar_enabled,
             "news_source_image_enabled": self.settings.news_source_image_enabled,
-            "no_x_launch_candidates_enabled": (
-                self.settings.no_x_launch_candidates_enabled
-            ),
+            "no_x_launch_candidates_enabled": (self.settings.no_x_launch_candidates_enabled),
             "no_x_launch_min_score": self.settings.no_x_launch_min_score,
             "x_news_stream_enabled": self.settings.x_news_stream_enabled,
             "x_news_stream_configured": self.x_news_stream.configured,
