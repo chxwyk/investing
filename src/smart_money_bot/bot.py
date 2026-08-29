@@ -22,6 +22,7 @@ from .constants import BOT_VERSION, PAPER_DEMO_ENTRY_PRICE_USD, PAPER_DEMO_MINT
 from .engine import SmartMoneyEngine
 from .errors import DiscoveryError, JupiterError, PumpLaunchError
 from .lab.decision import Decision
+from .lab.evidence import buyer_evidence, organic_demand_text
 from .lab.exits import PaperPosition
 from .lab.identity import (
     NO_DESCRIPTION,
@@ -1861,11 +1862,7 @@ def _runner_digest_embed(
         reasons = candidate.why_surfaced or why_surfaced(quality)
         why = "\n".join(f"• {item}" for item in reasons[:4]) or "• qualified on market quality"
         warnings = "\n".join(f"• {item}" for item in quality.quality_warnings[:3])
-        independence = (
-            f"{demand.estimated_independent_buyers}/{demand.traced_wallets} traced"
-            if demand.estimated_independent_buyers is not None
-            else "not traced yet"
-        )
+        independence = buyer_evidence(demand, candidate.forensics).independence_text
         safety_line = (
             f"Safety `{candidate.safety.status}` • scam risk "
             f"`{candidate.safety.scam_risk_score}/100 — {candidate.safety.scam_risk_level}`"
@@ -1967,6 +1964,7 @@ def _runner_forensic_embed(
 ) -> discord.Embed:
     current = candidate.current
     forensic = candidate.forensics
+    forensic_buyers = buyer_evidence(candidate.quality.demand, forensic)
 
     def value(item: object, suffix: str = "") -> str:
         return "unknown" if item is None else f"{item}{suffix}"
@@ -2022,8 +2020,8 @@ def _runner_forensic_embed(
     embed.add_field(
         name="Shared funding / independence",
         value=(
-            f"Raw buyers `{forensic.raw_unique_buyers}` • independent clusters "
-            f"`{value(forensic.estimated_independent_clusters)}` • largest cluster "
+            f"Verified buyers `{forensic_buyers.verified_buyers_text}` • independent "
+            f"`{forensic_buyers.independence_text}` • largest cluster "
             f"`{value(forensic.largest_cluster_size)}` wallets / "
             f"`{value(forensic.largest_cluster_supply_percent, '%')}` supply\n"
             f"Cluster-adjusted ownership `{value(forensic.cluster_adjusted_percent, '%')}` • "
@@ -4652,6 +4650,11 @@ def _lab_opportunity_embed(
     )
     if result.identity.image_url:
         embed.set_thumbnail(url=result.identity.image_url)
+    buyers = buyer_evidence(demand, candidate.forensics)
+    limited_by = decision.evidence.get("confidence_limited_by") or ()
+    confidence_note = (
+        f" (capped: {', '.join(str(item) for item in limited_by[:2])})" if limited_by else ""
+    )
     embed.add_field(
         name="SETUP",
         value=_lab_setup_line(result.lifecycle, current.market_cap_usd)[
@@ -4659,11 +4662,17 @@ def _lab_opportunity_embed(
         ],
         inline=False,
     )
+    organic = organic_demand_text(
+        quality.organic_score,
+        authenticity_quality=result.authenticity.quality,
+        demand_confidence=demand.confidence,
+    )
     embed.add_field(
         name="QUALITY",
         value=(
             f"Opportunity `{quality.opportunity_score:.0f}` • momentum "
-            f"`{quality.momentum_score:.0f}` • organic `{quality.organic_score:.0f}`\n"
+            f"`{quality.momentum_score:.0f}`\n"
+            f"Organic demand `{organic}`\n"
             f"Economic authenticity `{result.authenticity.score:.0f}` "
             f"({result.authenticity.band}) • safety **{decision.safety}**\n"
             f"Evidence `{decision.evidence_quality}`"
@@ -4673,13 +4682,14 @@ def _lab_opportunity_embed(
     embed.add_field(
         name="ACTIVITY / EXECUTION",
         value=(
-            f"Independent buyers `{demand.estimated_independent_buyers or 'unknown'}` • "
-            f"liquidity `{short_money(current.liquidity_usd)}`\n"
-            f"Flow 5m `{current.buys_5m}` buys / `{current.sells_5m}` sells • route "
+            f"Independent buyers `{buyers.independence_text}` • verified buyers "
+            f"`{buyers.verified_buyers_text}`\n"
+            f"Liquidity `{short_money(current.liquidity_usd)}` • flow 5m "
+            f"`{current.buys_5m}` buys / `{current.sells_5m}` sells • route "
             f"`{current.buy_route_status}`/`{current.sell_route_status}`\n"
             f"Round-trip cost `{result.evaluation.edge.cost_percent}%` • expected NET edge "
             f"`{decision.expected_net_edge_percent}%` • confidence "
-            f"`{decision.edge_confidence}`"
+            f"`{decision.edge_confidence}`{confidence_note}"
         )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
         inline=False,
     )

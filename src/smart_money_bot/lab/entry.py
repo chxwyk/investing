@@ -31,6 +31,7 @@ from .decision import (
     SafetyStatus,
     TradeDecision,
 )
+from .evidence import confidence_cap, organic_demand_state
 from .lifecycle import (
     COOLDOWN,
     REENTRY_QUALIFIED,
@@ -300,6 +301,19 @@ def evaluate_entry(
         blockers.append(sizing.blocked_reason)
 
     # --- 9. expected net edge ---------------------------------------------
+    # Confidence is a claim about how much is known, so it is ceilinged by the
+    # weakest evidence behind it.  A caller that hands in an over-stated number
+    # cannot push an unjustified confidence into the persisted decision or the
+    # rendered card.
+    cap = confidence_cap(
+        evidence_quality=quality,
+        authenticity_quality=(authenticity.quality if authenticity is not None else None),
+        activity_available=(
+            authenticity.activity.available if authenticity is not None else None
+        ),
+        safety_status=str(safety),
+        data_degraded=context.data_degraded or context.provider_disagreement,
+    )
     notional = sizing.size_usd if sizing.size_usd > 0 else config.normal_position_usd
     edge = estimate_expected_edge(
         notional_usd=notional,
@@ -310,7 +324,7 @@ def evaluate_entry(
         slippage_bps=(
             int(context.slippage_percent * 100) if context.slippage_percent is not None else None
         ),
-        confidence=context.edge_confidence,
+        confidence=cap.apply(context.edge_confidence),
         quality=quality,
         config=config,
     )
@@ -365,6 +379,13 @@ def evaluate_entry(
                 str(context.slippage_percent) if context.slippage_percent is not None else None
             ),
             "gross_upside_percent": str(edge.gross_upside_percent),
+            "confidence_ceiling": str(cap.ceiling),
+            "confidence_limited_by": list(cap.reasons),
+            "organic_demand_state": organic_demand_state(
+                authenticity_quality=(
+                    authenticity.quality if authenticity is not None else None
+                ),
+            ),
             "sizing_multiplier": str(sizing.multiplier),
             "sizing_reductions": list(sizing.reductions),
             "supporting": list(dict.fromkeys(supporting)),

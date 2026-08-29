@@ -27,6 +27,7 @@ from .lab.bankroll import apply_exit as apply_bankroll_exit
 from .lab.config import DEFAULT_LAB_CONFIG, STRATEGY_VERSION, LabConfig
 from .lab.decision import EvidenceQuality, TradeDecision
 from .lab.entry import EntryContext, EntryEvaluation, evaluate_entry
+from .lab.evidence import confidence_cap
 from .lab.exits import (
     ExitContext,
     PaperPosition,
@@ -665,6 +666,7 @@ class LabRuntime:
         demand = getattr(quality, "demand", None)
 
         price = _field(current, "price_usd")
+        degraded = bool(getattr(getattr(candidate, "forensics", None), "degraded", False))
         liquidity = _field(current, "liquidity_usd")
         first_liquidity = _field(first, "liquidity_usd")
         move_since_surface = lifecycle.return_from_surface(price)
@@ -708,8 +710,13 @@ class LabRuntime:
             regime=self._regime,
             expected_upside_percent=_expected_upside(quality, lifecycle),
             expected_downside_percent=_expected_downside(quality),
-            edge_confidence=_edge_confidence(quality, authenticity),
-            data_degraded=bool(getattr(getattr(candidate, "forensics", None), "degraded", False)),
+            edge_confidence=_edge_confidence(
+                quality,
+                authenticity,
+                safety_status=str(getattr(safety, "status", "UNKNOWN")),
+                data_degraded=degraded,
+            ),
+            data_degraded=degraded,
         )
 
     def _events(
@@ -867,7 +874,21 @@ def _expected_downside(quality: Any) -> Decimal | None:
     return (Decimal("60") - organic / 4).quantize(Decimal("0.01"))
 
 
-def _edge_confidence(quality: Any, authenticity: AuthenticityAssessment) -> Decimal | None:
+def _edge_confidence(
+    quality: Any,
+    authenticity: AuthenticityAssessment,
+    *,
+    safety_status: str | None = None,
+    data_degraded: bool = False,
+) -> Decimal | None:
+    """Confidence in the edge estimate, ceilinged by evidence completeness.
+
+    The organic-demand score measures *visible* demand.  On its own it can read
+    100/100 while economic authenticity is UNKNOWN and the bounded SOL activity
+    sample is missing, which is exactly the state in which a 100% confidence
+    reading is unjustified.  The cap makes the claim match the evidence.
+    """
+
     if quality is None:
         return None
     demand = getattr(quality, "demand", None)
@@ -875,8 +896,18 @@ def _edge_confidence(quality: Any, authenticity: AuthenticityAssessment) -> Deci
     if authenticity.quality is not EvidenceQuality.UNKNOWN:
         confidence = (confidence + authenticity.score) / 2
     if getattr(demand, "confidence", "UNKNOWN") == "UNKNOWN":
+        # Kept from before the cap existed: an untraced candidate halves its
+        # confidence outright.  The ceiling below is applied on top, so this can
+        # only ever be more conservative, never less.
         confidence = confidence / 2
-    return confidence.quantize(Decimal("0.01"))
+    cap = confidence_cap(
+        authenticity_quality=authenticity.quality,
+        activity_available=authenticity.activity.available,
+        safety_status=safety_status,
+        demand_confidence=getattr(demand, "confidence", None),
+        data_degraded=data_degraded,
+    )
+    return cap.apply(confidence.quantize(Decimal("0.01")))
 
 
 def _field(source: Any, name: str) -> Decimal | None:
