@@ -49,6 +49,7 @@ from .models import (
     TokenInfo,
     TrackedTrader,
 )
+from .quality import STAGE_LABELS, why_surfaced
 
 logger = logging.getLogger(__name__)
 
@@ -1551,8 +1552,12 @@ def _runner_embed(
             f"**[{candidate.name or 'Unknown token'}]"
             f"({_fomo_coin_url(candidate.mint, fomo_referral_code)})** "
             f"`${candidate.symbol or 'UNKNOWN'}`\n`{candidate.mint}`\n\n"
-            f"Candidate `{index + 1}/{total}` • Runner score "
-            f"**{candidate.score}/100** • state **{candidate.state}**\n"
+            f"Candidate `{index + 1}/{total}` • stage "
+            f"**{STAGE_LABELS.get(candidate.stage, candidate.stage)}**\n"
+            f"Opportunity **{candidate.quality.opportunity_score:.0f}/100** • momentum "
+            f"**{candidate.quality.momentum_score:.0f}/100** • organic demand "
+            f"**{candidate.quality.organic_score:.0f}/100** • legacy score "
+            f"`{candidate.score}/100`\n"
             f"{_runner_links(candidate, fomo_referral_code)}\n"
             "Links only navigate • no automatic buying"
         ),
@@ -1621,6 +1626,25 @@ def _runner_embed(
         inline=False,
     )
     risk = current
+    if candidate.safety.status == "FAIL":
+        embed.add_field(
+            name="🛑 SAFETY: FAIL — " + candidate.safety.scam_risk_level,
+            value=(
+                "\n".join(f"• {item}" for item in candidate.safety.failures[:6])
+                or "• fail-closed safety rejection"
+            )[:1024],
+            inline=False,
+        )
+    elif candidate.safety.status == "UNKNOWN":
+        embed.add_field(
+            name="⚠️ SAFETY: UNKNOWN — never treated as a pass",
+            value=(
+                "Missing evidence: "
+                + ", ".join(candidate.safety.critical_unknowns[:6])
+                + "\nEntry eligibility stays blocked while any of this is unavailable."
+            )[:1024],
+            inline=False,
+        )
     embed.add_field(
         name="Risk / route",
         value=(
@@ -1663,16 +1687,26 @@ def _runner_embed(
         if forensics.largest_cluster_size is not None
         else "unknown"
     )
+    demand = candidate.quality.demand
+    fresh_wallets = (
+        f"{forensics.fresh_wallet_count}/{forensics.traced_wallets}"
+        if forensics.fresh_wallet_count is not None
+        else "unknown"
+    )
     embed.add_field(
         name="Cluster / buyer independence",
         value=(
-            f"Raw unique buyers `{forensics.raw_unique_buyers}` • estimated independent "
-            f"clusters `{independent}`\n"
+            f"Raw unique buyers `{forensics.raw_unique_buyers}` • traced wallets "
+            f"`{forensics.traced_wallets}` • independent among traced `{independent}` "
+            f"(confidence `{demand.confidence}`)\n"
             f"Shared-funder groups `{len(forensics.shared_funder_groups)}` • time-linked "
-            f"groups `{len(forensics.time_linked_groups)}` • largest cluster wallets "
-            f"`{largest_size}`\n"
-            f"Raw Top10 `{evidence(risk.top10_percent)}%` • cluster-adjusted "
-            f"`{evidence(forensics.cluster_adjusted_percent)}%`"
+            f"groups `{len(forensics.time_linked_groups)}` ({demand.time_linked_wallets} "
+            f"wallets) • upstream-linked `{demand.upstream_linked_clusters}` • largest "
+            f"cluster wallets `{largest_size}`\n"
+            f"Fresh wallets among traced `{fresh_wallets}` • raw Top10 "
+            f"`{evidence(risk.top10_percent)}%` • cluster-adjusted "
+            f"`{evidence(forensics.cluster_adjusted_percent)}%`\n"
+            "Funding links describe public-chain coordination only, never wallet ownership."
         )[:1024],
         inline=False,
     )
@@ -1690,6 +1724,19 @@ def _runner_embed(
         inline=False,
     )
     embed.add_field(name="X exact-contract verification", value=x_text[:1024], inline=False)
+    reasons = candidate.why_surfaced or why_surfaced(candidate.quality)
+    if reasons:
+        embed.add_field(
+            name="WHY SURFACED",
+            value="\n".join(f"• {item}" for item in reasons)[:1024],
+            inline=False,
+        )
+    if candidate.quality.quality_warnings:
+        embed.add_field(
+            name="QUALITY WARNINGS",
+            value="\n".join(f"• {item}" for item in candidate.quality.quality_warnings)[:1024],
+            inline=False,
+        )
     if candidate.positives:
         embed.add_field(
             name="Why it is being measured",
@@ -1717,14 +1764,18 @@ def _runner_digest_embed(
     embed = discord.Embed(
         title="FOMO RUNNER RADAR — RESEARCH",
         description=(
-            "Changed existing-token observations from the shadow runner. This is a "
-            f"non-pinging digest below the `{public_floor}/100` public-alert floor."
+            "Qualified existing-token setups, ranked by opportunity quality, "
+            "acceleration, buyer independence and freshness. Tokens that only "
+            "graduated are watched silently and never listed here. Non-pinging; "
+            f"still below the `{public_floor}/100` public-alert floor."
         ),
         color=0xF1C40F,
         timestamp=discord.utils.utcnow(),
     )
     for index, candidate in enumerate(candidates, start=1):
         current = candidate.current
+        quality = candidate.quality
+        demand = quality.demand
         source_created_at = (
             candidate.chain_created_at
             or candidate.graduated_at
@@ -1735,12 +1786,31 @@ def _runner_digest_embed(
             if source_created_at
             else None
         )
-        blockers = "; ".join(candidate.hard_blockers[:3]) or "none recorded"
         x_status = "verified" if candidate.x_evidence.available else "not verified"
+        reasons = candidate.why_surfaced or why_surfaced(quality)
+        why = "\n".join(f"• {item}" for item in reasons[:4]) or "• qualified on market quality"
+        warnings = "\n".join(f"• {item}" for item in quality.quality_warnings[:3])
+        independence = (
+            f"{demand.estimated_independent_buyers}/{demand.traced_wallets} traced"
+            if demand.estimated_independent_buyers is not None
+            else "not traced yet"
+        )
+        safety_line = (
+            f"Safety `{candidate.safety.status}` • scam risk "
+            f"`{candidate.safety.scam_risk_score}/100 — {candidate.safety.scam_risk_level}`"
+        )
+        if candidate.safety.status == "FAIL" and candidate.safety.failures:
+            safety_line = (
+                f"🛑 **SAFETY FAIL — {candidate.safety.scam_risk_level}**\n"
+                + "\n".join(f"• {item}" for item in candidate.safety.failures[:3])
+            )
+        elif candidate.hard_blockers:
+            safety_line += "\nBlockers: " + "; ".join(candidate.hard_blockers[:2])
         embed.add_field(
             name=(
                 f"#{index} {candidate.name or 'Unknown'} "
-                f"${candidate.symbol or 'UNKNOWN'} — {candidate.score}/100"
+                f"${candidate.symbol or 'UNKNOWN'} — "
+                f"opp {quality.opportunity_score:.0f} / mom {quality.momentum_score:.0f}"
             )[:256],
             value=(
                 f"**[{candidate.name or 'Unknown'}]"
@@ -1757,14 +1827,13 @@ def _runner_digest_embed(
                 f"Volume `{_money(current.volume_5m_usd)}` • liquidity "
                 f"`{_money(current.liquidity_usd)}` • holders "
                 f"`{current.holder_count if current.holder_count is not None else 'unknown'}`\n"
-                f"Smart-wallet overlap `{len(candidate.smart_wallets)}` • risk "
-                f"`{current.risk_score if current.risk_score is not None else 'unknown'}/10` "
-                f"• X `{x_status}`\n"
-                f"Safety `{candidate.safety.status}` • scam risk "
-                f"`{candidate.safety.scam_risk_score}/100 — "
-                f"{candidate.safety.scam_risk_level}`\n"
-                f"Blockers: {blockers}\n"
-                f"{_runner_links(candidate, fomo_referral_code)}"
+                f"Independent buyers `{independence}` • smart wallets "
+                f"`{demand.raw_smart_wallets}` raw / "
+                f"`{demand.independent_smart_clusters}` independent • X `{x_status}`\n"
+                f"{safety_line}\n"
+                f"**WHY SURFACED**\n{why}"
+                + (f"\n**WARNINGS**\n{warnings}" if warnings else "")
+                + f"\n{_runner_links(candidate, fomo_referral_code)}"
             )[:1024],
             inline=False,
         )
@@ -4839,6 +4908,132 @@ class FomoCommands(
             ),
             view=RunnerAlertView(self.bot, candidate),
         )
+
+    @app_commands.command(
+        name="quality",
+        description="Funnel throughput, alert precision and missed-runner analysis.",
+    )
+    @app_commands.describe(days="How many days of observations to summarize")
+    async def quality(
+        self,
+        interaction: discord.Interaction,
+        days: app_commands.Range[int, 1, 30] = 7,
+    ) -> None:
+        if not await self._require_admin(interaction):
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        result = await self.bot.engine.runner_quality_report(since_days=days)
+        stages = result["stage_counts"]
+        assert isinstance(stages, dict)
+        latency = result["latency"]
+        assert isinstance(latency, dict)
+
+        def number(value: object, suffix: str = "") -> str:
+            if value is None:
+                return "pending"
+            if isinstance(value, Decimal):
+                return f"{value:.2f}{suffix}"
+            return f"{value}{suffix}"
+
+        def cohort(label: str, row: object) -> str:
+            assert isinstance(row, dict)
+            return (
+                f"**{label}** n=`{row['count']}` measured=`{row['measured']}`\n"
+                f"+10 before −25 `{row['plus_10_before_minus_25']}` • "
+                f"+25 before −25 `{row['plus_25_before_minus_25']}` • "
+                f"+50 before −50 `{row['plus_50_before_minus_50']}` • "
+                f"+100 before −50 `{row['plus_100_before_minus_50']}`\n"
+                f"reached +50 `{row['reached_50']}` • +100 `{row['reached_100']}` • "
+                f"+200 `{row['reached_200']}` • severe failures `{row['severe_failures']}` "
+                f"(`{number(row['severe_failure_rate_percent'], '%')}`)"
+            )
+
+        embed = discord.Embed(
+            title=f"FOMO RUNNER QUALITY — LAST {days}D",
+            description=(
+                f"Raw universe observed `{result['raw_universe']}` • silent watched "
+                f"`{result['silent_watched']}` • qualified `{result['qualified']}`\n"
+                "Stage counts: "
+                + (
+                    " • ".join(f"`{name}` {count}" for name, count in sorted(stages.items()))
+                    or "collecting"
+                )
+                + f"\nAlert precision (+25 before −25) "
+                f"`{number(result['alert_precision_percent'], '%')}` • missed-runner rate "
+                f"`{number(result['missed_runner_rate_percent'], '%')}`"
+            ),
+            color=0x1ABC9C,
+            timestamp=discord.utils.utcnow(),
+        )
+        embed.add_field(
+            name="Qualified candidates (from first observation)",
+            value=cohort("QUALIFIED", result["qualified_performance"])[:1024],
+            inline=False,
+        )
+        embed.add_field(
+            name="Qualified candidates (from the alert forward)",
+            value=cohort("POST-ALERT", result["post_alert_performance"])[:1024],
+            inline=False,
+        )
+        embed.add_field(
+            name="Silent / rejected candidates — the counterfactual",
+            value=cohort("SILENT", result["silent_performance"])[:1024],
+            inline=False,
+        )
+        missed = result["missed_runner_examples"]
+        assert isinstance(missed, tuple)
+        embed.add_field(
+            name="Missed runners (never qualified, later reached +50)",
+            value=(
+                f"Count `{result['missed_runners']}`\n"
+                + ("\n".join(f"• `{item}`" for item in missed) or "• none in this window")
+            )[:1024],
+            inline=False,
+        )
+        embed.add_field(
+            name="Latency / timing",
+            value=(
+                f"source → first seen p50 `{number(latency['source_to_first_seen_p50'], 's')}` • "
+                f"p90 `{number(latency['source_to_first_seen_p90'], 's')}`\n"
+                "first seen → qualified p50 "
+                f"`{number(latency['first_seen_to_qualified_p50'], 's')}` • p90 "
+                f"`{number(latency['first_seen_to_qualified_p90'], 's')}`\n"
+                "median move already gone before qualification "
+                f"`{number(result['move_lost_before_visibility_median'], '%')}`"
+            )[:1024],
+            inline=False,
+        )
+        calls = result["provider_calls"]
+        assert isinstance(calls, tuple)
+        degraded = result["degraded_providers"]
+        assert isinstance(degraded, tuple)
+        embed.add_field(
+            name="Provider cost today",
+            value=(
+                (
+                    "\n".join(
+                        f"`{row['provider']}/{row['feature']}` calls `{row['calls']}` • "
+                        f"cache `{row['cache_hits']}` • errors `{row['errors']}`"
+                        for row in calls[:8]
+                    )
+                    or "No provider requests recorded today."
+                )
+                + (
+                    f"\n⚠️ degraded: {', '.join(degraded)} — affected safety fields report "
+                    "UNKNOWN, never PASS"
+                    if degraded
+                    else ""
+                )
+            )[:1024],
+            inline=False,
+        )
+        embed.set_footer(
+            text=(
+                "No look-ahead • silent candidates measured with the same forward maths • "
+                "thresholds not changed by this command"
+            )
+        )
+        await interaction.edit_original_response(embed=embed, view=None)
 
     @app_commands.command(
         name="calibration",

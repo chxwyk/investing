@@ -11,7 +11,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta
 from datetime import time as datetime_time
 from decimal import Decimal
-from typing import Protocol
+from typing import Any, Protocol, cast
 from zoneinfo import ZoneInfo
 
 from .callouts import (
@@ -24,7 +24,12 @@ from .callouts import (
     should_publish_fomo_watch,
 )
 from .config import Settings
-from .constants import BOT_VERSION, PAPER_DEMO_ENTRY_PRICE_USD, PAPER_DEMO_MINT
+from .constants import (
+    BOT_VERSION,
+    INFRASTRUCTURE_ADDRESSES,
+    PAPER_DEMO_ENTRY_PRICE_USD,
+    PAPER_DEMO_MINT,
+)
 from .database import Database
 from .detector import SwapDetector
 from .discovery import (
@@ -76,6 +81,7 @@ from .models import (
     RunnerCandidate,
     RunnerForensics,
     RunnerFundingObservation,
+    RunnerMarketSnapshot,
     ScoredTrader,
     Side,
     Signal,
@@ -88,6 +94,18 @@ from .news import (
     RssNewsPoller,
     XFilteredNewsStream,
     is_coin_actionable_news,
+)
+from .quality import (
+    STAGE_ENTRY,
+    STAGE_HEATING,
+    STAGE_QUALIFIED,
+    STAGE_RAW,
+    STAGE_STRONG,
+    STAGE_UNSAFE,
+    USER_FACING_STAGES,
+    merge_best_stage,
+    quality_config_from_settings,
+    rank_for_attention,
 )
 from .risk import RiskEngine
 from .rotation import CandidateRotator, RotationResult, is_pump_mint
@@ -120,6 +138,12 @@ from .stream import RealtimeWalletStream, StreamEvent
 from .x_budget import XBudgetManager
 
 logger = logging.getLogger(__name__)
+
+#: Stages that earn their own Discord message instead of a digest row.
+ALERT_STAGES = frozenset({STAGE_HEATING, STAGE_UNSAFE, STAGE_ENTRY, STAGE_STRONG})
+#: Stages that may be described as entry quality. Never reachable while safety
+#: is UNKNOWN or FAIL — that gate lives in ``assess_runner_safety``.
+ENTRY_QUALITY_STAGES = frozenset({STAGE_ENTRY, STAGE_STRONG})
 
 
 def _launch_failure_status(message: str) -> str:
@@ -359,6 +383,7 @@ class SmartMoneyEngine:
         }
         self._fomo_radar_seen: dict[str, int] = {}
         self._runner_last_alert: dict[str, tuple[int, Decimal]] = {}
+        self._quality_config = quality_config_from_settings(settings)
         self.runner_last_evaluated_at: int | None = None
         self.runner_last_candidate_mint: str | None = None
         self.runner_last_fast_watch_mint: str | None = None
@@ -1351,11 +1376,27 @@ class SmartMoneyEngine:
             forensics=forensics,
             score_history=score_history,
             pair_created_at=pair_created_at,
+            quality_config=self._quality_config,
             now=now,
         )
         if prior_candidate is not None:
             candidate = replace(
                 candidate,
+                # The funnel high-water mark and the immutable detection
+                # snapshot both survive every re-evaluation, so "did this ever
+                # qualify?" stays answerable for missed-runner analysis.
+                best_stage=merge_best_stage(prior_candidate.best_stage, candidate.stage),
+                qualified_at=prior_candidate.qualified_at or candidate.qualified_at,
+                qualified_market_cap_usd=(
+                    prior_candidate.qualified_market_cap_usd
+                    or candidate.qualified_market_cap_usd
+                ),
+                heating_at=prior_candidate.heating_at or candidate.heating_at,
+                detection_quality=(
+                    prior_candidate.detection_quality
+                    if prior_candidate.detection_quality.evaluated_at
+                    else candidate.detection_quality
+                ),
                 chain_created_at=prior_candidate.chain_created_at,
                 pair_created_at=prior_candidate.pair_created_at or candidate.pair_created_at,
                 radar_first_seen_at=(
@@ -1380,7 +1421,8 @@ class SmartMoneyEngine:
         else:
             candidate = replace(candidate, radar_first_seen_at=radar_seen_at)
         public_ready = bool(
-            candidate.score >= self.settings.fomo_runner_public_alert_min_score
+            candidate.stage in ENTRY_QUALITY_STAGES
+            and candidate.score >= self.settings.fomo_runner_public_alert_min_score
             and candidate.safety.status == "PASS"
             and candidate.safety.entry_eligible
             and not candidate.overextended
@@ -1422,10 +1464,37 @@ class SmartMoneyEngine:
                     forensics=forensics,
                     score_history=candidate.score_history[:-1],
                     pair_created_at=pair_created_at,
+                    quality_config=self._quality_config,
                     now=now,
                 )
                 candidate = replace(
                     candidate,
+                    best_stage=(
+                        merge_best_stage(prior_candidate.best_stage, candidate.stage)
+                        if prior_candidate
+                        else candidate.stage
+                    ),
+                    qualified_at=(
+                        (prior_candidate.qualified_at if prior_candidate else None)
+                        or candidate.qualified_at
+                    ),
+                    qualified_market_cap_usd=(
+                        (
+                            prior_candidate.qualified_market_cap_usd
+                            if prior_candidate
+                            else None
+                        )
+                        or candidate.qualified_market_cap_usd
+                    ),
+                    heating_at=(
+                        (prior_candidate.heating_at if prior_candidate else None)
+                        or candidate.heating_at
+                    ),
+                    detection_quality=(
+                        prior_candidate.detection_quality
+                        if prior_candidate and prior_candidate.detection_quality.evaluated_at
+                        else candidate.detection_quality
+                    ),
                     chain_created_at=(
                         prior_candidate.chain_created_at if prior_candidate else None
                     ),
@@ -1476,7 +1545,8 @@ class SmartMoneyEngine:
                         else candidate.detection_score
                     ),
                     research_only=bool(
-                        candidate.score < self.settings.fomo_runner_public_alert_min_score
+                        candidate.stage not in ENTRY_QUALITY_STAGES
+                        or candidate.score < self.settings.fomo_runner_public_alert_min_score
                         or candidate.safety.status != "PASS"
                         or candidate.overextended
                     ),
@@ -1497,9 +1567,64 @@ class SmartMoneyEngine:
         await self._record_runner_outcomes(candidate)
         if prior_candidate is not None:
             await self._evaluate_runner_transitions(prior_candidate, candidate)
+        await self._flush_provider_usage()
         self.runner_last_evaluated_at = now
         self.runner_last_candidate_mint = mint
         return candidate
+
+    async def _flush_provider_usage(self) -> None:
+        """Drain in-memory client counters into per-feature daily accounting."""
+
+        usage = self.tracker_token_risk.usage_snapshot()
+        if usage["calls"] or usage["cache_hits"] or usage["errors"]:
+            self.tracker_token_risk.reset_usage()
+            await self._record_provider_call(
+                "solana_tracker",
+                "runner_token_risk",
+                calls=int(usage["calls"] or 0),
+                cache_hits=int(usage["cache_hits"] or 0),
+                errors=int(usage["errors"] or 0),
+            )
+
+    async def _resolve_wallet_origin(
+        self,
+        wallet: str,
+        *,
+        history_limit: int,
+        now: int,
+        counter: list[int],
+    ) -> tuple[RunnerFundingObservation, bool]:
+        """Find a wallet's first transaction and the account that funded it.
+
+        ``getSignaturesForAddress`` returns newest first.  If the bounded page
+        comes back short, its last entry really is the wallet's first ever
+        transaction, so the funder and the wallet age are exact.  If the page
+        is full, the wallet is older than the page and both stay unknown —
+        v2.34 treated the oldest entry of a 20-signature page as the funding
+        transfer, which is the wrong transaction for any active wallet.
+
+        Returns the observation and whether the trace actually completed.
+        """
+
+        signatures = await self.rpc.get_signatures_for_address(wallet, limit=history_limit)
+        counter[0] += 1
+        if not signatures:
+            return RunnerFundingObservation(wallet=wallet), False
+        complete = len(signatures) < history_limit
+        if not complete:
+            return RunnerFundingObservation(wallet=wallet, trace_complete=False), False
+        signature = str(signatures[-1].get("signature") or "")
+        if not signature:
+            return RunnerFundingObservation(wallet=wallet), False
+        transaction = await self.rpc.get_transaction(signature)
+        counter[0] += 1
+        observation = funding_observation_from_transaction(
+            transaction,
+            wallet=wallet,
+            trace_complete=True,
+            now=now,
+        )
+        return observation, True
 
     async def _collect_runner_forensics(
         self,
@@ -1511,77 +1636,159 @@ class SmartMoneyEngine:
         now: int,
         cached: RunnerForensics | None = None,
     ) -> RunnerForensics:
-        """Bounded documented-RPC holder/funder trace for promoted candidates only."""
+        """Bounded documented-RPC holder/funder trace for promoted candidates only.
 
+        Cost is capped three ways: at most
+        ``FOMO_RUNNER_FORENSICS_MAX_WALLETS`` holders are traced, upstream
+        tracing stops at ``FOMO_RUNNER_FUNDING_MAX_DEPTH`` hops, and every
+        resolved funding edge is cached permanently because a funding
+        relationship, once observed, never changes.
+        """
+
+        max_wallets = max(4, self.settings.fomo_runner_forensics_max_wallets)
+        history_limit = max(10, self.settings.fomo_runner_wallet_history_limit)
+        max_depth = max(1, self.settings.fomo_runner_funding_max_depth)
+        excluded = frozenset(
+            (*INFRASTRUCTURE_ADDRESSES, *self.settings.fomo_runner_excluded_funders)
+        )
+        counter = [0]
         try:
             largest_rows, supply_row = await asyncio.gather(
                 self.rpc.get_token_largest_accounts(mint),
                 self.rpc.get_token_supply(mint),
             )
+            counter[0] += 2
             token_accounts = [
                 str(item.get("address") or "")
-                for item in largest_rows[:12]
+                for item in largest_rows[:max_wallets]
                 if item.get("address")
             ]
             accounts = await self.rpc.get_multiple_parsed_accounts(token_accounts)
+            counter[0] += 1
             supply_raw = Decimal(str(supply_row.get("amount") or 0))
             owner_supply: dict[str, Decimal] = {}
-            for largest, account in zip(largest_rows[:12], accounts, strict=False):
+            for largest, account in zip(largest_rows[:max_wallets], accounts, strict=False):
                 if not isinstance(account, dict):
                     continue
                 info = (((account.get("data") or {}).get("parsed") or {}).get("info") or {})
                 owner = str(info.get("owner") or "")
                 amount_raw = Decimal(str(largest.get("amount") or 0))
-                if owner and supply_raw > 0:
+                if owner and owner not in excluded and supply_raw > 0:
                     owner_supply[owner] = owner_supply.get(owner, Decimal("0")) + (
                         amount_raw / supply_raw * Decimal("100")
                     )
 
             cached_observations = {
-                item.wallet: item for item in (cached.observations if cached else ())
+                item.wallet: item
+                for item in (cached.observations if cached else ())
+                if item.trace_complete
             }
+            stored_edges = await self.database.cached_funding_edges(list(owner_supply))
+            semaphore = asyncio.Semaphore(4)
+            new_edges: list[dict[str, Any]] = []
 
             async def trace(owner: str, supply_percent: Decimal) -> RunnerFundingObservation:
+                bought_at = buyer_first_seen_at.get(owner)
                 prior = cached_observations.get(owner)
-                if prior is not None and prior.funder:
+                if prior is not None:
                     return replace(
                         prior,
                         supply_percent=supply_percent,
-                        bought_at=prior.bought_at or buyer_first_seen_at.get(owner),
+                        bought_at=prior.bought_at or bought_at,
+                        wallet_age_seconds=(
+                            max(0, now - prior.first_activity_at)
+                            if prior.first_activity_at is not None
+                            else prior.wallet_age_seconds
+                        ),
                     )
-                try:
-                    signatures = await self.rpc.get_signatures_for_address(owner, limit=20)
-                    if not signatures:
-                        return RunnerFundingObservation(
-                            wallet=owner,
-                            supply_percent=supply_percent,
-                        )
-                    signature = str(signatures[-1].get("signature") or "")
-                    transaction = await self.rpc.get_transaction(signature) if signature else None
-                    return funding_observation_from_transaction(
-                        transaction,
-                        wallet=owner,
-                        supply_percent=supply_percent,
-                        bought_at=buyer_first_seen_at.get(owner),
-                    )
-                except (RpcError, ValueError, TypeError):
+                edge = stored_edges.get(owner)
+                if edge and edge.get("trace_complete"):
+                    first_activity = edge.get("first_activity_at")
                     return RunnerFundingObservation(
                         wallet=owner,
+                        funder=edge.get("funder"),
+                        funded_at=edge.get("funded_at"),
+                        amount_sol=(
+                            Decimal(str(edge["amount_sol"]))
+                            if edge.get("amount_sol") is not None
+                            else None
+                        ),
+                        bought_at=bought_at,
                         supply_percent=supply_percent,
+                        first_activity_at=first_activity,
+                        wallet_age_seconds=(
+                            max(0, now - int(first_activity))
+                            if first_activity is not None
+                            else None
+                        ),
+                        trace_complete=True,
                     )
+                try:
+                    async with semaphore:
+                        observation, resolved = await self._resolve_wallet_origin(
+                            owner,
+                            history_limit=history_limit,
+                            now=now,
+                            counter=counter,
+                        )
+                except (RpcError, ValueError, TypeError):
+                    return RunnerFundingObservation(wallet=owner, supply_percent=supply_percent)
+                if resolved:
+                    new_edges.append(
+                        {
+                            "wallet": owner,
+                            "funder": observation.funder,
+                            "funded_at": observation.funded_at,
+                            "amount_sol": (
+                                float(observation.amount_sol)
+                                if observation.amount_sol is not None
+                                else None
+                            ),
+                            "first_activity_at": observation.first_activity_at,
+                            "trace_complete": True,
+                        }
+                    )
+                funder = observation.funder if observation.funder not in excluded else None
+                return replace(
+                    observation,
+                    funder=funder,
+                    funded_at=observation.funded_at if funder else None,
+                    amount_sol=observation.amount_sol if funder else None,
+                    supply_percent=supply_percent,
+                    bought_at=bought_at,
+                )
 
-            observations = await asyncio.gather(
-                *(trace(owner, percent) for owner, percent in owner_supply.items())
+            observations = list(
+                await asyncio.gather(
+                    *(trace(owner, percent) for owner, percent in owner_supply.items())
+                )
+            )
+            observations = await self._trace_upstream_funders(
+                observations,
+                excluded=excluded,
+                history_limit=history_limit,
+                max_depth=max_depth,
+                now=now,
+                counter=counter,
+                new_edges=new_edges,
+            )
+            await self.database.store_funding_edges(new_edges)
+            await self._record_provider_call(
+                "solana_rpc", "runner_forensics", calls=counter[0]
             )
             result = summarize_forensics(
                 observations,
                 raw_unique_buyers=raw_unique_buyers,
                 raw_top10_percent=raw_top10_percent,
                 checked_at=now,
+                excluded_funders=excluded,
+                provider_calls=counter[0],
                 warnings=(
                     "Bounded top-holder trace; untraced wallets remain independent "
                     "only as unknown.",
                     "Funding links are coordination evidence, not real-person identification.",
+                    "Wallet age and funder are reported only where the bounded signature "
+                    "page actually reached the wallet's first transaction.",
                     "Creator history is unavailable unless direct public-chain evidence "
                     "identifies it.",
                 ),
@@ -1596,12 +1803,124 @@ class SmartMoneyEngine:
                 dynamic_checked_at=now,
             )
         except (RpcError, ValueError, TypeError) as exc:
+            await self._record_provider_call(
+                "solana_rpc", "runner_forensics", calls=counter[0], errors=1
+            )
             return RunnerForensics(
                 available=False,
                 raw_unique_buyers=raw_unique_buyers,
                 warnings=(f"bounded public RPC forensics unavailable: {str(exc)[:160]}",),
                 checked_at=now,
+                provider_calls=counter[0],
+                degraded=True,
             )
+
+    async def _trace_upstream_funders(
+        self,
+        observations: list[RunnerFundingObservation],
+        *,
+        excluded: frozenset[str],
+        history_limit: int,
+        max_depth: int,
+        now: int,
+        counter: list[int],
+        new_edges: list[dict[str, Any]],
+    ) -> list[RunnerFundingObservation]:
+        """Resolve one bounded hop above funders that only fund a single holder.
+
+        Catches the common shape where one source funds several intermediaries
+        which each fund one fresh wallet, so every direct funder differs while
+        the upstream source is identical.  Funders that already form a direct
+        cluster are skipped: their relationship is established, and paying for
+        another hop would buy nothing.
+        """
+
+        if max_depth < 2:
+            return observations
+        counts: dict[str, int] = {}
+        for item in observations:
+            if item.funder:
+                counts[item.funder] = counts.get(item.funder, 0) + 1
+        singletons = [funder for funder, count in counts.items() if count == 1]
+        budget = max(0, self.settings.fomo_runner_forensics_max_wallets - len(observations))
+        targets = singletons[: max(0, min(len(singletons), budget))]
+        if not targets:
+            return observations
+        stored = await self.database.cached_funding_edges(targets)
+        semaphore = asyncio.Semaphore(3)
+
+        async def upstream(funder: str) -> tuple[str, str | None]:
+            edge = stored.get(funder)
+            if edge and edge.get("trace_complete"):
+                return funder, edge.get("funder")
+            try:
+                async with semaphore:
+                    observation, resolved = await self._resolve_wallet_origin(
+                        funder,
+                        history_limit=history_limit,
+                        now=now,
+                        counter=counter,
+                    )
+            except (RpcError, ValueError, TypeError):
+                return funder, None
+            if resolved:
+                new_edges.append(
+                    {
+                        "wallet": funder,
+                        "funder": observation.funder,
+                        "funded_at": observation.funded_at,
+                        "amount_sol": (
+                            float(observation.amount_sol)
+                            if observation.amount_sol is not None
+                            else None
+                        ),
+                        "first_activity_at": observation.first_activity_at,
+                        "trace_complete": True,
+                    }
+                )
+            return funder, observation.funder
+
+        resolved_pairs = dict(await asyncio.gather(*(upstream(item) for item in targets)))
+        return [
+            replace(
+                item,
+                upstream_funder=(
+                    resolved_pairs.get(item.funder)
+                    if item.funder
+                    and resolved_pairs.get(item.funder) not in excluded
+                    else None
+                ),
+                funder_depth=2 if item.funder and resolved_pairs.get(item.funder) else 1,
+            )
+            if item.funder
+            else item
+            for item in observations
+        ]
+
+    async def _record_provider_call(
+        self,
+        provider: str,
+        feature: str,
+        *,
+        calls: int = 1,
+        cache_hits: int = 0,
+        errors: int = 0,
+    ) -> None:
+        """Attribute provider spend to a feature; never let accounting break a scan."""
+
+        if self.database.connection is None or not (calls or cache_hits or errors):
+            return
+        try:
+            await self.database.record_provider_call(
+                provider=provider,
+                feature=feature,
+                usage_day=self._x_usage_day(),
+                calls=calls,
+                cache_hits=cache_hits,
+                errors=errors,
+            )
+        except Exception:  # pragma: no cover - accounting is never load-bearing
+            logger.debug("provider accounting write failed", exc_info=True)
 
     async def runner_forensic(self, mint: str) -> RunnerCandidate:
         """Run read-only exact-mint forensics; never executes, signs, launches, or spends."""
@@ -1699,8 +2018,14 @@ class SmartMoneyEngine:
                 continue
             if not item.current.market_cap_usd and not item.current.price_usd:
                 continue
+            # A qualified candidate belongs in the pool regardless of the legacy
+            # score floor: a genuinely early setup can be interesting long before
+            # the old additive score climbs.
             if research_test or (
-                item.score >= self.settings.fomo_runner_fast_watch_min_score
+                (
+                    item.stage in USER_FACING_STAGES
+                    or item.score >= self.settings.fomo_runner_fast_watch_min_score
+                )
                 and not item.hard_blockers
             ):
                 by_mint[item.mint] = item
@@ -1716,16 +2041,23 @@ class SmartMoneyEngine:
         *,
         research_test: bool,
         max_age_seconds: int = 86_400,
+        limit: int | None = None,
     ) -> tuple[RunnerCandidate, ...]:
-        """Read real persisted runner observations without touching a network provider."""
+        """Read real persisted runner observations without touching a network provider.
+
+        ``limit`` widens the pool for callers that rank before truncating; the
+        digest must choose the best few out of the whole watched universe, not
+        out of whichever six happen to hold the highest legacy score.
+        """
 
         await self.initialize()
         now = int(time.time())
+        keep = limit or self.settings.fomo_runner_lab_candidates
         candidates: list[RunnerCandidate] = []
         rows = await self.database.recent_runner_candidate_payloads(
             now=now,
             max_age_seconds=max_age_seconds,
-            limit=self.settings.fomo_runner_lab_candidates * 2,
+            limit=keep * 2,
         )
         for raw in rows:
             try:
@@ -1734,8 +2066,14 @@ class SmartMoneyEngine:
                 continue
             if not item.current.market_cap_usd and not item.current.price_usd:
                 continue
+            # A qualified candidate belongs in the pool regardless of the legacy
+            # score floor: a genuinely early setup can be interesting long before
+            # the old additive score climbs.
             if research_test or (
-                item.score >= self.settings.fomo_runner_fast_watch_min_score
+                (
+                    item.stage in USER_FACING_STAGES
+                    or item.score >= self.settings.fomo_runner_fast_watch_min_score
+                )
                 and not item.hard_blockers
             ):
                 candidates.append(item)
@@ -1743,12 +2081,26 @@ class SmartMoneyEngine:
             key=lambda item: (item.score, item.current.captured_at),
             reverse=True,
         )
-        return tuple(candidates[: self.settings.fomo_runner_lab_candidates])
+        return tuple(candidates[:keep])
 
     async def _maybe_publish_fresh(self, candidate: RunnerCandidate) -> bool:
+        """STAGE 1 -> Discord only when STAGE 2 evidence is already present.
+
+        v2.34 fired this the moment a token was young, alive and not obviously
+        rugged, which is a graduation mirror rather than a signal.  The token is
+        still admitted to the silent watch at the same instant; only the message
+        waits for affirmative evidence, so detection latency is unchanged and
+        the alert now means something.
+        """
+
         if not self.settings.fomo_runner_fresh_alert_enabled or not is_fresh_research_worthy(
             candidate,
             max_age_seconds=self.settings.fomo_runner_fresh_max_age_seconds,
+        ):
+            return False
+        if (
+            self.settings.fomo_runner_fresh_requires_qualification
+            and candidate.stage not in USER_FACING_STAGES
         ):
             return False
         now = int(time.time())
@@ -1925,13 +2277,21 @@ class SmartMoneyEngine:
             )
 
     async def _maybe_publish_runner(self, candidate: RunnerCandidate) -> None:
-        if candidate.research_only:
+        """Individual alert lane: HEATING UP and above only.
+
+        Plain QUALIFIED_RESEARCH candidates flow through the ranked digest so a
+        merely-interesting setup competes for attention instead of pinging.
+        """
+
+        if candidate.stage not in ALERT_STAGES and candidate.research_only:
             return
         now = int(time.time())
         previous = self._runner_last_alert.get(candidate.mint)
         if previous and now - previous[0] < 300 and candidate.score < previous[1] + 5:
             return
-        fingerprint = f"{int(candidate.score // 5)}:{candidate.state}:{candidate.safety.status}"
+        fingerprint = (
+            f"{candidate.stage}:{int(candidate.score // 5)}:{candidate.safety.status}"
+        )
         if not await self.database.reserve_runner_alert(
             mint=candidate.mint,
             event_type="STRONG",
@@ -1990,6 +2350,9 @@ class SmartMoneyEngine:
             (
                 candidate.score < self.settings.fomo_runner_fast_watch_min_score
                 and not watch_as_fresh
+                # A qualified candidate is watched on its evidence, not on the
+                # legacy additive score, which can lag a genuinely early setup.
+                and candidate.stage not in USER_FACING_STAGES
             )
             or age_minutes is None
             or age_minutes > self.settings.fomo_runner_max_graduation_age_minutes
@@ -2026,11 +2389,19 @@ class SmartMoneyEngine:
                 await asyncio.sleep(delay)
             prior_payload = await self.database.runner_candidate_payload(mint)
             prior = runner_candidate_from_json(prior_payload) if prior_payload else None
-            # Entry-quality candidates refresh the dynamic sell route on every staged
-            # observation. The heavier holder/funding RPC trace remains cached inside
-            # ``analyze_runner`` and refreshes no more than once per minute.
+            # Progressive analysis: the expensive holder/funding trace is spent on
+            # candidates that are actually close to qualifying, so buyer-independence
+            # evidence exists at the moment the qualification decision is made rather
+            # than arriving after the alert. It still refreshes at most once a minute
+            # inside ``analyze_runner``, and never blocks first observation.
             deep = bool(
-                prior and prior.score >= self.settings.fomo_runner_forensics_min_score
+                prior
+                and (
+                    prior.stage in USER_FACING_STAGES
+                    or prior.score >= self.settings.fomo_runner_forensics_min_score
+                    or prior.quality.opportunity_score
+                    >= self._quality_config.min_opportunity_score - 10
+                )
             )
             candidate = await self.analyze_runner(
                 mint,
@@ -2110,20 +2481,51 @@ class SmartMoneyEngine:
         raw = json.dumps(rows, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(raw.encode()).hexdigest()
 
+    def _digest_age_seconds(self, candidate: RunnerCandidate) -> int | None:
+        source = (
+            candidate.chain_created_at
+            or candidate.graduated_at
+            or candidate.pair_created_at
+        )
+        return max(0, candidate.generated_at - source) if source else None
+
     async def _publish_runner_digest(self) -> bool:
-        """Send changed below-floor research from SQLite without provider or X calls."""
+        """Rank the qualified research lane; never mirror the graduated universe.
+
+        The old digest published "every changed candidate above a low score",
+        which is how a 27/100 with unknown safety ended up next to a real
+        setup.  Selection is now qualification, and ordering is opportunity
+        quality, acceleration, buyer independence, freshness and safety
+        confidence — the best few things worth looking at right now.
+        """
 
         candidates = await self.runner_lab_cached_candidates(
             research_test=True,
             max_age_seconds=86_400,
+            limit=max(20, self.settings.fomo_runner_digest_max_candidates * 4),
         )
-        selected = tuple(
+        eligible = [
             item
             for item in candidates
-            if self.settings.fomo_runner_digest_min_score
-            <= item.score
-            < self.settings.fomo_runner_public_alert_min_score
-        )[: self.settings.fomo_runner_digest_max_candidates]
+            if item.stage == STAGE_QUALIFIED
+            and item.research_only
+            and item.score >= self.settings.fomo_runner_digest_min_score
+        ]
+        selected = tuple(
+            cast(RunnerCandidate, item)
+            for item in rank_for_attention(
+                [
+                    (
+                        item.quality,
+                        item.safety,
+                        self._digest_age_seconds(item),
+                        item,
+                    )
+                    for item in eligible
+                ],
+                limit=self.settings.fomo_runner_digest_max_candidates,
+            )
+        )
         if not selected:
             return False
         fingerprint = self._runner_digest_fingerprint(selected)
@@ -2135,6 +2537,16 @@ class SmartMoneyEngine:
             self.settings.fomo_runner_public_alert_min_score,
         )
         now = int(time.time())
+        # The digest IS Discord visibility. Recording it keeps risk escalation
+        # and setup invalidation working for digest-only candidates, which both
+        # key off first_discord_visible_at, and keeps the MC-at-first-visible
+        # timing honest now that fewer candidates fire a standalone alert.
+        for item in selected:
+            await self.database.mark_runner_visible(
+                mint=item.mint,
+                visible_at=now,
+                market_cap_usd=item.current.market_cap_usd,
+            )
         await self.database.set_setting("runner_digest_fingerprint", fingerprint)
         await self.database.set_setting("runner_last_digest_at", str(now))
         await self.database.set_setting(
@@ -2794,6 +3206,45 @@ class SmartMoneyEngine:
             "gte_60": sum(value >= 60 for value in detection_scores),
             "gte_70": sum(value >= 70 for value in detection_scores),
         }
+        # Chronological split, never random: a random split would let a token
+        # observed after a threshold was chosen validate that threshold.
+        ordered_candidates = sorted(
+            candidates.values(),
+            key=lambda item: item.first_seen_at,
+        )
+        split_index = int(len(ordered_candidates) * 0.7)
+        calibration_slice = ordered_candidates[:split_index]
+        holdout_slice = ordered_candidates[split_index:]
+
+        def qualification_rate(items: list[RunnerCandidate]) -> dict[str, object]:
+            measured = [item for item in items if item.detection_quality.evaluated_at]
+            qualified_items = [
+                item
+                for item in measured
+                if self.database.user_facing_stage(item.detection_quality.stage)
+            ]
+            winners = 0
+            for item in qualified_items:
+                path = excursions.get(item.mint, {})
+                if isinstance(path, dict) and path.get("plus_25_before_minus_25") is True:
+                    winners += 1
+            return {
+                "observed": len(items),
+                "with_decision_snapshot": len(measured),
+                "qualified": len(qualified_items),
+                "qualified_plus_25_before_minus_25": winners,
+                "precision_percent": (
+                    (
+                        Decimal(winners) / Decimal(len(qualified_items)) * Decimal("100")
+                    ).quantize(Decimal("0.01"))
+                    if qualified_items
+                    else None
+                ),
+                "window": (
+                    (items[0].first_seen_at, items[-1].first_seen_at) if items else None
+                ),
+            }
+
         return {
             "candidate_count": results["candidates"],
             "outcome_count": results["outcomes"],
@@ -2801,8 +3252,207 @@ class SmartMoneyEngine:
             "winner_characteristics": characteristics(cohort("winner")),
             "failure_characteristics": characteristics(cohort("failure")),
             "safety_buckets": results["breakdowns"]["safety"],
+            "walk_forward": {
+                "split": "chronological 70/30 on first_seen_at",
+                "calibration": qualification_rate(calibration_slice),
+                "holdout": qualification_rate(holdout_slice),
+                "note": (
+                    "Defaults ship unfitted. Compare these two slices before "
+                    "changing any FOMO_RUNNER_* threshold; a rule that only "
+                    "works on the calibration slice is overfitted."
+                ),
+            },
             "thresholds_changed": False,
             "no_look_ahead": True,
+        }
+
+    async def runner_quality_report(self, *, since_days: int = 7) -> dict[str, object]:
+        """Funnel throughput, alert precision and the missed-runner counterfactual.
+
+        Silent and rejected candidates are scored with exactly the same forward
+        maths as alerted ones.  Without that, a filter that quietly rejects
+        every winner looks perfect.  All returns are measured forward from an
+        observation that already existed at the time, so nothing here uses
+        information the decision could not have had.
+        """
+
+        now = int(time.time())
+        since = now - max(1, since_days) * 86_400
+        rows = await self.database.runner_funnel_rows(since=since)
+        stage_counts = await self.database.runner_stage_counts(since=since)
+        snapshot_rows = await self.database.runner_all_snapshot_rows()
+        by_mint: dict[str, list[RunnerMarketSnapshot]] = {}
+        for row in snapshot_rows:
+            mint = str(row["mint"])
+            by_mint.setdefault(mint, []).append(
+                runner_snapshot_from_json(str(row["snapshot_json"]))
+            )
+
+        qualified: list[dict[str, object]] = []
+        silent: list[dict[str, object]] = []
+        for row in rows:
+            mint = str(row["mint"])
+            series = sorted(by_mint.get(mint, ()), key=lambda item: item.captured_at)
+            if not series:
+                continue
+            path = runner_path_metrics(series[0], series)
+            qualified_at = row.get("qualified_at")
+            post_alert = None
+            if qualified_at is not None:
+                after = [
+                    item for item in series if item.captured_at >= int(qualified_at)
+                ]
+                if after:
+                    post_alert = runner_path_metrics(after[0], after)
+            entry = {
+                "mint": mint,
+                "best_stage": str(row.get("best_stage") or STAGE_RAW),
+                "qualified_at": qualified_at,
+                "first_seen_at": row.get("radar_first_seen_at") or row.get("first_seen_at"),
+                "source_at": (
+                    row.get("chain_created_at")
+                    or row.get("pair_created_at")
+                    or row.get("graduated_at")
+                ),
+                "visible_at": row.get("first_discord_visible_at"),
+                "mc_first_seen": row.get("first_market_cap_usd"),
+                "mc_qualified": row.get("qualified_market_cap_usd"),
+                "mc_visible": row.get("first_visible_market_cap_usd"),
+                "mc_entry": row.get("entry_market_cap_usd"),
+                "mc_peak": row.get("peak_market_cap_usd"),
+                "path": path,
+                "post_alert_path": post_alert,
+            }
+            if self.database.user_facing_stage(entry["best_stage"]):
+                qualified.append(entry)
+            else:
+                silent.append(entry)
+
+        def performance(items: list[dict[str, object]], *, key: str = "path") -> dict[str, object]:
+            paths = [
+                item[key] for item in items if isinstance(item.get(key), dict)
+            ]
+
+            def hits(field: str) -> int:
+                return sum(1 for path in paths if path.get(field) is True)
+
+            def reached(level: int) -> int:
+                return sum(
+                    1
+                    for path in paths
+                    if path.get("peak_return") is not None
+                    and Decimal(str(path["peak_return"])) >= level
+                )
+
+            severe = sum(
+                1
+                for path in paths
+                if path.get("rug_or_liquidity_failure")
+                or Decimal(str(path.get("max_drawdown_from_peak") or 0)) >= 80
+            )
+            return {
+                "count": len(items),
+                "measured": len(paths),
+                "plus_10_before_minus_25": hits("plus_10_before_minus_25"),
+                "plus_25_before_minus_25": hits("plus_25_before_minus_25"),
+                "plus_50_before_minus_50": hits("plus_50_before_minus_50"),
+                "plus_100_before_minus_50": hits("plus_100_before_minus_50"),
+                "reached_50": reached(50),
+                "reached_100": reached(100),
+                "reached_200": reached(200),
+                "severe_failures": severe,
+                "severe_failure_rate_percent": (
+                    (Decimal(severe) / Decimal(len(paths)) * Decimal("100")).quantize(
+                        Decimal("0.01")
+                    )
+                    if paths
+                    else None
+                ),
+            }
+
+        qualified_performance = performance(qualified)
+        post_alert_performance = performance(qualified, key="post_alert_path")
+        silent_performance = performance(silent)
+        missed = [
+            item
+            for item in silent
+            if isinstance(item.get("path"), dict)
+            and item["path"].get("peak_return") is not None
+            and Decimal(str(item["path"]["peak_return"])) >= 50
+        ]
+        measured_qualified = int(qualified_performance["measured"] or 0)
+        precision = (
+            Decimal(int(qualified_performance["plus_25_before_minus_25"]))
+            / Decimal(measured_qualified)
+            * Decimal("100")
+        ).quantize(Decimal("0.01")) if measured_qualified else None
+        missed_rate = (
+            Decimal(len(missed))
+            / Decimal(len(missed) + int(qualified_performance["reached_50"] or 0))
+            * Decimal("100")
+        ).quantize(Decimal("0.01")) if (missed or qualified_performance["reached_50"]) else None
+
+        def percentile(values: list[int], quantile: Decimal) -> int | None:
+            ordered = sorted(values)
+            if not ordered:
+                return None
+            position = int((Decimal(len(ordered) - 1) * quantile).to_integral_value())
+            return ordered[position]
+
+        source_delays = [
+            int(item["first_seen_at"]) - int(item["source_at"])
+            for item in (*qualified, *silent)
+            if item.get("source_at") and item.get("first_seen_at")
+            and int(item["first_seen_at"]) >= int(item["source_at"])
+        ]
+        qualify_delays = [
+            int(item["qualified_at"]) - int(item["first_seen_at"])
+            for item in qualified
+            if item.get("qualified_at") and item.get("first_seen_at")
+            and int(item["qualified_at"]) >= int(item["first_seen_at"])
+        ]
+        lost_moves = [
+            forward_return_percent(
+                Decimal(str(item["mc_qualified"])),
+                Decimal(str(item["mc_first_seen"])),
+            )
+            for item in qualified
+            if item.get("mc_qualified") and item.get("mc_first_seen")
+        ]
+        lost_moves = [value for value in lost_moves if value is not None]
+        provider_rows = await self.database.provider_call_rows(usage_day=self._x_usage_day())
+        return {
+            "window_days": since_days,
+            "raw_universe": len(rows),
+            "stage_counts": stage_counts,
+            "silent_watched": len(silent),
+            "qualified": len(qualified),
+            "qualified_performance": qualified_performance,
+            "post_alert_performance": post_alert_performance,
+            "silent_performance": silent_performance,
+            "missed_runners": len(missed),
+            "missed_runner_examples": tuple(item["mint"] for item in missed[:5]),
+            "alert_precision_percent": precision,
+            "missed_runner_rate_percent": missed_rate,
+            "latency": {
+                "source_to_first_seen_p50": percentile(source_delays, Decimal("0.50")),
+                "source_to_first_seen_p90": percentile(source_delays, Decimal("0.90")),
+                "first_seen_to_qualified_p50": percentile(qualify_delays, Decimal("0.50")),
+                "first_seen_to_qualified_p90": percentile(qualify_delays, Decimal("0.90")),
+            },
+            "move_lost_before_visibility_median": (
+                sorted(lost_moves)[len(lost_moves) // 2] if lost_moves else None
+            ),
+            "provider_calls": tuple(provider_rows),
+            "degraded_providers": tuple(
+                name
+                for name, degraded in (
+                    ("solana_tracker", self.tracker_token_risk.degraded),
+                )
+                if degraded
+            ),
+            "no_look_ahead": True,
+            "thresholds_changed": False,
         }
 
     async def _handle_news_alert(self, alert: NewsAlert) -> None:

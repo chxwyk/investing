@@ -81,6 +81,13 @@ def _str_tuple(name: str, default: str = "") -> tuple[str, ...]:
     return tuple(item.strip() for item in raw.split("|") if item.strip())
 
 
+def _address_tuple(name: str, default: str = "") -> tuple[str, ...]:
+    """Accept either comma- or pipe-separated public addresses."""
+
+    raw = os.getenv(name, default).replace("|", ",")
+    return tuple(dict.fromkeys(item.strip() for item in raw.split(",") if item.strip()))
+
+
 def _int_tuple(name: str, default: str = "") -> tuple[int, ...]:
     raw = os.getenv(name, default)
     return tuple(int(item.strip()) for item in raw.split(",") if item.strip())
@@ -153,6 +160,24 @@ class Settings:
     fomo_runner_fresh_watch_seconds: int
     fomo_runner_fresh_watch_max: int
     fomo_runner_forensics_min_score: Decimal
+    # --- v2.35 candidate-qualification group -------------------------------
+    # Every one of these has a working default; none needs to be set in
+    # Railway for the upgrade to run.  They exist so `/fomo calibration` can
+    # drive them from real forward outcomes instead of code edits.
+    fomo_runner_min_evidence_families: int
+    fomo_runner_min_opportunity_score: Decimal
+    fomo_runner_heating_min_opportunity: Decimal
+    fomo_runner_heating_min_momentum: Decimal
+    fomo_runner_entry_min_opportunity: Decimal
+    fomo_runner_entry_min_momentum: Decimal
+    fomo_runner_min_independence_ratio: Decimal
+    fomo_runner_max_cluster_supply_percent: Decimal
+    fomo_runner_fresh_requires_qualification: bool
+    fomo_runner_forensics_max_wallets: int
+    fomo_runner_funding_max_depth: int
+    fomo_runner_wallet_history_limit: int
+    fomo_runner_excluded_funders: tuple[str, ...]
+    # -----------------------------------------------------------------------
     fomo_runner_invalidation_drawdown_percent: Decimal
     fomo_runner_invalidation_liquidity_decline_percent: Decimal
     fomo_runner_invalidation_liquidity_floor_usd: Decimal
@@ -394,6 +419,41 @@ class Settings:
             fomo_runner_fresh_watch_enabled=_bool("FOMO_RUNNER_FRESH_WATCH_ENABLED", True),
             fomo_runner_fresh_watch_seconds=_int("FOMO_RUNNER_FRESH_WATCH_SECONDS", 15),
             fomo_runner_fresh_watch_max=_int("FOMO_RUNNER_FRESH_WATCH_MAX", 15),
+            fomo_runner_min_evidence_families=_int(
+                "FOMO_RUNNER_MIN_EVIDENCE_FAMILIES", 2
+            ),
+            fomo_runner_min_opportunity_score=_decimal(
+                "FOMO_RUNNER_MIN_OPPORTUNITY_SCORE", "45"
+            ),
+            fomo_runner_heating_min_opportunity=_decimal(
+                "FOMO_RUNNER_HEATING_MIN_OPPORTUNITY", "55"
+            ),
+            fomo_runner_heating_min_momentum=_decimal(
+                "FOMO_RUNNER_HEATING_MIN_MOMENTUM", "60"
+            ),
+            fomo_runner_entry_min_opportunity=_decimal(
+                "FOMO_RUNNER_ENTRY_MIN_OPPORTUNITY", "65"
+            ),
+            fomo_runner_entry_min_momentum=_decimal(
+                "FOMO_RUNNER_ENTRY_MIN_MOMENTUM", "50"
+            ),
+            fomo_runner_min_independence_ratio=_decimal(
+                "FOMO_RUNNER_MIN_INDEPENDENCE_RATIO", "0.45"
+            ),
+            fomo_runner_max_cluster_supply_percent=_decimal(
+                "FOMO_RUNNER_MAX_CLUSTER_SUPPLY_PERCENT", "25"
+            ),
+            fomo_runner_fresh_requires_qualification=_bool(
+                "FOMO_RUNNER_FRESH_REQUIRES_QUALIFICATION", True
+            ),
+            fomo_runner_forensics_max_wallets=_int(
+                "FOMO_RUNNER_FORENSICS_MAX_WALLETS", 14
+            ),
+            fomo_runner_funding_max_depth=_int("FOMO_RUNNER_FUNDING_MAX_DEPTH", 2),
+            fomo_runner_wallet_history_limit=_int(
+                "FOMO_RUNNER_WALLET_HISTORY_LIMIT", 60
+            ),
+            fomo_runner_excluded_funders=_address_tuple("FOMO_RUNNER_EXCLUDED_FUNDERS"),
             fomo_runner_forensics_min_score=_decimal(
                 "FOMO_RUNNER_FORENSICS_MIN_SCORE", "50"
             ),
@@ -709,6 +769,29 @@ class Settings:
             raise ValueError("FOMO_RUNNER_FRESH_WATCH_MAX must be between 1 and 20")
         if not 0 <= self.fomo_runner_forensics_min_score <= 100:
             raise ValueError("FOMO_RUNNER_FORENSICS_MIN_SCORE must be between 0 and 100")
+        if not 1 <= self.fomo_runner_min_evidence_families <= 6:
+            raise ValueError("FOMO_RUNNER_MIN_EVIDENCE_FAMILIES must be between 1 and 6")
+        for name, value in (
+            ("FOMO_RUNNER_MIN_OPPORTUNITY_SCORE", self.fomo_runner_min_opportunity_score),
+            ("FOMO_RUNNER_HEATING_MIN_OPPORTUNITY", self.fomo_runner_heating_min_opportunity),
+            ("FOMO_RUNNER_HEATING_MIN_MOMENTUM", self.fomo_runner_heating_min_momentum),
+            ("FOMO_RUNNER_ENTRY_MIN_OPPORTUNITY", self.fomo_runner_entry_min_opportunity),
+            ("FOMO_RUNNER_ENTRY_MIN_MOMENTUM", self.fomo_runner_entry_min_momentum),
+            (
+                "FOMO_RUNNER_MAX_CLUSTER_SUPPLY_PERCENT",
+                self.fomo_runner_max_cluster_supply_percent,
+            ),
+        ):
+            if not 0 <= value <= 100:
+                raise ValueError(f"{name} must be between 0 and 100")
+        if not 0 <= self.fomo_runner_min_independence_ratio <= 1:
+            raise ValueError("FOMO_RUNNER_MIN_INDEPENDENCE_RATIO must be between 0 and 1")
+        if not 4 <= self.fomo_runner_forensics_max_wallets <= 40:
+            raise ValueError("FOMO_RUNNER_FORENSICS_MAX_WALLETS must be between 4 and 40")
+        if not 1 <= self.fomo_runner_funding_max_depth <= 3:
+            raise ValueError("FOMO_RUNNER_FUNDING_MAX_DEPTH must be between 1 and 3")
+        if not 10 <= self.fomo_runner_wallet_history_limit <= 1000:
+            raise ValueError("FOMO_RUNNER_WALLET_HISTORY_LIMIT must be between 10 and 1000")
         if not 1 <= self.fomo_runner_invalidation_drawdown_percent <= 100:
             raise ValueError(
                 "FOMO_RUNNER_INVALIDATION_DRAWDOWN_PERCENT must be between 1 and 100"

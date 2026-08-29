@@ -782,15 +782,52 @@ class SolanaTrackerTokenRiskClient:
 
     BASE_URL = "https://data.solanatracker.io"
 
+    #: HTTP statuses that mean "the plan is exhausted or throttled", as opposed
+    #: to "this token is unknown". Only these open the degraded window.
+    CREDIT_STATUSES = frozenset({401, 402, 403, 429})
+    #: How long to stop calling after repeated credit failures.
+    DEGRADED_COOLDOWN_SECONDS = 300
+
     def __init__(self, api_key: str | None, *, timeout_seconds: int = 15) -> None:
         self.api_key = api_key
         self.timeout = aiohttp.ClientTimeout(total=timeout_seconds)
         self._session: aiohttp.ClientSession | None = None
         self._cache: dict[str, tuple[float, TokenRiskSnapshot]] = {}
+        self._credit_failures = 0
+        self._degraded_until = 0.0
+        self.last_error: str | None = None
+        self.calls = 0
+        self.cache_hits = 0
+        self.errors = 0
 
     @property
     def configured(self) -> bool:
         return bool(self.api_key)
+
+    @property
+    def degraded(self) -> bool:
+        """True while the provider is being skipped after credit failures.
+
+        Degraded means every risk field is reported as unavailable, which the
+        safety model turns into ``UNKNOWN``.  It never turns into ``PASS``, and
+        it never raises.
+        """
+
+        return time.monotonic() < self._degraded_until
+
+    def usage_snapshot(self) -> dict[str, int | bool | str | None]:
+        return {
+            "calls": self.calls,
+            "cache_hits": self.cache_hits,
+            "errors": self.errors,
+            "degraded": self.degraded,
+            "last_error": self.last_error,
+        }
+
+    def reset_usage(self) -> None:
+        self.calls = 0
+        self.cache_hits = 0
+        self.errors = 0
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -807,8 +844,19 @@ class SolanaTrackerTokenRiskClient:
         cached = self._cache.get(mint)
         now = time.monotonic()
         if cached and now - cached[0] <= 60:
+            self.cache_hits += 1
             return cached[1]
+        if self.degraded:
+            # Credits are exhausted or throttled. Skip the request entirely
+            # rather than burning latency on a call that will fail, and report
+            # the fields as unavailable so safety stays UNKNOWN.
+            self.cache_hits += 1
+            return TokenRiskSnapshot(
+                available=False,
+                error="Tracker degraded — risk evidence unavailable, not a pass",
+            )
         session = await self._get_session()
+        self.calls += 1
         try:
             async with session.get(
                 f"{self.BASE_URL}/tokens/{mint}",
@@ -816,11 +864,20 @@ class SolanaTrackerTokenRiskClient:
             ) as response:
                 body = await response.json(content_type=None)
                 if response.status >= 400:
+                    self.errors += 1
+                    self.last_error = f"Tracker HTTP {response.status}"
+                    if response.status in self.CREDIT_STATUSES:
+                        self._credit_failures += 1
+                        if self._credit_failures >= 3:
+                            self._degraded_until = now + self.DEGRADED_COOLDOWN_SECONDS
                     return TokenRiskSnapshot(
                         available=False, error=f"Tracker HTTP {response.status}"
                     )
         except (TimeoutError, aiohttp.ClientError, ValueError) as exc:
+            self.errors += 1
+            self.last_error = str(exc)[:160]
             return TokenRiskSnapshot(available=False, error=str(exc)[:160])
+        self._credit_failures = 0
         snapshot = parse_tracker_risk(body)
         self._cache[mint] = (now, snapshot)
         return snapshot

@@ -9,17 +9,30 @@ from typing import Any
 from .models import (
     CoinCallout,
     RunnerCandidate,
+    RunnerDemandProfile,
     RunnerForensics,
     RunnerFundingCluster,
     RunnerFundingObservation,
     RunnerMarketSnapshot,
     RunnerMomentumWindow,
+    RunnerQualityAssessment,
     RunnerSafetyAssessment,
     RunnerScoreBreakdown,
     XSocialSnapshot,
 )
+from .quality import (
+    DEFAULT_QUALITY_CONFIG,
+    STAGE_ENTRY,
+    STAGE_HEATING,
+    STAGE_STRONG,
+    STAGE_UNSAFE,
+    RunnerQualityConfig,
+    assess_runner_quality,
+    why_surfaced,
+)
 
 RUNNER_HORIZONS_SECONDS = (60, 300, 900, 1_800, 3_600, 14_400, 86_400)
+HEATING_OR_BETTER = frozenset({STAGE_HEATING, STAGE_UNSAFE, STAGE_ENTRY, STAGE_STRONG})
 RUNNER_MOMENTUM_WINDOWS_SECONDS = (15, 30, 60, 180, 300)
 FRESH_WATCH_OFFSETS_SECONDS = (0, 15, 30, 60, 120, 180, 300, 600, 900)
 
@@ -28,55 +41,129 @@ def _unique(items: Iterable[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(item for item in items if item))
 
 
+def _cluster_from_rows(
+    *,
+    cluster_id: str,
+    rows: list[RunnerFundingObservation],
+    kind: str,
+    funding_window_seconds: int,
+    amount_tolerance_percent: Decimal,
+    buy_window_seconds: int,
+    time_linked_min_wallets: int,
+) -> RunnerFundingCluster:
+    wallets = _unique(item.wallet for item in rows)
+    times = sorted(item.funded_at for item in rows if item.funded_at is not None)
+    interval = times[-1] - times[0] if len(times) >= 2 else None
+    amounts = sorted(item.amount_sol for item in rows if item.amount_sol is not None)
+    similar = False
+    median_amount: Decimal | None = None
+    if amounts:
+        median_amount = amounts[len(amounts) // 2]
+    if len(amounts) >= 2 and amounts[0] > 0:
+        spread = (amounts[-1] - amounts[0]) / amounts[0] * Decimal("100")
+        similar = spread <= amount_tolerance_percent
+    buys = sorted(item.bought_at for item in rows if item.bought_at is not None)
+    buy_interval = buys[-1] - buys[0] if len(buys) >= 2 else None
+    # Coordination needs more than a shared counterparty: exchanges and common
+    # infrastructure fund unrelated wallets all day.  Require a tight funding
+    # window plus either near-identical amounts or a tight buy window, and
+    # enough wallets that two coincidences cannot trip it.
+    time_linked = bool(
+        len(wallets) >= time_linked_min_wallets
+        and interval is not None
+        and interval <= funding_window_seconds
+        and (
+            similar
+            or (buy_interval is not None and buy_interval <= buy_window_seconds)
+        )
+    )
+    supply_values = [item.supply_percent for item in rows if item.supply_percent is not None]
+    supply = sum(supply_values, Decimal("0")) if supply_values else None
+    if time_linked:
+        confidence = "HIGH"
+    elif kind == "UPSTREAM_FUNDER":
+        confidence = "LOW"
+    else:
+        confidence = "MEDIUM"
+    return RunnerFundingCluster(
+        cluster_id=cluster_id,
+        wallets=wallets,
+        wallet_count=len(wallets),
+        supply_percent=(supply.quantize(Decimal("0.01")) if supply is not None else None),
+        funding_interval_seconds=interval,
+        similar_amounts=similar,
+        time_linked=time_linked,
+        confidence=confidence,
+        cluster_kind=kind,
+        buy_interval_seconds=buy_interval,
+        median_amount_sol=median_amount,
+    )
+
+
 def build_funding_clusters(
     observations: Iterable[RunnerFundingObservation],
     *,
     funding_window_seconds: int = 1_800,
     amount_tolerance_percent: Decimal = Decimal("10"),
+    buy_window_seconds: int = 300,
+    time_linked_min_wallets: int = 2,
+    excluded_funders: frozenset[str] = frozenset(),
 ) -> tuple[RunnerFundingCluster, ...]:
-    """Group direct funder links and flag close-time/similar-amount coordination.
+    """Group wallets by shared direct funder, then by shared upstream funder.
 
-    This only describes public transaction relationships. It is a coordination
-    signal, not proof that the wallets share a real-world owner or committed fraud.
+    A second pass catches the common evasion where one source funds a handful of
+    intermediaries which each fund a fresh wallet, so the direct funders all
+    differ while the upstream source is identical.  Only wallets whose direct
+    funders differ form an upstream group, so the same relationship is never
+    counted twice.
+
+    This describes public transaction relationships only.  It is a coordination
+    signal, not proof that the wallets share a real-world owner or that any
+    offence occurred.
     """
 
+    rows = [item for item in observations if item.wallet]
     by_funder: dict[str, list[RunnerFundingObservation]] = {}
-    for item in observations:
-        if item.funder:
+    for item in rows:
+        if item.funder and item.funder not in excluded_funders:
             by_funder.setdefault(item.funder, []).append(item)
     groups: list[RunnerFundingCluster] = []
-    for funder, rows in by_funder.items():
-        wallets = _unique(item.wallet for item in rows)
-        if len(wallets) < 2:
+    clustered: set[str] = set()
+    for funder, funded in by_funder.items():
+        if len({item.wallet for item in funded}) < 2:
             continue
-        times = sorted(item.funded_at for item in rows if item.funded_at is not None)
-        interval = times[-1] - times[0] if len(times) >= 2 else None
-        amounts = [item.amount_sol for item in rows if item.amount_sol is not None]
-        similar = False
-        if len(amounts) >= 2 and min(amounts) > 0:
-            spread = (max(amounts) - min(amounts)) / min(amounts) * Decimal("100")
-            similar = spread <= amount_tolerance_percent
-        buys = sorted(item.bought_at for item in rows if item.bought_at is not None)
-        buy_interval = buys[-1] - buys[0] if len(buys) >= 2 else None
-        time_linked = bool(
-            interval is not None
-            and interval <= funding_window_seconds
-            and similar
-            and buy_interval is not None
-            and buy_interval <= funding_window_seconds
+        cluster = _cluster_from_rows(
+            cluster_id=funder,
+            rows=funded,
+            kind="DIRECT_FUNDER",
+            funding_window_seconds=funding_window_seconds,
+            amount_tolerance_percent=amount_tolerance_percent,
+            buy_window_seconds=buy_window_seconds,
+            time_linked_min_wallets=time_linked_min_wallets,
         )
-        supply_values = [item.supply_percent for item in rows if item.supply_percent is not None]
-        supply = sum(supply_values, Decimal("0")) if supply_values else None
+        groups.append(cluster)
+        clustered.update(cluster.wallets)
+
+    by_upstream: dict[str, list[RunnerFundingObservation]] = {}
+    for item in rows:
+        upstream = item.upstream_funder
+        if not upstream or upstream in excluded_funders or item.wallet in clustered:
+            continue
+        by_upstream.setdefault(upstream, []).append(item)
+    for upstream, funded in by_upstream.items():
+        wallets = {item.wallet for item in funded}
+        direct = {item.funder for item in funded if item.funder}
+        if len(wallets) < 2 or len(direct) < 2:
+            continue
         groups.append(
-            RunnerFundingCluster(
-                cluster_id=funder,
-                wallets=wallets,
-                wallet_count=len(wallets),
-                supply_percent=(supply.quantize(Decimal("0.01")) if supply is not None else None),
-                funding_interval_seconds=interval,
-                similar_amounts=similar,
-                time_linked=time_linked,
-                confidence="HIGH" if time_linked else "MEDIUM",
+            _cluster_from_rows(
+                cluster_id=upstream,
+                rows=funded,
+                kind="UPSTREAM_FUNDER",
+                funding_window_seconds=funding_window_seconds,
+                amount_tolerance_percent=amount_tolerance_percent,
+                buy_window_seconds=buy_window_seconds,
+                time_linked_min_wallets=time_linked_min_wallets,
             )
         )
     return tuple(
@@ -95,12 +182,32 @@ def summarize_forensics(
     raw_top10_percent: Decimal | None = None,
     checked_at: int = 0,
     warnings: Iterable[str] = (),
+    fresh_wallet_max_age_seconds: int = 21_600,
+    excluded_funders: frozenset[str] = frozenset(),
+    provider_calls: int = 0,
+    degraded: bool = False,
 ) -> RunnerForensics:
+    """Collapse one bounded wallet trace into independence and concentration.
+
+    Independence is reported over the population that was actually traced, not
+    extrapolated over every raw buyer.  ``estimated_independent_clusters`` is
+    therefore "of the ``traced_wallets`` meaningful wallets we resolved, this
+    many look unlinked" — a number the evidence supports.
+    """
+
     rows = tuple(observations)
-    clusters = build_funding_clusters(rows)
+    clusters = build_funding_clusters(rows, excluded_funders=excluded_funders)
+    traced = len(_unique(item.wallet for item in rows))
+    resolved = sum(1 for item in rows if item.funder)
     linked_reductions = sum(max(0, item.wallet_count - 1) for item in clusters)
-    raw_entities = max(raw_unique_buyers, len(_unique(item.wallet for item in rows)))
-    independent = max(0, raw_entities - linked_reductions) if raw_entities else 0
+    independent = max(0, traced - linked_reductions) if traced else None
+    fresh = [
+        item
+        for item in rows
+        if item.wallet_age_seconds is not None
+        and item.wallet_age_seconds <= fresh_wallet_max_age_seconds
+    ]
+    aged = [item for item in rows if item.wallet_age_seconds is not None]
     largest = clusters[0] if clusters else None
     linked_supply = largest.supply_percent if largest else None
     adjusted_values = [value for value in (raw_top10_percent, linked_supply) if value is not None]
@@ -118,6 +225,12 @@ def summarize_forensics(
         checked_at=checked_at,
         funding_checked_at=checked_at,
         dynamic_checked_at=checked_at,
+        traced_wallets=traced,
+        resolved_funders=resolved,
+        fresh_wallet_count=len(fresh) if aged else None,
+        upstream_traced_wallets=sum(1 for item in rows if item.upstream_funder),
+        provider_calls=provider_calls,
+        degraded=degraded,
     )
 
 
@@ -127,11 +240,30 @@ def funding_observation_from_transaction(
     wallet: str,
     supply_percent: Decimal | None = None,
     bought_at: int | None = None,
+    trace_complete: bool = False,
+    upstream_funder: str | None = None,
+    funder_depth: int = 0,
+    now: int | None = None,
 ) -> RunnerFundingObservation:
-    """Extract a direct native-SOL funder from one documented parsed RPC transaction."""
+    """Extract a direct native-SOL funder from one documented parsed RPC transaction.
+
+    ``trace_complete`` must be ``True`` only when the caller actually reached the
+    wallet's first transaction.  v2.34 took the oldest signature of a bounded
+    20-signature page and treated it as the funding transfer, which is simply
+    the wrong transaction for any wallet with more than 20 transactions.  When
+    the page was truncated this now returns an unresolved observation instead
+    of a confident wrong one.
+    """
 
     if not isinstance(transaction, dict):
         return RunnerFundingObservation(wallet=wallet, supply_percent=supply_percent)
+    if not trace_complete:
+        return RunnerFundingObservation(
+            wallet=wallet,
+            supply_percent=supply_percent,
+            bought_at=bought_at,
+            trace_complete=False,
+        )
     message = ((transaction.get("transaction") or {}).get("message") or {})
     meta = transaction.get("meta") or {}
     raw_keys = message.get("accountKeys") or []
@@ -166,6 +298,11 @@ def funding_observation_from_transaction(
     amount = Decimal(wallet_gain) / Decimal("1000000000") if wallet_gain > 0 else None
     block_time = transaction.get("blockTime")
     observed_at = int(block_time) if block_time is not None else None
+    # The first transaction a wallet ever signed or received is its on-chain
+    # birth.  Age is evidence, never an accusation on its own.
+    age_seconds = (
+        max(0, now - observed_at) if now is not None and observed_at is not None else None
+    )
     return RunnerFundingObservation(
         wallet=wallet,
         funder=funder,
@@ -173,6 +310,11 @@ def funding_observation_from_transaction(
         amount_sol=amount if funder else None,
         bought_at=bought_at,
         supply_percent=supply_percent,
+        first_activity_at=observed_at,
+        wallet_age_seconds=age_seconds,
+        upstream_funder=upstream_funder,
+        funder_depth=funder_depth if funder else 0,
+        trace_complete=True,
     )
 
 
@@ -323,6 +465,15 @@ def fresh_watch_schedule(base_seconds: int = 15, minutes: int = 15) -> tuple[int
 
 
 def is_fresh_research_worthy(candidate: RunnerCandidate, *, max_age_seconds: int = 300) -> bool:
+    """Internal STAGE 1 ingest gate — deliberately permissive, never a Discord gate.
+
+    Passing this only means "young enough and alive enough to be worth watching
+    silently".  It answers *should we keep looking*, not *should the user look*.
+    The user-facing decision belongs to
+    :func:`smart_money_bot.quality.assess_runner_quality`, which requires
+    affirmative evidence rather than the mere absence of a catastrophe.
+    """
+
     age = (
         candidate.generated_at - candidate.pair_created_at
         if candidate.pair_created_at is not None
@@ -513,6 +664,7 @@ def score_runner_candidate(
     forensics: RunnerForensics | None = None,
     score_history: tuple[Decimal, ...] = (),
     pair_created_at: int | None = None,
+    quality_config: RunnerQualityConfig | None = None,
     now: int,
 ) -> RunnerCandidate:
     """Score only evidence available at ``now``; future outcome rows never enter here."""
@@ -741,6 +893,29 @@ def score_runner_candidate(
     forensic_result = forensics or RunnerForensics()
     safety = assess_runner_safety(current, forensic_result)
     age_seconds = now - pair_created_at if pair_created_at is not None else None
+
+    # STAGE 2+: the separated evidence model that decides user visibility. The
+    # legacy 0-100 ``score`` stays exactly as it was so persisted history,
+    # digests and calibration remain comparable across the upgrade.
+    projected_history = tuple(score_history) or ()
+    if not projected_history or projected_history[-1] != score:
+        projected_history = (*projected_history, score)
+    quality = assess_runner_quality(
+        first=first,
+        current=current,
+        history=history_items,
+        forensics=forensic_result,
+        safety=safety,
+        dex_price_change_5m=dex_5m,
+        score_history=projected_history,
+        raw_smart_wallets=raw_smart_count,
+        independent_smart_clusters=smart_count,
+        age_seconds=(now - source_created_at) if source_created_at is not None else None,
+        hard_blockers=tuple(dict.fromkeys(blockers)),
+        now=now,
+        config=quality_config or DEFAULT_QUALITY_CONFIG,
+    )
+
     if score >= Decimal("50") and safety.status == "FAIL":
         state = "⚠️ UNSAFE MOMENTUM"
     elif score >= Decimal("85") and safety.status == "PASS":
@@ -807,6 +982,14 @@ def score_runner_candidate(
         detection_score=score,
         raw_smart_wallet_count=raw_smart_count,
         estimated_independent_smart_wallets=smart_count,
+        quality=quality,
+        detection_quality=quality,
+        stage=quality.stage,
+        best_stage=quality.stage,
+        qualified_at=now if quality.qualified else None,
+        qualified_market_cap_usd=(current.market_cap_usd if quality.qualified else None),
+        heating_at=(now if quality.stage in HEATING_OR_BETTER else None),
+        why_surfaced=why_surfaced(quality),
     )
 
 
@@ -835,8 +1018,9 @@ def runner_forensics_from_json(raw: str) -> RunnerForensics:
     def cluster(raw_item: Any) -> RunnerFundingCluster:
         item = dict(raw_item)
         item["wallets"] = tuple(item.get("wallets") or ())
-        if item.get("supply_percent") is not None:
-            item["supply_percent"] = Decimal(str(item["supply_percent"]))
+        for key in ("supply_percent", "median_amount_sol"):
+            if item.get(key) is not None:
+                item[key] = Decimal(str(item[key]))
         return RunnerFundingCluster(**item)
 
     payload["shared_funder_groups"] = tuple(
@@ -856,6 +1040,45 @@ def runner_forensics_from_json(raw: str) -> RunnerForensics:
     for key in ("creator_linked_wallets", "warnings"):
         payload[key] = tuple(payload.get(key) or ())
     return RunnerForensics(**payload)
+
+
+def runner_quality_from_payload(value: Any) -> RunnerQualityAssessment:
+    """Rebuild a persisted decision snapshot without inventing missing evidence."""
+
+    if not isinstance(value, dict):
+        return RunnerQualityAssessment()
+    item = dict(value)
+    for key in (
+        "momentum_score",
+        "opportunity_score",
+        "organic_score",
+        "liquidity_quality",
+        "volume_quality",
+        "holder_quality",
+        "price_quality",
+        "score_velocity",
+        "liquidity_to_market_cap",
+        "volume_to_liquidity",
+        "volume_to_market_cap",
+    ):
+        if item.get(key) is not None:
+            item[key] = Decimal(str(item[key]))
+    for key in ("evidence", "evidence_families", "quality_warnings"):
+        item[key] = tuple(item.get(key) or ())
+    demand = item.get("demand")
+    if isinstance(demand, dict):
+        demand_values = dict(demand)
+        for key in (
+            "independence_ratio",
+            "cluster_supply_percent",
+            "fresh_wallet_percent",
+        ):
+            if demand_values.get(key) is not None:
+                demand_values[key] = Decimal(str(demand_values[key]))
+        item["demand"] = RunnerDemandProfile(**demand_values)
+    else:
+        item["demand"] = RunnerDemandProfile()
+    return RunnerQualityAssessment(**item)
 
 
 def _decimal_fields(payload: dict[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:
@@ -909,9 +1132,11 @@ def runner_candidate_from_json(raw: str) -> RunnerCandidate:
     x_data["posts_per_minute"] = Decimal(str(x_data.get("posts_per_minute") or 0))
     for key in ("notable_accounts", "notable_posts"):
         x_data[key] = tuple(x_data.get(key) or ())
-    for key in ("smart_wallets", "positives", "warnings", "hard_blockers"):
+    for key in ("smart_wallets", "positives", "warnings", "hard_blockers", "why_surfaced"):
         payload[key] = tuple(payload.get(key) or ())
     payload["score"] = Decimal(str(payload["score"]))
+    if payload.get("qualified_market_cap_usd") is not None:
+        payload["qualified_market_cap_usd"] = Decimal(str(payload["qualified_market_cap_usd"]))
     payload["score_history"] = tuple(
         Decimal(str(item)) for item in payload.get("score_history", ())
     )
@@ -972,6 +1197,8 @@ def runner_candidate_from_json(raw: str) -> RunnerCandidate:
     )
     safety = safety_from_payload(payload.pop("safety", None))
     detection_safety = safety_from_payload(payload.pop("detection_safety", None))
+    quality = runner_quality_from_payload(payload.pop("quality", None))
+    detection_quality = runner_quality_from_payload(payload.pop("detection_quality", None))
     if payload.get("detection_score") is not None:
         payload["detection_score"] = Decimal(str(payload["detection_score"]))
     return RunnerCandidate(
@@ -984,6 +1211,8 @@ def runner_candidate_from_json(raw: str) -> RunnerCandidate:
         detection_safety=detection_safety,
         forensics=forensics,
         detection_forensics=detection_forensics,
+        quality=quality,
+        detection_quality=detection_quality,
         **payload,
     )
 

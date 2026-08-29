@@ -7,6 +7,26 @@ transactions, and mirrors every newly detected hot-wallet swap in PAPER mode. PA
 as either a forced source-price observation ledger or an executable Jupiter quote-shadow
 trial; the two answer different questions and are labeled separately.
 
+Version 2.35.0 replaces the single 0-100 runner score with a multi-stage funnel and three
+separated models: **momentum** (how hard it is accelerating), **opportunity quality** (how
+interesting the setup is, dominated by how much of the visible activity looks like independent
+demand), and the unchanged fail-closed **safety** assessment where an `UNKNOWN` never becomes a
+`PASS`. Discovery and silent watching are unchanged and just as fast — the funnel filters the
+*user-facing* feed, not detection. `RAW_DISCOVERY` and `SILENT_WATCH` are silent; only a
+`QUALIFIED_RESEARCH` candidate reaches the digest, and only `HEATING_UP` and above earn their own
+message. Qualification needs at least two *affirmative* evidence families (flow, holders,
+liquidity, price, smart money, forensics) rather than the absence of a catastrophe, so "this
+graduated and has a pulse" no longer surfaces anything. Buyer independence is measured over the
+wallets actually traced: shared direct funders, bounded upstream funders one hop above, wallets
+funded close together with similar amounts that then buy close together, and wallets first active
+only hours ago all reduce it. A funder-page truncation bug that let v2.34 report the wrong
+transaction as a wallet's funding transfer is fixed — a truncated trace now reports unknown.
+Every card carries `WHY SURFACED` and `QUALITY WARNINGS`, the digest ranks and caps instead of
+listing, and `/fomo quality` reports funnel throughput, alert precision, the missed-runner
+counterfactual over silently rejected tokens, latency percentiles and provider cost by feature.
+Risk escalation, setup invalidation, dedupe, exact-mint Fomo/Pump/DEX/Solscan links and the
+read-only guarantee are unchanged. No runner path buys, sells, signs, calls J7, or spends SOL.
+
 Version 2.34.0 separates the existing-token runner into a fast, age-prioritized discovery lane
 and a slower research digest. Fresh candidates can now produce one deduplicated, non-pinging
 exact-mint Discord alert before the digest, then follow a staged 0/15/30/60-second through
@@ -765,6 +785,43 @@ The bot needs these Discord application permissions:
 No privileged Discord gateway intents are required.
 
 ## Railway deployment
+
+### v2.35.0 Railway changes
+
+**Nothing is required.** Every new variable has a working default, and the upgrade migrates an
+existing database in place — no runner row, snapshot, outcome or forensic record is dropped.
+
+**ADD (optional — tune only after `/fomo calibration` shows enough forward outcomes):**
+
+```text
+FOMO_RUNNER_MIN_EVIDENCE_FAMILIES=2
+FOMO_RUNNER_MIN_OPPORTUNITY_SCORE=45
+FOMO_RUNNER_HEATING_MIN_OPPORTUNITY=55
+FOMO_RUNNER_HEATING_MIN_MOMENTUM=60
+FOMO_RUNNER_ENTRY_MIN_OPPORTUNITY=65
+FOMO_RUNNER_ENTRY_MIN_MOMENTUM=50
+FOMO_RUNNER_MIN_INDEPENDENCE_RATIO=0.45
+FOMO_RUNNER_MAX_CLUSTER_SUPPLY_PERCENT=25
+FOMO_RUNNER_FRESH_REQUIRES_QUALIFICATION=true
+FOMO_RUNNER_FORENSICS_MAX_WALLETS=14
+FOMO_RUNNER_FUNDING_MAX_DEPTH=2
+FOMO_RUNNER_WALLET_HISTORY_LIMIT=60
+FOMO_RUNNER_EXCLUDED_FUNDERS=
+```
+
+`FOMO_RUNNER_EXCLUDED_FUNDERS` takes a comma- or pipe-separated list of addresses that must never
+form a wallet cluster. Protocol accounts are already excluded in code; add centralised-exchange
+hot wallets here as you identify them, because a shared exchange withdrawal address would
+otherwise look like a shared funder.
+
+**CHANGE (recommended):**
+
+```text
+FOMO_RUNNER_DIGEST_MAX_CANDIDATES=5
+```
+
+The digest now ranks and caps rather than listing everything above a floor, so a smaller number
+means "the best few worth looking at" rather than "fewer coins exist".
 
 ### v2.34.0 Railway changes
 

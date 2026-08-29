@@ -757,7 +757,16 @@ async def test_fomo_lab_is_admin_only_and_weak_real_candidate_can_display(settin
 @pytest.mark.asyncio
 async def test_fomo_lab_test_bypasses_display_floor_only(settings) -> None:
     engine = SmartMoneyEngine(settings)
-    weak = replace(_candidate(), score=Decimal("12"), research_only=True)
+    # v2.35: the production pool admits anything that reached a user-facing
+    # funnel stage even at a low legacy score, so a "weak" fixture now has to be
+    # genuinely unqualified rather than merely low-scoring.
+    weak = replace(
+        _candidate(),
+        score=Decimal("12"),
+        research_only=True,
+        stage="SILENT_WATCH",
+        best_stage="SILENT_WATCH",
+    )
     engine.initialize = AsyncMock()
     engine.dex_screener.trending_mints = AsyncMock(return_value=(MINT,))
     engine.database.recent_observed_token_mints = AsyncMock(return_value=[])

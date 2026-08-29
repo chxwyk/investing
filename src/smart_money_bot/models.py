@@ -332,7 +332,13 @@ class CoinCallout:
 
 @dataclass(frozen=True, slots=True)
 class RunnerFundingObservation:
-    """Bounded public-chain funding evidence for one holder/buyer wallet."""
+    """Bounded public-chain funding evidence for one holder/buyer wallet.
+
+    ``trace_complete`` records whether the bounded signature page actually
+    reached the wallet's first transaction.  When it did not, ``funder`` and
+    ``wallet_age_seconds`` stay unknown instead of being guessed from the
+    oldest signature the page happened to contain.
+    """
 
     wallet: str
     funder: str | None = None
@@ -340,11 +346,20 @@ class RunnerFundingObservation:
     amount_sol: Decimal | None = None
     bought_at: int | None = None
     supply_percent: Decimal | None = None
+    first_activity_at: int | None = None
+    wallet_age_seconds: int | None = None
+    upstream_funder: str | None = None
+    funder_depth: int = 0
+    trace_complete: bool = False
 
 
 @dataclass(frozen=True, slots=True)
 class RunnerFundingCluster:
-    """Wallets linked by a directly observed public funding relationship."""
+    """Wallets linked by an observed public funding relationship.
+
+    This is public-chain coordination evidence only.  It never asserts that the
+    wallets belong to one real person or that any offence occurred.
+    """
 
     cluster_id: str
     wallets: tuple[str, ...]
@@ -354,6 +369,9 @@ class RunnerFundingCluster:
     similar_amounts: bool = False
     time_linked: bool = False
     confidence: str = "LOW"
+    cluster_kind: str = "DIRECT_FUNDER"
+    buy_interval_seconds: int | None = None
+    median_amount_sol: Decimal | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -378,6 +396,68 @@ class RunnerForensics:
     checked_at: int = 0
     funding_checked_at: int = 0
     dynamic_checked_at: int = 0
+    traced_wallets: int = 0
+    resolved_funders: int = 0
+    fresh_wallet_count: int | None = None
+    upstream_traced_wallets: int = 0
+    provider_calls: int = 0
+    degraded: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class RunnerDemandProfile:
+    """Who is actually buying, as opposed to how many transactions there were.
+
+    ``estimated_independent_buyers`` stays ``None`` when the bounded trace did
+    not run.  Unknown independence is never treated as confirmed independence.
+    """
+
+    raw_buyers: int = 0
+    estimated_independent_buyers: int | None = None
+    independence_ratio: Decimal | None = None
+    largest_cluster_wallets: int | None = None
+    cluster_supply_percent: Decimal | None = None
+    fresh_wallet_count: int | None = None
+    fresh_wallet_percent: Decimal | None = None
+    traced_wallets: int = 0
+    time_linked_clusters: int = 0
+    time_linked_wallets: int = 0
+    upstream_linked_clusters: int = 0
+    largest_cluster_id: str | None = None
+    raw_smart_wallets: int = 0
+    independent_smart_clusters: int = 0
+    confidence: str = "UNKNOWN"
+
+
+@dataclass(frozen=True, slots=True)
+class RunnerQualityAssessment:
+    """Separated momentum / opportunity / funnel-stage decision at one time.
+
+    Persisted immutably at detection time so calibration never scores a past
+    decision with information that only became available later.
+    """
+
+    momentum_score: Decimal = Decimal("0")
+    opportunity_score: Decimal = Decimal("0")
+    organic_score: Decimal = Decimal("0")
+    liquidity_quality: Decimal | None = None
+    volume_quality: Decimal | None = None
+    holder_quality: Decimal | None = None
+    price_quality: Decimal | None = None
+    stage: str = "RAW_DISCOVERY"
+    qualified: bool = False
+    evidence: tuple[str, ...] = ()
+    evidence_families: tuple[str, ...] = ()
+    quality_warnings: tuple[str, ...] = ()
+    score_velocity: Decimal | None = None
+    liquidity_to_market_cap: Decimal | None = None
+    volume_to_liquidity: Decimal | None = None
+    volume_to_market_cap: Decimal | None = None
+    overextended: bool = False
+    coordination_veto: bool = False
+    demand: RunnerDemandProfile = field(default_factory=RunnerDemandProfile)
+    decision_version: str = "quality-v1"
+    evaluated_at: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -498,6 +578,14 @@ class RunnerCandidate:
     detection_score: Decimal | None = None
     raw_smart_wallet_count: int = 0
     estimated_independent_smart_wallets: int = 0
+    quality: RunnerQualityAssessment = field(default_factory=RunnerQualityAssessment)
+    detection_quality: RunnerQualityAssessment = field(default_factory=RunnerQualityAssessment)
+    stage: str = "RAW_DISCOVERY"
+    best_stage: str = "RAW_DISCOVERY"
+    qualified_at: int | None = None
+    qualified_market_cap_usd: Decimal | None = None
+    heating_at: int | None = None
+    why_surfaced: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

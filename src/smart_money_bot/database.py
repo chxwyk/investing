@@ -27,6 +27,7 @@ from .models import (
     TraderMetrics,
     WalletRotationEvent,
 )
+from .quality import STAGE_RAW, USER_FACING_STAGES, merge_best_stage
 
 
 def _d(value: Any) -> Decimal:
@@ -401,6 +402,52 @@ class Database:
                 FOREIGN KEY (mint) REFERENCES runner_candidates(mint) ON DELETE CASCADE
             );
 
+            -- Immutable funnel decisions. One row per (mint, stage, second) so a
+            -- later re-evaluation can never rewrite what was known at the time.
+            CREATE TABLE IF NOT EXISTS runner_stage_events (
+                mint TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                decided_at INTEGER NOT NULL,
+                momentum_score REAL,
+                opportunity_score REAL,
+                organic_score REAL,
+                safety_status TEXT,
+                market_cap_usd REAL,
+                liquidity_usd REAL,
+                evidence_json TEXT,
+                warnings_json TEXT,
+                decision_version TEXT NOT NULL DEFAULT 'quality-v1',
+                PRIMARY KEY (mint, stage, decided_at),
+                FOREIGN KEY (mint) REFERENCES runner_candidates(mint) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_runner_stage_events_stage
+                ON runner_stage_events(stage, decided_at DESC);
+
+            -- Provider request accounting that is not tied to a daily cap, so
+            -- cost can be attributed per feature without gating anything.
+            CREATE TABLE IF NOT EXISTS provider_call_usage (
+                provider TEXT NOT NULL,
+                feature TEXT NOT NULL,
+                usage_day TEXT NOT NULL,
+                calls INTEGER NOT NULL DEFAULT 0,
+                cache_hits INTEGER NOT NULL DEFAULT 0,
+                errors INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (provider, feature, usage_day)
+            );
+
+            -- Funding relationships are immutable once observed, so caching them
+            -- removes the dominant repeat RPC cost of the forensic trace.
+            CREATE TABLE IF NOT EXISTS wallet_funding_edges (
+                wallet TEXT PRIMARY KEY,
+                funder TEXT,
+                funded_at INTEGER,
+                amount_sol REAL,
+                first_activity_at INTEGER,
+                trace_complete INTEGER NOT NULL DEFAULT 0,
+                resolved_at INTEGER NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS api_usage_daily (
                 provider TEXT NOT NULL,
                 operation TEXT NOT NULL,
@@ -519,6 +566,16 @@ class Database:
             ("first_visible_market_cap_usd", "REAL"),
             ("entry_market_cap_usd", "REAL"),
             ("peak_market_cap_usd", "REAL"),
+            # v2.35 funnel columns. Added, never replacing anything, so every
+            # existing runner row and forward observation survives the upgrade.
+            ("stage", "TEXT NOT NULL DEFAULT 'RAW_DISCOVERY'"),
+            ("best_stage", "TEXT NOT NULL DEFAULT 'RAW_DISCOVERY'"),
+            ("qualified_at", "INTEGER"),
+            ("qualified_market_cap_usd", "REAL"),
+            ("heating_at", "INTEGER"),
+            ("momentum_score", "REAL"),
+            ("opportunity_score", "REAL"),
+            ("organic_score", "REAL"),
         ):
             await self._ensure_column("runner_candidates", column, definition)
         await self.db.execute(
@@ -3435,6 +3492,7 @@ class Database:
                         "detection_safety",
                         "detection_forensics",
                         "detection_score",
+                        "detection_quality",
                     ):
                         updated_payload[key] = existing_payload.get(key)
                     for key in (
@@ -3449,8 +3507,18 @@ class Database:
                         "first_discord_visible_at",
                         "entry_eligible_at",
                         "strong_alert_at",
+                        "qualified_at",
+                        "qualified_market_cap_usd",
+                        "heating_at",
                     ):
                         updated_payload[key] = existing_payload.get(key) or updated_payload.get(key)
+                    # The funnel high-water mark never regresses, so
+                    # missed-runner analysis can ask "did this token ever
+                    # qualify?" long after it cooled off.
+                    updated_payload["best_stage"] = merge_best_stage(
+                        str(existing_payload.get("best_stage") or ""),
+                        str(updated_payload.get("stage") or STAGE_RAW),
+                    )
                     payload_json = json.dumps(updated_payload, separators=(",", ":"))
                 await self.db.execute(
                     """
@@ -3565,6 +3633,37 @@ class Database:
                         candidate.generated_at,
                     ),
                 )
+                merged = json.loads(payload_json)
+                quality = candidate.quality
+                await self.db.execute(
+                    """
+                    UPDATE runner_candidates SET
+                        stage = ?,
+                        best_stage = ?,
+                        qualified_at = COALESCE(qualified_at, ?),
+                        qualified_market_cap_usd = COALESCE(qualified_market_cap_usd, ?),
+                        heating_at = COALESCE(heating_at, ?),
+                        momentum_score = ?,
+                        opportunity_score = ?,
+                        organic_score = ?
+                    WHERE mint = ?
+                    """,
+                    (
+                        candidate.stage,
+                        str(merged.get("best_stage") or candidate.best_stage),
+                        merged.get("qualified_at"),
+                        (
+                            float(merged["qualified_market_cap_usd"])
+                            if merged.get("qualified_market_cap_usd") is not None
+                            else None
+                        ),
+                        merged.get("heating_at"),
+                        float(quality.momentum_score),
+                        float(quality.opportunity_score),
+                        float(quality.organic_score),
+                        candidate.mint,
+                    ),
+                )
                 await self.db.execute(
                     """
                     INSERT OR IGNORE INTO runner_snapshots(
@@ -3576,6 +3675,40 @@ class Database:
                         candidate.current.captured_at,
                         snapshot_json,
                         float(candidate.score),
+                    ),
+                )
+                # One immutable decision row per stage transition. Calibration
+                # replays these, so nothing here may ever be rewritten with
+                # information that arrived later.
+                await self.db.execute(
+                    """
+                    INSERT OR IGNORE INTO runner_stage_events(
+                        mint, stage, decided_at, momentum_score, opportunity_score,
+                        organic_score, safety_status, market_cap_usd, liquidity_usd,
+                        evidence_json, warnings_json, decision_version
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        candidate.mint,
+                        candidate.stage,
+                        candidate.generated_at,
+                        float(quality.momentum_score),
+                        float(quality.opportunity_score),
+                        float(quality.organic_score),
+                        candidate.safety.status,
+                        (
+                            float(candidate.current.market_cap_usd)
+                            if candidate.current.market_cap_usd is not None
+                            else None
+                        ),
+                        (
+                            float(candidate.current.liquidity_usd)
+                            if candidate.current.liquidity_usd is not None
+                            else None
+                        ),
+                        json.dumps(list(quality.evidence), separators=(",", ":")),
+                        json.dumps(list(quality.quality_warnings), separators=(",", ":")),
+                        quality.decision_version,
                     ),
                 )
                 await self.db.commit()
@@ -3881,6 +4014,207 @@ class Database:
             """
         )
         return [dict(row) for row in await cursor.fetchall()]
+
+    async def record_provider_call(
+        self,
+        *,
+        provider: str,
+        feature: str,
+        usage_day: str,
+        calls: int = 1,
+        cache_hits: int = 0,
+        errors: int = 0,
+    ) -> None:
+        """Attribute provider cost to the feature that spent it.
+
+        Uncapped on purpose: this is accounting, not a budget gate.  The paid
+        daily caps stay in ``api_usage_daily``.
+        """
+
+        now = int(time.time())
+        async with self._write_lock:
+            await self.db.execute(
+                """
+                INSERT INTO provider_call_usage(
+                    provider, feature, usage_day, calls, cache_hits, errors, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(provider, feature, usage_day) DO UPDATE SET
+                    calls = provider_call_usage.calls + excluded.calls,
+                    cache_hits = provider_call_usage.cache_hits + excluded.cache_hits,
+                    errors = provider_call_usage.errors + excluded.errors,
+                    updated_at = excluded.updated_at
+                """,
+                (provider, feature, usage_day, calls, cache_hits, errors, now),
+            )
+            await self.db.commit()
+
+    async def provider_call_rows(self, *, usage_day: str | None = None) -> list[dict[str, Any]]:
+        if usage_day is None:
+            cursor = await self.db.execute(
+                """
+                SELECT provider, feature, usage_day, calls, cache_hits, errors
+                FROM provider_call_usage
+                ORDER BY usage_day DESC, calls DESC
+                LIMIT 200
+                """
+            )
+        else:
+            cursor = await self.db.execute(
+                """
+                SELECT provider, feature, usage_day, calls, cache_hits, errors
+                FROM provider_call_usage
+                WHERE usage_day = ?
+                ORDER BY calls DESC
+                """,
+                (usage_day,),
+            )
+        return [dict(row) for row in await cursor.fetchall()]
+
+    async def cached_funding_edges(self, wallets: list[str]) -> dict[str, dict[str, Any]]:
+        """Read previously resolved funding relationships for these wallets."""
+
+        if not wallets:
+            return {}
+        placeholders = ",".join("?" for _ in wallets[:100])
+        cursor = await self.db.execute(
+            f"""
+            SELECT wallet, funder, funded_at, amount_sol, first_activity_at, trace_complete
+            FROM wallet_funding_edges WHERE wallet IN ({placeholders})
+            """,
+            tuple(wallets[:100]),
+        )
+        return {str(row["wallet"]): dict(row) for row in await cursor.fetchall()}
+
+    async def store_funding_edges(self, edges: list[dict[str, Any]]) -> None:
+        """Cache immutable funding relationships; a resolved edge never changes."""
+
+        if not edges:
+            return
+        now = int(time.time())
+        async with self._write_lock:
+            await self.db.executemany(
+                """
+                INSERT INTO wallet_funding_edges(
+                    wallet, funder, funded_at, amount_sol, first_activity_at,
+                    trace_complete, resolved_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(wallet) DO UPDATE SET
+                    funder = COALESCE(excluded.funder, wallet_funding_edges.funder),
+                    funded_at = COALESCE(excluded.funded_at, wallet_funding_edges.funded_at),
+                    amount_sol = COALESCE(excluded.amount_sol, wallet_funding_edges.amount_sol),
+                    first_activity_at = COALESCE(
+                        excluded.first_activity_at, wallet_funding_edges.first_activity_at
+                    ),
+                    trace_complete = MAX(
+                        wallet_funding_edges.trace_complete, excluded.trace_complete
+                    ),
+                    resolved_at = excluded.resolved_at
+                """,
+                [
+                    (
+                        edge["wallet"],
+                        edge.get("funder"),
+                        edge.get("funded_at"),
+                        edge.get("amount_sol"),
+                        edge.get("first_activity_at"),
+                        int(bool(edge.get("trace_complete"))),
+                        now,
+                    )
+                    for edge in edges
+                    if edge.get("wallet")
+                ],
+            )
+            await self.db.commit()
+
+    async def runner_stage_counts(self, *, since: int = 0) -> dict[str, int]:
+        """Count how many distinct mints ever reached each funnel stage."""
+
+        cursor = await self.db.execute(
+            """
+            SELECT stage, COUNT(DISTINCT mint) AS mints
+            FROM runner_stage_events
+            WHERE decided_at >= ?
+            GROUP BY stage
+            """,
+            (since,),
+        )
+        return {str(row["stage"]): int(row["mints"]) for row in await cursor.fetchall()}
+
+    async def runner_funnel_rows(self, *, since: int = 0) -> list[dict[str, Any]]:
+        """One row per observed token with its funnel outcome and forward path.
+
+        Silent and rejected candidates are deliberately included: a system that
+        only measures what it alerted on cannot detect a missed runner.
+        """
+
+        cursor = await self.db.execute(
+            """
+            SELECT
+                c.mint,
+                c.stage,
+                c.best_stage,
+                c.qualified_at,
+                c.qualified_market_cap_usd,
+                c.heating_at,
+                c.first_discord_visible_at,
+                c.first_seen_at,
+                c.radar_first_seen_at,
+                c.pair_created_at,
+                c.chain_created_at,
+                c.graduated_at,
+                c.first_market_cap_usd,
+                c.first_visible_market_cap_usd,
+                c.entry_market_cap_usd,
+                c.peak_market_cap_usd,
+                c.first_score,
+                c.latest_score,
+                c.momentum_score,
+                c.opportunity_score,
+                c.organic_score,
+                MAX(COALESCE(
+                    o.price_return_percent, o.market_cap_return_percent
+                )) AS best_return_percent,
+                MIN(COALESCE(
+                    o.price_return_percent, o.market_cap_return_percent
+                )) AS worst_return_percent,
+                MAX(COALESCE(o.liquidity_disappeared, 0)) AS liquidity_disappeared,
+                MAX(COALESCE(o.rugged, 0)) AS rugged,
+                COUNT(o.horizon_seconds) AS outcome_rows
+            FROM runner_candidates AS c
+            LEFT JOIN runner_outcomes AS o ON o.mint = c.mint
+            WHERE c.first_seen_at >= ?
+            GROUP BY c.mint
+            ORDER BY c.first_seen_at DESC
+            LIMIT 2000
+            """,
+            (since,),
+        )
+        return [dict(row) for row in await cursor.fetchall()]
+
+    async def runner_stage_event_rows(
+        self,
+        *,
+        mint: str | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        if mint:
+            cursor = await self.db.execute(
+                """
+                SELECT * FROM runner_stage_events WHERE mint = ?
+                ORDER BY decided_at DESC LIMIT ?
+                """,
+                (mint, limit),
+            )
+        else:
+            cursor = await self.db.execute(
+                "SELECT * FROM runner_stage_events ORDER BY decided_at DESC LIMIT ?",
+                (limit,),
+            )
+        return [dict(row) for row in await cursor.fetchall()]
+
+    @staticmethod
+    def user_facing_stage(stage: str | None) -> bool:
+        return str(stage or STAGE_RAW) in USER_FACING_STAGES
 
     async def runner_observation_count(self) -> int:
         cursor = await self.db.execute("SELECT COUNT(*) AS count FROM runner_candidates")
