@@ -222,6 +222,22 @@ def parse_dex_snapshot(payload: Any, *, mint: str) -> DexSnapshot:
         "",
     )
     x_path = urlparse(x_url).path.strip("/").split("/")[0] if x_url else ""
+    telegram_url = next(
+        (
+            str(item.get("url") or "")
+            for item in socials
+            if isinstance(item, dict) and str(item.get("type") or "").lower() == "telegram"
+        ),
+        "",
+    )
+    discord_url = next(
+        (
+            str(item.get("url") or "")
+            for item in socials
+            if isinstance(item, dict) and str(item.get("type") or "").lower() == "discord"
+        ),
+        "",
+    )
     created_ms = _integer(pair.get("pairCreatedAt"))
     age_minutes = (
         max(0, int((time.time() * 1000 - created_ms) / 60_000)) if created_ms > 0 else None
@@ -249,6 +265,9 @@ def parse_dex_snapshot(payload: Any, *, mint: str) -> DexSnapshot:
         website_url=website_url,
         x_handle=x_path.lstrip("@"),
         pair_url=str(pair.get("url") or ""),
+        image_url=str(info.get("imageUrl") or ""),
+        telegram_url=telegram_url,
+        discord_url=discord_url,
     )
 
 

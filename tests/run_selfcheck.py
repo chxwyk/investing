@@ -224,10 +224,89 @@ async def main() -> None:
         finally:
             await database.close()
 
+    await check_paper_laboratory()
+
     print(
         "SELF-CHECK PASSED: detector, scoring, database, discovery rotation, "
-        "paper P&L, and risk gate"
+        "paper P&L, risk gate, and PAPER laboratory invariants"
     )
+
+
+async def check_paper_laboratory() -> None:
+    """The invariants that must hold before this release may ever be trusted.
+
+    These are deliberately the non-negotiables from the product contract, not a
+    happy path: no live execution, safety never becomes PASS by omission, an old
+    pump never returns as a fresh setup, no public account can enter or launch,
+    and the broad social radar stays off.
+    """
+
+    import smart_money_bot.lab as lab
+    from smart_money_bot.lab.decision import Decision, Reason
+    from smart_money_bot.lab.entry import EntryContext, evaluate_entry
+    from smart_money_bot.lab.lifecycle import (
+        FIRST_DISCOVERY,
+        LifecycleObservation,
+        advance_lifecycle,
+        new_lifecycle,
+    )
+    from smart_money_bot.lab.registry import (
+        IDEA_ONLY_ACCOUNTS,
+        TIER_A_ACCOUNTS,
+        TIER_B_ACCOUNTS,
+        TIER_C_ACCOUNTS,
+    )
+
+    assert lab.LIVE_EXECUTION_ENABLED is False, "live execution must stay disabled"
+    assert lab.DEFAULT_LAB_CONFIG.broad_social_radar_enabled is False
+    assert lab.DEFAULT_LAB_CONFIG.bankroll_usd == Decimal("100")
+    assert lab.DEFAULT_LAB_CONFIG.normal_position_usd == Decimal("5")
+    assert lab.DEFAULT_LAB_CONFIG.max_position_usd == Decimal("10")
+
+    for account in (*TIER_A_ACCOUNTS, *TIER_B_ACCOUNTS, *TIER_C_ACCOUNTS, *IDEA_ONLY_ACCOUNTS):
+        assert account.can_enter is False
+        assert account.can_launch is False
+    for account in IDEA_ONLY_ACCOUNTS:
+        assert account.can_qualify_token is False
+
+    # Missing evidence must never become PASS.
+    blank = evaluate_entry(
+        EntryContext(mint=TOKEN, now=1_000),
+        lifecycle=new_lifecycle(TOKEN, now=0),
+        bankroll=lab.BankrollState(),
+    )
+    assert not blank.entry_eligible
+    assert Reason.SAFETY_UNKNOWN in blank.decision.reason_codes
+    assert blank.decision.decision is not Decision.ENTRY
+
+    # An old pump is never a fresh setup again.
+    record = new_lifecycle(TOKEN, now=0)
+    for at, price, market_cap, extra in (
+        (10, "0.000032", "32000", {"surfaced": True, "qualified": True}),
+        (60, "0.00015", "150000", {}),
+        (120, "0.000038", "38000", {}),
+    ):
+        record = advance_lifecycle(
+            record,
+            LifecycleObservation(
+                observed_at=at,
+                price_usd=Decimal(price),
+                market_cap_usd=Decimal(market_cap),
+                **extra,
+            ),
+        )
+    assert record.state != FIRST_DISCOVERY
+    assert record.first_surface_market_cap_usd == Decimal("32000")
+    assert record.historical_high_market_cap_usd == Decimal("150000")
+    assert not record.is_fresh_setup
+
+    rehydrated = lab.lifecycle_from_json(lab.lifecycle_to_json(record))
+    assert rehydrated == record
+
+    # Only NET PnL counts.
+    cost = lab.estimate_round_trip_cost(Decimal("5"), buy_price_impact_percent=Decimal("1"))
+    assert cost.total_cost_usd > 0
+    assert cost.platform_fees_usd > 0 and cost.network_fees_usd > 0
 
 
 if __name__ == "__main__":

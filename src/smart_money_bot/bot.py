@@ -21,6 +21,24 @@ from .config import Settings
 from .constants import BOT_VERSION, PAPER_DEMO_ENTRY_PRICE_USD, PAPER_DEMO_MINT
 from .engine import SmartMoneyEngine
 from .errors import DiscoveryError, JupiterError, PumpLaunchError
+from .lab.decision import Decision
+from .lab.exits import PaperPosition
+from .lab.identity import (
+    NO_DESCRIPTION,
+    TokenIdentity,
+    format_age,
+    identity_from_candidate,
+    short_money,
+)
+from .lab.lifecycle import TokenLifecycle
+from .lab.registry import (
+    IDEA_ONLY_ACCOUNTS,
+    TIER_A_ACCOUNTS,
+    TIER_B_ACCOUNTS,
+    TIER_C_ACCOUNTS,
+)
+from .lab.replay import SAMPLE_TOO_SMALL, PerformanceReport
+from .lab_runtime import LabEvaluation
 from .launch import (
     NO_X_LAUNCH_VERDICT,
     X_VERIFIED_LAUNCH_VERDICT,
@@ -1600,6 +1618,22 @@ def _runner_embed(
         ),
         color=(0xE74C3C if candidate.hard_blockers else 0xF1C40F if research_test else 0x5865F2),
         timestamp=datetime.fromtimestamp(candidate.generated_at, tz=UTC),
+    )
+    identity = identity_from_candidate(candidate, now=candidate.generated_at)
+    if identity.image_url:
+        embed.set_thumbnail(url=identity.image_url)
+    embed.add_field(
+        name="Identity",
+        value=(
+            f"ABOUT: {identity.description}\n"
+            f"Age `{format_age(identity.pair_age_seconds or identity.token_age_seconds)}`"
+            + (
+                "\n" + " • ".join(f"[{link.label}]({link.url})" for link in identity.links[:4])
+                if identity.links
+                else ""
+            )
+        )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+        inline=False,
     )
     embed.add_field(
         name="Source / detection timing",
@@ -4535,6 +4569,416 @@ class SmartMoneyCommands(
         await interaction.response.send_message(text, ephemeral=True)
 
 
+def _lab_identity_lines(
+    identity: TokenIdentity,
+    mint: str,
+    *,
+    referral_code: str | None,
+) -> str:
+    """IDENTITY block: what is actually being evaluated (section BE)."""
+
+    about = identity.description
+    links = " • ".join(
+        f"[{link.label}]({link.url})"
+        for link in identity.links[:5]
+        if link.source != "canonical"
+    )
+    canonical = (
+        f"[FOMO]({_fomo_coin_url(mint, referral_code)}) • "
+        f"[PUMP.FUN](https://pump.fun/coin/{mint}) • "
+        f"[DEX](https://dexscreener.com/solana/{mint}) • "
+        f"[SOLSCAN](https://solscan.io/token/{mint})"
+    )
+    age = format_age(identity.pair_age_seconds or identity.token_age_seconds)
+    return (
+        f"**{identity.name[:RUNNER_TOKEN_NAME_LIMIT]}** `${identity.symbol}`\n"
+        f"`{mint}`\n"
+        f"ABOUT: {about}\n"
+        f"Age `{age}`\n"
+        + (f"{links}\n" if links else "")
+        + canonical
+    )
+
+
+def _lab_setup_line(lifecycle: TokenLifecycle, current_market_cap: Decimal | None) -> str:
+    """SETUP block: lifecycle, fresh vs re-entry, surface MC, peak, drawdown."""
+
+    kind = "FRESH" if lifecycle.is_fresh_setup else "RE-ENTRY"
+    return (
+        f"Lifecycle **{lifecycle.state}** • {kind}\n"
+        f"Current MC `{short_money(current_market_cap)}` • first-surface MC "
+        f"`{short_money(lifecycle.first_surface_market_cap_usd)}`\n"
+        f"Observed peak MC `{short_money(lifecycle.historical_high_market_cap_usd)}` • "
+        f"peak drawdown `{lifecycle.current_drawdown_percent or 0}%` • max "
+        f"`{lifecycle.max_drawdown_percent or 0}%`"
+    )
+
+
+def _lab_opportunity_embed(
+    candidate: RunnerCandidate,
+    result: LabEvaluation,
+    *,
+    index: int,
+    total: int,
+    referral_code: str | None,
+) -> discord.Embed:
+    """One `/fomo opportunities` card.
+
+    Showing a rejected or watched candidate here never makes it entry
+    eligible: the decision rendered is the same authoritative one the PAPER
+    engine used.
+    """
+
+    decision = result.decision
+    current = candidate.current
+    quality = candidate.quality
+    demand = quality.demand
+    colour = {
+        str(Decision.ENTRY): 0x2ECC71,
+        str(Decision.REENTRY_QUALIFIED): 0x27AE60,
+        str(Decision.WAIT): 0xF1C40F,
+        str(Decision.REENTRY_WATCH): 0xE67E22,
+        str(Decision.COOLDOWN): 0x95A5A6,
+        str(Decision.REJECT): 0xE74C3C,
+    }.get(str(decision.decision), 0x5865F2)
+
+    embed = discord.Embed(
+        title=f"FOMO OPPORTUNITY {index + 1}/{total} — {decision.decision}",
+        description=_lab_identity_lines(
+            result.identity, candidate.mint, referral_code=referral_code
+        ),
+        colour=colour,
+        timestamp=discord.utils.utcnow(),
+    )
+    if result.identity.image_url:
+        embed.set_thumbnail(url=result.identity.image_url)
+    embed.add_field(
+        name="SETUP",
+        value=_lab_setup_line(result.lifecycle, current.market_cap_usd)[
+            :DISCORD_EMBED_FIELD_VALUE_LIMIT
+        ],
+        inline=False,
+    )
+    embed.add_field(
+        name="QUALITY",
+        value=(
+            f"Opportunity `{quality.opportunity_score:.0f}` • momentum "
+            f"`{quality.momentum_score:.0f}` • organic `{quality.organic_score:.0f}`\n"
+            f"Economic authenticity `{result.authenticity.score:.0f}` "
+            f"({result.authenticity.band}) • safety **{decision.safety}**\n"
+            f"Evidence `{decision.evidence_quality}`"
+        )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+        inline=False,
+    )
+    embed.add_field(
+        name="ACTIVITY / EXECUTION",
+        value=(
+            f"Independent buyers `{demand.estimated_independent_buyers or 'unknown'}` • "
+            f"liquidity `{short_money(current.liquidity_usd)}`\n"
+            f"Flow 5m `{current.buys_5m}` buys / `{current.sells_5m}` sells • route "
+            f"`{current.buy_route_status}`/`{current.sell_route_status}`\n"
+            f"Round-trip cost `{result.evaluation.edge.cost_percent}%` • expected NET edge "
+            f"`{decision.expected_net_edge_percent}%` • confidence "
+            f"`{decision.edge_confidence}`"
+        )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+        inline=False,
+    )
+    smart = result.smart_money
+    embed.add_field(
+        name="SMART / SOCIAL",
+        value=(
+            f"Verified independent smart wallets `{smart.independent_clusters}` • proven "
+            f"early `{smart.proven_early}` • posture `{smart.posture}`\n"
+            + ("\n".join(f"• {item}" for item in smart.warnings[:2]) or "• no wallet warnings")
+        )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+        inline=False,
+    )
+    surfaced = why_surfaced(quality) or ("Nothing yet — candidate is still being observed",)
+    embed.add_field(
+        name="WHY SURFACED",
+        value="\n".join(f"• {item}" for item in surfaced)[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+        inline=False,
+    )
+    warnings = tuple(quality.quality_warnings) + result.authenticity.warnings
+    embed.add_field(
+        name="QUALITY WARNINGS",
+        value=(
+            "\n".join(f"• {item}" for item in warnings[:6]) or "• none recorded"
+        )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+        inline=False,
+    )
+    embed.add_field(
+        name="WHY NOT ENTRY" if not result.entry_eligible else "WHY ENTRY",
+        value=(
+            "\n".join(f"• {item}" for item in decision.human_reasons[:8]) or "• no reasons recorded"
+        )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+        inline=False,
+    )
+    embed.set_footer(
+        text=(
+            f"{decision.strategy_version} • config {decision.config_hash} • "
+            "PAPER only — research visibility never enables an entry"
+        )
+    )
+    return _clamp_embed(embed)
+
+
+def _open_state(position: PaperPosition) -> str:
+    return "OPEN" if position.is_open else "CLOSED"
+
+
+def _lab_trades_embed(positions: tuple[PaperPosition, ...]) -> discord.Embed:
+    embed = discord.Embed(
+        title="FOMO PAPER TRADES — SIMULATED ONLY",
+        colour=0x3498DB,
+        timestamp=discord.utils.utcnow(),
+    )
+    if not positions:
+        embed.description = "No simulated position has been opened yet."
+        return _clamp_embed(embed)
+    embed.description = f"{len(positions)} simulated position(s). No real funds move."
+    for position in positions[:8]:
+        price = position.last_price_usd
+        unrealized = position.unrealized_percent(price)
+        gross = position.realized_gross_pnl_usd
+        embed.add_field(
+            name=f"{_short(position.mint)} • {position.lifecycle_state or 'UNKNOWN'}",
+            value=(
+                f"Entry `{_price(position.entry_price_usd)}` • current `{_price(price)}` • "
+                f"unrealized `{unrealized if unrealized is not None else 'unknown'}%`\n"
+                f"GROSS PnL `${gross}` • **NET PnL `${position.realized_net_pnl_usd}`**\n"
+                f"Peak unrealized `{position.max_favourable_percent}%` • drawdown from peak "
+                f"`{position.drawdown_from_peak_percent(price) or 0}%`\n"
+                f"Remaining `{position.remaining_fraction}` • secured "
+                f"`${position.secured_proceeds_usd}`\n"
+                f"Entry reason `{', '.join(position.entry_reason_codes[:3]) or 'n/a'}`\n"
+                f"Exit state `{position.close_reason or _open_state(position)}`"
+            )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+            inline=False,
+        )
+    embed.set_footer(text="Unrealized gain is not realized profit")
+    return _clamp_embed(embed)
+
+
+def _lab_performance_embed(payload: dict[str, object]) -> discord.Embed:
+    report = payload["report"]
+    assert isinstance(report, PerformanceReport)
+
+    def value(item: object, suffix: str = "") -> str:
+        return "pending" if item is None else f"{item}{suffix}"
+
+    embed = discord.Embed(
+        title="FOMO PAPER PERFORMANCE — SIMULATED ONLY",
+        description=(
+            f"Starting bankroll `${payload['starting_bankroll_usd']}` • current "
+            f"`${payload['current_bankroll_usd']}`\n"
+            f"Realized NET `${payload['realized_net_pnl_usd']}` • unrealized (separate) "
+            f"`${payload['unrealized_net_pnl_usd']}`\n"
+            f"Open simulated positions `{payload['open_positions']}` • strategy "
+            f"`{payload['strategy_version']}`"
+        ),
+        colour=0x9B59B6,
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(
+        name="Completed trades",
+        value=(
+            f"Sample `{report.sample}` • wins `{report.wins}` • losses `{report.losses}` • "
+            f"win rate `{value(report.win_rate_percent, '%')}`\n"
+            f"Median return `{value(report.median_return_percent, '%')}` • average winner "
+            f"`{value(report.average_win_usd)}` • average loser "
+            f"`{value(report.average_loss_usd)}`\n"
+            f"Profit factor `{value(report.profit_factor)}` • expectancy "
+            f"`{value(report.expectancy_usd)}` • max drawdown `${report.max_drawdown_usd}`"
+        )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+        inline=False,
+    )
+    embed.add_field(
+        name="Costs and reach",
+        value=(
+            f"Total cost `${report.total_cost_usd}` • cost / gross "
+            f"`{value(report.cost_to_gross_percent, '%')}`\n"
+            f"+10 `{value(report.reach_10_percent, '%')}` • +25 "
+            f"`{value(report.reach_25_percent, '%')}` • +50 "
+            f"`{value(report.reach_50_percent, '%')}` • +100 "
+            f"`{value(report.reach_100_percent, '%')}`"
+        )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+        inline=False,
+    )
+    regimes = " • ".join(f"`{name}` {total}" for name, total in sorted(report.by_regime.items()))
+    embed.add_field(
+        name="Cohorts",
+        value=(
+            f"Fresh `{report.fresh_sample}` (expectancy "
+            f"`{value(report.fresh_expectancy_usd)}`) • re-entry `{report.reentry_sample}` "
+            f"(expectancy `{value(report.reentry_expectancy_usd)}`)\n"
+            f"By regime: {regimes or 'collecting'}"
+        )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+        inline=False,
+    )
+    if report.sample_too_small:
+        embed.add_field(
+            name="⚠️ " + SAMPLE_TOO_SMALL,
+            value=(
+                "Not enough completed forward trades to draw any conclusion. "
+                "No threshold has been tuned to make these numbers look better."
+            ),
+            inline=False,
+        )
+    embed.set_footer(text="PAPER only • NET PnL is the only measure of profitability")
+    return _clamp_embed(embed)
+
+
+def _lab_exits_embed(rows: tuple[dict[str, object], ...]) -> discord.Embed:
+    embed = discord.Embed(
+        title="FOMO PAPER EXIT JOURNAL",
+        colour=0x1ABC9C,
+        timestamp=discord.utils.utcnow(),
+    )
+    if not rows:
+        embed.description = "No simulated exit has been recorded yet."
+        return _clamp_embed(embed)
+    lines = [
+        f"<t:{row['occurred_at']}:R> `{_short(str(row['mint']))}` "
+        f"**{row['reason_code']}** • sold `{row['fraction_sold']}` • gross "
+        f"`${row['gross_proceeds_usd']}` • cost `${row['total_cost_usd']}` • NET "
+        f"`${row['net_pnl_usd']}`{' • FINAL' if row['final'] else ''}"
+        for row in rows[:12]
+    ]
+    embed.description = "\n".join(lines)[:DISCORD_EMBED_DESCRIPTION_LIMIT]
+    embed.set_footer(text="Every partial exit stores its own realistic cost breakdown")
+    return _clamp_embed(embed)
+
+
+def _lab_lifecycle_embed(payload: dict[str, object], *, referral_code: str | None) -> discord.Embed:
+    lifecycle = payload["lifecycle"]
+    assert isinstance(lifecycle, TokenLifecycle)
+    identity_payload = payload.get("identity")
+    mint = str(payload["mint"])
+    name = "Unknown token"
+    symbol = "UNKNOWN"
+    about = NO_DESCRIPTION
+    image = ""
+    if isinstance(identity_payload, dict):
+        name = str(identity_payload.get("name") or name)
+        symbol = str(identity_payload.get("symbol") or symbol)
+        about = str(identity_payload.get("description") or NO_DESCRIPTION)
+        image = str(identity_payload.get("image_url") or "")
+
+    embed = discord.Embed(
+        title=f"LIFECYCLE — {name[:RUNNER_TOKEN_NAME_LIMIT]} (${symbol})",
+        description=(
+            f"`{mint}`\nABOUT: {about}\n"
+            f"[FOMO]({_fomo_coin_url(mint, referral_code)}) • "
+            f"[DEX](https://dexscreener.com/solana/{mint}) • "
+            f"[SOLSCAN](https://solscan.io/token/{mint})"
+        ),
+        colour=0x5865F2,
+        timestamp=discord.utils.utcnow(),
+    )
+    if image:
+        embed.set_thumbnail(url=image)
+    embed.add_field(
+        name="Memory",
+        value=(
+            f"State **{lifecycle.state}** • "
+            f"{'FRESH' if lifecycle.is_fresh_setup else 'RE-ENTRY'} • cycles "
+            f"`{lifecycle.cycle_count}`\n"
+            f"First discovered <t:{lifecycle.first_discovered_at}:R> • first surfaced "
+            + (
+                f"<t:{lifecycle.first_surfaced_at}:R>"
+                if lifecycle.first_surfaced_at
+                else "not yet"
+            )
+            + f"\nFirst surface MC `{short_money(lifecycle.first_surface_market_cap_usd)}` • "
+            f"historical peak MC `{short_money(lifecycle.historical_high_market_cap_usd)}`\n"
+            f"Max return from surface `{lifecycle.max_return_from_surface_percent or 0}%` • "
+            f"current drawdown `{lifecycle.current_drawdown_percent or 0}%`"
+        )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+        inline=False,
+    )
+    embed.add_field(
+        name="Activity history",
+        value=(
+            f"Alerts `{lifecycle.publications}` • qualifications "
+            f"`{lifecycle.qualification_count}`\n"
+            f"PAPER entries `{lifecycle.paper_entries}` • PAPER exits "
+            f"`{lifecycle.paper_exits}` • realized NET `${lifecycle.realized_net_pnl_usd}`\n"
+            f"Persisted events `{payload['event_count']}` • re-entry status "
+            f"`{lifecycle.state if lifecycle.is_reentry else 'not applicable'}`"
+        )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+        inline=False,
+    )
+    signals = payload.get("social_signals") or ()
+    assert isinstance(signals, tuple)
+    embed.add_field(
+        name="Public signal history",
+        value=(
+            "\n".join(
+                f"• `@{row['account']}` ({row['tier']}) {row['classification']} "
+                f"<t:{row['source_timestamp']}:R>"
+                for row in signals[:5]
+                if isinstance(row, dict)
+            )
+            or "• no curated public signal recorded for this exact mint"
+        )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+        inline=False,
+    )
+    history = lifecycle.state_history[-6:]
+    embed.add_field(
+        name="State transitions",
+        value=(
+            "\n".join(f"• <t:{at}:R> → `{state}`" for at, state in history) or "• none recorded"
+        )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+        inline=False,
+    )
+    embed.set_footer(text="A restart never resets this record — an old pump stays an old pump")
+    return _clamp_embed(embed)
+
+
+def _lab_smartmoney_embed(payload: dict[str, object]) -> discord.Embed:
+    mint = str(payload.get("mint") or "")
+    if not payload.get("available"):
+        embed = discord.Embed(
+            title=f"SMART MONEY — {_short(mint)}",
+            description="No persisted runner observation exists for this exact mint yet.",
+            colour=0x95A5A6,
+        )
+        return _clamp_embed(embed)
+    assessment = payload["assessment"]
+    embed = discord.Embed(
+        title=f"SMART MONEY — {_short(mint)}",
+        description=(
+            f"Strength `{assessment.strength}` • posture `{assessment.posture}`\n"
+            f"Proven early `{assessment.proven_early}` • useful confirmation "
+            f"`{assessment.useful_confirmation}` • late chasers `{assessment.late_chasers}` • "
+            f"poor history `{assessment.poor_history}` • unknown `{assessment.unknown}`\n"
+            f"Independent clusters `{assessment.independent_clusters}` • stale signals "
+            f"`{assessment.stale_signals}`"
+        ),
+        colour=0x2ECC71 if assessment.is_supporting_evidence else 0xE67E22,
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(
+        name="Supporting",
+        value=(
+            "\n".join(f"• {item}" for item in assessment.supporting) or "• nothing corroborating"
+        )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+        inline=False,
+    )
+    embed.add_field(
+        name="Warnings",
+        value=(
+            "\n".join(f"• {item}" for item in assessment.warnings) or "• none"
+        )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+        inline=False,
+    )
+    embed.set_footer(
+        text="Smart money can strengthen a valid setup; it can never rescue an invalid one"
+    )
+    return _clamp_embed(embed)
+
+
 class FomoCommands(
     commands.GroupCog,
     group_name="fomo",
@@ -5226,6 +5670,200 @@ class FomoCommands(
             text="No look-ahead • detection snapshots stay immutable • thresholds not changed"
         )
         await interaction.edit_original_response(embed=embed, view=None)
+
+    # ------------------------------------------------------------------
+    # PAPER research laboratory (v2.36)
+    # ------------------------------------------------------------------
+
+    @app_commands.command(
+        name="opportunities",
+        description="The strongest real setups the lab sees right now, with the reasons.",
+    )
+    @app_commands.describe(count="How many candidates to show")
+    async def opportunities(
+        self,
+        interaction: discord.Interaction,
+        count: app_commands.Range[int, 1, 5] = 3,
+    ) -> None:
+        if not await self._require_admin(interaction):
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        try:
+            async with asyncio.timeout(FOMO_LAB_TOTAL_DEADLINE_SECONDS):
+                rows = await self.bot.engine.lab_opportunities(limit=count)
+        except TimeoutError:
+            await self._resolve_lab(
+                interaction,
+                content=(
+                    "`/fomo opportunities` exceeded its hard deadline and was cancelled. "
+                    "No provider request, SOL, buy or launch was used."
+                ),
+            )
+            return
+        except Exception as exc:
+            await self._resolve_lab(
+                interaction,
+                content=(
+                    "`/fomo opportunities` failed unexpectedly: "
+                    f"`{type(exc).__name__}`. No buy or launch was attempted."
+                ),
+            )
+            return
+        if not rows:
+            await self._resolve_lab(
+                interaction,
+                content=(
+                    "The laboratory has no persisted candidate to rank yet. Nothing was "
+                    "fabricated to fill the card."
+                ),
+            )
+            return
+        embeds = [
+            _lab_opportunity_embed(
+                candidate,
+                result,
+                index=index,
+                total=len(rows),
+                referral_code=self.bot.settings.fomo_referral_code,
+            )
+            for index, (candidate, result) in enumerate(rows)
+        ]
+        try:
+            await interaction.edit_original_response(content=None, embeds=embeds, view=None)
+        except Exception:
+            logger.exception("`/fomo opportunities` card was rejected by Discord")
+            await self._resolve_lab(
+                interaction,
+                content=(
+                    "Real candidates were found but Discord rejected the rendered cards. "
+                    "Nothing was fabricated and no buy was attempted."
+                ),
+            )
+
+    @app_commands.command(
+        name="trades",
+        description="Simulated PAPER positions with GROSS and NET results.",
+    )
+    async def trades(self, interaction: discord.Interaction) -> None:
+        if not await self._require_admin(interaction):
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        positions = await self.bot.engine.lab_trades(limit=8)
+        await self._resolve_lab(interaction, embed=_lab_trades_embed(positions))
+
+    @app_commands.command(
+        name="performance",
+        description="Simulated bankroll, NET expectancy and forward sample size.",
+    )
+    async def performance(self, interaction: discord.Interaction) -> None:
+        if not await self._require_admin(interaction):
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        payload = await self.bot.engine.lab_performance()
+        await self._resolve_lab(interaction, embed=_lab_performance_embed(payload))
+
+    @app_commands.command(
+        name="exits",
+        description="The immutable simulated partial/full exit journal.",
+    )
+    async def exits(self, interaction: discord.Interaction) -> None:
+        if not await self._require_admin(interaction):
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        rows = await self.bot.engine.lab_exit_rows(limit=12)
+        await self._resolve_lab(interaction, embed=_lab_exits_embed(rows))
+
+    @app_commands.command(
+        name="lifecycle",
+        description="Everything the lab remembers about one exact Solana mint.",
+    )
+    @app_commands.describe(mint="Exact Solana token mint; ticker searches are not accepted")
+    async def lifecycle(self, interaction: discord.Interaction, mint: str) -> None:
+        if not await self._require_admin(interaction):
+            return
+        try:
+            exact_mint = str(Pubkey.from_string(mint.strip()))
+        except ValueError:
+            await interaction.response.send_message(
+                "Enter an exact valid Solana mint. Ticker searches are not accepted.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        payload = await self.bot.engine.lab_lifecycle(exact_mint)
+        await self._resolve_lab(
+            interaction,
+            embed=_lab_lifecycle_embed(
+                payload, referral_code=self.bot.settings.fomo_referral_code
+            ),
+        )
+
+    @app_commands.command(
+        name="smartmoney",
+        description="Independent smart-wallet evidence for one exact Solana mint.",
+    )
+    @app_commands.describe(mint="Exact Solana token mint; ticker searches are not accepted")
+    async def smartmoney(self, interaction: discord.Interaction, mint: str) -> None:
+        if not await self._require_admin(interaction):
+            return
+        try:
+            exact_mint = str(Pubkey.from_string(mint.strip()))
+        except ValueError:
+            await interaction.response.send_message(
+                "Enter an exact valid Solana mint. Ticker searches are not accepted.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        payload = await self.bot.engine.lab_smart_money(exact_mint)
+        await self._resolve_lab(interaction, embed=_lab_smartmoney_embed(payload))
+
+    @app_commands.command(
+        name="sources",
+        description="The curated public-account registry and what each tier may do.",
+    )
+    async def sources(self, interaction: discord.Interaction) -> None:
+        if not await self._require_admin(interaction):
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        status = await self.bot.engine.lab_status()
+        embed = discord.Embed(
+            title="CURATED PUBLIC-SOURCE REGISTRY",
+            description=(
+                "Broad social radar is "
+                f"**{'ENABLED' if status['broad_social_radar'] else 'OFF by default'}**. "
+                "Everything outside this registry is muted, so the wider tracked-account "
+                "list costs nothing until an operator supplies a legitimate export.\n"
+                "**No public account, in any tier, can produce a PAPER entry or a launch.**"
+            ),
+            colour=0x34495E,
+            timestamp=discord.utils.utcnow(),
+        )
+        for name, accounts, purpose in (
+            ("TIER A — official platform / infrastructure", TIER_A_ACCOUNTS, "context only"),
+            ("TIER B — on-chain / fast market signals", TIER_B_ACCOUNTS, "candidate confirmation"),
+            ("TIER C — Solana sentiment / trench", TIER_C_ACCOUNTS, "supporting narrative"),
+            (
+                "IDEA-ONLY — meme / culture discovery",
+                IDEA_ONLY_ACCOUNTS,
+                "topic discovery only; can never qualify a token",
+            ),
+        ):
+            embed.add_field(
+                name=f"{name} ({len(accounts)})",
+                value=(
+                    ", ".join(f"`@{item.handle}`" for item in accounts) + f"\n*{purpose}*"
+                )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+                inline=False,
+            )
+        embed.set_footer(
+            text=(
+                "Tier membership is a starting hypothesis — predictive value is measured "
+                "from forward observations, never assumed"
+            )
+        )
+        await self._resolve_lab(interaction, embed=_clamp_embed(embed))
+
 
 
 def run_bot(settings: Settings) -> None:

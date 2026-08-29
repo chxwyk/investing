@@ -516,6 +516,207 @@ class Database:
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+
+            -- ============================================================
+            -- PAPER research laboratory (v2.36).  Every table below is
+            -- additive: nothing existing is dropped, renamed or rewritten,
+            -- and every write is keyed so a Railway restart or a retried
+            -- coroutine cannot duplicate a lifecycle, alert, entry or exit.
+            -- ============================================================
+
+            -- Durable per-mint memory.  This is what stops an old pump from
+            -- ever being re-discovered as a brand new setup.
+            CREATE TABLE IF NOT EXISTS lab_token_lifecycle (
+                mint TEXT PRIMARY KEY,
+                state TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                first_discovered_at INTEGER NOT NULL,
+                first_surfaced_at INTEGER,
+                cycle_count INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_lab_lifecycle_state
+                ON lab_token_lifecycle(state, updated_at DESC);
+
+            -- The authoritative chronological event stream.  ``event_id`` is a
+            -- content hash, so replaying a write is a no-op instead of a
+            -- duplicate fact.
+            CREATE TABLE IF NOT EXISTS lab_token_events (
+                event_id TEXT PRIMARY KEY,
+                mint TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                occurred_at INTEGER NOT NULL,
+                payload_json TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_lab_events_mint_time
+                ON lab_token_events(mint, occurred_at);
+            CREATE INDEX IF NOT EXISTS idx_lab_events_type
+                ON lab_token_events(event_type, occurred_at DESC);
+
+            -- Immutable decisions.  Old trades stay attributable to the exact
+            -- rules and thresholds that produced them.
+            CREATE TABLE IF NOT EXISTS lab_decisions (
+                mint TEXT NOT NULL,
+                decided_at INTEGER NOT NULL,
+                strategy_version TEXT NOT NULL,
+                decision TEXT NOT NULL,
+                reason_codes_json TEXT NOT NULL,
+                evidence_quality TEXT NOT NULL,
+                safety_status TEXT NOT NULL,
+                lifecycle_state TEXT NOT NULL,
+                expected_net_edge_percent REAL,
+                size_usd REAL NOT NULL DEFAULT 0,
+                config_hash TEXT NOT NULL,
+                bot_version TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                PRIMARY KEY (mint, decided_at, strategy_version)
+            );
+            CREATE INDEX IF NOT EXISTS idx_lab_decisions_recent
+                ON lab_decisions(decided_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_lab_decisions_decision
+                ON lab_decisions(decision, decided_at DESC);
+
+            -- Simulated positions.  The partial unique index is the duplicate
+            -- entry lock: one open simulated position per mint per strategy.
+            CREATE TABLE IF NOT EXISTS lab_positions (
+                position_id TEXT PRIMARY KEY,
+                mint TEXT NOT NULL,
+                strategy_version TEXT NOT NULL,
+                opened_at INTEGER NOT NULL,
+                closed_at INTEGER,
+                size_usd REAL NOT NULL,
+                entry_price_usd REAL NOT NULL,
+                realized_net_pnl_usd REAL NOT NULL DEFAULT 0,
+                close_reason TEXT NOT NULL DEFAULT '',
+                is_reentry INTEGER NOT NULL DEFAULT 0,
+                lifecycle_state TEXT NOT NULL DEFAULT '',
+                config_hash TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_lab_positions_open_unique
+                ON lab_positions(mint, strategy_version)
+                WHERE closed_at IS NULL;
+            CREATE INDEX IF NOT EXISTS idx_lab_positions_recent
+                ON lab_positions(opened_at DESC);
+
+            -- The partial-exit journal.  (position_id, sequence) makes a retried
+            -- exit idempotent instead of double-selling a simulated position.
+            CREATE TABLE IF NOT EXISTS lab_exits (
+                position_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                mint TEXT NOT NULL,
+                occurred_at INTEGER NOT NULL,
+                reason_code TEXT NOT NULL,
+                fraction_sold REAL NOT NULL,
+                gross_proceeds_usd REAL NOT NULL,
+                total_cost_usd REAL NOT NULL,
+                net_pnl_usd REAL NOT NULL,
+                final INTEGER NOT NULL DEFAULT 0,
+                payload_json TEXT NOT NULL,
+                PRIMARY KEY (position_id, sequence)
+            );
+            CREATE INDEX IF NOT EXISTS idx_lab_exits_recent
+                ON lab_exits(occurred_at DESC);
+
+            -- One simulated bankroll per strategy, so champion and challenger
+            -- never share capital state.
+            CREATE TABLE IF NOT EXISTS lab_bankroll (
+                strategy_version TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            -- What was last published for a mint, so identical cards are
+            -- suppressed across restarts.
+            CREATE TABLE IF NOT EXISTS lab_publications (
+                mint TEXT PRIMARY KEY,
+                published_at INTEGER NOT NULL,
+                lifecycle_state TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                payload_json TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS lab_wallet_reputation (
+                wallet TEXT PRIMARY KEY,
+                samples INTEGER NOT NULL DEFAULT 0,
+                score REAL NOT NULL DEFAULT 50,
+                state TEXT NOT NULL DEFAULT 'UNKNOWN',
+                payload_json TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            -- Public social signals.  ``dedupe_key`` stops the same post from
+            -- being counted twice, which is what makes the account lead/lag
+            -- statistics honest.
+            CREATE TABLE IF NOT EXISTS lab_social_signals (
+                dedupe_key TEXT PRIMARY KEY,
+                platform TEXT NOT NULL,
+                account TEXT NOT NULL,
+                tier TEXT NOT NULL,
+                mint TEXT,
+                classification TEXT NOT NULL,
+                observed_at INTEGER NOT NULL,
+                source_timestamp INTEGER NOT NULL,
+                exact_mint_confidence REAL NOT NULL DEFAULT 0,
+                price_at_signal REAL,
+                market_cap_at_signal REAL,
+                url TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_lab_social_account
+                ON lab_social_signals(account, source_timestamp DESC);
+            CREATE INDEX IF NOT EXISTS idx_lab_social_mint
+                ON lab_social_signals(mint, source_timestamp DESC);
+
+            CREATE TABLE IF NOT EXISTS lab_account_performance (
+                account TEXT PRIMARY KEY,
+                tier TEXT NOT NULL,
+                samples INTEGER NOT NULL DEFAULT 0,
+                classification TEXT NOT NULL DEFAULT 'INSUFFICIENT_DATA',
+                lead_lag TEXT NOT NULL DEFAULT 'INSUFFICIENT_DATA',
+                strategy_weight REAL NOT NULL DEFAULT 0,
+                payload_json TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            -- Static account metadata is cached aggressively so the curated
+            -- radar spends as few X requests as possible.
+            CREATE TABLE IF NOT EXISTS lab_account_cache (
+                account TEXT PRIMARY KEY,
+                fetched_at INTEGER NOT NULL,
+                payload_json TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS lab_social_budget (
+                usage_day TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                calls INTEGER NOT NULL DEFAULT 0,
+                posts_processed INTEGER NOT NULL DEFAULT 0,
+                cache_hits INTEGER NOT NULL DEFAULT 0,
+                cache_misses INTEGER NOT NULL DEFAULT 0,
+                useful_signals INTEGER NOT NULL DEFAULT 0,
+                useless_signals INTEGER NOT NULL DEFAULT 0,
+                estimated_cost_usd REAL NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (usage_day, provider)
+            );
+
+            CREATE TABLE IF NOT EXISTS lab_strategy_registry (
+                strategy_version TEXT PRIMARY KEY,
+                role TEXT NOT NULL DEFAULT 'CHAMPION',
+                config_hash TEXT NOT NULL DEFAULT '',
+                activated_at INTEGER NOT NULL DEFAULT 0,
+                calibration_cutoff_at INTEGER NOT NULL DEFAULT 0,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                updated_at INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS lab_token_identity (
+                mint TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL,
+                resolved_at INTEGER NOT NULL
+            );
             """
         )
         await self._migrate_pump_launch_status_constraint()

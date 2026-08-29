@@ -7,6 +7,70 @@ transactions, and mirrors every newly detected hot-wallet swap in PAPER mode. PA
 as either a forced source-price observation ledger or an executable Jupiter quote-shadow
 trial; the two answer different questions and are labeled separately.
 
+Version 2.36.0 turns the Fomo runner into an autonomous **PAPER-only research laboratory**.
+Nothing in it can move real funds: the whole `smart_money_bot.lab` package contains no wallet,
+no signer and no live route, and `lab.LIVE_EXECUTION_ENABLED` is a hard `False` verified by the
+self-check. Every evaluated candidate now produces one canonical decision — `ENTRY`, `WAIT`,
+`REJECT`, `COOLDOWN`, `REENTRY_WATCH` or `REENTRY_QUALIFIED` — carrying stable machine reason
+codes, Discord-readable reasons, an evidence-quality grade, the safety verdict, the strategy
+version and a config hash, so an old decision stays attributable to the exact rules that made
+it. Trade eligibility lives in that one layer; no Discord handler or provider re-derives it.
+
+The laboratory answers "what is this coin, and has it already had its run?". Each mint gets a
+durable lifecycle record: first discovery, first surface price and market cap, historical peak,
+maximum and current drawdown, alert and qualification counts, and PAPER entry/exit history. A
+token that surfaced at $32k, ran to $150k and fell back to $38k comes back as a **retraced old
+winner**, never as a first discovery — and a Railway restart rehydrates that record instead of
+rebuilding it, so the memory survives. Cheap again is not good again: a re-entry needs a
+stabilized base, no continuing lower lows, returning momentum, re-accelerating volume, renewed
+independent buyers, stable liquidity, no worsening clustering, `SAFETY PASS`, a healthy route
+and sufficient net edge. A small bounce off the low with none of that is classified as a dead
+cat and stays `REENTRY_WATCH`. Re-publication requires a real change — a lifecycle transition,
+a material quality improvement, a safety improvement, a meaningful smart-wallet event or a risk
+deterioration — so polling rediscovery alone can no longer repost the same card.
+
+Money is modelled honestly. Every simulated position pays platform fees, Solana network fees,
+priority fees, price impact and slippage on **both** legs, and only NET PnL counts as profit. An
+entry needs an expected net edge that clears an absolute floor *and* a multiple of realistic
+round-trip costs. Default simulated bankroll is $100 with a ~$5 normal position and a ~$10
+exceptional maximum; sizing only ever moves down — for thin liquidity, weaker independence,
+unknown authenticity, a re-entry, a hostile regime or a drawdown — and never up after losses.
+There is no averaging down, no martingale and no revenge sizing anywhere. Exits are staged
+rather than "sell everything at +10%": reference milestones at +10/+25/+50/+100 with an optional
+moon bag, break-even protection, a real trailing stop off the post-entry high, momentum-decay,
+flow-reversal, volume-exhaustion, liquidity, concentration and safety exits, plus a time stop
+and a hard loss stop. A genuinely healthy runner — independent demand, momentum, liquidity and
+controlled sellers — is allowed to keep more upside. Peak, maximum favourable and maximum
+adverse excursion are tracked per position, so "was +110%, now +20%" is never scored like "never
+went green", and every partial exit writes an immutable journal row with its own cost breakdown.
+
+Evidence is event-sourced. One chronological stream per mint records prices, market caps,
+liquidity, holders, flow, wallet events, lifecycle changes, alerts and PAPER entries/exits, each
+with its provider, source timestamp, observation time, cache state and confidence. Replay and
+counterfactuals read that stream through a `before(t)` gate, so a strategy physically cannot see
+the future peak it is being scored against, and simulating eight entry policies against nine
+exit policies costs zero provider requests because it runs entirely on persisted observations.
+`SAMPLE_TOO_SMALL` is reported honestly, losing trades are never removed from the metrics, and a
+challenger strategy cannot be promoted on in-sample replay — promotion demands out-of-sample
+forward evidence of better NET expectancy, profit factor, drawdown and rug avoidance.
+
+Public social sources are curated, measured and cheap. Tier A (official platform), Tier B
+(on-chain / fast market) and Tier C (Solana sentiment) accounts are supporting evidence only; a
+separate idea-only registry can surface a meme or a cultural event but can never qualify a
+token, and **no account in any tier can produce a PAPER entry or a launch**. Everything outside
+the registry is muted by default, the broad radar is off by default, windows are bounded to ten
+recent posts per account, account metadata is cached aggressively and a daily request budget is
+enforced. Account usefulness is learned from forward outcomes — before, during or after the move
+— and material strategy weight requires a real sample, so tier membership is a starting
+hypothesis, not a permanent trust grant. A mention is not a buy, and an early call found too
+late is `EDGE_CONSUMED`, not an entry.
+
+New admin commands: `/fomo opportunities` (the strongest real setups right now, with identity,
+lifecycle, quality, activity, smart/social evidence, `WHY SURFACED`, `QUALITY WARNINGS` and
+`WHY NOT ENTRY`), `/fomo trades`, `/fomo performance`, `/fomo exits`, `/fomo lifecycle <mint>`,
+`/fomo smartmoney <mint>` and `/fomo sources`. Research visibility never weakens automatic PAPER
+eligibility: a `REJECT` or `COOLDOWN` candidate is shown with its reasons, not promoted.
+
 Version 2.35.0 replaces the single 0-100 runner score with a multi-stage funnel and three
 separated models: **momentum** (how hard it is accelerating), **opportunity quality** (how
 interesting the setup is, dominated by how much of the visible activity looks like independent
@@ -316,6 +380,22 @@ unless four separate controls are deliberately configured.
   the strategy with evidence.
 - It does not trade perpetual futures, borrow funds, or use leverage.
 - It never asks for a seed phrase in Discord or chat.
+- The v2.36 PAPER research laboratory does not execute anything. The `smart_money_bot.lab`
+  package contains no wallet, no signer, no private key handling and no live route; its
+  "capital" is a bookkeeping entry. A future live-execution mode would need its own explicit
+  acknowledgement, kill switch, dedicated low-balance wallet, per-trade and total exposure caps,
+  daily loss limit, route re-verification and restart reconciliation — none of which this
+  release enables.
+- No public account, however famous, can produce a PAPER entry or a launch. Social evidence is
+  supporting only and can never lift a safety, overextension, liquidity, cost or lifecycle
+  block.
+- It does not treat SOL spend as proof of legitimacy. Bots pay real network fees, so the
+  authenticity model reports concentration alongside volume and rewards independence.
+- It does not deanonymize wallets or infer where anyone is. Coordination analysis reads only
+  publicly observable on-chain relationships, and correlation is never called common ownership.
+- It does not crack, decrypt or scrape a J7 Tracker backup, and it does not fabricate account
+  identities. The curated registry is the manually reviewed starting list; a legitimate
+  plaintext export or documented feed can extend it later.
 
 ## Paper raw-mirror strategy
 
@@ -796,6 +876,49 @@ No privileged Discord gateway intents are required.
 
 ## Railway deployment
 
+### v2.36.0 Railway changes
+
+Every laboratory setting has a safe code default, so **no Railway variable has to be added for
+this release**. The entries below are optional overrides. Nothing here enables live trading;
+there is no live-execution variable, because there is no live-execution path.
+
+**ADD:** none required.
+
+**CHANGE:** none required.
+
+**OPTIONAL:**
+
+```text
+FOMO_LAB_ENGINE_ENABLED=true            # persist lifecycle/decisions/positions
+FOMO_LAB_AUTO_PAPER_ENABLED=true        # open simulated positions automatically
+FOMO_LAB_BANKROLL_USD=100
+FOMO_LAB_POSITION_USD=5
+FOMO_LAB_MAX_POSITION_USD=10
+FOMO_LAB_MAX_CONCURRENT_POSITIONS=5
+FOMO_LAB_MAX_TOTAL_EXPOSURE_USD=30
+FOMO_LAB_DAILY_LOSS_CAP_USD=15
+FOMO_LAB_MIN_LIQUIDITY_USD=15000
+FOMO_LAB_MAX_PRICE_IMPACT_PERCENT=2.5
+FOMO_LAB_MAX_SLIPPAGE_PERCENT=2.5
+FOMO_LAB_MIN_NET_EDGE_PERCENT=12
+FOMO_LAB_PLATFORM_FEE_BPS=100
+FOMO_LAB_SLIPPAGE_BPS=80
+FOMO_LAB_PRIORITY_FEE_USD=0.02
+FOMO_LAB_NETWORK_FEE_USD=0.0008
+FOMO_LAB_COOLDOWN_SECONDS=3600
+FOMO_LAB_MIN_FORWARD_SAMPLE=30
+FOMO_SOCIAL_RADAR_ENABLED=false         # broad radar stays OFF by default
+FOMO_SOCIAL_POSTS_PER_ACCOUNT=10
+FOMO_SOCIAL_DAILY_REQUEST_BUDGET=40
+```
+
+Schema changes are additive only (`lab_token_lifecycle`, `lab_token_events`, `lab_decisions`,
+`lab_positions`, `lab_exits`, `lab_bankroll`, `lab_publications`, `lab_wallet_reputation`,
+`lab_social_signals`, `lab_account_performance`, `lab_account_cache`, `lab_social_budget`,
+`lab_strategy_registry`, `lab_token_identity`). No existing table, column or row is dropped,
+renamed or rewritten, and every statement is `CREATE TABLE IF NOT EXISTS`, so re-running the
+migration is safe.
+
 ### v2.35.0 Railway changes
 
 **Nothing is required.** Every new variable has a working default, and the upgrade migrates an
@@ -1065,6 +1188,21 @@ authorizes a trade.
 
 Mutation commands require Discord Administrator or a role listed in
 `DISCORD_ADMIN_ROLE_IDS`.
+
+### PAPER research laboratory (v2.36, admin only)
+
+| Command | What it answers |
+| --- | --- |
+| `/fomo opportunities [count]` | What are the strongest real setups right now, and why is each one not an entry? |
+| `/fomo trades` | Which simulated positions are open, with GROSS and NET results, peak unrealized and drawdown? |
+| `/fomo performance` | Simulated bankroll, realized NET, unrealized separately, win rate, profit factor, expectancy, reach rates, fresh vs re-entry, and whether the sample is too small to mean anything. |
+| `/fomo exits` | The immutable partial/full exit journal with its per-exit cost breakdown. |
+| `/fomo lifecycle <mint>` | Everything the lab remembers about one exact mint: first surface, historical peak, drawdown, alerts, PAPER history, public-signal history and state transitions. |
+| `/fomo smartmoney <mint>` | Independent smart-wallet evidence, posture and warnings for one exact mint. |
+| `/fomo sources` | The curated Tier A/B/C and idea-only registry, and the guarantee that none of them can enter or launch. |
+
+Every one of these is read-only research. They show `WAIT`, `REJECT`, `COOLDOWN` and
+`REENTRY_WATCH` candidates on purpose; seeing a candidate never makes it entry eligible.
 
 ### Clean PAPER controls and manual exits
 

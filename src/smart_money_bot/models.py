@@ -141,6 +141,11 @@ class DexSnapshot:
     website_url: str = ""
     x_handle: str = ""
     pair_url: str = ""
+    # Identity fields carried on the same DEX response the runner already
+    # fetched, so resolving "what is this coin?" costs no extra request.
+    image_url: str = ""
+    telegram_url: str = ""
+    discord_url: str = ""
 
 
 @dataclass(frozen=True, slots=True)

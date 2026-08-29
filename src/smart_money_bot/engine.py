@@ -46,6 +46,11 @@ from .errors import (
     UnknownLaunchResultError,
 )
 from .executor import ExecutionManager
+from .lab.config import lab_config_from_settings
+from .lab.exits import ExitContext as LabExitContext
+from .lab.regime import RegimeSample as LabRegimeSample
+from .lab_runtime import LabEvaluation, LabRuntime
+from .lab_store import LabStore
 from .launch import (
     OneClickLaunchClient,
     alert_key,
@@ -384,6 +389,18 @@ class SmartMoneyEngine:
         self._fomo_radar_seen: dict[str, int] = {}
         self._runner_last_alert: dict[str, tuple[int, Decimal]] = {}
         self._quality_config = quality_config_from_settings(settings)
+        self._lab_config = lab_config_from_settings(settings)
+        self.lab_store = LabStore(self.database)
+        # The lab is a research laboratory, not an execution path: it holds no
+        # signer, no wallet and no live route, so enabling it can only ever
+        # write simulated rows.
+        self.lab = LabRuntime(
+            self.lab_store,
+            config=self._lab_config,
+            enabled=settings.fomo_lab_auto_paper_enabled,
+        )
+        self.lab_enabled = settings.fomo_lab_engine_enabled
+        self._lab_regime_refreshed_at = 0
         self.runner_last_evaluated_at: int | None = None
         self.runner_last_candidate_mint: str | None = None
         self.runner_last_fast_watch_mint: str | None = None
@@ -461,6 +478,12 @@ class SmartMoneyEngine:
         raw_profiles = await self.database.get_setting("pump_profile_last_refresh")
         self.last_profile_refresh_at = int(raw_profiles) if raw_profiles else None
         self._candidate_pool = await self.database.load_discovery_candidates()
+        if self.lab_enabled:
+            await self.lab_store.register_strategy(
+                strategy_version=self._lab_config.strategy_version,
+                role="CHAMPION",
+                config_hash=self._lab_config.config_hash(),
+            )
         self._initialized = True
 
     async def start(self) -> None:
@@ -1567,10 +1590,145 @@ class SmartMoneyEngine:
         await self._record_runner_outcomes(candidate)
         if prior_candidate is not None:
             await self._evaluate_runner_transitions(prior_candidate, candidate)
+        await self._run_lab_cycle(candidate, now=now, callout=callout)
         await self._flush_provider_usage()
         self.runner_last_evaluated_at = now
         self.runner_last_candidate_mint = mint
         return candidate
+
+    @staticmethod
+    def _lab_metadata(callout: CoinCallout | None) -> dict[str, object]:
+        """Identity fields already present on the DEX response the runner paid for.
+
+        No description is invented here: DEX Screener publishes no ABOUT text, so
+        the card honestly reports that none is available until a documented
+        metadata source supplies one.
+        """
+
+        if callout is None or not callout.dex.available:
+            return {}
+        dex = callout.dex
+        return {
+            "source": "dexscreener",
+            "name": (callout.token_info.name if callout.token_info else None),
+            "symbol": (callout.token_info.symbol if callout.token_info else None),
+            "image": dex.image_url,
+            "website": dex.website_url,
+            "x_handle": dex.x_handle,
+            "telegram": dex.telegram_url,
+            "discord": dex.discord_url,
+        }
+
+    async def _run_lab_cycle(
+        self,
+        candidate: RunnerCandidate,
+        *,
+        now: int,
+        callout: CoinCallout | None = None,
+    ) -> LabEvaluation | None:
+        """Advance the PAPER laboratory for one freshly evaluated candidate.
+
+        This spends no provider budget: it reads only the evidence the runner
+        already collected, and writes simulated rows.  A failure here must never
+        take down the research pipeline, so it is logged and swallowed.
+        """
+
+        if not self.lab_enabled or self.database.connection is None:
+            return None
+        try:
+            await self._refresh_lab_regime(now=now)
+            result = await self.lab.evaluate_candidate(
+                candidate,
+                now=now,
+                metadata=self._lab_metadata(callout),
+                surfaced=candidate.first_discord_visible_at is not None,
+            )
+            if self.settings.fomo_lab_auto_paper_enabled:
+                await self.lab.maybe_open_position(result, now=now)
+            await self._manage_lab_position(candidate, now=now)
+            return result
+        except Exception:
+            logger.exception("PAPER laboratory cycle failed for %s", candidate.mint)
+            return None
+
+    async def _refresh_lab_regime(self, *, now: int, max_age_seconds: int = 86_400) -> None:
+        """Recompute the bounded market regime from already-persisted outcomes.
+
+        Costs no provider request, and is throttled so a busy radar does not
+        rebuild it on every candidate.  A weak regime only makes the lab smaller
+        and more selective; it never relaxes a safety gate.
+        """
+
+        if now - self._lab_regime_refreshed_at < 300:
+            return
+        self._lab_regime_refreshed_at = now
+        rows = await self.database.runner_results_rows()
+        samples: list[LabRegimeSample] = []
+        seen: set[str] = set()
+        for row in rows:
+            mint = str(row.get("mint") or "")
+            if not mint or mint in seen:
+                continue
+            first_seen = int(row.get("first_seen_at") or 0)
+            if first_seen and now - first_seen > max_age_seconds:
+                continue
+            horizon = row.get("horizon_seconds")
+            if horizon is None:
+                continue
+            seen.add(mint)
+            forward = row.get("market_cap_return_percent")
+            samples.append(
+                LabRegimeSample(
+                    mint=mint,
+                    observed_at=int(row.get("observed_at") or first_seen),
+                    liquidity_usd=None,
+                    forward_return_percent=(
+                        Decimal(str(forward)) if forward is not None else None
+                    ),
+                    max_favourable_percent=(
+                        Decimal(str(forward)) if forward is not None else None
+                    ),
+                    max_adverse_percent=(
+                        abs(Decimal(str(forward))) if forward is not None and forward < 0 else None
+                    ),
+                    route_available=bool(row.get("route_available")),
+                    rugged=bool(row.get("rugged")),
+                    graduated=bool(row.get("graduated_at")),
+                )
+            )
+        if samples:
+            self.lab.update_regime(samples)
+
+    async def _manage_lab_position(self, candidate: RunnerCandidate, *, now: int) -> None:
+        """Advance any open simulated position for this mint by one observation."""
+
+        position = await self.lab_store.open_position_for(
+            candidate.mint, strategy_version=self._lab_config.strategy_version
+        )
+        if position is None:
+            return
+        current = candidate.current
+        first = candidate.first
+        await self.lab.manage_position(
+            position,
+            LabExitContext(
+                now=now,
+                price_usd=current.price_usd,
+                market_cap_usd=current.market_cap_usd,
+                liquidity_usd=current.liquidity_usd,
+                entry_liquidity_usd=first.liquidity_usd,
+                momentum_score=candidate.quality.momentum_score,
+                organic_score=candidate.quality.organic_score,
+                buys=current.buys_5m,
+                sells=current.sells_5m,
+                volume_usd=current.volume_5m_usd,
+                entry_volume_usd=first.volume_5m_usd,
+                cluster_supply_percent=candidate.quality.demand.cluster_supply_percent,
+                safety_status=candidate.safety.status,
+                route_available=current.route_available,
+                price_impact_percent=current.sell_route_price_impact_percent,
+            ),
+        )
 
     async def _flush_provider_usage(self) -> None:
         """Drain in-memory client counters into per-feature daily accounting."""
@@ -2084,6 +2242,124 @@ class SmartMoneyEngine:
             reverse=True,
         )
         return tuple(candidates[:keep])
+
+    async def lab_opportunities(
+        self,
+        *,
+        limit: int = 5,
+        max_age_seconds: int = 86_400,
+    ) -> tuple[tuple[RunnerCandidate, LabEvaluation], ...]:
+        """Rank the strongest *real* setups the lab currently sees.
+
+        Reads only persisted observations, so answering "what do you see right
+        now?" costs no provider credits and never relaxes an entry gate: a
+        WAIT/REJECT/COOLDOWN candidate is shown with its reasons, not promoted.
+        """
+
+        await self.initialize()
+        if not self.lab_enabled:
+            return ()
+        now = int(time.time())
+        candidates = await self.runner_lab_cached_candidates(
+            research_test=True,
+            max_age_seconds=max_age_seconds,
+            limit=max(limit * 3, 12),
+        )
+        results: list[tuple[RunnerCandidate, LabEvaluation]] = []
+        for candidate in candidates:
+            try:
+                evaluation = await self.lab.evaluate_candidate(candidate, now=now)
+            except Exception:
+                logger.exception("Lab evaluation failed for %s", candidate.mint)
+                continue
+            results.append((candidate, evaluation))
+        results.sort(key=self._lab_rank_key, reverse=True)
+        return tuple(results[:limit])
+
+    @staticmethod
+    def _lab_rank_key(row: tuple[RunnerCandidate, LabEvaluation]) -> tuple[int, Decimal, Decimal]:
+        candidate, evaluation = row
+        decision_rank = {
+            "ENTRY": 5,
+            "REENTRY_QUALIFIED": 4,
+            "WAIT": 3,
+            "REENTRY_WATCH": 2,
+            "COOLDOWN": 1,
+            "REJECT": 0,
+        }.get(str(evaluation.decision.decision), 0)
+        edge = evaluation.decision.expected_net_edge_percent or Decimal("0")
+        return decision_rank, edge, candidate.quality.opportunity_score
+
+    async def lab_trades(self, *, limit: int = 10) -> tuple[object, ...]:
+        await self.initialize()
+        return tuple(await self.lab.trades(limit=limit))
+
+    async def lab_performance(self) -> dict[str, object]:
+        await self.initialize()
+        return await self.lab.performance()
+
+    async def lab_exit_rows(self, *, limit: int = 15) -> tuple[dict[str, object], ...]:
+        await self.initialize()
+        return tuple(await self.lab_store.exit_rows(limit=limit))
+
+    async def lab_lifecycle(self, mint: str) -> dict[str, object]:
+        """Everything the lab remembers about one exact mint."""
+
+        await self.initialize()
+        lifecycle = await self.lab_store.load_lifecycle(mint)
+        identity = await self.lab_store.identity_payload(mint)
+        decision = await self.lab_store.latest_decision(
+            mint, strategy_version=self._lab_config.strategy_version
+        )
+        open_position = await self.lab_store.open_position_for(
+            mint, strategy_version=self._lab_config.strategy_version
+        )
+        timeline = await self.lab_store.timeline(mint, limit=200)
+        signals = await self.lab_store.social_signals_for(mint)
+        return {
+            "mint": mint,
+            "lifecycle": lifecycle,
+            "identity": identity,
+            "decision": decision,
+            "open_position": open_position,
+            "event_count": len(timeline),
+            "events": timeline.events[-8:],
+            "social_signals": tuple(signals),
+        }
+
+    async def lab_smart_money(self, mint: str) -> dict[str, object]:
+        await self.initialize()
+        raw = await self.database.runner_candidate_payload(mint)
+        if not raw:
+            return {"mint": mint, "available": False}
+        candidate = runner_candidate_from_json(raw)
+        evaluation = await self.lab.evaluate_candidate(candidate, now=int(time.time()))
+        reputations = await self.lab_store.load_reputations(list(candidate.smart_wallets))
+        return {
+            "mint": mint,
+            "available": True,
+            "assessment": evaluation.smart_money,
+            "reputations": tuple(reputations.values()),
+            "wallets": candidate.smart_wallets,
+            "decision": evaluation.decision,
+        }
+
+    async def lab_status(self) -> dict[str, object]:
+        """Operational state of the laboratory, for the status card."""
+
+        await self.initialize()
+        bankroll = await self.lab.bankroll()
+        return {
+            "enabled": self.lab_enabled,
+            "auto_paper": self.settings.fomo_lab_auto_paper_enabled,
+            "strategy_version": self._lab_config.strategy_version,
+            "config_hash": self._lab_config.config_hash(),
+            "bankroll_usd": bankroll.equity_usd,
+            "open_positions": bankroll.open_positions,
+            "events": await self.lab_store.event_count(),
+            "broad_social_radar": self._lab_config.broad_social_radar_enabled,
+            "live_execution": False,
+        }
 
     async def _maybe_publish_fresh(self, candidate: RunnerCandidate) -> bool:
         """STAGE 1 -> Discord only when STAGE 2 evidence is already present.

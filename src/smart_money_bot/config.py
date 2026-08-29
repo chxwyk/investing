@@ -182,6 +182,31 @@ class Settings:
     fomo_runner_invalidation_liquidity_decline_percent: Decimal
     fomo_runner_invalidation_liquidity_floor_usd: Decimal
 
+    # --- PAPER research laboratory (v2.36) -------------------------------
+    # Safe code defaults cover every value below, so a deployment does not
+    # need to define any of these Railway variables to run the lab.
+    fomo_lab_engine_enabled: bool
+    fomo_lab_auto_paper_enabled: bool
+    fomo_lab_bankroll_usd: Decimal
+    fomo_lab_position_usd: Decimal
+    fomo_lab_max_position_usd: Decimal
+    fomo_lab_max_concurrent_positions: int
+    fomo_lab_max_total_exposure_usd: Decimal
+    fomo_lab_daily_loss_cap_usd: Decimal
+    fomo_lab_min_liquidity_usd: Decimal
+    fomo_lab_max_price_impact_percent: Decimal
+    fomo_lab_max_slippage_percent: Decimal
+    fomo_lab_min_net_edge_percent: Decimal
+    fomo_lab_platform_fee_bps: int
+    fomo_lab_slippage_bps: int
+    fomo_lab_priority_fee_usd: Decimal
+    fomo_lab_network_fee_usd: Decimal
+    fomo_lab_cooldown_seconds: int
+    fomo_lab_min_forward_sample: int
+    fomo_social_radar_enabled: bool
+    fomo_social_posts_per_account: int
+    fomo_social_daily_request_budget: int
+
     news_radar_enabled: bool
     x_news_stream_enabled: bool
     x_news_stream_rule: str
@@ -466,6 +491,29 @@ class Settings:
             fomo_runner_invalidation_liquidity_floor_usd=_decimal(
                 "FOMO_RUNNER_INVALIDATION_LIQUIDITY_FLOOR_USD", "500"
             ),
+            fomo_lab_engine_enabled=_bool("FOMO_LAB_ENGINE_ENABLED", True),
+            fomo_lab_auto_paper_enabled=_bool("FOMO_LAB_AUTO_PAPER_ENABLED", True),
+            fomo_lab_bankroll_usd=_decimal("FOMO_LAB_BANKROLL_USD", "100"),
+            fomo_lab_position_usd=_decimal("FOMO_LAB_POSITION_USD", "5"),
+            fomo_lab_max_position_usd=_decimal("FOMO_LAB_MAX_POSITION_USD", "10"),
+            fomo_lab_max_concurrent_positions=_int("FOMO_LAB_MAX_CONCURRENT_POSITIONS", 5),
+            fomo_lab_max_total_exposure_usd=_decimal("FOMO_LAB_MAX_TOTAL_EXPOSURE_USD", "30"),
+            fomo_lab_daily_loss_cap_usd=_decimal("FOMO_LAB_DAILY_LOSS_CAP_USD", "15"),
+            fomo_lab_min_liquidity_usd=_decimal("FOMO_LAB_MIN_LIQUIDITY_USD", "15000"),
+            fomo_lab_max_price_impact_percent=_decimal(
+                "FOMO_LAB_MAX_PRICE_IMPACT_PERCENT", "2.5"
+            ),
+            fomo_lab_max_slippage_percent=_decimal("FOMO_LAB_MAX_SLIPPAGE_PERCENT", "2.5"),
+            fomo_lab_min_net_edge_percent=_decimal("FOMO_LAB_MIN_NET_EDGE_PERCENT", "12"),
+            fomo_lab_platform_fee_bps=_int("FOMO_LAB_PLATFORM_FEE_BPS", 100),
+            fomo_lab_slippage_bps=_int("FOMO_LAB_SLIPPAGE_BPS", 80),
+            fomo_lab_priority_fee_usd=_decimal("FOMO_LAB_PRIORITY_FEE_USD", "0.02"),
+            fomo_lab_network_fee_usd=_decimal("FOMO_LAB_NETWORK_FEE_USD", "0.0008"),
+            fomo_lab_cooldown_seconds=_int("FOMO_LAB_COOLDOWN_SECONDS", 3600),
+            fomo_lab_min_forward_sample=_int("FOMO_LAB_MIN_FORWARD_SAMPLE", 30),
+            fomo_social_radar_enabled=_bool("FOMO_SOCIAL_RADAR_ENABLED", False),
+            fomo_social_posts_per_account=_int("FOMO_SOCIAL_POSTS_PER_ACCOUNT", 10),
+            fomo_social_daily_request_budget=_int("FOMO_SOCIAL_DAILY_REQUEST_BUDGET", 40),
             news_radar_enabled=_bool("NEWS_RADAR_ENABLED", True),
             x_news_stream_enabled=_bool("X_NEWS_STREAM_ENABLED", False),
             x_news_stream_rule=os.getenv("X_NEWS_STREAM_RULE", DEFAULT_X_NEWS_RULE).strip(),
@@ -802,6 +850,40 @@ class Settings:
             )
         if self.fomo_runner_invalidation_liquidity_floor_usd < 0:
             raise ValueError("FOMO_RUNNER_INVALIDATION_LIQUIDITY_FLOOR_USD cannot be negative")
+        if self.fomo_lab_bankroll_usd <= 0:
+            raise ValueError("FOMO_LAB_BANKROLL_USD must be positive")
+        if not 0 < self.fomo_lab_position_usd <= self.fomo_lab_max_position_usd:
+            raise ValueError("FOMO_LAB_POSITION_USD must be positive and at most the maximum")
+        if self.fomo_lab_max_position_usd > self.fomo_lab_bankroll_usd:
+            raise ValueError("FOMO_LAB_MAX_POSITION_USD cannot exceed the simulated bankroll")
+        if not 1 <= self.fomo_lab_max_concurrent_positions <= 25:
+            raise ValueError("FOMO_LAB_MAX_CONCURRENT_POSITIONS must be between 1 and 25")
+        if self.fomo_lab_max_total_exposure_usd <= 0:
+            raise ValueError("FOMO_LAB_MAX_TOTAL_EXPOSURE_USD must be positive")
+        if self.fomo_lab_daily_loss_cap_usd <= 0:
+            raise ValueError("FOMO_LAB_DAILY_LOSS_CAP_USD must be positive")
+        if self.fomo_lab_min_liquidity_usd < 0:
+            raise ValueError("FOMO_LAB_MIN_LIQUIDITY_USD cannot be negative")
+        if not 0 < self.fomo_lab_max_price_impact_percent <= 100:
+            raise ValueError("FOMO_LAB_MAX_PRICE_IMPACT_PERCENT must be between 0 and 100")
+        if not 0 < self.fomo_lab_max_slippage_percent <= 100:
+            raise ValueError("FOMO_LAB_MAX_SLIPPAGE_PERCENT must be between 0 and 100")
+        if self.fomo_lab_min_net_edge_percent < 0:
+            raise ValueError("FOMO_LAB_MIN_NET_EDGE_PERCENT cannot be negative")
+        if not 0 <= self.fomo_lab_platform_fee_bps <= 5000:
+            raise ValueError("FOMO_LAB_PLATFORM_FEE_BPS must be between 0 and 5000")
+        if not 0 <= self.fomo_lab_slippage_bps <= 5000:
+            raise ValueError("FOMO_LAB_SLIPPAGE_BPS must be between 0 and 5000")
+        if self.fomo_lab_priority_fee_usd < 0 or self.fomo_lab_network_fee_usd < 0:
+            raise ValueError("Simulated network and priority fees cannot be negative")
+        if not 60 <= self.fomo_lab_cooldown_seconds <= 604_800:
+            raise ValueError("FOMO_LAB_COOLDOWN_SECONDS must be between 60 and 604800")
+        if not 1 <= self.fomo_lab_min_forward_sample <= 10_000:
+            raise ValueError("FOMO_LAB_MIN_FORWARD_SAMPLE must be between 1 and 10000")
+        if not 1 <= self.fomo_social_posts_per_account <= 100:
+            raise ValueError("FOMO_SOCIAL_POSTS_PER_ACCOUNT must be between 1 and 100")
+        if not 0 <= self.fomo_social_daily_request_budget <= 10_000:
+            raise ValueError("FOMO_SOCIAL_DAILY_REQUEST_BUDGET must be between 0 and 10000")
         if len(self.x_news_stream_rule) > 1024:
             raise ValueError("X_NEWS_STREAM_RULE cannot exceed 1024 characters")
         if not 15 <= self.news_poll_seconds <= 3600:
