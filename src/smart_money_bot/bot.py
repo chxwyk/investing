@@ -10,7 +10,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Literal
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 import discord
 from discord import app_commands
@@ -172,6 +172,75 @@ def _token_view(mint: str, fomo_referral_code: str | None = None) -> discord.ui.
         )
     )
     return view
+
+
+def _runner_dex_url(candidate: RunnerCandidate) -> str:
+    parsed = urlparse(candidate.pair_url)
+    if (
+        parsed.scheme == "https"
+        and parsed.netloc.casefold() in {"dexscreener.com", "www.dexscreener.com"}
+        and parsed.path.casefold().startswith("/solana/")
+    ):
+        return candidate.pair_url
+    return f"https://dexscreener.com/solana/{candidate.mint}"
+
+
+def _runner_links(candidate: RunnerCandidate, referral_code: str | None) -> str:
+    mint = candidate.mint
+    return (
+        f"[FOMO]({_fomo_coin_url(mint, referral_code)}) • "
+        f"[PUMP.FUN](https://pump.fun/coin/{mint}) • "
+        f"[DEX]({_runner_dex_url(candidate)}) • "
+        f"[SOLSCAN](https://solscan.io/token/{mint})"
+    )
+
+
+class RunnerForensicsButton(discord.ui.Button):
+    def __init__(self, bot: SmartMoneyBot, candidate: RunnerCandidate) -> None:
+        super().__init__(
+            label="FORENSICS",
+            style=discord.ButtonStyle.secondary,
+            row=0,
+        )
+        self.bot = bot
+        self.candidate = candidate
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not _member_is_admin(interaction.user, self.bot.settings):
+            await interaction.response.send_message(
+                "Administrator access is required for the bounded forensic refresh.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        candidate = await self.bot.engine.runner_forensic(self.candidate.mint)
+        await interaction.edit_original_response(
+            embed=_runner_forensic_embed(candidate),
+            view=RunnerAlertView(self.bot, candidate),
+        )
+
+
+class RunnerAlertView(discord.ui.View):
+    """Runner-only navigation. It has no buy, sell, launch, sign, or spend control."""
+
+    def __init__(self, bot: SmartMoneyBot, candidate: RunnerCandidate) -> None:
+        super().__init__(timeout=900)
+        mint = candidate.mint
+        for label, url in (
+            ("OPEN FOMO", _fomo_coin_url(mint, bot.settings.fomo_referral_code)),
+            ("OPEN PUMP", f"https://pump.fun/coin/{mint}"),
+            ("DEXSCREENER", _runner_dex_url(candidate)),
+            ("SOLSCAN", f"https://solscan.io/token/{mint}"),
+        ):
+            self.add_item(
+                discord.ui.Button(
+                    label=label,
+                    style=discord.ButtonStyle.link,
+                    url=url,
+                    row=0,
+                )
+            )
+        self.add_item(RunnerForensicsButton(bot, candidate))
 
 
 def _news_lead_view(alert: NewsAlert) -> discord.ui.View:
@@ -1092,7 +1161,7 @@ class FomoRunnerLabView(discord.ui.View):
         mint = self.candidate.mint
         self.fomo_link.url = _fomo_coin_url(mint, self.bot.settings.fomo_referral_code)
         self.pump_link.url = f"https://pump.fun/coin/{mint}"
-        self.dex_link.url = self.candidate.pair_url or f"https://dexscreener.com/solana/{mint}"
+        self.dex_link.url = _runner_dex_url(self.candidate)
         self.solscan_link.url = f"https://solscan.io/token/{mint}"
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -1112,6 +1181,7 @@ class FomoRunnerLabView(discord.ui.View):
             index=self.index,
             total=len(self.candidates),
             research_test=self.research_test,
+            fomo_referral_code=self.bot.settings.fomo_referral_code,
         )
 
     async def refresh_message(
@@ -1196,6 +1266,22 @@ class FomoRunnerLabView(discord.ui.View):
             content="Fomo Runner Lab closed. No SOL was spent and no token was bought.",
             embed=None,
             view=None,
+        )
+
+    @discord.ui.button(label="FORENSICS", style=discord.ButtonStyle.secondary, row=1)
+    async def forensics(
+        self,
+        interaction: discord.Interaction,
+        _button: discord.ui.Button,
+    ) -> None:
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        self.candidates[self.index] = await self.bot.engine.runner_forensic(
+            self.candidate.mint
+        )
+        self.sync_links()
+        await interaction.edit_original_response(
+            embed=_runner_forensic_embed(self.candidate),
+            view=self,
         )
 
 
@@ -1422,11 +1508,18 @@ def _runner_embed(
     index: int = 0,
     total: int = 1,
     research_test: bool = False,
+    fomo_referral_code: str | None = None,
 ) -> discord.Embed:
     current = candidate.current
     first = candidate.first
     title = "🧪 FOMO RUNNER PIPELINE TEST — RESEARCH ONLY" if research_test else f"{candidate.tier}"
-    graduation = f"<t:{candidate.graduated_at}:R>" if candidate.graduated_at else "unavailable"
+    chain_created = (
+        f"<t:{candidate.chain_created_at}:R>" if candidate.chain_created_at else "unavailable"
+    )
+    pair_created = (
+        f"<t:{candidate.pair_created_at}:R>" if candidate.pair_created_at else "unavailable"
+    )
+    graduated = f"<t:{candidate.graduated_at}:R>" if candidate.graduated_at else "unavailable"
     x = candidate.x_evidence
     x_text = (
         f"CHECKED • exact-contract posts `{x.contract_posts}` • authors "
@@ -1447,6 +1540,7 @@ def _runner_embed(
         if candidate.earliest_smart_entry_age_seconds is not None
         else "unavailable"
     )
+    raw_smart_wallets = candidate.raw_smart_wallet_count or len(candidate.smart_wallets)
 
     def evidence(value: Decimal | None) -> Decimal | str:
         return value if value is not None else "unavailable"
@@ -1454,20 +1548,26 @@ def _runner_embed(
     embed = discord.Embed(
         title=title[:256],
         description=(
-            f"**{candidate.name or 'Unknown token'}** "
+            f"**[{candidate.name or 'Unknown token'}]"
+            f"({_fomo_coin_url(candidate.mint, fomo_referral_code)})** "
             f"`${candidate.symbol or 'UNKNOWN'}`\n`{candidate.mint}`\n\n"
             f"Candidate `{index + 1}/{total}` • Runner score "
-            f"**{candidate.score}/100** • no automatic buying"
+            f"**{candidate.score}/100** • state **{candidate.state}**\n"
+            f"{_runner_links(candidate, fomo_referral_code)}\n"
+            "Links only navigate • no automatic buying"
         ),
         color=(0xE74C3C if candidate.hard_blockers else 0xF1C40F if research_test else 0x5865F2),
         timestamp=datetime.fromtimestamp(candidate.generated_at, tz=UTC),
     )
     embed.add_field(
-        name="Graduation / timing",
+        name="Source / detection timing",
         value=(
-            f"Graduation-age proxy: {graduation}\n"
+            f"Chain created: {chain_created} • pair created: {pair_created}\n"
+            f"Graduated: {graduated}\n"
             f"Source: `{candidate.graduation_source}`\n"
-            f"First seen: <t:{candidate.first_seen_at}:R>"
+            f"Radar first seen: <t:{candidate.radar_first_seen_at or candidate.first_seen_at}:R> "
+            "• first market data: "
+            f"<t:{candidate.first_market_data_at or candidate.first_seen_at}:R>"
         ),
         inline=False,
     )
@@ -1512,9 +1612,10 @@ def _runner_embed(
     embed.add_field(
         name="Wallet overlap",
         value=(
-            f"Smart wallets `{len(candidate.smart_wallets)}` • "
+            f"Raw smart wallets `{raw_smart_wallets}` • "
+            f"estimated independent `{candidate.estimated_independent_smart_wallets}` • "
             f"{', '.join(candidate.smart_wallets[:5]) or 'none yet'}\n"
-            f"Earliest smart entry after proxy graduation: `{earliest_entry}s`\n"
+            f"Earliest smart entry after source creation: `{earliest_entry}s`\n"
             "Public Fomo top-trader overlap: `not available through an authorized API`"
         ),
         inline=False,
@@ -1523,14 +1624,56 @@ def _runner_embed(
     embed.add_field(
         name="Risk / route",
         value=(
+            f"Scam risk `{candidate.safety.scam_risk_score}/100 — "
+            f"{candidate.safety.scam_risk_level}` • safety `{candidate.safety.status}`\n"
             f"Tracker risk `{evidence(risk.risk_score)}/10` • "
             f"bundlers `{evidence(risk.bundlers_percent)}%` • "
             f"insiders `{evidence(risk.insiders_percent)}%`\n"
             f"snipers `{evidence(risk.snipers_percent)}%` • "
             f"dev `{evidence(risk.dev_percent)}%` • "
             f"top holders `{evidence(risk.top10_percent)}%`\n"
-            f"Jupiter `$5` route `{'available' if risk.route_available else 'unavailable'}`"
+            f"BUY ROUTE `{risk.buy_route_status}` impact "
+            f"`{evidence(risk.route_price_impact_percent)}%` • SELL ROUTE "
+            f"`{risk.sell_route_status}` impact "
+            f"`{evidence(risk.sell_route_price_impact_percent)}%`"
         ),
+        inline=False,
+    )
+    if candidate.score_history:
+        values = " → ".join(f"{value:.0f}" for value in candidate.score_history[-5:])
+        delta = (
+            candidate.score_history[-1] - candidate.score_history[-2]
+            if len(candidate.score_history) >= 2
+            else Decimal("0")
+        )
+        arrow = "↑" if delta >= 5 else "↓" if delta <= -5 else "→"
+        embed.add_field(
+            name="Signal progression",
+            value=f"`{values} {arrow}` • meaningful delta `{delta:+.0f}`",
+            inline=False,
+        )
+    forensics = candidate.forensics
+    independent = (
+        forensics.estimated_independent_clusters
+        if forensics.estimated_independent_clusters is not None
+        else "unknown"
+    )
+    largest_size = (
+        forensics.largest_cluster_size
+        if forensics.largest_cluster_size is not None
+        else "unknown"
+    )
+    embed.add_field(
+        name="Cluster / buyer independence",
+        value=(
+            f"Raw unique buyers `{forensics.raw_unique_buyers}` • estimated independent "
+            f"clusters `{independent}`\n"
+            f"Shared-funder groups `{len(forensics.shared_funder_groups)}` • time-linked "
+            f"groups `{len(forensics.time_linked_groups)}` • largest cluster wallets "
+            f"`{largest_size}`\n"
+            f"Raw Top10 `{evidence(risk.top10_percent)}%` • cluster-adjusted "
+            f"`{evidence(forensics.cluster_adjusted_percent)}%`"
+        )[:1024],
         inline=False,
     )
     breakdown = candidate.breakdown
@@ -1569,6 +1712,7 @@ def _runner_embed(
 def _runner_digest_embed(
     candidates: tuple[RunnerCandidate, ...],
     public_floor: Decimal,
+    fomo_referral_code: str | None = None,
 ) -> discord.Embed:
     embed = discord.Embed(
         title="FOMO RUNNER RADAR — RESEARCH",
@@ -1581,9 +1725,14 @@ def _runner_digest_embed(
     )
     for index, candidate in enumerate(candidates, start=1):
         current = candidate.current
+        source_created_at = (
+            candidate.chain_created_at
+            or candidate.graduated_at
+            or candidate.pair_created_at
+        )
         graduation_age = (
-            max(0, candidate.generated_at - candidate.graduated_at) // 60
-            if candidate.graduated_at
+            max(0, candidate.generated_at - source_created_at) // 60
+            if source_created_at
             else None
         )
         blockers = "; ".join(candidate.hard_blockers[:3]) or "none recorded"
@@ -1594,8 +1743,11 @@ def _runner_digest_embed(
                 f"${candidate.symbol or 'UNKNOWN'} — {candidate.score}/100"
             )[:256],
             value=(
+                f"**[{candidate.name or 'Unknown'}]"
+                f"({_fomo_coin_url(candidate.mint, fomo_referral_code)})** "
+                f"`${candidate.symbol or 'UNKNOWN'}`\n"
                 f"Age proxy `{f'{graduation_age}m' if graduation_age is not None else 'unknown'}` "
-                f"• mint `{_short(candidate.mint)}`\n"
+                f"• mint `{candidate.mint}`\n"
                 f"MC `{_money(candidate.first.market_cap_usd)}` → "
                 f"`{_money(current.market_cap_usd)}` "
                 f"(`{_percent_change(current.market_cap_usd, candidate.first.market_cap_usd)}`)\n"
@@ -1608,7 +1760,11 @@ def _runner_digest_embed(
                 f"Smart-wallet overlap `{len(candidate.smart_wallets)}` • risk "
                 f"`{current.risk_score if current.risk_score is not None else 'unknown'}/10` "
                 f"• X `{x_status}`\n"
-                f"Blockers: {blockers}"
+                f"Safety `{candidate.safety.status}` • scam risk "
+                f"`{candidate.safety.scam_risk_score}/100 — "
+                f"{candidate.safety.scam_risk_level}`\n"
+                f"Blockers: {blockers}\n"
+                f"{_runner_links(candidate, fomo_referral_code)}"
             )[:1024],
             inline=False,
         )
@@ -1618,6 +1774,208 @@ def _runner_digest_embed(
             "no buy, SOL spend, X lookup, or J7 call"
         )
     )
+    return embed
+
+
+def _runner_fresh_embed(
+    candidate: RunnerCandidate,
+    fomo_referral_code: str | None = None,
+) -> discord.Embed:
+    current = candidate.current
+    source_created_at = (
+        candidate.chain_created_at or candidate.graduated_at or candidate.pair_created_at
+    )
+    age = (
+        max(0, candidate.generated_at - source_created_at)
+        if source_created_at is not None
+        else None
+    )
+    first_seen_ago = max(
+        0,
+        candidate.generated_at
+        - (candidate.radar_first_seen_at or candidate.first_seen_at),
+    )
+    embed = discord.Embed(
+        title="⚡ FRESH RUNNER DETECTED",
+        description=(
+            f"**[{candidate.name or 'Unknown token'}]"
+            f"({_fomo_coin_url(candidate.mint, fomo_referral_code)})** "
+            f"`${candidate.symbol or 'UNKNOWN'}`\n`{candidate.mint}`\n\n"
+            f"**Age:** `{f'{age}s' if age is not None else 'unknown'}`\n"
+            f"**Bot first saw:** `{first_seen_ago}s ago`\n"
+            f"**MC:** `{_money(current.market_cap_usd)}`\n"
+            f"**Liquidity:** `{_money(current.liquidity_usd)}`\n"
+            f"**Activity:** `{current.buys_5m} buys / {current.sells_5m} sells`\n\n"
+            f"**Signal:** `{candidate.score}/100 — EARLY DATA`\n"
+            f"**Safety:** `{candidate.safety.status} — "
+            f"{candidate.safety.scam_risk_level}`\n\n"
+            f"{_runner_links(candidate, fomo_referral_code)}\n\n"
+            "**RESEARCH ONLY.**"
+        ),
+        color=0x3498DB,
+        timestamp=datetime.fromtimestamp(candidate.generated_at, tz=UTC),
+    )
+    embed.set_footer(
+        text="Non-pinging fresh lane • no buy • no sell • no J7 • no signing • no SOL spend"
+    )
+    return embed
+
+
+def _runner_forensic_embed(
+    candidate: RunnerCandidate,
+    fomo_referral_code: str | None = None,
+) -> discord.Embed:
+    current = candidate.current
+    forensic = candidate.forensics
+
+    def value(item: object, suffix: str = "") -> str:
+        return "unknown" if item is None else f"{item}{suffix}"
+
+    shared = "\n".join(
+        f"• `{_short(group.cluster_id)}` • {group.wallet_count} wallets • "
+        f"{value(group.supply_percent, '%')} supply • interval "
+        f"{value(group.funding_interval_seconds, 's')} • {group.confidence}"
+        for group in forensic.shared_funder_groups[:5]
+    ) or "No shared-funder group confirmed in the bounded trace."
+    pair_age = (
+        candidate.generated_at - candidate.pair_created_at
+        if candidate.pair_created_at
+        else None
+    )
+    entry = "YES" if candidate.safety.entry_eligible and candidate.score >= 70 else "NO"
+    embed = discord.Embed(
+        title="FOMO FORENSICS — READ ONLY",
+        description=(
+            f"**[{candidate.name or 'Unknown token'}]"
+            f"({_fomo_coin_url(candidate.mint, fomo_referral_code)})** "
+            f"`${candidate.symbol or 'UNKNOWN'}`\n`{candidate.mint}`\n"
+            f"{_runner_links(candidate, fomo_referral_code)}"
+        ),
+        color=0xE67E22 if candidate.safety.status == "FAIL" else 0x5865F2,
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(
+        name="Market / signal",
+        value=(
+            f"Age `{value(pair_age, 's')}` • MC `{_money(current.market_cap_usd)}` • "
+            f"liquidity `{_money(current.liquidity_usd)}` • "
+            f"holders `{value(current.holder_count)}`\n"
+            f"Runner signal `{candidate.score}/100` • history "
+            f"`{' → '.join(f'{item:.0f}' for item in candidate.score_history[-5:]) or 'none'}`"
+        )[:1024],
+        inline=False,
+    )
+    embed.add_field(
+        name="Scam risk / entry safety",
+        value=(
+            f"Scam risk `{candidate.safety.scam_risk_score}/100 — "
+            f"{candidate.safety.scam_risk_level}` • safety `{candidate.safety.status}` • "
+            f"entry `{entry}`\n"
+            f"Top10 `{value(current.top10_percent, '%')}` • dev "
+            f"`{value(current.dev_percent, '%')}` • bundlers "
+            f"`{value(current.bundlers_percent, '%')}` • insiders "
+            f"`{value(current.insiders_percent, '%')}` • snipers "
+            f"`{value(current.snipers_percent, '%')}`"
+        )[:1024],
+        inline=False,
+    )
+    embed.add_field(
+        name="Shared funding / independence",
+        value=(
+            f"Raw buyers `{forensic.raw_unique_buyers}` • independent clusters "
+            f"`{value(forensic.estimated_independent_clusters)}` • largest cluster "
+            f"`{value(forensic.largest_cluster_size)}` wallets / "
+            f"`{value(forensic.largest_cluster_supply_percent, '%')}` supply\n"
+            f"Cluster-adjusted ownership `{value(forensic.cluster_adjusted_percent, '%')}` • "
+            f"time-linked groups `{len(forensic.time_linked_groups)}`\n{shared}"
+        )[:1024],
+        inline=False,
+    )
+    embed.add_field(
+        name="Routes / creator evidence",
+        value=(
+            f"BUY ROUTE `{current.buy_route_status}` impact "
+            f"`{value(current.route_price_impact_percent, '%')}` • SELL ROUTE "
+            f"`{current.sell_route_status}` impact "
+            f"`{value(current.sell_route_price_impact_percent, '%')}`\n"
+            f"Creator wallet `{forensic.creator_wallet or 'not reliably identified'}` • "
+            f"previous deployments `{value(forensic.previous_token_deployments)}` • "
+            f"previous severe collapses `{value(forensic.previous_severe_collapses)}`"
+        )[:1024],
+        inline=False,
+    )
+    warnings = candidate.safety.failures + candidate.safety.critical_unknowns + forensic.warnings
+    if warnings:
+        embed.add_field(
+            name="Warnings / unknowns",
+            value="\n".join(f"• {item}" for item in warnings)[:1024],
+            inline=False,
+        )
+    embed.set_footer(text="No buy • no sell • no J7 • no transaction • no signature • no SOL")
+    return embed
+
+
+def _runner_risk_escalation_embed(
+    candidate: RunnerCandidate,
+    changes: tuple[str, ...],
+    fomo_referral_code: str | None = None,
+) -> discord.Embed:
+    return discord.Embed(
+        title="⚠️ RUNNER RISK ESCALATION",
+        description=(
+            f"**[{candidate.name or 'Unknown token'}]"
+            f"({_fomo_coin_url(candidate.mint, fomo_referral_code)})** "
+            f"`${candidate.symbol or 'UNKNOWN'}`\n`{candidate.mint}`\n\n"
+            + "\n".join(f"• {item}" for item in changes)
+            + f"\n\nSafety `{candidate.safety.status}` • scam risk "
+            f"`{candidate.safety.scam_risk_score}/100 — "
+            f"{candidate.safety.scam_risk_level}`\n"
+            f"{_runner_links(candidate, fomo_referral_code)}\n\nNo automatic sell."
+        )[:4096],
+        color=0xE67E22,
+        timestamp=discord.utils.utcnow(),
+    )
+
+
+def _runner_invalidated_embed(
+    candidate: RunnerCandidate,
+    metrics: dict[str, object],
+    reasons: tuple[str, ...],
+    fomo_referral_code: str | None = None,
+) -> discord.Embed:
+    def number(key: str) -> str:
+        value = metrics.get(key)
+        return "unknown" if value is None else f"{Decimal(str(value)):+.2f}%"
+
+    embed = discord.Embed(
+        title="🛑 SETUP INVALIDATED",
+        description=(
+            f"**[{candidate.name or 'Unknown token'}]"
+            f"({_fomo_coin_url(candidate.mint, fomo_referral_code)})** "
+            f"`${candidate.symbol or 'UNKNOWN'}`\n`{candidate.mint}`\n"
+            f"{_runner_links(candidate, fomo_referral_code)}"
+        ),
+        color=0xE74C3C,
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(
+        name="Path after detection",
+        value=(
+            f"First detected MC `{_money(metrics.get('first_market_cap'))}` • peak MC "
+            f"`{_money(metrics.get('peak_market_cap'))}` • current MC "
+            f"`{_money(metrics.get('current_market_cap'))}`\n"
+            f"Peak return `{number('peak_return')}` • drawdown from peak "
+            f"`{number('drawdown_from_peak')}` • liquidity deterioration "
+            f"`{number('liquidity_decline')}`"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Reason",
+        value="\n".join(f"• {item}" for item in reasons)[:1024],
+        inline=False,
+    )
+    embed.set_footer(text="Deduplicated research warning • no automatic sell or transaction")
     return embed
 
 
@@ -2416,10 +2774,10 @@ class SmartMoneyBot(commands.Bot):
         token_mint: str | None = None,
         ping_user: bool = False,
         view: discord.ui.View | None = None,
-    ) -> None:
+    ) -> bool:
         channel = await self._alert_channel()
         if channel is None:
-            return
+            return False
         alert_user_id = self.settings.discord_alert_user_id
         should_ping = ping_user and alert_user_id is not None
         content = f"<@{alert_user_id}>" if should_ping else None
@@ -2441,8 +2799,10 @@ class SmartMoneyBot(commands.Bot):
                 ),
                 allowed_mentions=allowed_mentions,
             )
+            return True
         except (discord.Forbidden, discord.HTTPException):
             logger.exception("Could not post to alert channel")
+            return False
 
     async def on_swap(self, swap: DetectedSwap, trader: TrackedTrader) -> None:
         if not self.settings.trade_activity_alerts_enabled:
@@ -2597,11 +2957,53 @@ class SmartMoneyBot(commands.Bot):
             ping_user=True,
         )
 
-    async def on_runner_alert(self, candidate: RunnerCandidate) -> None:
-        await self._send_alert(
-            _runner_embed(candidate),
-            token_mint=candidate.mint,
+    async def on_runner_alert(self, candidate: RunnerCandidate) -> bool:
+        return await self._send_alert(
+            _runner_embed(
+                candidate,
+                fomo_referral_code=self.settings.fomo_referral_code,
+            ),
             ping_user=True,
+            view=RunnerAlertView(self, candidate),
+        )
+
+    async def on_runner_fresh(self, candidate: RunnerCandidate) -> bool:
+        return await self._send_alert(
+            _runner_fresh_embed(candidate, self.settings.fomo_referral_code),
+            ping_user=False,
+            view=RunnerAlertView(self, candidate),
+        )
+
+    async def on_runner_risk_escalation(
+        self,
+        candidate: RunnerCandidate,
+        changes: tuple[str, ...],
+    ) -> bool:
+        return await self._send_alert(
+            _runner_risk_escalation_embed(
+                candidate,
+                changes,
+                self.settings.fomo_referral_code,
+            ),
+            ping_user=False,
+            view=RunnerAlertView(self, candidate),
+        )
+
+    async def on_runner_invalidated(
+        self,
+        candidate: RunnerCandidate,
+        metrics: dict[str, object],
+        reasons: tuple[str, ...],
+    ) -> bool:
+        return await self._send_alert(
+            _runner_invalidated_embed(
+                candidate,
+                metrics,
+                reasons,
+                self.settings.fomo_referral_code,
+            ),
+            ping_user=False,
+            view=RunnerAlertView(self, candidate),
         )
 
     async def on_runner_digest(
@@ -2610,7 +3012,11 @@ class SmartMoneyBot(commands.Bot):
         public_floor: Decimal,
     ) -> None:
         await self._send_alert(
-            _runner_digest_embed(candidates, public_floor),
+            _runner_digest_embed(
+                candidates,
+                public_floor,
+                getattr(getattr(self, "settings", None), "fomo_referral_code", None),
+            ),
             ping_user=False,
         )
 
@@ -4237,6 +4643,7 @@ class FomoCommands(
             inline=False,
         )
         embed.add_field(name="By X status", value=bucket_lines("x"), inline=False)
+        embed.add_field(name="By detection safety", value=bucket_lines("safety"), inline=False)
         embed.add_field(
             name="Baseline comparison",
             value=str(result["baseline_status"]),
@@ -4255,6 +4662,7 @@ class FomoCommands(
                 f"median `{score_text(distribution['median'])}` • "
                 f"p90 `{score_text(distribution['p90'])}` • "
                 f"p95 `{score_text(distribution['p95'])}`\n"
+                f"15+ `{distribution['gte_15']}` • 20+ `{distribution['gte_20']}` • "
                 f"35+ `{distribution['gte_35']}` • 50+ `{distribution['gte_50']}` • "
                 f"60+ `{distribution['gte_60']}` • 70+ `{distribution['gte_70']}`"
             ),
@@ -4296,10 +4704,222 @@ class FomoCommands(
             value=radar_visibility,
             inline=False,
         )
+        path = result["path_analytics"]
+        assert isinstance(path, dict)
+
+        def percent(value: object) -> str:
+            return f"{value:.2f}%" if isinstance(value, Decimal) else "pending"
+
+        def seconds(value: object) -> str:
+            return f"{value:.0f}s" if isinstance(value, Decimal) else "pending"
+
+        embed.add_field(
+            name="Usable path outcomes",
+            value=(
+                f"+10 before -25 `{percent(path['plus_10_before_minus_25_rate'])}` • "
+                f"+25 before -25 `{percent(path['plus_25_before_minus_25_rate'])}`\n"
+                f"+50 before -50 `{percent(path['plus_50_before_minus_50_rate'])}` • "
+                f"+100 before -50 `{percent(path['plus_100_before_minus_50_rate'])}`\n"
+                f"Median time +25 `{seconds(path['median_time_to_25_seconds'])}` • "
+                f"+50 `{seconds(path['median_time_to_50_seconds'])}`\n"
+                f"Median MFE `{percent(path['median_maximum_favorable_excursion'])}` • "
+                f"MAE `{percent(path['median_maximum_adverse_excursion'])}` • severe failure "
+                f"`{percent(path['severe_failure_rate'])}`"
+            ),
+            inline=False,
+        )
         embed.set_footer(
             text="No look-ahead scoring • shadow research only • no auto-buy or profit claim"
         )
         await interaction.edit_original_response(content=None, embed=embed, view=None)
+
+    @app_commands.command(
+        name="latency",
+        description="Measure source-to-detection and first-Discord runner latency.",
+    )
+    @app_commands.describe(sample="Use the most recent 50 or 100 candidates")
+    async def latency(
+        self,
+        interaction: discord.Interaction,
+        sample: Literal[50, 100] = 100,
+    ) -> None:
+        if not await self._require_admin(interaction):
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        result = await self.bot.engine.runner_latency(limit=sample)
+
+        def metric(value: object, suffix: str = "s") -> str:
+            return f"{value:.2f}{suffix}" if isinstance(value, Decimal) else "pending"
+
+        within = result["discovered_within"]
+        assert isinstance(within, dict)
+        appreciation = result["median_mc_appreciation_to_visible"]
+        warning = (
+            "\n\n⚠️ Median candidate already doubled before Discord. The pipeline is too slow."
+            if isinstance(appreciation, Decimal) and appreciation >= 100
+            else ""
+        )
+        embed = discord.Embed(
+            title=f"FOMO RUNNER LATENCY — RECENT {sample}",
+            description=(
+                f"Candidates `{result['count']}` • source samples "
+                f"`{result['source_samples']}` • visible samples "
+                f"`{result['visible_samples']}`\n\n"
+                f"Source → first seen median "
+                f"`{metric(result['source_to_first_seen_median'])}` • p90 "
+                f"`{metric(result['source_to_first_seen_p90'])}`\n"
+                f"First seen → Discord median "
+                f"`{metric(result['first_seen_to_discord_median'])}` • p90 "
+                f"`{metric(result['first_seen_to_discord_p90'])}`\n\n"
+                f"Within 30s `{metric(within['30s'], '%')}` • 60s "
+                f"`{metric(within['60s'], '%')}` • 2m `{metric(within['2m'], '%')}` • "
+                f"5m `{metric(within['5m'], '%')}` • 10m "
+                f"`{metric(within['10m'], '%')}`\n\n"
+                f"Median MC first seen `{_money(result['median_mc_first_seen'])}` • "
+                f"first visible `{_money(result['median_mc_first_visible'])}`\n"
+                f"Median MC appreciation before visible "
+                f"`{metric(appreciation, '%')}`{warning}"
+            ),
+            color=0x3498DB,
+            timestamp=discord.utils.utcnow(),
+        )
+        recent = result["tokens"]
+        assert isinstance(recent, tuple)
+        lines = [
+            f"`{_short(str(row['mint']))}` • first `{_money(row['mc_at_first_seen'])}` • "
+            f"visible `{_money(row['mc_at_first_visible_alert'])}` • entry "
+            f"`{_money(row['mc_at_entry_eligible'])}` • peak "
+            f"`{_money(row['peak_mc_after_detection'])}`"
+            for row in recent[:5]
+            if isinstance(row, dict)
+        ]
+        embed.add_field(
+            name="MC_AT_FIRST_SEEN → FIRST_VISIBLE → ENTRY → PEAK",
+            value="\n".join(lines) or "No complete market-cap path yet.",
+            inline=False,
+        )
+        embed.set_footer(text="Digest time is never used as first-seen time")
+        await interaction.edit_original_response(embed=embed, view=None)
+
+    @app_commands.command(
+        name="forensic",
+        description="Run bounded read-only public-chain forensics for an exact Solana mint.",
+    )
+    @app_commands.describe(mint="Exact Solana token mint; ticker searches are not accepted")
+    async def forensic(self, interaction: discord.Interaction, mint: str) -> None:
+        if not await self._require_admin(interaction):
+            return
+        try:
+            exact_mint = str(Pubkey.from_string(mint.strip()))
+        except ValueError:
+            await interaction.response.send_message(
+                "Enter an exact valid Solana mint. Ticker searches are not accepted.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        try:
+            async with asyncio.timeout(45):
+                candidate = await self.bot.engine.runner_forensic(exact_mint)
+        except TimeoutError:
+            await interaction.edit_original_response(
+                content=(
+                    "The bounded public-chain forensic trace timed out. No buy, sell, "
+                    "J7, signature, transaction, or SOL action was attempted."
+                ),
+                embed=None,
+                view=None,
+            )
+            return
+        await interaction.edit_original_response(
+            content=None,
+            embed=_runner_forensic_embed(
+                candidate,
+                self.bot.settings.fomo_referral_code,
+            ),
+            view=RunnerAlertView(self.bot, candidate),
+        )
+
+    @app_commands.command(
+        name="calibration",
+        description="Compare detection-time runner evidence with forward outcomes.",
+    )
+    async def calibration(self, interaction: discord.Interaction) -> None:
+        if not await self._require_admin(interaction):
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        result = await self.bot.engine.runner_calibration()
+        distribution = result["score_distribution"]
+        assert isinstance(distribution, dict)
+
+        def score(value: object) -> str:
+            return f"{value:.2f}" if isinstance(value, Decimal) else "pending"
+
+        def characteristics(label: str, row: object) -> str:
+            assert isinstance(row, dict)
+            return (
+                f"**{label}** n=`{row['count']}` • initial MC "
+                f"`{_money(row['initial_market_cap'])}` • liquidity "
+                f"`{_money(row['liquidity'])}` • holders `{score(row['holders'])}`\n"
+                f"age `{score(row['pair_age_seconds'])}s` • Top10 "
+                f"`{score(row['top10'])}%` • dev `{score(row['dev'])}%` • bundlers "
+                f"`{score(row['bundlers'])}%` • insiders `{score(row['insiders'])}%` • "
+                f"snipers `{score(row['snipers'])}%`\n"
+                f"largest cluster `{score(row['largest_cluster'])}%` • shared funders "
+                f"`{score(row['shared_funders'])}` • independent clusters "
+                f"`{score(row['buyer_independence'])}` • smart overlap "
+                f"`{score(row['smart_wallet_overlap'])}` • sell PASS "
+                f"`{score(row['sell_route_pass_rate'])}%`"
+            )
+
+        embed = discord.Embed(
+            title="FOMO RUNNER CALIBRATION — OBSERVE ONLY",
+            description=(
+                f"Candidates `{result['candidate_count']}` • outcomes "
+                f"`{result['outcome_count']}`\n"
+                f"Score max `{score(distribution['max'])}` • median "
+                f"`{score(distribution['median'])}` • p90 "
+                f"`{score(distribution['p90'])}` • p95 "
+                f"`{score(distribution['p95'])}`\n"
+                f"15+ `{distribution['gte_15']}` • 20+ `{distribution['gte_20']}` • "
+                f"35+ `{distribution['gte_35']}` • 50+ `{distribution['gte_50']}` • "
+                f"60+ `{distribution['gte_60']}` • 70+ `{distribution['gte_70']}`"
+            ),
+            color=0x9B59B6,
+            timestamp=discord.utils.utcnow(),
+        )
+        embed.add_field(
+            name="Winner characteristics",
+            value=characteristics("+25 MFE", result["winner_characteristics"])[:1024],
+            inline=False,
+        )
+        embed.add_field(
+            name="Failure characteristics",
+            value=characteristics("Severe failure", result["failure_characteristics"])[
+                :1024
+            ],
+            inline=False,
+        )
+        safety = result["safety_buckets"]
+        assert isinstance(safety, dict)
+        safety_lines = []
+        for label, row in safety.items():
+            assert isinstance(row, dict)
+            safety_lines.append(
+                f"`{label}` n={row['count']} • avg "
+                f"`{score(row['average'])}%` • +25 "
+                f"`{score(row['hit_25_percent'])}%` • failure "
+                f"`{score(row['failure_rate_percent'])}%`"
+            )
+        embed.add_field(
+            name="Forward performance by detection safety",
+            value="\n".join(safety_lines) or "Collecting outcomes.",
+            inline=False,
+        )
+        embed.set_footer(
+            text="No look-ahead • detection snapshots stay immutable • thresholds not changed"
+        )
+        await interaction.edit_original_response(embed=embed, view=None)
 
 
 def run_bot(settings: Settings) -> None:

@@ -12,10 +12,14 @@ import pytest
 from smart_money_bot.bot import (
     FomoCommands,
     FomoRunnerLabView,
+    RunnerAlertView,
     RunnerXVerificationConfirmationView,
     SmartMoneyBot,
+    _runner_digest_embed,
+    _runner_forensic_embed,
+    _runner_fresh_embed,
 )
-from smart_money_bot.callouts import parse_dex_snapshot
+from smart_money_bot.callouts import CoinCalloutAnalyzer, parse_dex_snapshot
 from smart_money_bot.database import Database
 from smart_money_bot.engine import SmartMoneyEngine
 from smart_money_bot.models import (
@@ -23,7 +27,10 @@ from smart_money_bot.models import (
     DetectedSwap,
     DexSnapshot,
     DiscoveryCandidate,
+    RunnerForensics,
+    RunnerFundingObservation,
     RunnerMarketSnapshot,
+    RunnerSafetyAssessment,
     Side,
     SwapQuote,
     TokenInfo,
@@ -31,12 +38,18 @@ from smart_money_bot.models import (
     XSocialSnapshot,
 )
 from smart_money_bot.runner import (
+    assess_runner_safety,
+    build_funding_clusters,
     forward_return_percent,
+    fresh_watch_schedule,
+    is_fresh_research_worthy,
     runner_candidate_from_json,
     runner_candidate_to_json,
+    runner_path_metrics,
     runner_snapshot_from_callout,
     runner_snapshot_to_json,
     score_runner_candidate,
+    summarize_forensics,
 )
 
 MINT = "So11111111111111111111111111111111111111112"
@@ -641,14 +654,35 @@ async def test_free_runner_analysis_and_targeted_x_share_client(settings) -> Non
         engine.database.runner_candidate_payload = AsyncMock(return_value=None)
         engine.database.runner_snapshot_payloads = AsyncMock(return_value=[])
         engine.database.store_runner_candidate = AsyncMock(return_value=True)
+        engine.database.store_runner_forensics = AsyncMock()
         engine.database.record_runner_outcome = AsyncMock(return_value=True)
+        base_callout = _callout(
+            liquidity="30000",
+            holders=300,
+            pair_age=2,
+            change_5m="20",
+            smart_wallets=("alpha", "beta", "gamma"),
+        )
         engine.analyze_coin = AsyncMock(
-            return_value=_callout(
-                liquidity="30000",
-                holders=300,
-                pair_age=2,
-                change_5m="20",
-                smart_wallets=("alpha", "beta", "gamma"),
+            return_value=replace(
+                base_callout,
+                token_info=replace(
+                    base_callout.token_info,
+                    mint_authority_disabled=True,
+                    freeze_authority_disabled=True,
+                ),
+                sell_quote=_quote(),
+            )
+        )
+        engine._collect_runner_forensics = AsyncMock(
+            return_value=summarize_forensics(
+                (
+                    RunnerFundingObservation(wallet="a", funder="funder-a"),
+                    RunnerFundingObservation(wallet="b", funder="funder-b"),
+                ),
+                raw_unique_buyers=5,
+                raw_top10_percent=Decimal("25"),
+                checked_at=int(time.time()),
             )
         )
 
@@ -674,7 +708,7 @@ async def test_free_runner_analysis_and_targeted_x_share_client(settings) -> Non
         posts_per_minute=Decimal("0.5"),
     )
     x_engine.x_social.snapshot = AsyncMock(return_value=strong_x)
-    verified = await x_engine.analyze_runner(MINT)
+    verified = await x_engine.analyze_runner(MINT, deep_forensics=True)
 
     x_engine.x_social.snapshot.assert_awaited_once()
     assert verified.x_evidence.available is True
@@ -700,7 +734,7 @@ async def test_two_stage_fast_watch_admits_only_young_promising_candidate(settin
     engine._start_runner_fast_watch(old)
     await asyncio.sleep(0)
 
-    engine._fast_watch_runner.assert_awaited_once_with(MINT)
+    engine._fast_watch_runner.assert_awaited_once_with(MINT, fresh=False)
     assert MINT_TWO not in engine._runner_fast_watch_tasks
 
 
@@ -981,12 +1015,14 @@ def test_runner_defaults_do_not_change_launch_or_x_production_thresholds(setting
     assert settings.pump_launch_min_score == 72
     assert settings.launch_lab_min_score == 60
     assert settings.fomo_runner_enabled is True
-    assert settings.fomo_runner_fast_watch_seconds == 20
+    assert settings.fomo_runner_fast_watch_seconds == 15
+    assert settings.fomo_runner_fast_watch_min_score == Decimal("20")
+    assert settings.fomo_runner_max_fast_watch == 12
     assert settings.fomo_runner_public_alert_min_score == Decimal("70")
     assert settings.fomo_runner_digest_enabled is True
-    assert settings.fomo_runner_digest_seconds == 900
-    assert settings.fomo_runner_digest_min_score == Decimal("35")
-    assert settings.fomo_runner_digest_max_candidates == 3
+    assert settings.fomo_runner_digest_seconds == 180
+    assert settings.fomo_runner_digest_min_score == Decimal("15")
+    assert settings.fomo_runner_digest_max_candidates == 10
 
 
 @pytest.mark.asyncio
@@ -1088,3 +1124,433 @@ async def test_runner_results_exposes_empirical_score_distribution(settings, tmp
     assert distribution["gte_60"] == 2
     assert distribution["gte_70"] == 1
     assert len(result["best_current_candidates"]) == 3
+
+
+def test_entry_safety_is_separate_fail_closed_and_sell_route_required() -> None:
+    base = replace(
+        _snapshot(_callout(), at=1_800_000_000),
+        buy_route_status="PASS",
+        sell_route_status="PASS",
+        mint_authority_disabled=True,
+        freeze_authority_disabled=True,
+    )
+    forensics = summarize_forensics(
+        (
+            RunnerFundingObservation(wallet="holder-a", funder="funder-a"),
+            RunnerFundingObservation(wallet="holder-b", funder="funder-b"),
+        ),
+        raw_top10_percent=base.top10_percent,
+        checked_at=base.captured_at,
+    )
+
+    safe = assess_runner_safety(base, forensics)
+    unknown = assess_runner_safety(replace(base, sell_route_status="UNKNOWN"), forensics)
+    concentrated = assess_runner_safety(replace(base, top10_percent=Decimal("86.55")), forensics)
+    thin = assess_runner_safety(replace(base, liquidity_usd=Decimal("1000")), forensics)
+    rugged = assess_runner_safety(replace(base, rugged=True), forensics)
+    unsellable = assess_runner_safety(replace(base, sell_route_status="FAIL"), forensics)
+
+    assert safe.status == "PASS"
+    assert safe.entry_eligible is True
+    assert unknown.status == "UNKNOWN"
+    assert unknown.entry_eligible is False
+    assert concentrated.status == "FAIL"
+    assert thin.status == "FAIL"
+    assert rugged.scam_risk_score == Decimal("100.00")
+    assert unsellable.status == "FAIL"
+
+
+def test_shared_funding_time_links_and_cluster_adjusted_ownership() -> None:
+    observations = (
+        RunnerFundingObservation(
+            wallet="wallet-a",
+            funder="shared-funder",
+            funded_at=1_000,
+            amount_sol=Decimal("0.035"),
+            bought_at=1_100,
+            supply_percent=Decimal("22"),
+        ),
+        RunnerFundingObservation(
+            wallet="wallet-b",
+            funder="shared-funder",
+            funded_at=1_500,
+            amount_sol=Decimal("0.038"),
+            bought_at=1_115,
+            supply_percent=Decimal("24"),
+        ),
+        RunnerFundingObservation(
+            wallet="wallet-c",
+            funder="independent-funder",
+            funded_at=900,
+            amount_sol=Decimal("1"),
+            bought_at=1_120,
+            supply_percent=Decimal("2"),
+        ),
+    )
+
+    clusters = build_funding_clusters(observations)
+    forensics = summarize_forensics(
+        observations,
+        raw_unique_buyers=3,
+        raw_top10_percent=Decimal("28"),
+        checked_at=2_000,
+    )
+
+    assert len(clusters) == 1
+    assert clusters[0].wallet_count == 2
+    assert clusters[0].funding_interval_seconds == 500
+    assert clusters[0].similar_amounts is True
+    assert clusters[0].time_linked is True
+    assert clusters[0].supply_percent == Decimal("46.00")
+    assert forensics.cluster_adjusted_percent == Decimal("46.00")
+    assert forensics.estimated_independent_clusters == 2
+    assert len(forensics.time_linked_groups) == 1
+
+
+def test_smart_wallet_score_counts_confirmed_funding_cluster_once() -> None:
+    forensic = summarize_forensics(
+        (
+            RunnerFundingObservation(wallet="wallet-a", funder="same"),
+            RunnerFundingObservation(wallet="wallet-b", funder="same"),
+        ),
+        raw_top10_percent=Decimal("25"),
+        checked_at=1_800_000_600,
+    )
+    item = score_runner_candidate(
+        _callout(),
+        first=_snapshot(_callout(), at=1_800_000_000),
+        current=_snapshot(_callout(), at=1_800_000_600),
+        graduated_at=1_800_000_000,
+        graduation_source="DEX_PAIR_CREATED_PROXY",
+        smart_wallets=("alpha", "beta"),
+        smart_wallet_addresses=("wallet-a", "wallet-b"),
+        forensics=forensic,
+        now=1_800_000_600,
+    )
+
+    assert item.raw_smart_wallet_count == 2
+    assert item.estimated_independent_smart_wallets == 1
+    assert item.breakdown.smart_wallets == 4
+
+
+def test_post_detection_path_preserves_peak_then_collapse() -> None:
+    first = replace(
+        _snapshot(_callout(price="1", market_cap="100"), at=1_000),
+        price_usd=Decimal("1"),
+        market_cap_usd=Decimal("100"),
+    )
+    series = (
+        first,
+        replace(first, captured_at=1_060, price_usd=Decimal("1.30")),
+        replace(first, captured_at=1_120, price_usd=Decimal("1.60")),
+        replace(first, captured_at=1_180, price_usd=Decimal("0.40")),
+    )
+
+    path = runner_path_metrics(first, series)
+
+    assert path["peak_return"] == Decimal("60.00")
+    assert path["time_to_peak_seconds"] == 120
+    assert path["maximum_adverse_excursion"] == Decimal("-60.00")
+    assert path["max_drawdown_from_peak"] == Decimal("75.00")
+    assert path["plus_25_before_minus_25"] is True
+    assert path["plus_50_before_minus_50"] is True
+
+
+def test_fresh_candidate_uses_exact_links_and_runner_view_has_no_trade_control() -> None:
+    candidate = _candidate(
+        current_callout=_callout(pair_age=1, buys=12, sells=4, volume="3000"),
+    )
+    bot = SimpleNamespace(
+        settings=SimpleNamespace(fomo_referral_code="ref-code"),
+        engine=SimpleNamespace(runner_forensic=AsyncMock()),
+    )
+
+    assert is_fresh_research_worthy(candidate) is True
+    assert fresh_watch_schedule() == (0, 15, 30, 60, 120, 180, 300, 600, 900)
+    embed = _runner_fresh_embed(candidate, "ref-code")
+    forensic_embed = _runner_forensic_embed(candidate, "ref-code")
+    view = RunnerAlertView(bot, candidate)
+    buttons = {item.label: item for item in view.children}
+
+    assert candidate.mint in embed.description
+    assert f"address={candidate.mint}" in embed.description
+    assert candidate.mint in forensic_embed.description
+    assert buttons["OPEN FOMO"].url.endswith("r=ref-code&source=share_link")
+    assert buttons["OPEN PUMP"].url == f"https://pump.fun/coin/{candidate.mint}"
+    assert buttons["SOLSCAN"].url == f"https://solscan.io/token/{candidate.mint}"
+    assert set(buttons) == {"OPEN FOMO", "OPEN PUMP", "DEXSCREENER", "SOLSCAN", "FORENSICS"}
+    assert all(
+        forbidden not in " ".join(buttons).upper()
+        for forbidden in ("BUY", "SELL", "J7", "LAUNCH")
+    )
+
+
+def test_runner_digest_links_are_isolated_by_exact_mint() -> None:
+    first = _candidate(current_callout=_callout(pair_age=1))
+    second = replace(
+        _candidate(current_callout=_callout(pair_age=2)),
+        mint=MINT_TWO,
+        name="Second Token",
+        symbol="TWO",
+        pair_url="https://not-dex.example/search/TWO",
+    )
+
+    embed = _runner_digest_embed((first, second), Decimal("70"), "ref")
+    joined = "\n".join(field.value for field in embed.fields)
+
+    assert f"address={MINT}" in joined
+    assert f"address={MINT_TWO}" in joined
+    assert f"https://pump.fun/coin/{MINT}" in joined
+    assert f"https://pump.fun/coin/{MINT_TWO}" in joined
+    assert f"https://dexscreener.com/solana/{MINT_TWO}" in joined
+    assert "search/TWO" not in joined
+
+
+@pytest.mark.asyncio
+async def test_fresh_alert_bypasses_digest_and_persists_actual_visibility(
+    settings,
+    tmp_path,
+) -> None:
+    notifier = SimpleNamespace(on_runner_fresh=AsyncMock(return_value=True))
+    engine = SmartMoneyEngine(
+        replace(settings, database_path=str(tmp_path / "fresh.db")),
+        notifier=notifier,
+    )
+    candidate = _candidate(
+        current_callout=_callout(pair_age=1, buys=12, sells=4, volume="3000"),
+    )
+    await engine.initialize()
+    try:
+        await engine.database.store_runner_candidate(
+            candidate,
+            payload_json=runner_candidate_to_json(candidate),
+            snapshot_json=runner_snapshot_to_json(candidate.current),
+        )
+
+        assert await engine._maybe_publish_fresh(candidate) is True
+        assert await engine._maybe_publish_fresh(candidate) is False
+        rows = await engine.database.runner_latency_rows(limit=50)
+    finally:
+        await engine.close()
+
+    notifier.on_runner_fresh.assert_awaited_once_with(candidate)
+    assert rows[0]["first_discord_visible_at"] is not None
+    assert rows[0]["first_visible_market_cap_usd"] == float(
+        candidate.current.market_cap_usd
+    )
+
+
+@pytest.mark.asyncio
+async def test_latency_reports_source_visibility_and_mc_appreciation(settings, tmp_path) -> None:
+    engine = SmartMoneyEngine(replace(settings, database_path=str(tmp_path / "latency.db")))
+    candidate = replace(
+        _candidate(),
+        first_seen_at=1_050,
+        radar_first_seen_at=1_050,
+        pair_created_at=1_000,
+        first=replace(_candidate().first, captured_at=1_050, market_cap_usd=Decimal("100")),
+        current=replace(
+            _candidate().current,
+            captured_at=1_050,
+            market_cap_usd=Decimal("100"),
+        ),
+        generated_at=1_050,
+    )
+    await engine.initialize()
+    try:
+        await engine.database.store_runner_candidate(
+            candidate,
+            payload_json=runner_candidate_to_json(candidate),
+            snapshot_json=runner_snapshot_to_json(candidate.current),
+        )
+        await engine.database.mark_runner_visible(
+            mint=candidate.mint,
+            visible_at=1_090,
+            market_cap_usd=Decimal("200"),
+        )
+        result = await engine.runner_latency(limit=50)
+    finally:
+        await engine.close()
+
+    assert result["source_to_first_seen_median"] == Decimal("50")
+    assert result["first_seen_to_discord_median"] == Decimal("40")
+    assert result["discovered_within"]["60s"] == Decimal("100.00")
+    assert result["median_mc_appreciation_to_visible"] == Decimal("100.00")
+
+
+@pytest.mark.asyncio
+async def test_risk_escalation_and_invalidation_are_meaningful_and_deduplicated(
+    settings,
+    tmp_path,
+) -> None:
+    notifier = SimpleNamespace(
+        on_runner_risk_escalation=AsyncMock(return_value=True),
+        on_runner_invalidated=AsyncMock(return_value=True),
+    )
+    engine = SmartMoneyEngine(
+        replace(settings, database_path=str(tmp_path / "risk-events.db")),
+        notifier=notifier,
+    )
+    previous = replace(
+        _candidate(),
+        first_discord_visible_at=1_800_000_610,
+        current=replace(_candidate().current, top10_percent=Decimal("25")),
+        safety=RunnerSafetyAssessment(status="UNKNOWN"),
+    )
+    current = replace(
+        previous,
+        generated_at=previous.generated_at + 60,
+        current=replace(previous.current, top10_percent=Decimal("61")),
+        safety=RunnerSafetyAssessment(
+            scam_risk_score=Decimal("85"),
+            scam_risk_level="CRITICAL",
+            status="FAIL",
+            failures=("Top10 concentration is 61.0%",),
+        ),
+    )
+    await engine.initialize()
+    try:
+        for item in (previous, current):
+            await engine.database.store_runner_candidate(
+                item,
+                payload_json=runner_candidate_to_json(item),
+                snapshot_json=runner_snapshot_to_json(item.current),
+            )
+        await engine._evaluate_runner_transitions(previous, current)
+        await engine._evaluate_runner_transitions(previous, current)
+    finally:
+        await engine.close()
+
+    notifier.on_runner_risk_escalation.assert_awaited_once()
+    risk_changes = notifier.on_runner_risk_escalation.await_args.args[1]
+    assert any("Top10" in item for item in risk_changes)
+    notifier.on_runner_invalidated.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_detection_safety_and_forensics_never_gain_future_knowledge(
+    settings,
+    tmp_path,
+) -> None:
+    database = Database(str(tmp_path / "no-lookahead.db"), Decimal("1000"))
+    await database.connect()
+    detected = _candidate()
+    future_forensics = RunnerForensics(
+        available=True,
+        cluster_adjusted_percent=Decimal("60"),
+        checked_at=detected.generated_at + 60,
+    )
+    future = replace(
+        detected,
+        generated_at=detected.generated_at + 60,
+        score=Decimal("90"),
+        safety=RunnerSafetyAssessment(status="FAIL"),
+        forensics=future_forensics,
+        detection_safety=RunnerSafetyAssessment(status="FAIL"),
+        detection_forensics=future_forensics,
+        detection_score=Decimal("90"),
+    )
+    try:
+        for item in (detected, future):
+            await database.store_runner_candidate(
+                item,
+                payload_json=runner_candidate_to_json(item),
+                snapshot_json=runner_snapshot_to_json(item.current),
+            )
+        stored = runner_candidate_from_json(
+            str(await database.runner_candidate_payload(detected.mint))
+        )
+    finally:
+        await database.close()
+
+    assert stored.score == Decimal("90")
+    assert stored.detection_score == detected.detection_score
+    assert stored.detection_safety == detected.detection_safety
+    assert stored.detection_forensics == detected.detection_forensics
+
+
+@pytest.mark.asyncio
+async def test_sellability_check_is_quote_only_and_uses_bought_token_amount() -> None:
+    market = SimpleNamespace(api_key="configured", quote_order=AsyncMock(return_value=_quote()))
+    analyzer = CoinCalloutAnalyzer(
+        SimpleNamespace(),
+        SimpleNamespace(),
+        SimpleNamespace(),
+        market,
+    )
+    token = _callout().token_info
+    buy_quote = _quote()
+
+    sell_quote, error = await analyzer._sell_quote(token, buy_quote)
+
+    assert error is None
+    assert sell_quote is not None
+    market.quote_order.assert_awaited_once_with(
+        input_mint=MINT,
+        output_mint=MINT_TWO,
+        amount_raw=buy_quote.output_amount_raw,
+        input_decimals=6,
+        output_decimals=6,
+    )
+    assert not hasattr(market, "execute_order")
+
+
+def test_high_signal_with_failed_safety_is_unsafe_momentum_not_entry() -> None:
+    strong_social = XSocialSnapshot(
+        available=True,
+        contract_posts=8,
+        contract_authors=6,
+        credible_contract_authors=3,
+        posts_per_minute=Decimal("0.5"),
+    )
+    first_callout = _callout(
+        price="0.001",
+        market_cap="50000",
+        volume="1000",
+        buys=10,
+        sells=5,
+    )
+    risky_callout = replace(
+        _callout(
+            price="0.0014",
+            market_cap="70000",
+            liquidity="30000",
+            volume="7000",
+            buys=60,
+            sells=10,
+            holders=400,
+            pair_age=2,
+            change_5m="25",
+            top10="86.55",
+            social=strong_social,
+            smart_wallets=("alpha", "beta", "gamma"),
+        ),
+        sell_quote=_quote(),
+    )
+    forensics = RunnerForensics(
+        available=True,
+        cluster_adjusted_percent=Decimal("86.55"),
+        checked_at=1_800_000_600,
+    )
+
+    candidate = score_runner_candidate(
+        risky_callout,
+        first=_snapshot(first_callout, at=1_800_000_000),
+        current=_snapshot(risky_callout, at=1_800_000_600, unique=5),
+        history=(
+            _snapshot(
+                _callout(volume="2000", buys=25, sells=8),
+                at=1_800_000_300,
+            ),
+        ),
+        graduated_at=1_800_000_480,
+        graduation_source="DEX_PAIR_CREATED_PROXY",
+        smart_wallets=("alpha", "beta", "gamma"),
+        forensics=forensics,
+        now=1_800_000_600,
+    )
+
+    assert candidate.score >= 50
+    assert candidate.safety.status == "FAIL"
+    assert candidate.safety.entry_eligible is False
+    assert candidate.state == "⚠️ UNSAFE MOMENTUM"

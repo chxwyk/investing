@@ -74,6 +74,8 @@ from .models import (
     PumpLaunchResult,
     RiskDecision,
     RunnerCandidate,
+    RunnerForensics,
+    RunnerFundingObservation,
     ScoredTrader,
     Side,
     Signal,
@@ -93,12 +95,19 @@ from .rpc import SolanaRPC
 from .runner import (
     RUNNER_HORIZONS_SECONDS,
     forward_return_percent,
+    fresh_watch_schedule,
+    funding_observation_from_transaction,
+    is_fresh_research_worthy,
     runner_candidate_from_json,
     runner_candidate_to_json,
+    runner_forensics_from_json,
+    runner_forensics_to_json,
+    runner_path_metrics,
     runner_snapshot_from_callout,
     runner_snapshot_from_json,
     runner_snapshot_to_json,
     score_runner_candidate,
+    summarize_forensics,
 )
 from .scoring import rank_traders
 from .social import (
@@ -147,7 +156,20 @@ class Notifier(Protocol):
 
     async def on_fomo_watch(self, callout: CoinCallout) -> None: ...
 
-    async def on_runner_alert(self, candidate: RunnerCandidate) -> None: ...
+    async def on_runner_alert(self, candidate: RunnerCandidate) -> bool: ...
+
+    async def on_runner_fresh(self, candidate: RunnerCandidate) -> bool: ...
+
+    async def on_runner_risk_escalation(
+        self, candidate: RunnerCandidate, changes: tuple[str, ...]
+    ) -> bool: ...
+
+    async def on_runner_invalidated(
+        self,
+        candidate: RunnerCandidate,
+        metrics: dict[str, object],
+        reasons: tuple[str, ...],
+    ) -> bool: ...
 
     async def on_runner_digest(
         self,
@@ -192,8 +214,24 @@ class NullNotifier:
     async def on_fomo_watch(self, callout: CoinCallout) -> None:
         return None
 
-    async def on_runner_alert(self, candidate: RunnerCandidate) -> None:
-        return None
+    async def on_runner_alert(self, candidate: RunnerCandidate) -> bool:
+        return False
+
+    async def on_runner_fresh(self, candidate: RunnerCandidate) -> bool:
+        return False
+
+    async def on_runner_risk_escalation(
+        self, candidate: RunnerCandidate, changes: tuple[str, ...]
+    ) -> bool:
+        return False
+
+    async def on_runner_invalidated(
+        self,
+        candidate: RunnerCandidate,
+        metrics: dict[str, object],
+        reasons: tuple[str, ...],
+    ) -> bool:
+        return False
 
     async def on_runner_digest(
         self,
@@ -1141,7 +1179,7 @@ class SmartMoneyEngine:
             await asyncio.sleep(self.settings.x_radar_poll_seconds)
 
     async def _run_fomo_radar(self) -> None:
-        """Broad, cheap discovery feeding legacy callouts and runner shadow research."""
+        """Fast public nomination lane; the digest remains a separate slow summary."""
 
         while True:
             try:
@@ -1153,12 +1191,40 @@ class SmartMoneyEngine:
                     if now - self._fomo_radar_seen.get(mint, 0)
                     >= self.settings.fomo_radar_recheck_seconds
                 ]
-                for mint in due[: self.settings.fomo_radar_max_candidates_per_scan]:
+                selected = due[: self.settings.fomo_radar_max_candidates_per_scan]
+                for mint in selected:
                     self._fomo_radar_seen[mint] = now
                     if self.settings.coin_callouts_enabled:
                         self._queue_coin_callout(mint)
-                    if self.settings.fomo_runner_enabled:
-                        candidate = await self.analyze_runner(mint)
+                if self.settings.fomo_runner_enabled:
+                    async def evaluate(
+                        mint: str,
+                        radar_seen_at: int = now,
+                    ) -> RunnerCandidate | None:
+                        try:
+                            async with asyncio.timeout(30):
+                                return await self.analyze_runner(
+                                    mint,
+                                    radar_seen_at=radar_seen_at,
+                                )
+                        except Exception as exc:
+                            await self.notifier.on_error(
+                                f"Fomo fresh analysis {mint[:8]}", exc
+                            )
+                            return None
+
+                    evaluated = await asyncio.gather(*(evaluate(mint) for mint in selected))
+                    candidates = [item for item in evaluated if item is not None]
+                    candidates.sort(
+                        key=lambda item: (
+                            item.pair_created_at is not None,
+                            item.pair_created_at or 0,
+                            item.score,
+                        ),
+                        reverse=True,
+                    )
+                    for candidate in candidates:
+                        await self._maybe_publish_fresh(candidate)
                         await self._maybe_publish_runner(candidate)
                         self._start_runner_fast_watch(candidate)
                 if len(self._fomo_radar_seen) > 1000:
@@ -1182,25 +1248,30 @@ class SmartMoneyEngine:
         refresh_market: bool = True,
         x_evidence=None,
         allow_automatic_x: bool = True,
+        deep_forensics: bool = False,
+        radar_seen_at: int | None = None,
     ) -> RunnerCandidate:
         """Capture and persist one time-T existing-token runner evaluation."""
 
         await self.initialize()
-        now = int(time.time())
+        analysis_started_at = int(time.time())
+        radar_seen_at = radar_seen_at or analysis_started_at
         buyer_evidence = await self.database.recent_verified_token_buy_evidence(
             mint,
-            now - max(3_600, self.settings.coin_callout_window_seconds),
+            analysis_started_at - max(3_600, self.settings.coin_callout_window_seconds),
         )
         buyers = await self.database.recent_verified_token_buyers(
             mint,
-            now - max(3_600, self.settings.coin_callout_window_seconds),
+            analysis_started_at - max(3_600, self.settings.coin_callout_window_seconds),
         )
         callout = await self.analyze_coin(
             mint,
             buyers=buyers,
             allow_x_search=False,
             refresh_market=refresh_market,
+            verify_sell_route=deep_forensics,
         )
+        now = int(time.time())
         if x_evidence is not None:
             callout = replace(callout, social=x_evidence)
         current = runner_snapshot_from_callout(
@@ -1213,16 +1284,46 @@ class SmartMoneyEngine:
         if prior_raw:
             prior_candidate = runner_candidate_from_json(prior_raw)
             first = prior_candidate.first
-            graduated_at = prior_candidate.graduated_at
+            legacy_pair_proxy = bool(
+                prior_candidate.graduated_at is not None
+                and prior_candidate.graduation_source.startswith("DEX_PAIR_CREATED_PROXY")
+            )
+            pair_created_at = prior_candidate.pair_created_at or (
+                prior_candidate.graduated_at if legacy_pair_proxy else None
+            )
+            graduated_at = None if legacy_pair_proxy else prior_candidate.graduated_at
             graduation_source = prior_candidate.graduation_source
         else:
             first = current
             pair_age = callout.dex.pair_age_minutes
-            graduated_at = now - pair_age * 60 if pair_age is not None else None
+            pair_created_at = now - pair_age * 60 if pair_age is not None else None
+            graduated_at = None
             graduation_source = (
                 "DEX_PAIR_CREATED_PROXY — not exact Pump graduation"
                 if pair_age is not None
                 else "UNAVAILABLE"
+            )
+            prior_candidate = None
+        forensic_payload = (
+            await self.database.runner_forensics_payload(mint)
+            if self.database.connection is not None
+            else None
+        )
+        forensics = (
+            runner_forensics_from_json(forensic_payload)
+            if forensic_payload
+            else RunnerForensics()
+        )
+        if deep_forensics and (
+            not forensics.available or now - forensics.dynamic_checked_at >= 60
+        ):
+            forensics = await self._collect_runner_forensics(
+                mint,
+                raw_unique_buyers=int(buyer_evidence["unique_buyers"]),
+                raw_top10_percent=current.top10_percent,
+                buyer_first_seen_at=dict(buyer_evidence.get("buyer_first_seen_at", {})),
+                now=now,
+                cached=forensics if forensics.available else None,
             )
         history = tuple(
             runner_snapshot_from_json(item)
@@ -1231,6 +1332,11 @@ class SmartMoneyEngine:
                 before_at=now,
                 limit=30,
             )
+        )
+        score_history = (
+            await self.database.runner_score_history(mint)
+            if self.database.connection is not None
+            else ()
         )
         candidate = score_runner_candidate(
             callout,
@@ -1241,18 +1347,54 @@ class SmartMoneyEngine:
             graduation_source=graduation_source,
             earliest_smart_entry_at=buyer_evidence["earliest_buy_at"],
             smart_wallets=tuple(buyer_evidence["wallets"]),
+            smart_wallet_addresses=tuple(buyer_evidence.get("wallet_addresses", ())),
+            forensics=forensics,
+            score_history=score_history,
+            pair_created_at=pair_created_at,
             now=now,
         )
+        if prior_candidate is not None:
+            candidate = replace(
+                candidate,
+                chain_created_at=prior_candidate.chain_created_at,
+                pair_created_at=prior_candidate.pair_created_at or candidate.pair_created_at,
+                radar_first_seen_at=(
+                    prior_candidate.radar_first_seen_at or prior_candidate.first_seen_at
+                ),
+                first_market_data_at=(
+                    prior_candidate.first_market_data_at or candidate.first_market_data_at
+                ),
+                first_research_eligible_at=(
+                    prior_candidate.first_research_eligible_at
+                    or candidate.first_research_eligible_at
+                ),
+                first_discord_visible_at=prior_candidate.first_discord_visible_at,
+                entry_eligible_at=(
+                    prior_candidate.entry_eligible_at or candidate.entry_eligible_at
+                ),
+                strong_alert_at=prior_candidate.strong_alert_at,
+                detection_safety=prior_candidate.detection_safety,
+                detection_forensics=prior_candidate.detection_forensics,
+                detection_score=prior_candidate.detection_score,
+            )
+        else:
+            candidate = replace(candidate, radar_first_seen_at=radar_seen_at)
         public_ready = bool(
             candidate.score >= self.settings.fomo_runner_public_alert_min_score
-            and not candidate.hard_blockers
+            and candidate.safety.status == "PASS"
+            and candidate.safety.entry_eligible
+            and not candidate.overextended
+        )
+        x_worthy = bool(
+            candidate.score >= self.settings.fomo_runner_public_alert_min_score
+            and candidate.safety.status == "PASS"
             and not candidate.overextended
         )
         candidate = replace(candidate, research_only=not public_ready)
 
         if (
             allow_automatic_x
-            and public_ready
+            and x_worthy
             and self.x_social.search_enabled
             and not candidate.x_evidence.available
         ):
@@ -1274,13 +1416,68 @@ class SmartMoneyEngine:
                     graduation_source=graduation_source,
                     earliest_smart_entry_at=buyer_evidence["earliest_buy_at"],
                     smart_wallets=tuple(buyer_evidence["wallets"]),
+                    smart_wallet_addresses=tuple(
+                        buyer_evidence.get("wallet_addresses", ())
+                    ),
+                    forensics=forensics,
+                    score_history=candidate.score_history[:-1],
+                    pair_created_at=pair_created_at,
                     now=now,
                 )
                 candidate = replace(
                     candidate,
+                    chain_created_at=(
+                        prior_candidate.chain_created_at if prior_candidate else None
+                    ),
+                    pair_created_at=(
+                        prior_candidate.pair_created_at
+                        if prior_candidate and prior_candidate.pair_created_at
+                        else candidate.pair_created_at
+                    ),
+                    radar_first_seen_at=(
+                        prior_candidate.radar_first_seen_at
+                        if prior_candidate
+                        else radar_seen_at
+                    ),
+                    first_market_data_at=(
+                        prior_candidate.first_market_data_at
+                        if prior_candidate
+                        else candidate.first_market_data_at
+                    ),
+                    first_research_eligible_at=(
+                        prior_candidate.first_research_eligible_at
+                        if prior_candidate and prior_candidate.first_research_eligible_at
+                        else candidate.first_research_eligible_at
+                    ),
+                    first_discord_visible_at=(
+                        prior_candidate.first_discord_visible_at if prior_candidate else None
+                    ),
+                    entry_eligible_at=(
+                        prior_candidate.entry_eligible_at
+                        if prior_candidate and prior_candidate.entry_eligible_at
+                        else candidate.entry_eligible_at
+                    ),
+                    strong_alert_at=(
+                        prior_candidate.strong_alert_at if prior_candidate else None
+                    ),
+                    detection_safety=(
+                        prior_candidate.detection_safety
+                        if prior_candidate
+                        else candidate.detection_safety
+                    ),
+                    detection_forensics=(
+                        prior_candidate.detection_forensics
+                        if prior_candidate
+                        else candidate.detection_forensics
+                    ),
+                    detection_score=(
+                        prior_candidate.detection_score
+                        if prior_candidate
+                        else candidate.detection_score
+                    ),
                     research_only=bool(
                         candidate.score < self.settings.fomo_runner_public_alert_min_score
-                        or candidate.hard_blockers
+                        or candidate.safety.status != "PASS"
                         or candidate.overextended
                     ),
                 )
@@ -1290,10 +1487,131 @@ class SmartMoneyEngine:
             payload_json=runner_candidate_to_json(candidate),
             snapshot_json=runner_snapshot_to_json(candidate.current),
         )
+        if forensics.available:
+            await self.database.store_runner_forensics(
+                mint=mint,
+                payload_json=runner_forensics_to_json(forensics),
+                funding_checked_at=forensics.funding_checked_at or forensics.checked_at,
+                dynamic_checked_at=forensics.dynamic_checked_at or forensics.checked_at,
+            )
         await self._record_runner_outcomes(candidate)
+        if prior_candidate is not None:
+            await self._evaluate_runner_transitions(prior_candidate, candidate)
         self.runner_last_evaluated_at = now
         self.runner_last_candidate_mint = mint
         return candidate
+
+    async def _collect_runner_forensics(
+        self,
+        mint: str,
+        *,
+        raw_unique_buyers: int,
+        raw_top10_percent: Decimal | None,
+        buyer_first_seen_at: dict[str, int],
+        now: int,
+        cached: RunnerForensics | None = None,
+    ) -> RunnerForensics:
+        """Bounded documented-RPC holder/funder trace for promoted candidates only."""
+
+        try:
+            largest_rows, supply_row = await asyncio.gather(
+                self.rpc.get_token_largest_accounts(mint),
+                self.rpc.get_token_supply(mint),
+            )
+            token_accounts = [
+                str(item.get("address") or "")
+                for item in largest_rows[:12]
+                if item.get("address")
+            ]
+            accounts = await self.rpc.get_multiple_parsed_accounts(token_accounts)
+            supply_raw = Decimal(str(supply_row.get("amount") or 0))
+            owner_supply: dict[str, Decimal] = {}
+            for largest, account in zip(largest_rows[:12], accounts, strict=False):
+                if not isinstance(account, dict):
+                    continue
+                info = (((account.get("data") or {}).get("parsed") or {}).get("info") or {})
+                owner = str(info.get("owner") or "")
+                amount_raw = Decimal(str(largest.get("amount") or 0))
+                if owner and supply_raw > 0:
+                    owner_supply[owner] = owner_supply.get(owner, Decimal("0")) + (
+                        amount_raw / supply_raw * Decimal("100")
+                    )
+
+            cached_observations = {
+                item.wallet: item for item in (cached.observations if cached else ())
+            }
+
+            async def trace(owner: str, supply_percent: Decimal) -> RunnerFundingObservation:
+                prior = cached_observations.get(owner)
+                if prior is not None and prior.funder:
+                    return replace(
+                        prior,
+                        supply_percent=supply_percent,
+                        bought_at=prior.bought_at or buyer_first_seen_at.get(owner),
+                    )
+                try:
+                    signatures = await self.rpc.get_signatures_for_address(owner, limit=20)
+                    if not signatures:
+                        return RunnerFundingObservation(
+                            wallet=owner,
+                            supply_percent=supply_percent,
+                        )
+                    signature = str(signatures[-1].get("signature") or "")
+                    transaction = await self.rpc.get_transaction(signature) if signature else None
+                    return funding_observation_from_transaction(
+                        transaction,
+                        wallet=owner,
+                        supply_percent=supply_percent,
+                        bought_at=buyer_first_seen_at.get(owner),
+                    )
+                except (RpcError, ValueError, TypeError):
+                    return RunnerFundingObservation(
+                        wallet=owner,
+                        supply_percent=supply_percent,
+                    )
+
+            observations = await asyncio.gather(
+                *(trace(owner, percent) for owner, percent in owner_supply.items())
+            )
+            result = summarize_forensics(
+                observations,
+                raw_unique_buyers=raw_unique_buyers,
+                raw_top10_percent=raw_top10_percent,
+                checked_at=now,
+                warnings=(
+                    "Bounded top-holder trace; untraced wallets remain independent "
+                    "only as unknown.",
+                    "Funding links are coordination evidence, not real-person identification.",
+                    "Creator history is unavailable unless direct public-chain evidence "
+                    "identifies it.",
+                ),
+            )
+            return replace(
+                result,
+                funding_checked_at=(
+                    cached.funding_checked_at
+                    if cached and cached.funding_checked_at
+                    else now
+                ),
+                dynamic_checked_at=now,
+            )
+        except (RpcError, ValueError, TypeError) as exc:
+            return RunnerForensics(
+                available=False,
+                raw_unique_buyers=raw_unique_buyers,
+                warnings=(f"bounded public RPC forensics unavailable: {str(exc)[:160]}",),
+                checked_at=now,
+            )
+
+    async def runner_forensic(self, mint: str) -> RunnerCandidate:
+        """Run read-only exact-mint forensics; never executes, signs, launches, or spends."""
+
+        return await self.analyze_runner(
+            mint,
+            refresh_market=True,
+            allow_automatic_x=False,
+            deep_forensics=True,
+        )
 
     async def verify_runner_x(self, candidate: RunnerCandidate) -> RunnerCandidate:
         """Run one exact-contract official-X lookup through the shared budget guard."""
@@ -1427,6 +1745,185 @@ class SmartMoneyEngine:
         )
         return tuple(candidates[: self.settings.fomo_runner_lab_candidates])
 
+    async def _maybe_publish_fresh(self, candidate: RunnerCandidate) -> bool:
+        if not self.settings.fomo_runner_fresh_alert_enabled or not is_fresh_research_worthy(
+            candidate,
+            max_age_seconds=self.settings.fomo_runner_fresh_max_age_seconds,
+        ):
+            return False
+        now = int(time.time())
+        reserved = await self.database.reserve_runner_alert(
+            mint=candidate.mint,
+            event_type="FRESH",
+            fingerprint="fresh-v1",
+            now=now,
+        )
+        if not reserved:
+            return False
+        sent = await self.notifier.on_runner_fresh(candidate)
+        if sent is False:
+            await self.database.release_runner_alert(
+                mint=candidate.mint,
+                event_type="FRESH",
+            )
+            return False
+        visible_at = int(time.time())
+        await self.database.mark_runner_visible(
+            mint=candidate.mint,
+            visible_at=visible_at,
+            market_cap_usd=candidate.current.market_cap_usd,
+        )
+        return True
+
+    @staticmethod
+    def _runner_risk_changes(
+        previous: RunnerCandidate,
+        current: RunnerCandidate,
+    ) -> tuple[str, ...]:
+        changes: list[str] = []
+        pairs = (
+            ("Top10", previous.current.top10_percent, current.current.top10_percent),
+            (
+                "Largest cluster",
+                previous.forensics.largest_cluster_supply_percent,
+                current.forensics.largest_cluster_supply_percent,
+            ),
+        )
+        for label, before, after in pairs:
+            if before is not None and after is not None and after - before >= Decimal("15"):
+                changes.append(f"{label}: {before:.1f}% → {after:.1f}%")
+        before_liquidity = previous.current.liquidity_usd
+        after_liquidity = current.current.liquidity_usd
+        if (
+            before_liquidity is not None
+            and before_liquidity > 0
+            and after_liquidity is not None
+            and after_liquidity <= before_liquidity * Decimal("0.75")
+        ):
+            changes.append(
+                f"Liquidity: ${before_liquidity:,.0f} → ${after_liquidity:,.0f}"
+            )
+        if (
+            previous.current.sell_route_status == "PASS"
+            and current.current.sell_route_status != "PASS"
+        ):
+            changes.append(
+                f"Sell route: PASS → {current.current.sell_route_status}"
+            )
+        if previous.safety.status != "FAIL" and current.safety.status == "FAIL":
+            changes.append("Safety: non-fail → FAIL")
+        return tuple(changes)
+
+    async def _evaluate_runner_transitions(
+        self,
+        previous: RunnerCandidate,
+        current: RunnerCandidate,
+    ) -> None:
+        if previous.first_discord_visible_at is None:
+            return
+        changes = self._runner_risk_changes(previous, current)
+        if changes:
+            fingerprint = hashlib.sha256("|".join(changes).encode()).hexdigest()
+            if await self.database.reserve_runner_alert(
+                mint=current.mint,
+                event_type="RISK_ESCALATION",
+                fingerprint=fingerprint,
+                now=current.generated_at,
+                allow_changed_fingerprint=True,
+            ):
+                sent = await self.notifier.on_runner_risk_escalation(current, changes)
+                if sent is False:
+                    await self.database.release_runner_alert(
+                        mint=current.mint,
+                        event_type="RISK_ESCALATION",
+                    )
+
+        snapshots = [
+            runner_snapshot_from_json(raw)
+            for raw in await self.database.runner_snapshot_payloads(current.mint, limit=200)
+        ]
+        market_caps = [item.market_cap_usd for item in snapshots if item.market_cap_usd is not None]
+        peak_mc = max(market_caps) if market_caps else current.current.market_cap_usd
+        current_mc = current.current.market_cap_usd
+        drawdown = (
+            (Decimal("1") - current_mc / peak_mc) * Decimal("100")
+            if peak_mc is not None and peak_mc > 0 and current_mc is not None
+            else None
+        )
+        first_liquidity = current.first.liquidity_usd
+        current_liquidity = current.current.liquidity_usd
+        liquidity_decline = (
+            (Decimal("1") - current_liquidity / first_liquidity) * Decimal("100")
+            if first_liquidity is not None
+            and first_liquidity > 0
+            and current_liquidity is not None
+            else None
+        )
+        reasons: list[str] = []
+        if (
+            drawdown is not None
+            and drawdown >= self.settings.fomo_runner_invalidation_drawdown_percent
+        ):
+            reasons.append(f"post-detection peak drawdown reached {drawdown:.1f}%")
+        if (
+            liquidity_decline is not None
+            and liquidity_decline
+            >= self.settings.fomo_runner_invalidation_liquidity_decline_percent
+        ):
+            reasons.append(f"liquidity declined {liquidity_decline:.1f}%")
+        if (
+            current_liquidity is None
+            or current_liquidity
+            < self.settings.fomo_runner_invalidation_liquidity_floor_usd
+        ):
+            reasons.append("liquidity fell below the hard floor")
+        if current.current.rugged:
+            reasons.append("rug flag appeared")
+        if (
+            previous.current.sell_route_status == "PASS"
+            and current.current.sell_route_status != "PASS"
+        ):
+            reasons.append("sell route disappeared or degraded")
+        if previous.safety.status != "FAIL" and current.safety.status == "FAIL":
+            concentration_failures = tuple(
+                failure
+                for failure in current.safety.failures
+                if any(
+                    label in failure.casefold()
+                    for label in ("top10", "cluster", "bundler", "insider", "sniper", "dev")
+                )
+            )
+            if concentration_failures:
+                reasons.append("critical holder or linked-cluster risk appeared")
+        if not reasons:
+            return
+        fingerprint = hashlib.sha256("|".join(sorted(reasons)).encode()).hexdigest()
+        reserved = await self.database.reserve_runner_alert(
+            mint=current.mint,
+            event_type="INVALIDATED",
+            fingerprint=fingerprint,
+            now=current.generated_at,
+        )
+        if not reserved:
+            return
+        sent = await self.notifier.on_runner_invalidated(
+            current,
+            {
+                "first_market_cap": current.first.market_cap_usd,
+                "peak_market_cap": peak_mc,
+                "current_market_cap": current_mc,
+                "peak_return": forward_return_percent(peak_mc, current.first.market_cap_usd),
+                "drawdown_from_peak": drawdown,
+                "liquidity_decline": liquidity_decline,
+            },
+            tuple(reasons),
+        )
+        if sent is False:
+            await self.database.release_runner_alert(
+                mint=current.mint,
+                event_type="INVALIDATED",
+            )
+
     async def _maybe_publish_runner(self, candidate: RunnerCandidate) -> None:
         if candidate.research_only:
             return
@@ -1434,8 +1931,35 @@ class SmartMoneyEngine:
         previous = self._runner_last_alert.get(candidate.mint)
         if previous and now - previous[0] < 300 and candidate.score < previous[1] + 5:
             return
+        fingerprint = f"{int(candidate.score // 5)}:{candidate.state}:{candidate.safety.status}"
+        if not await self.database.reserve_runner_alert(
+            mint=candidate.mint,
+            event_type="STRONG",
+            fingerprint=fingerprint,
+            now=now,
+            allow_changed_fingerprint=True,
+        ):
+            return
         self._runner_last_alert[candidate.mint] = (now, candidate.score)
-        await self.notifier.on_runner_alert(candidate)
+        sent = await self.notifier.on_runner_alert(candidate)
+        if sent is False:
+            await self.database.release_runner_alert(
+                mint=candidate.mint,
+                event_type="STRONG",
+            )
+            return
+        visible_at = int(time.time())
+        await self.database.mark_runner_visible(
+            mint=candidate.mint,
+            visible_at=visible_at,
+            market_cap_usd=candidate.current.market_cap_usd,
+        )
+        await self.database.mark_runner_visible(
+            mint=candidate.mint,
+            visible_at=visible_at,
+            market_cap_usd=candidate.current.market_cap_usd,
+            strong=True,
+        )
         await self.database.set_setting("runner_last_strong_alert_at", str(now))
         await self.database.set_setting("runner_last_strong_alert_mint", candidate.mint)
 
@@ -1443,19 +1967,37 @@ class SmartMoneyEngine:
         if candidate.mint in self._runner_fast_watch_tasks:
             return
         age_minutes = (
-            max(0, candidate.generated_at - candidate.graduated_at) // 60
-            if candidate.graduated_at
+            max(
+                0,
+                candidate.generated_at
+                - (candidate.graduated_at or candidate.pair_created_at or 0),
+            )
+            // 60
+            if candidate.graduated_at or candidate.pair_created_at
             else None
         )
+        fresh = is_fresh_research_worthy(
+            candidate,
+            max_age_seconds=self.settings.fomo_runner_fresh_max_age_seconds,
+        )
+        watch_as_fresh = fresh and self.settings.fomo_runner_fresh_watch_enabled
+        maximum_watch = (
+            self.settings.fomo_runner_fresh_watch_max
+            if watch_as_fresh
+            else self.settings.fomo_runner_max_fast_watch
+        )
         if (
-            candidate.score < self.settings.fomo_runner_fast_watch_min_score
+            (
+                candidate.score < self.settings.fomo_runner_fast_watch_min_score
+                and not watch_as_fresh
+            )
             or age_minutes is None
             or age_minutes > self.settings.fomo_runner_max_graduation_age_minutes
-            or len(self._runner_fast_watch_tasks) >= self.settings.fomo_runner_max_fast_watch
+            or len(self._runner_fast_watch_tasks) >= maximum_watch
         ):
             return
         task = asyncio.create_task(
-            self._fast_watch_runner(candidate.mint),
+            self._fast_watch_runner(candidate.mint, fresh=watch_as_fresh),
             name=f"runner-fast-{candidate.mint[:8]}",
         )
         self._runner_fast_watch_tasks[candidate.mint] = task
@@ -1465,15 +2007,54 @@ class SmartMoneyEngine:
             lambda _task, mint=candidate.mint: self._runner_fast_watch_tasks.pop(mint, None)
         )
 
-    async def _fast_watch_runner(self, mint: str) -> None:
+    async def _fast_watch_runner(self, mint: str, *, fresh: bool = False) -> None:
         started_at = int(time.time())
         await self.database.set_setting("runner_last_fast_watch_mint", mint)
         await self.database.set_setting("runner_last_fast_watch_at", str(started_at))
-        stop_at = time.monotonic() + self.settings.fomo_runner_fast_watch_minutes * 60
-        while time.monotonic() < stop_at:
-            await asyncio.sleep(self.settings.fomo_runner_fast_watch_seconds)
-            candidate = await self.analyze_runner(mint, refresh_market=True)
+        schedule = fresh_watch_schedule(
+            (
+                self.settings.fomo_runner_fresh_watch_seconds
+                if fresh
+                else self.settings.fomo_runner_fast_watch_seconds
+            ),
+            self.settings.fomo_runner_fast_watch_minutes,
+        )
+        started_monotonic = time.monotonic()
+        for offset in schedule[1:]:
+            delay = offset - (time.monotonic() - started_monotonic)
+            if delay > 0:
+                await asyncio.sleep(delay)
+            prior_payload = await self.database.runner_candidate_payload(mint)
+            prior = runner_candidate_from_json(prior_payload) if prior_payload else None
+            # Entry-quality candidates refresh the dynamic sell route on every staged
+            # observation. The heavier holder/funding RPC trace remains cached inside
+            # ``analyze_runner`` and refreshes no more than once per minute.
+            deep = bool(
+                prior and prior.score >= self.settings.fomo_runner_forensics_min_score
+            )
+            candidate = await self.analyze_runner(
+                mint,
+                refresh_market=True,
+                deep_forensics=deep,
+            )
+            await self._maybe_publish_fresh(candidate)
             await self._maybe_publish_runner(candidate)
+            elapsed = int(time.monotonic() - started_monotonic)
+            current = candidate.current
+            if (
+                current.rugged
+                or current.sell_route_status == "FAIL"
+                or current.market_cap_usd is None
+                or current.liquidity_usd is None
+                or current.liquidity_usd
+                < self.settings.fomo_runner_invalidation_liquidity_floor_usd
+                or (
+                    elapsed >= 60
+                    and current.buys_5m + current.sells_5m == 0
+                    and current.volume_5m_usd < Decimal("50")
+                )
+            ):
+                break
 
     async def _run_runner_outcomes(self) -> None:
         while True:
@@ -1677,21 +2258,12 @@ class SmartMoneyEngine:
                 for row in snapshots
                 if str(row["mint"]) == mint
             ]
-            timed_changes = [
-                (item.captured_at, value)
-                for item in series
-                if (value := forward_return_percent(item.price_usd, first.price_usd))
-                is not None
-            ]
-            peak = max(timed_changes, key=lambda item: item[1]) if timed_changes else None
+            path = runner_path_metrics(first, series)
             excursions[mint] = {
-                "maximum_favorable": peak[1] if peak else None,
-                "maximum_drawdown": (
-                    min(value for _captured, value in timed_changes)
-                    if timed_changes
-                    else None
-                ),
-                "time_to_peak_seconds": peak[0] - first.captured_at if peak else None,
+                **path,
+                # Backward-compatible names retained for existing result consumers.
+                "maximum_favorable": path["maximum_favorable_excursion"],
+                "maximum_drawdown": path["maximum_adverse_excursion"],
             }
 
         latest_outcome: dict[str, dict[str, object]] = {}
@@ -1746,6 +2318,7 @@ class SmartMoneyEngine:
             "smart_wallets": {},
             "holder_quality": {},
             "x": {},
+            "safety": {},
         }
         detection_delays: list[int] = []
         for mint, item in candidate_objects.items():
@@ -1803,6 +2376,7 @@ class SmartMoneyEngine:
                 "smart_wallets": smart_label,
                 "holder_quality": holder_label,
                 "x": "verified" if item.x_evidence.available else "not-verified",
+                "safety": item.detection_safety.status,
             }
             for group, label in labels.items():
                 bucket_mints[group].setdefault(label, []).append(mint)
@@ -1880,6 +2454,8 @@ class SmartMoneyEngine:
             "median": percentile(score_values, Decimal("0.50")),
             "p90": percentile(score_values, Decimal("0.90")),
             "p95": percentile(score_values, Decimal("0.95")),
+            "gte_15": sum(value >= 15 for value in score_values),
+            "gte_20": sum(value >= 20 for value in score_values),
             "gte_35": sum(value >= 35 for value in score_values),
             "gte_50": sum(value >= 50 for value in score_values),
             "gte_60": sum(value >= 60 for value in score_values),
@@ -1899,6 +2475,65 @@ class SmartMoneyEngine:
             "runner_last_fast_watch_mint"
         )
         stored_fast_watch_at = await self.database.get_setting("runner_last_fast_watch_at")
+
+        def metric_values(key: str) -> list[Decimal]:
+            return sorted(
+                Decimal(str(row[key]))
+                for row in excursions.values()
+                if row.get(key) is not None
+            )
+
+        def event_rate(key: str) -> Decimal | None:
+            values = [row.get(key) for row in excursions.values() if row.get(key) is not None]
+            if not values:
+                return None
+            return (
+                Decimal(sum(value is True for value in values))
+                / Decimal(len(values))
+                * Decimal("100")
+            ).quantize(Decimal("0.01"))
+
+        def metric_median(key: str) -> Decimal | None:
+            return percentile(metric_values(key), Decimal("0.50"))
+
+        path_analytics = {
+            "plus_10_before_minus_25_rate": event_rate("plus_10_before_minus_25"),
+            "plus_25_before_minus_25_rate": event_rate("plus_25_before_minus_25"),
+            "plus_50_before_minus_50_rate": event_rate("plus_50_before_minus_50"),
+            "plus_100_before_minus_50_rate": event_rate("plus_100_before_minus_50"),
+            "median_time_to_25_seconds": metric_median("time_to_25"),
+            "median_time_to_50_seconds": metric_median("time_to_50"),
+            "median_maximum_favorable_excursion": metric_median(
+                "maximum_favorable_excursion"
+            ),
+            "median_maximum_adverse_excursion": metric_median(
+                "maximum_adverse_excursion"
+            ),
+            "median_post_peak_drawdown": metric_median("max_drawdown_from_peak"),
+            "severe_failure_rate": (
+                (
+                    Decimal(
+                        sum(
+                            bool(row.get("rug_or_liquidity_failure"))
+                            or Decimal(str(row.get("max_drawdown_from_peak") or 0)) >= 80
+                            for row in excursions.values()
+                        )
+                    )
+                    / Decimal(len(excursions))
+                    * Decimal("100")
+                ).quantize(Decimal("0.01"))
+                if excursions
+                else None
+            ),
+            "peak_return_distribution": {
+                "median": metric_median("peak_return"),
+                "p90": percentile(metric_values("peak_return"), Decimal("0.90")),
+            },
+            "post_peak_drawdown_distribution": {
+                "median": metric_median("max_drawdown_from_peak"),
+                "p90": percentile(metric_values("max_drawdown_from_peak"), Decimal("0.90")),
+            },
+        }
         return {
             "candidates": len(candidates),
             "outcomes": len(outcomes),
@@ -1909,6 +2544,7 @@ class SmartMoneyEngine:
             "breakdowns": breakdowns,
             "baselines": baselines,
             "score_distribution": score_distribution,
+            "path_analytics": path_analytics,
             "best_current_candidates": best_current,
             "last_strong_alert_at": (
                 int(last_strong_alert) if last_strong_alert else None
@@ -1930,6 +2566,243 @@ class SmartMoneyEngine:
                 "collecting — compare RunnerScore with age/volume/price-gain baselines "
                 "after at least 30 completed 1h observations"
             ),
+        }
+
+    async def runner_latency(self, *, limit: int = 100) -> dict[str, object]:
+        rows = await self.database.runner_latency_rows(limit=limit)
+
+        def percentile(values: list[Decimal], quantile: Decimal) -> Decimal | None:
+            ordered = sorted(values)
+            if not ordered:
+                return None
+            if len(ordered) == 1:
+                return ordered[0]
+            position = Decimal(len(ordered) - 1) * quantile
+            lower = int(position)
+            upper = min(lower + 1, len(ordered) - 1)
+            fraction = position - Decimal(lower)
+            return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
+
+        source_delays: list[Decimal] = []
+        visible_delays: list[Decimal] = []
+        first_caps: list[Decimal] = []
+        visible_caps: list[Decimal] = []
+        appreciations: list[Decimal] = []
+        token_rows: list[dict[str, object]] = []
+        for row in rows:
+            source_at = row.get("chain_created_at") or row.get("pair_created_at") or row.get(
+                "graduated_at"
+            )
+            first_seen = row.get("radar_first_seen_at")
+            visible_at = row.get("first_discord_visible_at")
+            source_delay = (
+                max(0, int(first_seen) - int(source_at))
+                if source_at is not None and first_seen is not None
+                else None
+            )
+            visible_delay = (
+                max(0, int(visible_at) - int(first_seen))
+                if visible_at is not None and first_seen is not None
+                else None
+            )
+            if source_delay is not None:
+                source_delays.append(Decimal(source_delay))
+            if visible_delay is not None:
+                visible_delays.append(Decimal(visible_delay))
+            first_cap = row.get("first_market_cap_usd")
+            visible_cap = row.get("first_visible_market_cap_usd")
+            if first_cap is not None:
+                first_caps.append(Decimal(str(first_cap)))
+            if visible_cap is not None:
+                visible_caps.append(Decimal(str(visible_cap)))
+            appreciation = (
+                forward_return_percent(Decimal(str(visible_cap)), Decimal(str(first_cap)))
+                if first_cap is not None and visible_cap is not None
+                else None
+            )
+            if appreciation is not None:
+                appreciations.append(appreciation)
+            token_rows.append(
+                {
+                    "mint": row["mint"],
+                    "source_to_first_seen_seconds": source_delay,
+                    "first_seen_to_discord_seconds": visible_delay,
+                    "mc_at_first_seen": first_cap,
+                    "mc_at_first_visible_alert": visible_cap,
+                    "mc_at_entry_eligible": row.get("entry_market_cap_usd"),
+                    "peak_mc_after_detection": row.get("peak_market_cap_usd"),
+                }
+            )
+
+        def pct_within(seconds: int) -> Decimal | None:
+            if not source_delays:
+                return None
+            return (
+                Decimal(sum(value <= seconds for value in source_delays))
+                / Decimal(len(source_delays))
+                * Decimal("100")
+            ).quantize(Decimal("0.01"))
+
+        return {
+            "count": len(rows),
+            "source_samples": len(source_delays),
+            "visible_samples": len(visible_delays),
+            "source_to_first_seen_median": percentile(source_delays, Decimal("0.50")),
+            "source_to_first_seen_p90": percentile(source_delays, Decimal("0.90")),
+            "first_seen_to_discord_median": percentile(visible_delays, Decimal("0.50")),
+            "first_seen_to_discord_p90": percentile(visible_delays, Decimal("0.90")),
+            "discovered_within": {
+                "30s": pct_within(30),
+                "60s": pct_within(60),
+                "2m": pct_within(120),
+                "5m": pct_within(300),
+                "10m": pct_within(600),
+            },
+            "median_mc_first_seen": percentile(first_caps, Decimal("0.50")),
+            "median_mc_first_visible": percentile(visible_caps, Decimal("0.50")),
+            "median_mc_appreciation_to_visible": percentile(
+                appreciations, Decimal("0.50")
+            ),
+            "tokens": tuple(token_rows),
+        }
+
+    async def runner_calibration(self) -> dict[str, object]:
+        """Describe detection-time evidence against later outcomes; never tune thresholds."""
+
+        results = await self.runner_results()
+        rows = await self.database.runner_results_rows()
+        mints = tuple(dict.fromkeys(str(row["mint"]) for row in rows))
+        candidates: dict[str, RunnerCandidate] = {}
+        for mint in mints:
+            payload = await self.database.runner_candidate_payload(mint)
+            if payload:
+                candidates[mint] = runner_candidate_from_json(payload)
+        excursions = results["excursions"]
+        assert isinstance(excursions, dict)
+
+        def cohort(kind: str) -> list[RunnerCandidate]:
+            selected: list[RunnerCandidate] = []
+            for mint, item in candidates.items():
+                path = excursions.get(mint, {})
+                if not isinstance(path, dict):
+                    continue
+                if kind == "winner" and Decimal(
+                    str(path.get("maximum_favorable_excursion") or -999)
+                ) >= 25:
+                    selected.append(item)
+                if kind == "failure" and (
+                    bool(path.get("rug_or_liquidity_failure"))
+                    or Decimal(str(path.get("max_drawdown_from_peak") or 0)) >= 80
+                ):
+                    selected.append(item)
+            return selected
+
+        def median(values: list[Decimal]) -> Decimal | None:
+            ordered = sorted(values)
+            return ordered[len(ordered) // 2] if ordered else None
+
+        def characteristics(items: list[RunnerCandidate]) -> dict[str, object]:
+            def decimals(getter) -> list[Decimal]:
+                return [value for item in items if (value := getter(item)) is not None]
+
+            return {
+                "count": len(items),
+                "initial_market_cap": median(decimals(lambda item: item.first.market_cap_usd)),
+                "liquidity": median(decimals(lambda item: item.first.liquidity_usd)),
+                "holders": median(
+                    decimals(
+                        lambda item: (
+                            Decimal(item.first.holder_count)
+                            if item.first.holder_count is not None
+                            else None
+                        )
+                    )
+                ),
+                "pair_age_seconds": median(
+                    decimals(
+                        lambda item: (
+                            Decimal(item.first_seen_at - item.pair_created_at)
+                            if item.pair_created_at is not None
+                            else None
+                        )
+                    )
+                ),
+                "top10": median(decimals(lambda item: item.first.top10_percent)),
+                "dev": median(decimals(lambda item: item.first.dev_percent)),
+                "bundlers": median(decimals(lambda item: item.first.bundlers_percent)),
+                "insiders": median(decimals(lambda item: item.first.insiders_percent)),
+                "snipers": median(decimals(lambda item: item.first.snipers_percent)),
+                "largest_cluster": median(
+                    decimals(
+                        lambda item: item.detection_forensics.largest_cluster_supply_percent
+                    )
+                ),
+                "shared_funders": median(
+                    [
+                        Decimal(len(item.detection_forensics.shared_funder_groups))
+                        for item in items
+                    ]
+                ),
+                "buyer_independence": median(
+                    decimals(
+                        lambda item: (
+                            Decimal(item.detection_forensics.estimated_independent_clusters)
+                            if item.detection_forensics.estimated_independent_clusters is not None
+                            else None
+                        )
+                    )
+                ),
+                "smart_wallet_overlap": median(
+                    [Decimal(item.first.smart_wallet_count) for item in items]
+                ),
+                "sell_route_pass_rate": (
+                    Decimal(sum(item.first.sell_route_status == "PASS" for item in items))
+                    / Decimal(len(items))
+                    * Decimal("100")
+                    if items
+                    else None
+                ),
+            }
+
+        detection_scores = sorted(
+            item.detection_score if item.detection_score is not None else item.score
+            for item in candidates.values()
+        )
+
+        def score_percentile(quantile: Decimal) -> Decimal | None:
+            if not detection_scores:
+                return None
+            if len(detection_scores) == 1:
+                return detection_scores[0]
+            position = Decimal(len(detection_scores) - 1) * quantile
+            lower = int(position)
+            upper = min(lower + 1, len(detection_scores) - 1)
+            fraction = position - Decimal(lower)
+            return detection_scores[lower] + (
+                detection_scores[upper] - detection_scores[lower]
+            ) * fraction
+
+        detection_distribution = {
+            "max": max(detection_scores) if detection_scores else None,
+            "median": score_percentile(Decimal("0.50")),
+            "p90": score_percentile(Decimal("0.90")),
+            "p95": score_percentile(Decimal("0.95")),
+            "gte_15": sum(value >= 15 for value in detection_scores),
+            "gte_20": sum(value >= 20 for value in detection_scores),
+            "gte_35": sum(value >= 35 for value in detection_scores),
+            "gte_50": sum(value >= 50 for value in detection_scores),
+            "gte_60": sum(value >= 60 for value in detection_scores),
+            "gte_70": sum(value >= 70 for value in detection_scores),
+        }
+        return {
+            "candidate_count": results["candidates"],
+            "outcome_count": results["outcomes"],
+            "score_distribution": detection_distribution,
+            "winner_characteristics": characteristics(cohort("winner")),
+            "failure_characteristics": characteristics(cohort("failure")),
+            "safety_buckets": results["breakdowns"]["safety"],
+            "thresholds_changed": False,
+            "no_look_ahead": True,
         }
 
     async def _handle_news_alert(self, alert: NewsAlert) -> None:
@@ -2750,6 +3623,7 @@ class SmartMoneyEngine:
         force_x_search: bool = False,
         allow_x_search: bool = True,
         refresh_market: bool = False,
+        verify_sell_route: bool = False,
     ) -> CoinCallout:
         if buyers is None:
             buyers = await self.database.recent_verified_token_buyers(
@@ -2768,6 +3642,7 @@ class SmartMoneyEngine:
             force_x_search=force_x_search,
             allow_x_search=allow_x_search,
             refresh_market=refresh_market,
+            verify_sell_route=verify_sell_route,
         )
         self._record_coin_scan(callout)
         return callout

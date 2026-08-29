@@ -136,3 +136,32 @@ class SolanaRPC:
                 },
             ],
         )
+
+    async def get_token_largest_accounts(self, mint: str) -> list[dict[str, Any]]:
+        result = await self.call(
+            "getTokenLargestAccounts",
+            [mint, {"commitment": "confirmed"}],
+        )
+        return list((result or {}).get("value") or [])
+
+    async def get_token_supply(self, mint: str) -> dict[str, Any]:
+        result = await self.call(
+            "getTokenSupply",
+            [mint, {"commitment": "confirmed"}],
+        )
+        return dict((result or {}).get("value") or {})
+
+    async def get_multiple_parsed_accounts(
+        self,
+        addresses: list[str],
+    ) -> list[dict[str, Any] | None]:
+        if not addresses:
+            return []
+        result = await self.call(
+            "getMultipleAccounts",
+            [
+                addresses[:100],
+                {"encoding": "jsonParsed", "commitment": "confirmed"},
+            ],
+        )
+        return list((result or {}).get("value") or [])

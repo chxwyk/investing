@@ -339,6 +339,17 @@ class Database:
                 latest_score REAL NOT NULL,
                 tier TEXT NOT NULL,
                 x_verified INTEGER NOT NULL DEFAULT 0,
+                chain_created_at INTEGER,
+                pair_created_at INTEGER,
+                radar_first_seen_at INTEGER,
+                first_market_data_at INTEGER,
+                first_research_eligible_at INTEGER,
+                first_discord_visible_at INTEGER,
+                entry_eligible_at INTEGER,
+                strong_alert_at INTEGER,
+                first_visible_market_cap_usd REAL,
+                entry_market_cap_usd REAL,
+                peak_market_cap_usd REAL,
                 last_seen_at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_runner_candidates_rank
@@ -370,6 +381,25 @@ class Database:
             );
             CREATE INDEX IF NOT EXISTS idx_runner_outcomes_horizon
                 ON runner_outcomes(horizon_seconds, observed_at DESC);
+
+            CREATE TABLE IF NOT EXISTS runner_alert_events (
+                mint TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                first_sent_at INTEGER NOT NULL,
+                last_sent_at INTEGER NOT NULL,
+                send_count INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (mint, event_type),
+                FOREIGN KEY (mint) REFERENCES runner_candidates(mint) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS runner_forensics (
+                mint TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL,
+                funding_checked_at INTEGER NOT NULL,
+                dynamic_checked_at INTEGER NOT NULL,
+                FOREIGN KEY (mint) REFERENCES runner_candidates(mint) ON DELETE CASCADE
+            );
 
             CREATE TABLE IF NOT EXISTS api_usage_daily (
                 provider TEXT NOT NULL,
@@ -477,6 +507,28 @@ class Database:
         await self._ensure_column("paper_trades", "quote_latency_ms", "INTEGER")
         await self._ensure_column("paper_trades", "quote_fee_bps", "INTEGER")
         await self._ensure_column("paper_trades", "quote_based", "INTEGER NOT NULL DEFAULT 0")
+        for column, definition in (
+            ("chain_created_at", "INTEGER"),
+            ("pair_created_at", "INTEGER"),
+            ("radar_first_seen_at", "INTEGER"),
+            ("first_market_data_at", "INTEGER"),
+            ("first_research_eligible_at", "INTEGER"),
+            ("first_discord_visible_at", "INTEGER"),
+            ("entry_eligible_at", "INTEGER"),
+            ("strong_alert_at", "INTEGER"),
+            ("first_visible_market_cap_usd", "REAL"),
+            ("entry_market_cap_usd", "REAL"),
+            ("peak_market_cap_usd", "REAL"),
+        ):
+            await self._ensure_column("runner_candidates", column, definition)
+        await self.db.execute(
+            """
+            UPDATE runner_candidates
+            SET pair_created_at = COALESCE(pair_created_at, graduated_at),
+                graduated_at = NULL
+            WHERE graduation_source LIKE 'DEX_PAIR_CREATED_PROXY%'
+            """
+        )
         await self.db.execute(
             """
             CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_trades_source_signature
@@ -2035,6 +2087,10 @@ class Database:
         largest_percent = max(values) / total * Decimal("100") if values and total > 0 else None
         return {
             "wallets": tuple(str(row["alias"]) for row in rows),
+            "wallet_addresses": tuple(str(row["trader_address"]) for row in rows),
+            "buyer_first_seen_at": {
+                str(row["trader_address"]): int(row["earliest_buy"]) for row in rows
+            },
             "unique_buyers": len(rows),
             "earliest_buy_at": (min(int(row["earliest_buy"]) for row in rows) if rows else None),
             "largest_buyer_percent": largest_percent,
@@ -3363,13 +3419,38 @@ class Database:
                     # the original detection inputs used for outcome measurement.
                     existing_payload = json.loads(str(existing["payload_json"]))
                     updated_payload = json.loads(payload_json)
+                    if str(existing_payload.get("graduation_source") or "").startswith(
+                        "DEX_PAIR_CREATED_PROXY"
+                    ):
+                        existing_payload["pair_created_at"] = (
+                            existing_payload.get("pair_created_at")
+                            or existing_payload.get("graduated_at")
+                        )
+                        existing_payload["graduated_at"] = None
                     for key in (
                         "first_seen_at",
                         "graduated_at",
                         "graduation_source",
                         "first",
+                        "detection_safety",
+                        "detection_forensics",
+                        "detection_score",
                     ):
                         updated_payload[key] = existing_payload.get(key)
+                    for key in (
+                        "chain_created_at",
+                        "pair_created_at",
+                        "radar_first_seen_at",
+                        "first_market_data_at",
+                    ):
+                        updated_payload[key] = existing_payload.get(key) or updated_payload.get(key)
+                    for key in (
+                        "first_research_eligible_at",
+                        "first_discord_visible_at",
+                        "entry_eligible_at",
+                        "strong_alert_at",
+                    ):
+                        updated_payload[key] = existing_payload.get(key) or updated_payload.get(key)
                     payload_json = json.dumps(updated_payload, separators=(",", ":"))
                 await self.db.execute(
                     """
@@ -3377,13 +3458,63 @@ class Database:
                         mint, payload_json, first_seen_at, graduated_at,
                         graduation_source, first_price_usd, first_market_cap_usd,
                         first_liquidity_usd, first_score, latest_score, tier,
-                        x_verified, last_seen_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        x_verified, chain_created_at, pair_created_at,
+                        radar_first_seen_at, first_market_data_at,
+                        first_research_eligible_at, first_discord_visible_at,
+                        entry_eligible_at, strong_alert_at,
+                        first_visible_market_cap_usd, entry_market_cap_usd,
+                        peak_market_cap_usd, last_seen_at
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    )
                     ON CONFLICT(mint) DO UPDATE SET
                         payload_json = excluded.payload_json,
                         latest_score = excluded.latest_score,
                         tier = excluded.tier,
                         x_verified = MAX(runner_candidates.x_verified, excluded.x_verified),
+                        graduated_at = COALESCE(
+                            runner_candidates.graduated_at,
+                            excluded.graduated_at
+                        ),
+                        chain_created_at = COALESCE(
+                            runner_candidates.chain_created_at,
+                            excluded.chain_created_at
+                        ),
+                        pair_created_at = COALESCE(
+                            runner_candidates.pair_created_at,
+                            excluded.pair_created_at
+                        ),
+                        radar_first_seen_at = COALESCE(
+                            runner_candidates.radar_first_seen_at,
+                            excluded.radar_first_seen_at
+                        ),
+                        first_market_data_at = COALESCE(
+                            runner_candidates.first_market_data_at,
+                            excluded.first_market_data_at
+                        ),
+                        first_research_eligible_at = COALESCE(
+                            runner_candidates.first_research_eligible_at,
+                            excluded.first_research_eligible_at
+                        ),
+                        entry_eligible_at = COALESCE(
+                            runner_candidates.entry_eligible_at,
+                            excluded.entry_eligible_at
+                        ),
+                        entry_market_cap_usd = COALESCE(
+                            runner_candidates.entry_market_cap_usd,
+                            excluded.entry_market_cap_usd
+                        ),
+                        peak_market_cap_usd = CASE
+                            WHEN runner_candidates.peak_market_cap_usd IS NULL
+                                THEN excluded.peak_market_cap_usd
+                            WHEN excluded.peak_market_cap_usd IS NULL
+                                THEN runner_candidates.peak_market_cap_usd
+                            ELSE MAX(
+                                runner_candidates.peak_market_cap_usd,
+                                excluded.peak_market_cap_usd
+                            )
+                        END,
                         last_seen_at = MAX(runner_candidates.last_seen_at, excluded.last_seen_at)
                     """,
                     (
@@ -3411,6 +3542,26 @@ class Database:
                         float(candidate.score),
                         candidate.tier[:80],
                         int(candidate.x_evidence.available),
+                        candidate.chain_created_at,
+                        candidate.pair_created_at,
+                        candidate.radar_first_seen_at or candidate.first_seen_at,
+                        candidate.first_market_data_at,
+                        candidate.first_research_eligible_at,
+                        candidate.first_discord_visible_at,
+                        candidate.entry_eligible_at,
+                        candidate.strong_alert_at,
+                        None,
+                        (
+                            float(candidate.current.market_cap_usd)
+                            if candidate.entry_eligible_at is not None
+                            and candidate.current.market_cap_usd is not None
+                            else None
+                        ),
+                        (
+                            float(candidate.current.market_cap_usd)
+                            if candidate.current.market_cap_usd is not None
+                            else None
+                        ),
                         candidate.generated_at,
                     ),
                 )
@@ -3454,6 +3605,169 @@ class Database:
     async def runner_candidate_payload(self, mint: str) -> str | None:
         cursor = await self.db.execute(
             "SELECT payload_json FROM runner_candidates WHERE mint = ?",
+            (mint,),
+        )
+        row = await cursor.fetchone()
+        return str(row["payload_json"]) if row else None
+
+    async def runner_score_history(self, mint: str, *, limit: int = 8) -> tuple[Decimal, ...]:
+        cursor = await self.db.execute(
+            """
+            SELECT score FROM runner_snapshots
+            WHERE mint = ? ORDER BY captured_at DESC LIMIT ?
+            """,
+            (mint, max(1, min(50, limit))),
+        )
+        rows = await cursor.fetchall()
+        return tuple(Decimal(str(row["score"])) for row in reversed(rows))
+
+    async def reserve_runner_alert(
+        self,
+        *,
+        mint: str,
+        event_type: str,
+        fingerprint: str,
+        now: int,
+        allow_changed_fingerprint: bool = False,
+    ) -> bool:
+        """Atomically deduplicate fresh, escalation, strong, and invalidation alerts."""
+
+        async with self._write_lock:
+            await self.db.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await self.db.execute(
+                    """
+                    SELECT fingerprint FROM runner_alert_events
+                    WHERE mint = ? AND event_type = ?
+                    """,
+                    (mint, event_type),
+                )
+                row = await cursor.fetchone()
+                if row is not None and (
+                    not allow_changed_fingerprint or str(row["fingerprint"]) == fingerprint
+                ):
+                    await self.db.rollback()
+                    return False
+                if row is None:
+                    await self.db.execute(
+                        """
+                        INSERT INTO runner_alert_events(
+                            mint, event_type, fingerprint, first_sent_at, last_sent_at
+                        ) VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (mint, event_type, fingerprint, now, now),
+                    )
+                else:
+                    await self.db.execute(
+                        """
+                        UPDATE runner_alert_events
+                        SET fingerprint = ?, last_sent_at = ?, send_count = send_count + 1
+                        WHERE mint = ? AND event_type = ?
+                        """,
+                        (fingerprint, now, mint, event_type),
+                    )
+                await self.db.commit()
+                return True
+            except Exception:
+                await self.db.rollback()
+                raise
+
+    async def mark_runner_visible(
+        self,
+        *,
+        mint: str,
+        visible_at: int,
+        market_cap_usd: Decimal | None,
+        strong: bool = False,
+    ) -> None:
+        """Persist actual post-notifier visibility separately from digest time."""
+
+        field = "strong_alert_at" if strong else "first_discord_visible_at"
+        market_field = "entry_market_cap_usd" if strong else "first_visible_market_cap_usd"
+        cursor = await self.db.execute(
+            "SELECT payload_json FROM runner_candidates WHERE mint = ?",
+            (mint,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return
+        payload = json.loads(str(row["payload_json"]))
+        payload[field] = payload.get(field) or visible_at
+        if not strong:
+            payload["first_discord_visible_at"] = (
+                payload.get("first_discord_visible_at") or visible_at
+            )
+        await self.db.execute(
+            f"""
+            UPDATE runner_candidates
+            SET {field} = COALESCE({field}, ?),
+                {market_field} = COALESCE({market_field}, ?),
+                payload_json = ?
+            WHERE mint = ?
+            """,
+            (
+                visible_at,
+                float(market_cap_usd) if market_cap_usd is not None else None,
+                json.dumps(payload, separators=(",", ":")),
+                mint,
+            ),
+        )
+        await self.db.commit()
+
+    async def release_runner_alert(self, *, mint: str, event_type: str) -> None:
+        await self.db.execute(
+            "DELETE FROM runner_alert_events WHERE mint = ? AND event_type = ?",
+            (mint, event_type),
+        )
+        await self.db.commit()
+
+    async def runner_latency_rows(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        cursor = await self.db.execute(
+            """
+            SELECT mint, chain_created_at, pair_created_at, graduated_at,
+                   radar_first_seen_at, first_market_data_at,
+                   first_research_eligible_at, first_discord_visible_at,
+                   entry_eligible_at, strong_alert_at,
+                   first_market_cap_usd, first_visible_market_cap_usd,
+                   entry_market_cap_usd, peak_market_cap_usd
+            FROM runner_candidates
+            ORDER BY first_seen_at DESC LIMIT ?
+            """,
+            (max(1, min(100, limit)),),
+        )
+        return [dict(row) for row in await cursor.fetchall()]
+
+    async def store_runner_forensics(
+        self,
+        *,
+        mint: str,
+        payload_json: str,
+        funding_checked_at: int,
+        dynamic_checked_at: int,
+    ) -> None:
+        await self.db.execute(
+            """
+            INSERT INTO runner_forensics(
+                mint, payload_json, funding_checked_at, dynamic_checked_at
+            ) VALUES (?, ?, ?, ?)
+            ON CONFLICT(mint) DO UPDATE SET
+                payload_json = excluded.payload_json,
+                funding_checked_at = MAX(
+                    runner_forensics.funding_checked_at,
+                    excluded.funding_checked_at
+                ),
+                dynamic_checked_at = MAX(
+                    runner_forensics.dynamic_checked_at,
+                    excluded.dynamic_checked_at
+                )
+            """,
+            (mint, payload_json, funding_checked_at, dynamic_checked_at),
+        )
+        await self.db.commit()
+
+    async def runner_forensics_payload(self, mint: str) -> str | None:
+        cursor = await self.db.execute(
+            "SELECT payload_json FROM runner_forensics WHERE mint = ?",
             (mint,),
         )
         row = await cursor.fetchone()

@@ -121,7 +121,7 @@ class DexScreenerClient:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
                 timeout=self.timeout,
-                headers={"User-Agent": "SmartMoneyCopyBot/2.33.3 coin-intelligence"},
+                headers={"User-Agent": "SmartMoneyCopyBot/2.34.0 coin-intelligence"},
             )
         return self._session
 
@@ -1079,6 +1079,31 @@ class CoinCalloutAnalyzer:
             return None, str(exc)[:180]
         return quote, None
 
+    async def _sell_quote(
+        self,
+        token_info: TokenInfo | None,
+        buy_quote: SwapQuote | None,
+    ) -> tuple[SwapQuote | None, str | None]:
+        """Check a realistic reverse route without creating or signing a transaction."""
+
+        if self.market is None or not self.market.api_key:
+            return None, "Jupiter executable quote is not configured"
+        if token_info is None or token_info.decimals is None:
+            return None, "token decimals are unavailable for sell-route verification"
+        if buy_quote is None or buy_quote.output_amount_raw <= 0:
+            return None, "buy route unavailable; sell-route amount could not be derived"
+        try:
+            quote = await self.market.quote_order(
+                input_mint=token_info.mint,
+                output_mint=USDC_MINT,
+                amount_raw=buy_quote.output_amount_raw,
+                input_decimals=token_info.decimals,
+                output_decimals=6,
+            )
+        except (JupiterError, ValueError) as exc:
+            return None, str(exc)[:180]
+        return quote, None
+
     async def analyze(
         self,
         *,
@@ -1088,6 +1113,7 @@ class CoinCalloutAnalyzer:
         force_x_search: bool = False,
         allow_x_search: bool = True,
         refresh_market: bool = False,
+        verify_sell_route: bool = False,
     ) -> CoinCallout:
         dex_snapshot = (
             self.dex.snapshot(mint, refresh=True)
@@ -1100,6 +1126,11 @@ class CoinCalloutAnalyzer:
             self._executable_quote(token_info),
         )
         executable_quote, quote_error = quote_result
+        sell_quote, sell_quote_error = (
+            await self._sell_quote(token_info, executable_quote)
+            if verify_sell_route
+            else (None, "sell route not checked at the cheap-filter stage")
+        )
         prefilter = score_callout(
             mint=mint,
             token_info=token_info,
@@ -1112,6 +1143,8 @@ class CoinCalloutAnalyzer:
             smart_wallets=smart_wallets,
             executable_quote=executable_quote,
             quote_error=quote_error,
+            sell_quote=sell_quote,
+            sell_quote_error=sell_quote_error,
         )
         if not allow_x_search or not self.social.search_enabled:
             return replace(
@@ -1156,6 +1189,8 @@ class CoinCalloutAnalyzer:
             smart_wallets=smart_wallets,
             executable_quote=executable_quote,
             quote_error=quote_error,
+            sell_quote=sell_quote,
+            sell_quote_error=sell_quote_error,
         )
         return replace(
             final,
@@ -1182,6 +1217,8 @@ def score_callout(
     smart_wallets: tuple[str, ...],
     executable_quote: SwapQuote | None = None,
     quote_error: str | None = None,
+    sell_quote: SwapQuote | None = None,
+    sell_quote_error: str | None = None,
 ) -> CoinCallout:
     score = Decimal("0")
     positives: list[str] = []
@@ -1506,6 +1543,8 @@ def score_callout(
         executable_quote=executable_quote,
         quote_error=quote_error,
         public_alert_eligible=public_alert_eligible,
+        sell_quote=sell_quote,
+        sell_quote_error=sell_quote_error,
     )
 
 

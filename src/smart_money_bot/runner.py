@@ -9,14 +9,342 @@ from typing import Any
 from .models import (
     CoinCallout,
     RunnerCandidate,
+    RunnerForensics,
+    RunnerFundingCluster,
+    RunnerFundingObservation,
     RunnerMarketSnapshot,
     RunnerMomentumWindow,
+    RunnerSafetyAssessment,
     RunnerScoreBreakdown,
     XSocialSnapshot,
 )
 
 RUNNER_HORIZONS_SECONDS = (60, 300, 900, 1_800, 3_600, 14_400, 86_400)
 RUNNER_MOMENTUM_WINDOWS_SECONDS = (15, 30, 60, 180, 300)
+FRESH_WATCH_OFFSETS_SECONDS = (0, 15, 30, 60, 120, 180, 300, 600, 900)
+
+
+def _unique(items: Iterable[str]) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(item for item in items if item))
+
+
+def build_funding_clusters(
+    observations: Iterable[RunnerFundingObservation],
+    *,
+    funding_window_seconds: int = 1_800,
+    amount_tolerance_percent: Decimal = Decimal("10"),
+) -> tuple[RunnerFundingCluster, ...]:
+    """Group direct funder links and flag close-time/similar-amount coordination.
+
+    This only describes public transaction relationships. It is a coordination
+    signal, not proof that the wallets share a real-world owner or committed fraud.
+    """
+
+    by_funder: dict[str, list[RunnerFundingObservation]] = {}
+    for item in observations:
+        if item.funder:
+            by_funder.setdefault(item.funder, []).append(item)
+    groups: list[RunnerFundingCluster] = []
+    for funder, rows in by_funder.items():
+        wallets = _unique(item.wallet for item in rows)
+        if len(wallets) < 2:
+            continue
+        times = sorted(item.funded_at for item in rows if item.funded_at is not None)
+        interval = times[-1] - times[0] if len(times) >= 2 else None
+        amounts = [item.amount_sol for item in rows if item.amount_sol is not None]
+        similar = False
+        if len(amounts) >= 2 and min(amounts) > 0:
+            spread = (max(amounts) - min(amounts)) / min(amounts) * Decimal("100")
+            similar = spread <= amount_tolerance_percent
+        buys = sorted(item.bought_at for item in rows if item.bought_at is not None)
+        buy_interval = buys[-1] - buys[0] if len(buys) >= 2 else None
+        time_linked = bool(
+            interval is not None
+            and interval <= funding_window_seconds
+            and similar
+            and buy_interval is not None
+            and buy_interval <= funding_window_seconds
+        )
+        supply_values = [item.supply_percent for item in rows if item.supply_percent is not None]
+        supply = sum(supply_values, Decimal("0")) if supply_values else None
+        groups.append(
+            RunnerFundingCluster(
+                cluster_id=funder,
+                wallets=wallets,
+                wallet_count=len(wallets),
+                supply_percent=(supply.quantize(Decimal("0.01")) if supply is not None else None),
+                funding_interval_seconds=interval,
+                similar_amounts=similar,
+                time_linked=time_linked,
+                confidence="HIGH" if time_linked else "MEDIUM",
+            )
+        )
+    return tuple(
+        sorted(
+            groups,
+            key=lambda item: (item.wallet_count, item.supply_percent or Decimal("0")),
+            reverse=True,
+        )
+    )
+
+
+def summarize_forensics(
+    observations: Iterable[RunnerFundingObservation],
+    *,
+    raw_unique_buyers: int = 0,
+    raw_top10_percent: Decimal | None = None,
+    checked_at: int = 0,
+    warnings: Iterable[str] = (),
+) -> RunnerForensics:
+    rows = tuple(observations)
+    clusters = build_funding_clusters(rows)
+    linked_reductions = sum(max(0, item.wallet_count - 1) for item in clusters)
+    raw_entities = max(raw_unique_buyers, len(_unique(item.wallet for item in rows)))
+    independent = max(0, raw_entities - linked_reductions) if raw_entities else 0
+    largest = clusters[0] if clusters else None
+    linked_supply = largest.supply_percent if largest else None
+    adjusted_values = [value for value in (raw_top10_percent, linked_supply) if value is not None]
+    return RunnerForensics(
+        available=True,
+        raw_unique_buyers=raw_unique_buyers,
+        estimated_independent_clusters=independent,
+        largest_cluster_size=largest.wallet_count if largest else 1 if rows else 0,
+        largest_cluster_supply_percent=linked_supply,
+        cluster_adjusted_percent=max(adjusted_values) if adjusted_values else None,
+        shared_funder_groups=clusters,
+        time_linked_groups=tuple(item for item in clusters if item.time_linked),
+        observations=rows,
+        warnings=tuple(dict.fromkeys(warnings)),
+        checked_at=checked_at,
+        funding_checked_at=checked_at,
+        dynamic_checked_at=checked_at,
+    )
+
+
+def funding_observation_from_transaction(
+    transaction: dict[str, Any] | None,
+    *,
+    wallet: str,
+    supply_percent: Decimal | None = None,
+    bought_at: int | None = None,
+) -> RunnerFundingObservation:
+    """Extract a direct native-SOL funder from one documented parsed RPC transaction."""
+
+    if not isinstance(transaction, dict):
+        return RunnerFundingObservation(wallet=wallet, supply_percent=supply_percent)
+    message = ((transaction.get("transaction") or {}).get("message") or {})
+    meta = transaction.get("meta") or {}
+    raw_keys = message.get("accountKeys") or []
+    keys: list[str] = []
+    signers: set[str] = set()
+    for item in raw_keys:
+        if isinstance(item, dict):
+            key = str(item.get("pubkey") or "")
+            if item.get("signer"):
+                signers.add(key)
+        else:
+            key = str(item)
+        keys.append(key)
+    try:
+        wallet_index = keys.index(wallet)
+    except ValueError:
+        return RunnerFundingObservation(wallet=wallet, supply_percent=supply_percent)
+    pre = meta.get("preBalances") or []
+    post = meta.get("postBalances") or []
+    if wallet_index >= len(pre) or wallet_index >= len(post):
+        return RunnerFundingObservation(wallet=wallet, supply_percent=supply_percent)
+    wallet_gain = int(post[wallet_index]) - int(pre[wallet_index])
+    funder: str | None = None
+    funder_loss = 0
+    for index, key in enumerate(keys):
+        if index >= len(pre) or index >= len(post) or key == wallet:
+            continue
+        loss = int(pre[index]) - int(post[index])
+        if key in signers and loss > funder_loss:
+            funder = key
+            funder_loss = loss
+    amount = Decimal(wallet_gain) / Decimal("1000000000") if wallet_gain > 0 else None
+    block_time = transaction.get("blockTime")
+    observed_at = int(block_time) if block_time is not None else None
+    return RunnerFundingObservation(
+        wallet=wallet,
+        funder=funder,
+        funded_at=observed_at if funder else None,
+        amount_sol=amount if funder else None,
+        bought_at=bought_at,
+        supply_percent=supply_percent,
+    )
+
+
+def assess_runner_safety(
+    snapshot: RunnerMarketSnapshot,
+    forensics: RunnerForensics | None = None,
+) -> RunnerSafetyAssessment:
+    """Fail closed for ENTRY while still allowing unsafe momentum research."""
+
+    forensics = forensics or RunnerForensics()
+    failures: list[str] = []
+    unknowns: list[str] = []
+    warnings: list[str] = []
+    risk = Decimal("0")
+
+    if snapshot.rugged:
+        failures.append("rugged state is present")
+        risk = Decimal("100")
+    if snapshot.suspicious:
+        failures.append("token metadata is flagged suspicious")
+        risk += 35
+    if snapshot.liquidity_usd is None:
+        unknowns.append("liquidity")
+    elif snapshot.liquidity_usd < Decimal("2000"):
+        failures.append("liquidity is below $2,000")
+        risk += 35
+    elif snapshot.liquidity_usd < Decimal("5000"):
+        warnings.append("launch-stage liquidity")
+        risk += 15
+    if snapshot.holder_count is None:
+        unknowns.append("holders")
+    elif snapshot.holder_count < 30:
+        failures.append("holder count is below 30")
+        risk += 25
+    elif snapshot.holder_count < 100:
+        warnings.append("holder count is below 100")
+        risk += 10
+
+    thresholds = (
+        ("Top10", snapshot.top10_percent, Decimal("45"), Decimal("35"), 35),
+        ("dev", snapshot.dev_percent, Decimal("10"), Decimal("5"), 25),
+        ("bundlers", snapshot.bundlers_percent, Decimal("20"), Decimal("10"), 30),
+        ("insiders", snapshot.insiders_percent, Decimal("20"), Decimal("10"), 30),
+        ("snipers", snapshot.snipers_percent, Decimal("35"), Decimal("20"), 25),
+    )
+    for label, value, hard, caution, weight in thresholds:
+        if value is None:
+            unknowns.append(label)
+        elif value > hard:
+            failures.append(f"{label} concentration is {value:.1f}%")
+            risk += weight
+        elif value > caution:
+            warnings.append(f"{label} concentration is elevated ({value:.1f}%)")
+            risk += Decimal(weight) / 2
+
+    if snapshot.risk_score is None:
+        unknowns.append("Tracker risk")
+    else:
+        risk += max(Decimal("0"), min(Decimal("35"), snapshot.risk_score * Decimal("3.5")))
+        if snapshot.risk_score >= Decimal("8"):
+            failures.append(f"Tracker risk is {snapshot.risk_score}/10")
+
+    for label, disabled in (
+        ("mint authority", snapshot.mint_authority_disabled),
+        ("freeze authority", snapshot.freeze_authority_disabled),
+    ):
+        if disabled is None:
+            unknowns.append(label)
+        elif disabled is False:
+            failures.append(f"{label} is enabled")
+            risk += 30
+
+    if snapshot.buy_route_status == "FAIL":
+        failures.append("buy route failed")
+        risk += 20
+    elif snapshot.buy_route_status != "PASS":
+        unknowns.append("buy route")
+    if snapshot.sell_route_status == "FAIL":
+        failures.append("sell route failed")
+        risk += 45
+    elif snapshot.sell_route_status != "PASS":
+        unknowns.append("sell route")
+    for label, impact in (
+        ("buy", snapshot.route_price_impact_percent),
+        ("sell", snapshot.sell_route_price_impact_percent),
+    ):
+        if impact is not None and impact > Decimal("3"):
+            failures.append(f"{label} route impact is {impact:.2f}%")
+            risk += 25
+
+    if not forensics.available or forensics.cluster_adjusted_percent is None:
+        unknowns.append("cluster-adjusted concentration")
+    else:
+        if forensics.cluster_adjusted_percent > Decimal("45"):
+            failures.append(
+                "cluster-adjusted concentration is "
+                f"{forensics.cluster_adjusted_percent:.1f}%"
+            )
+            risk += 40
+        elif forensics.cluster_adjusted_percent > Decimal("35"):
+            warnings.append("cluster-adjusted concentration is elevated")
+            risk += 15
+        if not forensics.observations or any(
+            item.funder is None for item in forensics.observations
+        ):
+            unknowns.append("holder funding relationships")
+    if forensics.time_linked_groups:
+        warnings.append("time-linked funding coordination signal detected")
+        risk += min(Decimal("20"), Decimal(len(forensics.time_linked_groups) * 5))
+
+    risk = max(Decimal("0"), min(Decimal("100"), risk)).quantize(Decimal("0.01"))
+    if failures:
+        status = "FAIL"
+    elif unknowns:
+        status = "UNKNOWN"
+    else:
+        status = "PASS"
+    level = (
+        "UNKNOWN"
+        if status == "UNKNOWN"
+        else "LOW"
+        if risk < 25
+        else "MODERATE"
+        if risk < 50
+        else "HIGH"
+        if risk < 75
+        else "CRITICAL"
+    )
+    return RunnerSafetyAssessment(
+        scam_risk_score=risk,
+        scam_risk_level=level,
+        status=status,
+        entry_eligible=status == "PASS",
+        critical_unknowns=tuple(dict.fromkeys(unknowns)),
+        failures=tuple(dict.fromkeys(failures)),
+        warnings=tuple(dict.fromkeys(warnings)),
+    )
+
+
+def fresh_watch_schedule(base_seconds: int = 15, minutes: int = 15) -> tuple[int, ...]:
+    ceiling = max(base_seconds, minutes * 60)
+    canonical = tuple(
+        value
+        for value in FRESH_WATCH_OFFSETS_SECONDS
+        if value == 0 or base_seconds <= value <= ceiling
+    )
+    return canonical or (0,)
+
+
+def is_fresh_research_worthy(candidate: RunnerCandidate, *, max_age_seconds: int = 300) -> bool:
+    age = (
+        candidate.generated_at - candidate.pair_created_at
+        if candidate.pair_created_at is not None
+        else None
+    )
+    current = candidate.current
+    immediate_catastrophe = bool(
+        current.rugged
+        or (current.liquidity_usd is not None and current.liquidity_usd < Decimal("2000"))
+        or current.sell_route_status == "FAIL"
+    )
+    return bool(
+        age is not None
+        and 0 <= age <= max_age_seconds
+        and current.market_cap_usd is not None
+        and current.liquidity_usd is not None
+        and current.liquidity_usd >= Decimal("2000")
+        and current.buys_5m + current.sells_5m >= 3
+        and current.buys_5m >= 2
+        and current.volume_5m_usd >= Decimal("250")
+        and not immediate_catastrophe
+    )
 
 
 def _pct(current: Decimal | None, base: Decimal | None) -> Decimal | None:
@@ -108,6 +436,23 @@ def runner_snapshot_from_callout(
         liquidity = token.liquidity_usd
     elif callout.dex.liquidity_usd is not None:
         liquidity = callout.dex.liquidity_usd
+    sell_status = "PASS" if callout.sell_quote is not None else "UNKNOWN"
+    if callout.sell_quote_error and not any(
+        phrase in callout.sell_quote_error.casefold()
+        for phrase in (
+            "not checked",
+            "not configured",
+            "decimals are unavailable",
+            "could not be derived",
+        )
+    ):
+        sell_status = "FAIL"
+    buy_status = "PASS" if quote is not None else "UNKNOWN"
+    if callout.quote_error and not any(
+        phrase in callout.quote_error.casefold()
+        for phrase in ("not configured", "decimals are unavailable")
+    ):
+        buy_status = "FAIL"
     return RunnerMarketSnapshot(
         mint=callout.mint,
         captured_at=captured_at,
@@ -143,6 +488,14 @@ def runner_snapshot_from_callout(
         rugged=risk.rugged,
         route_available=quote is not None,
         route_price_impact_percent=(quote.price_impact_percent if quote else None),
+        buy_route_status=buy_status,
+        sell_route_status=sell_status,
+        sell_route_price_impact_percent=(
+            callout.sell_quote.price_impact_percent if callout.sell_quote else None
+        ),
+        suspicious=bool(token.suspicious) if token else False,
+        mint_authority_disabled=(token.mint_authority_disabled if token else None),
+        freeze_authority_disabled=(token.freeze_authority_disabled if token else None),
     )
 
 
@@ -156,6 +509,10 @@ def score_runner_candidate(
     graduation_source: str,
     earliest_smart_entry_at: int | None = None,
     smart_wallets: tuple[str, ...] = (),
+    smart_wallet_addresses: tuple[str, ...] = (),
+    forensics: RunnerForensics | None = None,
+    score_history: tuple[Decimal, ...] = (),
+    pair_created_at: int | None = None,
     now: int,
 ) -> RunnerCandidate:
     """Score only evidence available at ``now``; future outcome rows never enter here."""
@@ -176,7 +533,14 @@ def score_runner_candidate(
         "penalties": 0,
     }
 
-    age_seconds = max(0, now - graduated_at) if graduated_at else None
+    observed_pair_created_at = (
+        now - callout.dex.pair_age_minutes * 60
+        if callout.dex.pair_age_minutes is not None
+        else None
+    )
+    pair_created_at = pair_created_at or observed_pair_created_at
+    source_created_at = graduated_at or pair_created_at
+    age_seconds = max(0, now - source_created_at) if source_created_at else None
     if age_seconds is not None:
         if age_seconds <= 300:
             parts["graduation_recency"] = 12
@@ -289,11 +653,18 @@ def score_runner_candidate(
         parts["holders"] += 3
         positives.append(f"holder count grew by {holder_growth} since first seen")
 
-    smart_count = len(set(smart_wallets))
+    raw_smart_count = len(set(smart_wallet_addresses or smart_wallets))
+    independent_smart_count = raw_smart_count
+    if forensics and forensics.available and smart_wallet_addresses:
+        smart_addresses = set(smart_wallet_addresses)
+        for group in forensics.shared_funder_groups:
+            overlap = len(smart_addresses.intersection(group.wallets))
+            independent_smart_count -= max(0, overlap - 1)
+    smart_count = max(0, independent_smart_count)
     parts["smart_wallets"] += min(12, smart_count * 4)
     earliest_age = None
-    if earliest_smart_entry_at is not None and graduated_at is not None:
-        earliest_age = max(0, earliest_smart_entry_at - graduated_at)
+    if earliest_smart_entry_at is not None and source_created_at is not None:
+        earliest_age = max(0, earliest_smart_entry_at - source_created_at)
         if earliest_age <= 300:
             parts["smart_wallets"] += 3
             positives.append("a verified smart wallet entered within five minutes")
@@ -324,7 +695,7 @@ def score_runner_candidate(
     ):
         if value is not None and value > hard:
             blockers.append(f"{label} concentration is {value:.1f}%")
-    if current.route_available:
+    if current.buy_route_status == "PASS" or current.route_available:
         impact = current.route_price_impact_percent or Decimal("0")
         if impact <= Decimal("3"):
             parts["safety_route"] += 6
@@ -332,6 +703,14 @@ def score_runner_candidate(
             blockers.append(f"$5 Jupiter route impact is {impact:.2f}%")
     else:
         blockers.append("executable $5 Jupiter route is unavailable")
+    if current.sell_route_status == "FAIL":
+        blockers.append("read-only sell route is unavailable")
+    elif current.sell_route_status == "PASS":
+        sell_impact = current.sell_route_price_impact_percent or Decimal("0")
+        if sell_impact <= Decimal("3"):
+            parts["safety_route"] += 3
+        else:
+            blockers.append(f"$5 sell-route impact is {sell_impact:.2f}%")
 
     social = callout.social
     if social.available:
@@ -359,14 +738,36 @@ def score_runner_candidate(
 
     raw_score = sum(parts.values())
     score = Decimal(max(0, min(100, raw_score))).quantize(Decimal("0.01"))
-    if blockers:
-        tier = "BLOCKED — RESEARCH ONLY"
-    elif score >= Decimal("82") and social.available:
-        tier = "FOMO RUNNER VERIFIED"
-    elif score >= Decimal("70"):
-        tier = "FOMO RUNNER DEVELOPING"
+    forensic_result = forensics or RunnerForensics()
+    safety = assess_runner_safety(current, forensic_result)
+    age_seconds = now - pair_created_at if pair_created_at is not None else None
+    if score >= Decimal("50") and safety.status == "FAIL":
+        state = "⚠️ UNSAFE MOMENTUM"
+    elif score >= Decimal("85") and safety.status == "PASS":
+        state = "🚨 STRONG RUNNER"
+    elif score >= Decimal("70") and safety.status == "PASS":
+        state = "✅ ENTRY CANDIDATE"
+    elif score >= Decimal("55"):
+        state = "🔥 HEATING UP"
+    elif score >= Decimal("35"):
+        state = "🟡 WATCH"
+    elif age_seconds is not None and age_seconds <= 300:
+        state = "⚡ FRESH RUNNER"
     else:
-        tier = "FOMO EARLY WATCH"
+        state = "👀 EARLY RESEARCH"
+    tier = "BLOCKED — RESEARCH ONLY" if blockers and score < Decimal("50") else state
+    first_research_eligible_at = (
+        now
+        if callout.dex.available
+        and current.market_cap_usd is not None
+        and current.liquidity_usd is not None
+        and current.buys_5m + current.sells_5m >= 3
+        else None
+    )
+    entry_ready = bool(score >= Decimal("70") and safety.entry_eligible and not overextended)
+    history_values = tuple(score_history)
+    if not history_values or history_values[-1] != score:
+        history_values = (*history_values, score)
     return RunnerCandidate(
         mint=callout.mint,
         symbol=callout.symbol,
@@ -392,6 +793,20 @@ def score_runner_candidate(
         research_only=True,
         pair_url=callout.dex.pair_url,
         generated_at=now,
+        pair_created_at=pair_created_at,
+        radar_first_seen_at=first.captured_at,
+        first_market_data_at=(first.captured_at if first.market_cap_usd is not None else None),
+        first_research_eligible_at=first_research_eligible_at,
+        entry_eligible_at=now if entry_ready else None,
+        score_history=history_values[-8:],
+        state=state,
+        safety=safety,
+        detection_safety=safety,
+        forensics=forensic_result,
+        detection_forensics=forensic_result,
+        detection_score=score,
+        raw_smart_wallet_count=raw_smart_count,
+        estimated_independent_smart_wallets=smart_count,
     )
 
 
@@ -401,6 +816,46 @@ def runner_candidate_to_json(candidate: RunnerCandidate) -> str:
 
 def runner_snapshot_to_json(snapshot: RunnerMarketSnapshot) -> str:
     return json.dumps(asdict(snapshot), default=str, separators=(",", ":"))
+
+
+def runner_forensics_to_json(forensics: RunnerForensics) -> str:
+    return json.dumps(asdict(forensics), default=str, separators=(",", ":"))
+
+
+def runner_forensics_from_json(raw: str) -> RunnerForensics:
+    payload = json.loads(raw)
+    observations: list[RunnerFundingObservation] = []
+    for raw_item in payload.pop("observations", ()):
+        item = dict(raw_item)
+        for key in ("amount_sol", "supply_percent"):
+            if item.get(key) is not None:
+                item[key] = Decimal(str(item[key]))
+        observations.append(RunnerFundingObservation(**item))
+
+    def cluster(raw_item: Any) -> RunnerFundingCluster:
+        item = dict(raw_item)
+        item["wallets"] = tuple(item.get("wallets") or ())
+        if item.get("supply_percent") is not None:
+            item["supply_percent"] = Decimal(str(item["supply_percent"]))
+        return RunnerFundingCluster(**item)
+
+    payload["shared_funder_groups"] = tuple(
+        cluster(item) for item in payload.get("shared_funder_groups", ())
+    )
+    payload["time_linked_groups"] = tuple(
+        cluster(item) for item in payload.get("time_linked_groups", ())
+    )
+    payload["observations"] = tuple(observations)
+    for key in (
+        "largest_cluster_supply_percent",
+        "cluster_adjusted_percent",
+        "creator_percent",
+    ):
+        if payload.get(key) is not None:
+            payload[key] = Decimal(str(payload[key]))
+    for key in ("creator_linked_wallets", "warnings"):
+        payload[key] = tuple(payload.get(key) or ())
+    return RunnerForensics(**payload)
 
 
 def _decimal_fields(payload: dict[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:
@@ -426,6 +881,7 @@ def runner_candidate_from_json(raw: str) -> RunnerCandidate:
         "snipers_percent",
         "risk_score",
         "route_price_impact_percent",
+        "sell_route_price_impact_percent",
     )
     first = RunnerMarketSnapshot(
         **_decimal_fields(dict(payload.pop("first")), snapshot_decimal_fields)
@@ -448,7 +904,7 @@ def runner_candidate_from_json(raw: str) -> RunnerCandidate:
         )
         for item in payload.pop("momentum_windows", ())
     )
-    x_data = dict(payload.pop("x_evidence"))
+    x_data = dict(payload.pop("x_evidence", {"available": False}))
     x_data["duplicate_percent"] = Decimal(str(x_data.get("duplicate_percent") or 0))
     x_data["posts_per_minute"] = Decimal(str(x_data.get("posts_per_minute") or 0))
     for key in ("notable_accounts", "notable_posts"):
@@ -456,12 +912,78 @@ def runner_candidate_from_json(raw: str) -> RunnerCandidate:
     for key in ("smart_wallets", "positives", "warnings", "hard_blockers"):
         payload[key] = tuple(payload.get(key) or ())
     payload["score"] = Decimal(str(payload["score"]))
+    payload["score_history"] = tuple(
+        Decimal(str(item)) for item in payload.get("score_history", ())
+    )
+
+    def safety_from_payload(value: Any) -> RunnerSafetyAssessment:
+        if not isinstance(value, dict):
+            return RunnerSafetyAssessment()
+        item = dict(value)
+        item["scam_risk_score"] = Decimal(str(item.get("scam_risk_score") or 0))
+        for key in ("critical_unknowns", "failures", "warnings"):
+            item[key] = tuple(item.get(key) or ())
+        return RunnerSafetyAssessment(**item)
+
+    forensic_data = payload.pop("forensics", None)
+    if isinstance(forensic_data, dict):
+        forensic_values = dict(forensic_data)
+        observations = []
+        for raw_item in forensic_values.pop("observations", ()):
+            item = dict(raw_item)
+            for key in ("amount_sol", "supply_percent"):
+                if item.get(key) is not None:
+                    item[key] = Decimal(str(item[key]))
+            observations.append(RunnerFundingObservation(**item))
+
+        def cluster_from_payload(raw_item: Any) -> RunnerFundingCluster:
+            item = dict(raw_item)
+            item["wallets"] = tuple(item.get("wallets") or ())
+            if item.get("supply_percent") is not None:
+                item["supply_percent"] = Decimal(str(item["supply_percent"]))
+            return RunnerFundingCluster(**item)
+
+        forensic_values["shared_funder_groups"] = tuple(
+            cluster_from_payload(item)
+            for item in forensic_values.get("shared_funder_groups", ())
+        )
+        forensic_values["time_linked_groups"] = tuple(
+            cluster_from_payload(item)
+            for item in forensic_values.get("time_linked_groups", ())
+        )
+        forensic_values["observations"] = tuple(observations)
+        for key in (
+            "largest_cluster_supply_percent",
+            "cluster_adjusted_percent",
+            "creator_percent",
+        ):
+            if forensic_values.get(key) is not None:
+                forensic_values[key] = Decimal(str(forensic_values[key]))
+        for key in ("creator_linked_wallets", "warnings"):
+            forensic_values[key] = tuple(forensic_values.get(key) or ())
+        forensics = RunnerForensics(**forensic_values)
+    else:
+        forensics = RunnerForensics()
+    detection_forensic_data = payload.pop("detection_forensics", None)
+    detection_forensics = (
+        runner_forensics_from_json(json.dumps(detection_forensic_data))
+        if isinstance(detection_forensic_data, dict)
+        else RunnerForensics()
+    )
+    safety = safety_from_payload(payload.pop("safety", None))
+    detection_safety = safety_from_payload(payload.pop("detection_safety", None))
+    if payload.get("detection_score") is not None:
+        payload["detection_score"] = Decimal(str(payload["detection_score"]))
     return RunnerCandidate(
         first=first,
         current=current,
         breakdown=breakdown,
         momentum_windows=momentum_windows,
         x_evidence=XSocialSnapshot(**x_data),
+        safety=safety,
+        detection_safety=detection_safety,
+        forensics=forensics,
+        detection_forensics=detection_forensics,
         **payload,
     )
 
@@ -481,6 +1003,7 @@ def runner_snapshot_from_json(raw: str) -> RunnerMarketSnapshot:
         "snipers_percent",
         "risk_score",
         "route_price_impact_percent",
+        "sell_route_price_impact_percent",
     )
     return RunnerMarketSnapshot(**_decimal_fields(json.loads(raw), decimal_fields))
 
@@ -491,3 +1014,86 @@ def forward_return_percent(
 ) -> Decimal | None:
     result = _pct(current, first)
     return result.quantize(Decimal("0.01")) if result is not None else None
+
+
+def runner_path_metrics(
+    first: RunnerMarketSnapshot,
+    snapshots: Iterable[RunnerMarketSnapshot],
+) -> dict[str, object]:
+    """Measure the usable post-detection path without feeding it back into scoring."""
+
+    series = sorted(snapshots, key=lambda item: item.captured_at)
+    points: list[tuple[int, Decimal, Decimal]] = []
+    for item in series:
+        base = first.price_usd
+        value = item.price_usd
+        if base is None or value is None or base <= 0:
+            base = first.market_cap_usd
+            value = item.market_cap_usd
+        change = forward_return_percent(value, base)
+        if value is not None and change is not None:
+            points.append((item.captured_at, value, change))
+    peak_point = max(points, key=lambda item: item[2]) if points else None
+    trough_point = min(points, key=lambda item: item[2]) if points else None
+    running_peak: Decimal | None = None
+    max_drawdown = Decimal("0")
+    for _captured_at, value, _change in points:
+        running_peak = value if running_peak is None else max(running_peak, value)
+        if running_peak > 0:
+            drawdown = (Decimal("1") - value / running_peak) * Decimal("100")
+            max_drawdown = max(max_drawdown, drawdown)
+
+    def first_cross(level: Decimal, *, upward: bool) -> int | None:
+        for captured_at, _value, change in points:
+            if (change >= level) if upward else (change <= level):
+                return captured_at
+        return None
+
+    positive_times = {
+        level: first_cross(Decimal(level), upward=True)
+        for level in (10, 25, 50, 100)
+    }
+    negative_times = {
+        level: first_cross(Decimal(-level), upward=False) for level in (25, 50)
+    }
+
+    def before(positive: int, negative: int) -> bool | None:
+        win_at = positive_times[positive]
+        loss_at = negative_times[negative]
+        if win_at is None and loss_at is None:
+            return None
+        return win_at is not None and (loss_at is None or win_at <= loss_at)
+
+    liquidities = [item.liquidity_usd for item in series if item.liquidity_usd is not None]
+    return {
+        "maximum_favorable_excursion": peak_point[2] if peak_point else None,
+        "maximum_adverse_excursion": trough_point[2] if trough_point else None,
+        "peak_return": peak_point[2] if peak_point else None,
+        "time_to_peak_seconds": (
+            peak_point[0] - first.captured_at if peak_point else None
+        ),
+        "max_drawdown_from_peak": max_drawdown.quantize(Decimal("0.01")),
+        "minimum_liquidity": min(liquidities) if liquidities else None,
+        "time_to_10": (
+            positive_times[10] - first.captured_at if positive_times[10] else None
+        ),
+        "time_to_25": (
+            positive_times[25] - first.captured_at if positive_times[25] else None
+        ),
+        "time_to_50": (
+            positive_times[50] - first.captured_at if positive_times[50] else None
+        ),
+        "time_to_100": (
+            positive_times[100] - first.captured_at if positive_times[100] else None
+        ),
+        "plus_25_before_minus_25": before(25, 25),
+        "plus_10_before_minus_25": before(10, 25),
+        "plus_50_before_minus_50": before(50, 50),
+        "plus_100_before_minus_50": before(100, 50),
+        "rug_or_liquidity_failure": any(
+            item.rugged
+            or item.liquidity_usd is None
+            or item.liquidity_usd < Decimal("500")
+            for item in series
+        ),
+    }

@@ -326,6 +326,71 @@ class CoinCallout:
     x_search_attempted: bool = False
     scan_stage: str = "UNSCANNED"
     scan_reason: str = ""
+    sell_quote: SwapQuote | None = None
+    sell_quote_error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RunnerFundingObservation:
+    """Bounded public-chain funding evidence for one holder/buyer wallet."""
+
+    wallet: str
+    funder: str | None = None
+    funded_at: int | None = None
+    amount_sol: Decimal | None = None
+    bought_at: int | None = None
+    supply_percent: Decimal | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RunnerFundingCluster:
+    """Wallets linked by a directly observed public funding relationship."""
+
+    cluster_id: str
+    wallets: tuple[str, ...]
+    wallet_count: int
+    supply_percent: Decimal | None = None
+    funding_interval_seconds: int | None = None
+    similar_amounts: bool = False
+    time_linked: bool = False
+    confidence: str = "LOW"
+
+
+@dataclass(frozen=True, slots=True)
+class RunnerForensics:
+    """Read-only wallet-cluster evidence; UNKNOWN values are never treated as safe."""
+
+    available: bool = False
+    raw_unique_buyers: int = 0
+    estimated_independent_clusters: int | None = None
+    largest_cluster_size: int | None = None
+    largest_cluster_supply_percent: Decimal | None = None
+    cluster_adjusted_percent: Decimal | None = None
+    shared_funder_groups: tuple[RunnerFundingCluster, ...] = ()
+    time_linked_groups: tuple[RunnerFundingCluster, ...] = ()
+    observations: tuple[RunnerFundingObservation, ...] = ()
+    creator_wallet: str | None = None
+    creator_percent: Decimal | None = None
+    creator_linked_wallets: tuple[str, ...] = ()
+    previous_token_deployments: int | None = None
+    previous_severe_collapses: int | None = None
+    warnings: tuple[str, ...] = ()
+    checked_at: int = 0
+    funding_checked_at: int = 0
+    dynamic_checked_at: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class RunnerSafetyAssessment:
+    """Separate scam-risk and entry-safety result at one point in time."""
+
+    scam_risk_score: Decimal = Decimal("0")
+    scam_risk_level: str = "UNKNOWN"
+    status: str = "UNKNOWN"
+    entry_eligible: bool = False
+    critical_unknowns: tuple[str, ...] = ()
+    failures: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -354,6 +419,12 @@ class RunnerMarketSnapshot:
     rugged: bool = False
     route_available: bool = False
     route_price_impact_percent: Decimal | None = None
+    buy_route_status: str = "UNKNOWN"
+    sell_route_status: str = "UNKNOWN"
+    sell_route_price_impact_percent: Decimal | None = None
+    suspicious: bool = False
+    mint_authority_disabled: bool | None = None
+    freeze_authority_disabled: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -410,6 +481,23 @@ class RunnerCandidate:
     research_only: bool = True
     pair_url: str = ""
     generated_at: int = 0
+    chain_created_at: int | None = None
+    pair_created_at: int | None = None
+    radar_first_seen_at: int | None = None
+    first_market_data_at: int | None = None
+    first_research_eligible_at: int | None = None
+    first_discord_visible_at: int | None = None
+    entry_eligible_at: int | None = None
+    strong_alert_at: int | None = None
+    score_history: tuple[Decimal, ...] = ()
+    state: str = "👀 EARLY RESEARCH"
+    safety: RunnerSafetyAssessment = field(default_factory=RunnerSafetyAssessment)
+    detection_safety: RunnerSafetyAssessment = field(default_factory=RunnerSafetyAssessment)
+    forensics: RunnerForensics = field(default_factory=RunnerForensics)
+    detection_forensics: RunnerForensics = field(default_factory=RunnerForensics)
+    detection_score: Decimal | None = None
+    raw_smart_wallet_count: int = 0
+    estimated_independent_smart_wallets: int = 0
 
 
 @dataclass(frozen=True, slots=True)

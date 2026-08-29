@@ -147,6 +147,15 @@ class Settings:
     fomo_runner_digest_seconds: int
     fomo_runner_digest_min_score: Decimal
     fomo_runner_digest_max_candidates: int
+    fomo_runner_fresh_alert_enabled: bool
+    fomo_runner_fresh_max_age_seconds: int
+    fomo_runner_fresh_watch_enabled: bool
+    fomo_runner_fresh_watch_seconds: int
+    fomo_runner_fresh_watch_max: int
+    fomo_runner_forensics_min_score: Decimal
+    fomo_runner_invalidation_drawdown_percent: Decimal
+    fomo_runner_invalidation_liquidity_decline_percent: Decimal
+    fomo_runner_invalidation_liquidity_floor_usd: Decimal
 
     news_radar_enabled: bool
     x_news_stream_enabled: bool
@@ -358,25 +367,44 @@ class Settings:
             x_radar_poll_seconds=_int("X_RADAR_POLL_SECONDS", 1800),
             x_radar_max_contracts_per_scan=_int("X_RADAR_MAX_CONTRACTS_PER_SCAN", 3),
             fomo_radar_enabled=_bool("FOMO_RADAR_ENABLED", True),
-            fomo_radar_poll_seconds=_int("FOMO_RADAR_POLL_SECONDS", 300),
-            fomo_radar_max_candidates_per_scan=_int("FOMO_RADAR_MAX_CANDIDATES_PER_SCAN", 5),
+            fomo_radar_poll_seconds=_int("FOMO_RADAR_POLL_SECONDS", 60),
+            fomo_radar_max_candidates_per_scan=_int("FOMO_RADAR_MAX_CANDIDATES_PER_SCAN", 12),
             fomo_radar_recheck_seconds=_int("FOMO_RADAR_RECHECK_SECONDS", 1800),
             fomo_runner_enabled=_bool("FOMO_RUNNER_ENABLED", True),
-            fomo_runner_fast_watch_seconds=_int("FOMO_RUNNER_FAST_WATCH_SECONDS", 20),
+            fomo_runner_fast_watch_seconds=_int("FOMO_RUNNER_FAST_WATCH_SECONDS", 15),
             fomo_runner_fast_watch_minutes=_int("FOMO_RUNNER_FAST_WATCH_MINUTES", 15),
-            fomo_runner_fast_watch_min_score=_decimal("FOMO_RUNNER_FAST_WATCH_MIN_SCORE", "35"),
+            fomo_runner_fast_watch_min_score=_decimal("FOMO_RUNNER_FAST_WATCH_MIN_SCORE", "20"),
             fomo_runner_public_alert_min_score=_decimal("FOMO_RUNNER_PUBLIC_ALERT_MIN_SCORE", "70"),
-            fomo_runner_max_fast_watch=_int("FOMO_RUNNER_MAX_FAST_WATCH", 5),
+            fomo_runner_max_fast_watch=_int("FOMO_RUNNER_MAX_FAST_WATCH", 12),
             fomo_runner_lab_candidates=_int("FOMO_RUNNER_LAB_CANDIDATES", 6),
             fomo_runner_max_graduation_age_minutes=_int(
                 "FOMO_RUNNER_MAX_GRADUATION_AGE_MINUTES", 60
             ),
             fomo_runner_outcome_poll_seconds=_int("FOMO_RUNNER_OUTCOME_POLL_SECONDS", 60),
             fomo_runner_digest_enabled=_bool("FOMO_RUNNER_DIGEST_ENABLED", True),
-            fomo_runner_digest_seconds=_int("FOMO_RUNNER_DIGEST_SECONDS", 900),
-            fomo_runner_digest_min_score=_decimal("FOMO_RUNNER_DIGEST_MIN_SCORE", "35"),
+            fomo_runner_digest_seconds=_int("FOMO_RUNNER_DIGEST_SECONDS", 180),
+            fomo_runner_digest_min_score=_decimal("FOMO_RUNNER_DIGEST_MIN_SCORE", "15"),
             fomo_runner_digest_max_candidates=_int(
-                "FOMO_RUNNER_DIGEST_MAX_CANDIDATES", 3
+                "FOMO_RUNNER_DIGEST_MAX_CANDIDATES", 10
+            ),
+            fomo_runner_fresh_alert_enabled=_bool("FOMO_RUNNER_FRESH_ALERT_ENABLED", True),
+            fomo_runner_fresh_max_age_seconds=_int(
+                "FOMO_RUNNER_FRESH_MAX_AGE_SECONDS", 300
+            ),
+            fomo_runner_fresh_watch_enabled=_bool("FOMO_RUNNER_FRESH_WATCH_ENABLED", True),
+            fomo_runner_fresh_watch_seconds=_int("FOMO_RUNNER_FRESH_WATCH_SECONDS", 15),
+            fomo_runner_fresh_watch_max=_int("FOMO_RUNNER_FRESH_WATCH_MAX", 15),
+            fomo_runner_forensics_min_score=_decimal(
+                "FOMO_RUNNER_FORENSICS_MIN_SCORE", "50"
+            ),
+            fomo_runner_invalidation_drawdown_percent=_decimal(
+                "FOMO_RUNNER_INVALIDATION_DRAWDOWN_PERCENT", "50"
+            ),
+            fomo_runner_invalidation_liquidity_decline_percent=_decimal(
+                "FOMO_RUNNER_INVALIDATION_LIQUIDITY_DECLINE_PERCENT", "35"
+            ),
+            fomo_runner_invalidation_liquidity_floor_usd=_decimal(
+                "FOMO_RUNNER_INVALIDATION_LIQUIDITY_FLOOR_USD", "500"
             ),
             news_radar_enabled=_bool("NEWS_RADAR_ENABLED", True),
             x_news_stream_enabled=_bool("X_NEWS_STREAM_ENABLED", False),
@@ -673,6 +701,24 @@ class Settings:
             raise ValueError("FOMO_RUNNER_DIGEST_MIN_SCORE must be between 0 and 100")
         if not 1 <= self.fomo_runner_digest_max_candidates <= 10:
             raise ValueError("FOMO_RUNNER_DIGEST_MAX_CANDIDATES must be between 1 and 10")
+        if not 30 <= self.fomo_runner_fresh_max_age_seconds <= 900:
+            raise ValueError("FOMO_RUNNER_FRESH_MAX_AGE_SECONDS must be between 30 and 900")
+        if not 15 <= self.fomo_runner_fresh_watch_seconds <= 300:
+            raise ValueError("FOMO_RUNNER_FRESH_WATCH_SECONDS must be between 15 and 300")
+        if not 1 <= self.fomo_runner_fresh_watch_max <= 20:
+            raise ValueError("FOMO_RUNNER_FRESH_WATCH_MAX must be between 1 and 20")
+        if not 0 <= self.fomo_runner_forensics_min_score <= 100:
+            raise ValueError("FOMO_RUNNER_FORENSICS_MIN_SCORE must be between 0 and 100")
+        if not 1 <= self.fomo_runner_invalidation_drawdown_percent <= 100:
+            raise ValueError(
+                "FOMO_RUNNER_INVALIDATION_DRAWDOWN_PERCENT must be between 1 and 100"
+            )
+        if not 1 <= self.fomo_runner_invalidation_liquidity_decline_percent <= 100:
+            raise ValueError(
+                "FOMO_RUNNER_INVALIDATION_LIQUIDITY_DECLINE_PERCENT must be between 1 and 100"
+            )
+        if self.fomo_runner_invalidation_liquidity_floor_usd < 0:
+            raise ValueError("FOMO_RUNNER_INVALIDATION_LIQUIDITY_FLOOR_USD cannot be negative")
         if len(self.x_news_stream_rule) > 1024:
             raise ValueError("X_NEWS_STREAM_RULE cannot exceed 1024 characters")
         if not 15 <= self.news_poll_seconds <= 3600:

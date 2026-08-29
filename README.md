@@ -7,6 +7,18 @@ transactions, and mirrors every newly detected hot-wallet swap in PAPER mode. PA
 as either a forced source-price observation ledger or an executable Jupiter quote-shadow
 trial; the two answer different questions and are labeled separately.
 
+Version 2.34.0 separates the existing-token runner into a fast, age-prioritized discovery lane
+and a slower research digest. Fresh candidates can now produce one deduplicated, non-pinging
+exact-mint Discord alert before the digest, then follow a staged 0/15/30/60-second through
+15-minute watch. Detection, market-data, eligibility, Discord, entry, and strong-alert times
+are persisted independently, and `/fomo latency` reports actual source-to-seen and seen-to-
+visible percentiles plus market-cap slippage. The runner also records immutable detection-time
+signal/safety snapshots, score progression, post-detection paths, and separate fail-closed scam
+risk based on routes, concentration, authorities, liquidity, and bounded public-chain wallet
+funding clusters. `/fomo forensic` and `/fomo calibration` expose the evidence read-only. Every
+runner card links the exact mint with Fomo first; no runner button buys, sells, signs, calls J7,
+or spends SOL.
+
 Version 2.33.3 immediately acknowledges every `/fomo lab` invocation before any database or
 provider work. Test mode renders a real cached runner observation without contacting live
 providers, while empty-cache refreshes and timeouts visibly replace the original ephemeral
@@ -753,6 +765,55 @@ The bot needs these Discord application permissions:
 No privileged Discord gateway intents are required.
 
 ## Railway deployment
+
+### v2.34.0 Railway changes
+
+The application only reads these variables; deploying this version does not overwrite values
+already stored in Railway.
+
+**ADD:**
+
+```text
+FOMO_RUNNER_FRESH_ALERT_ENABLED=true
+FOMO_RUNNER_FRESH_MAX_AGE_SECONDS=300
+FOMO_RUNNER_FRESH_WATCH_ENABLED=true
+FOMO_RUNNER_FRESH_WATCH_SECONDS=15
+FOMO_RUNNER_FRESH_WATCH_MAX=15
+FOMO_RUNNER_FORENSICS_MIN_SCORE=50
+FOMO_RUNNER_INVALIDATION_DRAWDOWN_PERCENT=50
+FOMO_RUNNER_INVALIDATION_LIQUIDITY_DECLINE_PERCENT=35
+FOMO_RUNNER_INVALIDATION_LIQUIDITY_FLOOR_USD=500
+```
+
+**CHANGE:**
+
+```text
+FOMO_RADAR_POLL_SECONDS=60
+FOMO_RADAR_MAX_CANDIDATES_PER_SCAN=12
+FOMO_RUNNER_FAST_WATCH_SECONDS=15
+FOMO_RUNNER_FAST_WATCH_MINUTES=15
+FOMO_RUNNER_FAST_WATCH_MIN_SCORE=20
+FOMO_RUNNER_MAX_FAST_WATCH=12
+FOMO_RUNNER_DIGEST_ENABLED=true
+FOMO_RUNNER_DIGEST_SECONDS=180
+FOMO_RUNNER_DIGEST_MIN_SCORE=15
+FOMO_RUNNER_DIGEST_MAX_CANDIDATES=10
+FOMO_RUNNER_PUBLIC_ALERT_MIN_SCORE=70
+```
+
+Start with these bounded values. The current public discovery source is DEX Screener profile and
+boost polling; no undocumented Fomo endpoint or unverifiable graduation event is assumed. Pair
+creation time remains a labeled source proxy, while unavailable chain/graduation times remain
+null. If Railway logs provider throttling, keep the 60-second radar interval and reduce
+`FOMO_RADAR_MAX_CANDIDATES_PER_SCAN` and `FOMO_RUNNER_MAX_FAST_WATCH` to 8 before increasing
+poll frequency. Jupiter quote checks are deliberately rate-limited and both buy and sell routes
+must be known before an entry-quality classification.
+
+**KEEP:** all Launch Lab, J7, PAPER, wallet-discovery, smart-wallet, X-budget, Pinata, and
+persistent SQLite-volume settings.
+
+**KEEP OFF:** `ENABLE_LIVE_TRADING=false`. Runner actions and links are research/navigation
+only.
 
 ### v2.33 Railway changes
 

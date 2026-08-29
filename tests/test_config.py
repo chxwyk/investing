@@ -266,6 +266,11 @@ def test_news_radar_defaults_to_fast_but_cost_bounded_sources(monkeypatch) -> No
         "FOMO_RADAR_POLL_SECONDS",
         "FOMO_RADAR_MAX_CANDIDATES_PER_SCAN",
         "FOMO_RADAR_RECHECK_SECONDS",
+        "FOMO_RUNNER_FRESH_ALERT_ENABLED",
+        "FOMO_RUNNER_FRESH_MAX_AGE_SECONDS",
+        "FOMO_RUNNER_FRESH_WATCH_ENABLED",
+        "FOMO_RUNNER_FRESH_WATCH_SECONDS",
+        "FOMO_RUNNER_FRESH_WATCH_MAX",
         "FOMO_WATCH_MIN_SCORE",
         "TRADE_ACTIVITY_ALERTS_ENABLED",
         "COIN_X_PREFILTER_MIN_SCORE",
@@ -325,9 +330,14 @@ def test_news_radar_defaults_to_fast_but_cost_bounded_sources(monkeypatch) -> No
     assert settings.x_radar_poll_seconds == 1800
     assert settings.x_radar_max_contracts_per_scan == 3
     assert settings.fomo_radar_enabled is True
-    assert settings.fomo_radar_poll_seconds == 300
-    assert settings.fomo_radar_max_candidates_per_scan == 5
+    assert settings.fomo_radar_poll_seconds == 60
+    assert settings.fomo_radar_max_candidates_per_scan == 12
     assert settings.fomo_radar_recheck_seconds == 1800
+    assert settings.fomo_runner_fresh_alert_enabled is True
+    assert settings.fomo_runner_fresh_max_age_seconds == 300
+    assert settings.fomo_runner_fresh_watch_enabled is True
+    assert settings.fomo_runner_fresh_watch_seconds == 15
+    assert settings.fomo_runner_fresh_watch_max == 15
     assert settings.fomo_watch_min_score == Decimal("50")
     assert settings.trade_activity_alerts_enabled is False
     assert settings.coin_x_prefilter_min_score == Decimal("60")
