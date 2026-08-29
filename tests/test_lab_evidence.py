@@ -263,18 +263,38 @@ def _traced_demand(traced: int = 14, *, raw_buyers: int = 0):
     return build_demand_profile(forensics=forensics, current=snapshot), forensics
 
 
-def test_zero_verified_buyers_beside_a_real_trace_is_never_rendered_as_zero() -> None:
-    """The exact reported defect: 14 independent clusters beside 0 raw buyers."""
+def test_unsampled_raw_buyers_are_unavailable_not_zero() -> None:
+    """The exact reported defect: "Raw unique buyers 0" beside a real trace.
+
+    Nothing in this system samples every on-chain buyer, so that population is
+    unavailable.  The verified-buyer count is a genuine observation and a zero
+    there is real and informative.
+    """
 
     demand, forensics = _traced_demand(14, raw_buyers=0)
-    assert demand.raw_buyers == 0
-    assert demand.estimated_independent_buyers == 14
-
     buyers = buyer_evidence(demand, forensics)
-    assert buyers.verified_buyers is None
-    assert buyers.verified_buyers_text == "not observed"
+
+    assert buyers.raw_unique_buyers is None
+    assert buyers.raw_buyers_text == "unavailable"
+    assert buyers.verified_buyers == 0
+    assert buyers.verified_buyers_text == "0"
+    assert buyers.tracked_text == "14"
     assert buyers.independence_text == "14 of 14 traced"
-    assert "0" not in buyers.verified_buyers_text
+
+
+def test_the_four_populations_stay_distinct() -> None:
+    """Section 31's coherent rendering, exactly."""
+
+    buyers = BuyerEvidence(
+        raw_unique_buyers=None,
+        tracked_wallets=14,
+        independent_tracked_wallets=12,
+        verified_buyers=0,
+    )
+    assert buyers.raw_buyers_text == "unavailable"
+    assert buyers.tracked_text == "14"
+    assert buyers.independence_text == "12 of 14 traced"
+    assert buyers.verified_buyers_text == "0"
 
 
 def test_independence_is_always_reported_against_its_own_population() -> None:
@@ -282,12 +302,21 @@ def test_independence_is_always_reported_against_its_own_population() -> None:
     buyers = buyer_evidence(demand, forensics)
     assert buyers.traced
     assert buyers.independence_text.endswith("traced")
-    assert str(buyers.traced_wallets) in buyers.independence_text
+    assert str(buyers.tracked_wallets) in buyers.independence_text
 
 
 def test_an_impossible_buyer_combination_can_never_be_constructed() -> None:
     with pytest.raises(ValueError):
-        BuyerEvidence(verified_buyers=0, traced_wallets=5, independent_clusters=14)
+        BuyerEvidence(tracked_wallets=5, independent_tracked_wallets=14)
+
+
+def test_same_population_measurements_must_stay_coherent() -> None:
+    """Verified buys are a subset of sampled raw buys when both are known."""
+
+    with pytest.raises(ValueError):
+        BuyerEvidence(raw_unique_buyers=3, verified_buyers=9)
+    # Different populations may legitimately differ, so this is allowed.
+    assert BuyerEvidence(tracked_wallets=14, independent_tracked_wallets=12, verified_buyers=0)
 
 
 def test_mixed_populations_are_clamped_rather_than_rendered() -> None:
@@ -302,8 +331,8 @@ def test_mixed_populations_are_clamped_rather_than_rendered() -> None:
         confidence="HIGH",
     )
     buyers = buyer_evidence(mixed)
-    assert buyers.independent_clusters == 5
-    assert buyers.independent_clusters <= buyers.traced_wallets
+    assert buyers.independent_tracked_wallets == 5
+    assert buyers.independent_tracked_wallets <= buyers.tracked_wallets
 
 
 def test_untraced_candidate_reports_not_traced_not_zero() -> None:
@@ -312,7 +341,8 @@ def test_untraced_candidate_reports_not_traced_not_zero() -> None:
     buyers = buyer_evidence(demand, None)
     assert not buyers.traced
     assert buyers.independence_text == "not traced"
-    assert buyers.verified_buyers_text == "none observed"
+    assert buyers.tracked_text == "not traced"
+    assert buyers.raw_buyers_text == "unavailable"
 
 
 def test_real_verified_buyers_are_reported_as_a_count() -> None:
@@ -320,6 +350,7 @@ def test_real_verified_buyers_are_reported_as_a_count() -> None:
     buyers = buyer_evidence(demand, forensics)
     assert buyers.verified_buyers == 7
     assert buyers.verified_buyers_text == "7"
+    assert buyers.raw_buyers_text == "unavailable"
 
 
 # ---------------------------------------------------------------------------
@@ -482,8 +513,9 @@ def test_opportunity_card_never_prints_an_impossible_buyer_pair() -> None:
     )
     rendered = "\n".join(field.value for field in embed.fields)
     assert "14 of 14 traced" in rendered
-    assert "verified buyers `not observed`" in rendered
-    assert "verified buyers `0`" not in rendered
+    assert "Raw buyers `unavailable`" in rendered
+    assert "Raw buyers `0`" not in rendered
+    assert "Verified buyers `0`" in rendered
 
 
 def test_opportunity_card_labels_uncorroborated_organic_demand() -> None:
@@ -537,5 +569,6 @@ def test_forensic_card_pairs_only_comparable_populations() -> None:
     embed = _runner_forensic_embed(candidate, None)
     rendered = "\n".join(field.value for field in embed.fields)
     assert "Raw buyers `0`" not in rendered
+    assert "Raw buyers `unavailable`" in rendered
     assert "14 of 14 traced" in rendered
-    assert "Verified buyers `not observed`" in rendered
+    assert "verified `0`" in rendered

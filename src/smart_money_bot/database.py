@@ -712,6 +712,29 @@ class Database:
                 updated_at INTEGER NOT NULL DEFAULT 0
             );
 
+            -- Cheap-discovery ledger (v2.37).  A candidate's first-seen time is
+            -- written here the instant cheap discovery detects it, BEFORE any
+            -- expensive enrichment, so ingestion latency measures ingestion and
+            -- not how long a provider took.  Stage times are filled forward
+            -- only; first_seen_at can never move later.
+            CREATE TABLE IF NOT EXISTS runner_discovery (
+                mint TEXT PRIMARY KEY,
+                source_name TEXT NOT NULL DEFAULT 'unknown',
+                source_event_at INTEGER,
+                source_is_realtime INTEGER NOT NULL DEFAULT 1,
+                ingested_at INTEGER NOT NULL,
+                first_seen_at INTEGER NOT NULL,
+                first_watch_at INTEGER,
+                first_qualified_at INTEGER,
+                first_paper_decision_at INTEGER,
+                simulated_fill_at INTEGER,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_runner_discovery_seen
+                ON runner_discovery(first_seen_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_runner_discovery_source
+                ON runner_discovery(source_name, first_seen_at DESC);
+
             CREATE TABLE IF NOT EXISTS lab_token_identity (
                 mint TEXT PRIMARY KEY,
                 payload_json TEXT NOT NULL,
@@ -3917,6 +3940,107 @@ class Database:
             except Exception:
                 await self.db.rollback()
                 raise
+
+    async def record_discovery(
+        self,
+        *,
+        mint: str,
+        source_name: str,
+        source_event_at: int | None,
+        now: int,
+        source_is_realtime: bool = True,
+    ) -> bool:
+        """Persist first-seen the moment cheap discovery detects a mint.
+
+        Called before any enrichment, so a slow provider can never inflate the
+        measured ingestion latency.  ``first_seen_at`` is written once and only
+        ever moves earlier, never later, so a rediscovery cannot rewrite history.
+        Returns whether this was the first time the mint was seen.
+        """
+
+        async with self._write_lock:
+            cursor = await self.db.execute(
+                """
+                INSERT INTO runner_discovery (
+                    mint, source_name, source_event_at, source_is_realtime,
+                    ingested_at, first_seen_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(mint) DO UPDATE SET
+                    first_seen_at = MIN(runner_discovery.first_seen_at, excluded.first_seen_at),
+                    source_event_at = COALESCE(
+                        runner_discovery.source_event_at, excluded.source_event_at
+                    ),
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    mint,
+                    source_name,
+                    source_event_at,
+                    1 if source_is_realtime else 0,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            await self.db.commit()
+            return bool(cursor.rowcount) and cursor.lastrowid is not None
+
+    async def mark_discovery_stage(
+        self,
+        *,
+        mint: str,
+        stage: str,
+        at: int,
+    ) -> None:
+        """Record the first time a candidate reached one pipeline stage.
+
+        Write-once per stage: ``COALESCE`` keeps the earliest real time, so a
+        re-evaluation cannot make the pipeline look faster than it was.
+        """
+
+        column = {
+            "watch": "first_watch_at",
+            "qualified": "first_qualified_at",
+            "decision": "first_paper_decision_at",
+            "fill": "simulated_fill_at",
+        }.get(stage)
+        if column is None:
+            return
+        async with self._write_lock:
+            await self.db.execute(
+                f"""
+                UPDATE runner_discovery
+                SET {column} = COALESCE({column}, ?), updated_at = ?
+                WHERE mint = ?
+                """,
+                (at, at, mint),
+            )
+            await self.db.commit()
+
+    async def discovery_latency_rows(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        """Timing rows joined with the market-cap path, newest first."""
+
+        cursor = await self.db.execute(
+            """
+            SELECT d.mint, d.source_name, d.source_event_at, d.source_is_realtime,
+                   d.ingested_at, d.first_seen_at, d.first_watch_at,
+                   d.first_qualified_at, d.first_paper_decision_at, d.simulated_fill_at,
+                   c.first_discord_visible_at, c.pair_created_at, c.chain_created_at,
+                   c.first_market_cap_usd, c.first_visible_market_cap_usd,
+                   c.entry_market_cap_usd, c.peak_market_cap_usd
+            FROM runner_discovery AS d
+            LEFT JOIN runner_candidates AS c ON c.mint = d.mint
+            ORDER BY d.first_seen_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        return [dict(row) for row in await cursor.fetchall()]
+
+    async def discovery_count(self) -> int:
+        cursor = await self.db.execute("SELECT COUNT(*) AS total FROM runner_discovery")
+        row = await cursor.fetchone()
+        return int(row["total"] or 0) if row else 0
 
     async def recent_runner_candidate_payloads(
         self,

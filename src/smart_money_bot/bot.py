@@ -19,6 +19,23 @@ from solders.pubkey import Pubkey
 
 from .config import Settings
 from .constants import BOT_VERSION, PAPER_DEMO_ENTRY_PRICE_USD, PAPER_DEMO_MINT
+from .discord_render import (
+    P_ABOUT,
+    P_DEMAND,
+    P_EDGE,
+    P_LIFECYCLE,
+    P_LIQUIDITY,
+    P_SAFETY,
+    P_SMART_MONEY,
+    P_WARNINGS,
+    P_WHY_NOT_ENTRY,
+    P_WHY_SURFACED,
+    SAFE_MESSAGE_BUDGET,
+    CardField,
+    CardSpec,
+    build_embed,
+    resolve_with_cards,
+)
 from .engine import SmartMoneyEngine
 from .errors import DiscoveryError, JupiterError, PumpLaunchError
 from .lab.decision import Decision
@@ -2020,7 +2037,8 @@ def _runner_forensic_embed(
     embed.add_field(
         name="Shared funding / independence",
         value=(
-            f"Verified buyers `{forensic_buyers.verified_buyers_text}` • independent "
+            f"Raw buyers `{forensic_buyers.raw_buyers_text}` • verified "
+            f"`{forensic_buyers.verified_buyers_text}` • independent "
             f"`{forensic_buyers.independence_text}` • largest cluster "
             f"`{value(forensic.largest_cluster_size)}` wallets / "
             f"`{value(forensic.largest_cluster_supply_percent, '%')}` supply\n"
@@ -2833,7 +2851,7 @@ class PaperSellConfirmationView(discord.ui.View):
             await interaction.edit_original_response(embed=result_embed, view=None)
             return
         await interaction.edit_original_response(
-            embeds=[result_embed, self.parent.embed()],
+            embeds=_fit_embed_pair(result_embed, self.parent.embed()),
             view=self.parent,
         )
 
@@ -4620,17 +4638,62 @@ def _lab_opportunity_embed(
     total: int,
     referral_code: str | None,
 ) -> discord.Embed:
-    """One `/fomo opportunities` card.
+    """One opportunity card as a standalone embed.
 
-    Showing a rejected or watched candidate here never makes it entry
-    eligible: the decision rendered is the same authoritative one the PAPER
-    engine used.
+    Delegates to the shared spec so the single-embed and budgeted multi-embed
+    paths can never drift apart.
+    """
+
+    spec = _lab_opportunity_spec(
+        candidate, result, index=index, total=total, referral_code=referral_code
+    )
+    return _clamp_embed(build_embed(spec))
+
+
+def _fit_embed_pair(*embeds: discord.Embed) -> list[discord.Embed]:
+    """Keep several embeds inside Discord's per-message budget.
+
+    Discord counts the 6000-character limit across the whole message, so two
+    individually-legal cards can still be rejected together.  Trailing fields
+    are dropped from the last embed first, then the last embed entirely.
+    """
+
+    chosen = [_clamp_embed(embed) for embed in embeds if embed is not None]
+    while len(chosen) > 1 and sum(len(item) for item in chosen) > SAFE_MESSAGE_BUDGET:
+        tail = chosen[-1]
+        if tail.fields:
+            tail.remove_field(len(tail.fields) - 1)
+        else:
+            chosen.pop()
+    return chosen
+
+
+def _open_state(position: PaperPosition) -> str:
+    return "OPEN" if position.is_open else "CLOSED"
+
+
+def _lab_opportunity_spec(
+    candidate: RunnerCandidate,
+    result: LabEvaluation,
+    *,
+    index: int,
+    total: int,
+    referral_code: str | None,
+) -> CardSpec:
+    """One `/fomo opportunities` card, described for the shared safe renderer.
+
+    Every field carries a trimming priority, so identity, the exact mint, the
+    decision, safety and WHY NOT ENTRY survive while long ABOUT text and verbose
+    narratives are dropped first.  Showing a rejected or suppressed candidate
+    here never makes it entry eligible.
     """
 
     decision = result.decision
     current = candidate.current
     quality = candidate.quality
     demand = quality.demand
+    buyers = buyer_evidence(demand, candidate.forensics)
+    action = result.actionability
     colour = {
         str(Decision.ENTRY): 0x2ECC71,
         str(Decision.REENTRY_QUALIFIED): 0x27AE60,
@@ -4640,101 +4703,132 @@ def _lab_opportunity_embed(
         str(Decision.REJECT): 0xE74C3C,
     }.get(str(decision.decision), 0x5865F2)
 
-    embed = discord.Embed(
-        title=f"FOMO OPPORTUNITY {index + 1}/{total} — {decision.decision}",
-        description=_lab_identity_lines(
-            result.identity, candidate.mint, referral_code=referral_code
-        ),
-        colour=colour,
-        timestamp=discord.utils.utcnow(),
-    )
-    if result.identity.image_url:
-        embed.set_thumbnail(url=result.identity.image_url)
-    buyers = buyer_evidence(demand, candidate.forensics)
     limited_by = decision.evidence.get("confidence_limited_by") or ()
     confidence_note = (
         f" (capped: {', '.join(str(item) for item in limited_by[:2])})" if limited_by else ""
-    )
-    embed.add_field(
-        name="SETUP",
-        value=_lab_setup_line(result.lifecycle, current.market_cap_usd)[
-            :DISCORD_EMBED_FIELD_VALUE_LIMIT
-        ],
-        inline=False,
     )
     organic = organic_demand_text(
         quality.organic_score,
         authenticity_quality=result.authenticity.quality,
         demand_confidence=demand.confidence,
     )
-    embed.add_field(
-        name="QUALITY",
-        value=(
-            f"Opportunity `{quality.opportunity_score:.0f}` • momentum "
-            f"`{quality.momentum_score:.0f}`\n"
-            f"Organic demand `{organic}`\n"
-            f"Economic authenticity `{result.authenticity.score:.0f}` "
-            f"({result.authenticity.band}) • safety **{decision.safety}**\n"
-            f"Evidence `{decision.evidence_quality}`"
-        )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
-        inline=False,
+    links = (
+        f"[FOMO]({_fomo_coin_url(candidate.mint, referral_code)}) • "
+        f"[PUMP.FUN](https://pump.fun/coin/{candidate.mint}) • "
+        f"[DEX](https://dexscreener.com/solana/{candidate.mint}) • "
+        f"[SOLSCAN](https://solscan.io/token/{candidate.mint})"
     )
-    embed.add_field(
-        name="ACTIVITY / EXECUTION",
-        value=(
-            f"Independent buyers `{buyers.independence_text}` • verified buyers "
-            f"`{buyers.verified_buyers_text}`\n"
-            f"Liquidity `{short_money(current.liquidity_usd)}` • flow 5m "
-            f"`{current.buys_5m}` buys / `{current.sells_5m}` sells • route "
-            f"`{current.buy_route_status}`/`{current.sell_route_status}`\n"
-            f"Round-trip cost `{result.evaluation.edge.cost_percent}%` • expected NET edge "
-            f"`{decision.expected_net_edge_percent}%` • confidence "
-            f"`{decision.edge_confidence}`{confidence_note}"
-        )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
-        inline=False,
+    compact = (
+        f"**{result.identity.name[:RUNNER_TOKEN_NAME_LIMIT]}** "
+        f"`${result.identity.symbol}`\n`{candidate.mint}`\n"
+        f"**{decision.decision}** • {action.label} • safety **{decision.safety}**\n{links}"
     )
-    smart = result.smart_money
-    embed.add_field(
-        name="SMART / SOCIAL",
-        value=(
-            f"Verified independent smart wallets `{smart.independent_clusters}` • proven "
-            f"early `{smart.proven_early}` • posture `{smart.posture}`\n"
-            + ("\n".join(f"• {item}" for item in smart.warnings[:2]) or "• no wallet warnings")
-        )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
-        inline=False,
-    )
-    surfaced = why_surfaced(quality) or ("Nothing yet — candidate is still being observed",)
-    embed.add_field(
-        name="WHY SURFACED",
-        value="\n".join(f"• {item}" for item in surfaced)[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
-        inline=False,
-    )
+
+    fields = [
+        CardField(
+            "SETUP",
+            (
+                _lab_setup_line(result.lifecycle, current.market_cap_usd)
+                + f"\nCurrent state **{action.label}** ({action.score:.0f}/100)"
+            ),
+            P_LIFECYCLE,
+        ),
+        CardField(
+            "QUALITY",
+            (
+                f"Opportunity `{quality.opportunity_score:.0f}` (historical) • momentum "
+                f"`{quality.momentum_score:.0f}`\n"
+                f"Organic demand `{organic}`\n"
+                f"Economic authenticity `{result.authenticity.score:.0f}` "
+                f"({result.authenticity.band}) • safety **{decision.safety}**\n"
+                f"Evidence `{decision.evidence_quality}`"
+            ),
+            P_SAFETY,
+        ),
+        CardField(
+            "ACTIVITY / EXECUTION",
+            (
+                f"Raw buyers `{buyers.raw_buyers_text}` • tracked `{buyers.tracked_text}` • "
+                f"independent `{buyers.independence_text}`\n"
+                f"Verified buyers `{buyers.verified_buyers_text}`\n"
+                f"Liquidity `{short_money(current.liquidity_usd)}` • flow 5m "
+                f"`{current.buys_5m}`/`{current.sells_5m}` • route "
+                f"`{current.buy_route_status}`/`{current.sell_route_status}`\n"
+                f"Round-trip cost `{result.evaluation.edge.cost_percent}%` • expected NET edge "
+                f"`{decision.expected_net_edge_percent}%` • confidence "
+                f"`{decision.edge_confidence}`{confidence_note}"
+            ),
+            P_EDGE,
+        ),
+        CardField(
+            "WHY NOT ENTRY" if not result.entry_eligible else "WHY ENTRY",
+            "\n".join(f"• {item}" for item in decision.human_reasons[:8])
+            or "• no reasons recorded",
+            P_WHY_NOT_ENTRY,
+        ),
+        CardField("LINKS", links, P_LIQUIDITY),
+    ]
+
+    if action.reasons:
+        fields.append(
+            CardField(
+                "CURRENT STATE — WHY",
+                "\n".join(f"• {item.replace('_', ' ').lower()}" for item in action.reasons[:5]),
+                P_DEMAND,
+            )
+        )
+    surfaced = why_surfaced(quality)
+    if surfaced:
+        fields.append(
+            CardField(
+                "WHY SURFACED",
+                "\n".join(f"• {item}" for item in surfaced),
+                P_WHY_SURFACED,
+            )
+        )
     warnings = tuple(quality.quality_warnings) + result.authenticity.warnings
-    embed.add_field(
-        name="QUALITY WARNINGS",
-        value=(
-            "\n".join(f"• {item}" for item in warnings[:6]) or "• none recorded"
-        )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
-        inline=False,
-    )
-    embed.add_field(
-        name="WHY NOT ENTRY" if not result.entry_eligible else "WHY ENTRY",
-        value=(
-            "\n".join(f"• {item}" for item in decision.human_reasons[:8]) or "• no reasons recorded"
-        )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
-        inline=False,
-    )
-    embed.set_footer(
-        text=(
+    if warnings:
+        fields.append(
+            CardField(
+                "QUALITY WARNINGS",
+                "\n".join(f"• {item}" for item in warnings[:6]),
+                P_WARNINGS,
+            )
+        )
+    smart = result.smart_money
+    if smart.wallets or smart.warnings:
+        fields.append(
+            CardField(
+                "SMART / SOCIAL",
+                (
+                    f"Independent clusters `{smart.independent_clusters}` • proven early "
+                    f"`{smart.proven_early}` • posture `{smart.posture}`\n"
+                    + ("\n".join(f"• {item}" for item in smart.warnings[:2]) or "• none")
+                ),
+                P_SMART_MONEY,
+            )
+        )
+    if result.identity.has_description:
+        fields.append(CardField("ABOUT", result.identity.description, P_ABOUT))
+
+    return CardSpec(
+        title=f"FOMO OPPORTUNITY {index + 1}/{total} — {decision.decision}",
+        description=(
+            f"**{result.identity.name[:RUNNER_TOKEN_NAME_LIMIT]}** "
+            f"`${result.identity.symbol}`\n`{candidate.mint}`\n"
+            f"Age `{format_age(result.identity.pair_age_seconds)}` • "
+            f"current state **{action.label}**\n{links}"
+        ),
+        compact_description=compact,
+        fields=tuple(fields),
+        footer=(
             f"{decision.strategy_version} • config {decision.config_hash} • "
             "PAPER only — research visibility never enables an entry"
-        )
+        ),
+        thumbnail_url=result.identity.image_url,
+        colour=colour,
+        timestamp=discord.utils.utcnow(),
     )
-    return _clamp_embed(embed)
-
-
-def _open_state(position: PaperPosition) -> str:
-    return "OPEN" if position.is_open else "CLOSED"
 
 
 def _lab_trades_embed(positions: tuple[PaperPosition, ...]) -> discord.Embed:
@@ -5432,8 +5526,59 @@ class FomoCommands(
             value="\n".join(lines) or "No complete market-cap path yet.",
             inline=False,
         )
-        embed.set_footer(text="Digest time is never used as first-seen time")
-        await interaction.edit_original_response(embed=embed, view=None)
+        try:
+            forensics = await self.bot.engine.discovery_latency(limit=sample)
+        except Exception:
+            logger.exception("Source latency forensics failed")
+            forensics = None
+        if forensics:
+            sources = forensics["sources"]
+            assert isinstance(sources, tuple)
+            source_lines = [
+                (
+                    f"`{item.source_name}` [{item.quality}] realtime n=`{item.realtime.count}` "
+                    f"p50 `{item.realtime.p50 or 'pending'}s` p90 "
+                    f"`{item.realtime.p90 or 'pending'}s` • historical "
+                    f"`{item.historical_count}` • unknown `{item.unknown_count}`"
+                )
+                for item in sources[:6]
+            ]
+            embed.add_field(
+                name="Per-source ingestion (realtime-graded only)",
+                value=(
+                    "\n".join(source_lines)
+                    or "No graded discovery samples yet — this fills as the radar runs."
+                )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+                inline=False,
+            )
+            pipeline = forensics["pipeline"]
+            assert isinstance(pipeline, dict)
+            stage_lines = [
+                f"`{stage}` n=`{stats.count}` p50 `{stats.p50 or 'pending'}s` "
+                f"p90 `{stats.p90 or 'pending'}s`"
+                for stage, stats in pipeline.items()
+            ]
+            embed.add_field(
+                name=f"Pipeline breakdown • slowest: `{forensics['slowest_stage'] or 'pending'}`",
+                value="\n".join(stage_lines)[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+                inline=False,
+            )
+            embed.add_field(
+                name="Timing quality",
+                value=(
+                    f"Realtime-graded `{forensics['realtime_samples']}` • historical "
+                    f"`{forensics['historical_samples']}` • unknown "
+                    f"`{forensics['unknown_samples']}` of `{forensics['samples']}`\n"
+                    "A pair created long before a trending feed surfaced it is graded "
+                    "HISTORICAL and excluded from the realtime percentiles, rather than "
+                    "reported as ingestion latency."
+                )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+                inline=False,
+            )
+        embed.set_footer(
+            text="Digest time is never used as first-seen time • no timestamp is rewritten"
+        )
+        await interaction.edit_original_response(embed=_clamp_embed(embed), view=None)
 
     @app_commands.command(
         name="forensic",
@@ -5728,8 +5873,8 @@ class FomoCommands(
                 ),
             )
             return
-        embeds = [
-            _lab_opportunity_embed(
+        specs = [
+            _lab_opportunity_spec(
                 candidate,
                 result,
                 index=index,
@@ -5738,17 +5883,17 @@ class FomoCommands(
             )
             for index, (candidate, result) in enumerate(rows)
         ]
-        try:
-            await interaction.edit_original_response(content=None, embeds=embeds, view=None)
-        except Exception:
-            logger.exception("`/fomo opportunities` card was rejected by Discord")
-            await self._resolve_lab(
-                interaction,
-                content=(
-                    "Real candidates were found but Discord rejected the rendered cards. "
-                    "Nothing was fabricated and no buy was attempted."
-                ),
-            )
+        # One shared budget across the whole message: Discord's 6000-character
+        # limit is per message, not per embed, which is what produced the
+        # HTTP 400 / 50035 failures with several valid candidates.
+        await resolve_with_cards(
+            interaction,
+            specs,
+            fallback_text=(
+                "Real candidates were found but Discord rejected every rendered form. "
+                "Nothing was fabricated and no buy was attempted."
+            ),
+        )
 
     @app_commands.command(
         name="trades",

@@ -10,15 +10,14 @@ thing: a number was being shown without the evidence that would justify it.
   statement about *how much we know*, so it is now capped by the weakest piece
   of evidence behind it.
 
-* **Buyer populations.** ``raw_unique_buyers`` counts buyers this bot itself
-  verified from tracked-wallet swaps — legitimately ``0`` for a token none of
-  the tracked wallets touched.  ``estimated_independent_clusters`` counts the
-  *bounded holder trace*, a completely different population.  Rendering them
-  side by side produced "Raw buyers 0 • independent clusters 14", which reads
-  as impossible because a reader assumes independence is a subset of buyers.
-  Independence is reported against the population it was actually measured
-  over — ``traced_wallets`` — and an unobserved verified-buyer count says so
-  instead of claiming zero.
+* **Buyer populations.** Five distinct populations were collapsed into one
+  number, producing cards that read "Raw unique buyers 0 • tracked wallets 14 •
+  independent among tracked 12".  They are measured by different mechanisms:
+  every on-chain buyer (never sampled here, so *unavailable* — not zero), the
+  bounded holder trace, the independent share of that trace, the buys this bot
+  verified itself (where ``0`` is a real observation), and the funding clusters
+  found.  Each is now typed separately, ``None`` means unavailable, ``0`` means
+  observed zero, and impossible combinations raise rather than render.
 
 Nothing here changes a score, a threshold or an entry decision.  It constrains
 what may be *claimed* from the evidence that exists.
@@ -147,17 +146,30 @@ def cap_confidence(raw: Decimal | None, cap: ConfidenceCap) -> Decimal | None:
 
 @dataclass(frozen=True, slots=True)
 class BuyerEvidence:
-    """One coherent view of the buyer and independence populations.
+    """The distinct buyer populations, each with explicit availability.
 
-    ``verified_buyers`` and ``traced_wallets`` are different populations
-    measured by different mechanisms, so they are never presented as if one
-    contains the other.  ``independent_clusters`` is always reported against
-    ``traced_wallets``, which is the population it was actually measured over.
+    Five different things were previously collapsed into one number, which is
+    how a card came to read "Raw unique buyers 0 • tracked wallets 14 •
+    independent among tracked 12".  They are measured by different mechanisms
+    over different populations:
+
+    * ``raw_unique_buyers`` — every buyer on chain.  This system does not
+      sample that population at all, so it is ``None``/unavailable, not zero.
+    * ``tracked_wallets`` — the bounded holder/funder trace actually performed.
+    * ``independent_tracked_wallets`` — of those traced, how many look unlinked.
+    * ``verified_buyers`` — buys this bot itself confirmed from tracked-wallet
+      swaps.  Here a zero is a real, informative observation.
+    * ``wallet_clusters`` — funding clusters found within the trace.
+
+    ``None`` means unavailable.  ``0`` means observed zero.  The two are never
+    rendered the same way.
     """
 
+    raw_unique_buyers: int | None = None
+    tracked_wallets: int = 0
+    independent_tracked_wallets: int | None = None
     verified_buyers: int | None = None
-    traced_wallets: int = 0
-    independent_clusters: int | None = None
+    wallet_clusters: int | None = None
     largest_cluster_wallets: int | None = None
     independence_ratio: Decimal | None = None
     confidence: str = "UNKNOWN"
@@ -166,27 +178,40 @@ class BuyerEvidence:
         # Structural guarantee: independence can never exceed the population it
         # was measured over.  An impossible pair is a bug, not a rendering.
         if (
-            self.independent_clusters is not None
-            and self.traced_wallets
-            and self.independent_clusters > self.traced_wallets
+            self.independent_tracked_wallets is not None
+            and self.tracked_wallets
+            and self.independent_tracked_wallets > self.tracked_wallets
         ):
             raise ValueError(
-                "independent clusters cannot exceed the traced wallet population"
+                "independent tracked wallets cannot exceed the traced population"
             )
+        # Two measurements of the *same* population must stay coherent.
+        if (
+            self.raw_unique_buyers is not None
+            and self.verified_buyers is not None
+            and self.verified_buyers > self.raw_unique_buyers
+        ):
+            raise ValueError("verified buyers cannot exceed the sampled raw buyers")
 
     @property
     def traced(self) -> bool:
-        return self.traced_wallets > 0 and self.independent_clusters is not None
+        return self.tracked_wallets > 0 and self.independent_tracked_wallets is not None
+
+    @property
+    def raw_buyers_text(self) -> str:
+        """Never sampled means unavailable, which is not the same as zero."""
+
+        return "unavailable" if self.raw_unique_buyers is None else str(self.raw_unique_buyers)
 
     @property
     def verified_buyers_text(self) -> str:
-        """``0`` verified buyers means "not observed", never "none exist"."""
+        """A verified zero is a real observation and is shown as ``0``."""
 
-        if self.verified_buyers is None:
-            return "not observed"
-        if self.verified_buyers == 0:
-            return "none observed"
-        return str(self.verified_buyers)
+        return "unavailable" if self.verified_buyers is None else str(self.verified_buyers)
+
+    @property
+    def tracked_text(self) -> str:
+        return "not traced" if self.tracked_wallets <= 0 else str(self.tracked_wallets)
 
     @property
     def independence_text(self) -> str:
@@ -194,13 +219,13 @@ class BuyerEvidence:
 
         if not self.traced:
             return "not traced"
-        return f"{self.independent_clusters} of {self.traced_wallets} traced"
+        return f"{self.independent_tracked_wallets} of {self.tracked_wallets} traced"
 
     @property
     def summary(self) -> str:
         return (
-            f"verified buyers {self.verified_buyers_text} • "
-            f"independent {self.independence_text}"
+            f"raw buyers {self.raw_buyers_text} • tracked {self.tracked_text} • "
+            f"independent {self.independence_text} • verified {self.verified_buyers_text}"
         )
 
 
@@ -222,26 +247,34 @@ def buyer_evidence(
     if independent is None:
         independent = _int(getattr(forensics, "estimated_independent_clusters", None))
 
-    raw = _int(getattr(demand, "raw_buyers", None))
-    if raw is None:
-        raw = _int(getattr(forensics, "raw_unique_buyers", None))
+    # The runner's ``raw_unique_buyers`` counts buys this bot verified from
+    # tracked-wallet swaps.  It is the *verified* population, not a sample of
+    # every buyer on chain, which nothing currently measures.
+    verified = _int(getattr(demand, "raw_buyers", None))
+    if verified is None:
+        verified = _int(getattr(forensics, "raw_unique_buyers", None))
 
-    # A zero verified-buyer count alongside a real trace means the tracked
-    # wallets simply never touched this mint — it is unobserved, not empty.
-    verified: int | None = raw
-    if raw is not None and raw == 0 and traced > 0:
-        verified = None
+    raw_sampled = _int(getattr(demand, "sampled_raw_buyers", None))
+    if raw_sampled is None:
+        raw_sampled = _int(getattr(forensics, "sampled_raw_buyers", None))
 
     if independent is not None and traced and independent > traced:
         # Defensive clamp: a caller mixing populations can never render an
         # impossible pair through this type.
         independent = traced
 
+    clusters = _int(getattr(forensics, "shared_funder_group_count", None))
+    if clusters is None:
+        groups = getattr(forensics, "shared_funder_groups", None)
+        clusters = len(groups) if groups is not None else None
+
     ratio = getattr(demand, "independence_ratio", None)
     return BuyerEvidence(
+        raw_unique_buyers=raw_sampled,
+        tracked_wallets=traced,
+        independent_tracked_wallets=independent,
         verified_buyers=verified,
-        traced_wallets=traced,
-        independent_clusters=independent,
+        wallet_clusters=clusters,
         largest_cluster_wallets=_int(getattr(demand, "largest_cluster_wallets", None))
         or _int(getattr(forensics, "largest_cluster_size", None)),
         independence_ratio=ratio if isinstance(ratio, Decimal) else None,

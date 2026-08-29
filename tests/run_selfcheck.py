@@ -228,7 +228,7 @@ async def main() -> None:
 
     print(
         "SELF-CHECK PASSED: detector, scoring, database, discovery rotation, "
-        "paper P&L, risk gate, and PAPER laboratory invariants"
+        "paper P&L, risk gate, PAPER laboratory and discovery-speed invariants"
     )
 
 
@@ -307,6 +307,64 @@ async def check_paper_laboratory() -> None:
     cost = lab.estimate_round_trip_cost(Decimal("5"), buy_price_impact_percent=Decimal("1"))
     assert cost.total_cost_usd > 0
     assert cost.platform_fees_usd > 0 and cost.network_fees_usd > 0
+
+    # --- v2.37 invariants -------------------------------------------------
+    from smart_money_bot.discord_render import (
+        MESSAGE_EMBED_LIMIT,
+        SAFE_MESSAGE_BUDGET,
+        CardField,
+        CardSpec,
+        render_message,
+    )
+    from smart_money_bot.lab.actionability import ActionabilityInputs, assess_actionability
+    from smart_money_bot.lab.fastwatch import FastWatchSignals, evaluate_fast_watch
+    from smart_money_bot.lab.latency import HISTORICAL, LatencySample
+
+    # FAST WATCH is research visibility only and can never authorise an entry.
+    hot = FastWatchSignals(
+        now=1_000,
+        pair_age_seconds=300,
+        price_change_percent=Decimal("25"),
+        volume_acceleration_ratio=Decimal("2"),
+        buys=90,
+        sells=20,
+        liquidity_usd=Decimal("30000"),
+        route_available=True,
+    )
+    watch = evaluate_fast_watch(hot)
+    assert watch.entry_eligible is False, "FAST WATCH must never be entry eligible"
+    assert watch.pending_evidence, "FAST WATCH must declare the evidence it skipped"
+
+    # A pair created long before we saw it is historical, not ingestion latency.
+    stale_timing = LatencySample(
+        mint=TOKEN, source_name="feed", source_event_at=1_000, first_seen_at=1_000 + 67_620
+    )
+    assert stale_timing.timing_quality == HISTORICAL
+    assert not stale_timing.counts_as_realtime
+
+    # A materially negative, fading candidate is kept out of the current radar.
+    jelly = assess_actionability(
+        ActionabilityInputs(
+            now=10_000,
+            first_seen_at=4_000,
+            return_since_first_seen_percent=Decimal("-21"),
+            momentum_score=Decimal("20"),
+            buys=5,
+            sells=30,
+        )
+    )
+    assert jelly.suppressed, "a deteriorated candidate must not rank beside fresh ones"
+
+    # Several rich cards must fit one Discord message.
+    card = CardSpec(
+        title="Card",
+        description="D" * 400,
+        compact_description="Token `MINT`",
+        fields=tuple(CardField(f"F{index}", "v" * 900) for index in range(6)),
+    )
+    embeds, _ = render_message([card] * 5)
+    total = sum(len(item) for item in embeds)
+    assert total <= SAFE_MESSAGE_BUDGET <= MESSAGE_EMBED_LIMIT
 
 
 if __name__ == "__main__":

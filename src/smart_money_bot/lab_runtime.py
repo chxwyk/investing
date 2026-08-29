@@ -17,6 +17,11 @@ from decimal import Decimal
 from typing import Any
 
 from .constants import BOT_VERSION
+from .lab.actionability import (
+    Actionability,
+    ActionabilityInputs,
+    assess_actionability,
+)
 from .lab.authenticity import (
     AuthenticityAssessment,
     aggregate_sol_activity,
@@ -36,6 +41,7 @@ from .lab.exits import (
     open_position,
     plan_exit,
 )
+from .lab.fastwatch import FastWatchSignals, FastWatchVerdict, evaluate_fast_watch
 from .lab.identity import TokenIdentity, build_token_identity, identity_from_payload
 from .lab.lifecycle import (
     LifecycleObservation,
@@ -234,6 +240,11 @@ class LabRuntime:
             config=self.config,
         )
 
+        actionability = self._actionability(
+            candidate, lifecycle=lifecycle, evaluation=evaluation, now=moment
+        )
+        fast_watch = self._fast_watch(candidate, now=moment)
+
         events = self._events(
             mint,
             candidate=candidate,
@@ -259,6 +270,8 @@ class LabRuntime:
             smart_money=smart_money,
             reentry=reentry,
             position=existing,
+            actionability=actionability,
+            fast_watch=fast_watch,
         )
 
     async def maybe_open_position(
@@ -572,6 +585,93 @@ class LabRuntime:
             sources=("runner",),
         )
 
+    def _actionability(
+        self,
+        candidate: Any,
+        *,
+        lifecycle: TokenLifecycle,
+        evaluation: EntryEvaluation,
+        now: int,
+    ) -> Actionability:
+        """Is this still worth surfacing now?  Current evidence only."""
+
+        current = getattr(candidate, "current", None)
+        first = getattr(candidate, "first", None)
+        quality = getattr(candidate, "quality", None)
+        demand = getattr(quality, "demand", None)
+        price = _field(current, "price_usd")
+        return assess_actionability(
+            ActionabilityInputs(
+                now=now,
+                first_seen_at=getattr(candidate, "first_seen_at", None),
+                signal_at=getattr(candidate, "qualified_at", None)
+                or getattr(candidate, "first_seen_at", None),
+                return_since_first_seen_percent=_change(price, _field(first, "price_usd")),
+                return_since_first_surface_percent=lifecycle.return_from_surface(price),
+                drawdown_from_peak_percent=lifecycle.drawdown_from_peak(price),
+                momentum_score=getattr(quality, "momentum_score", None),
+                buys=int(getattr(current, "buys_5m", 0) or 0),
+                sells=int(getattr(current, "sells_5m", 0) or 0),
+                liquidity_change_percent=_change(
+                    _field(current, "liquidity_usd"), _field(first, "liquidity_usd")
+                ),
+                volume_change_ratio=_ratio(
+                    _field(current, "volume_5m_usd"), _field(first, "volume_5m_usd")
+                ),
+                independent_buyer_change=_delta(
+                    getattr(demand, "estimated_independent_buyers", None),
+                    getattr(
+                        getattr(getattr(candidate, "detection_quality", None), "demand", None),
+                        "estimated_independent_buyers",
+                        None,
+                    ),
+                ),
+                lifecycle_state=lifecycle.state,
+                safety_status=str(getattr(getattr(candidate, "safety", None), "status", "UNKNOWN")),
+                route_available=bool(getattr(current, "route_available", False)),
+                expected_net_edge_percent=evaluation.decision.expected_net_edge_percent,
+            ),
+            config=self.config,
+        )
+
+    def _fast_watch(self, candidate: Any, *, now: int) -> FastWatchVerdict:
+        """Cheap early-acceleration verdict.  Never entry eligible."""
+
+        current = getattr(candidate, "current", None)
+        first = getattr(candidate, "first", None)
+        pair_created_at = getattr(candidate, "pair_created_at", None)
+        return evaluate_fast_watch(
+            FastWatchSignals(
+                now=now,
+                pair_age_seconds=_age(pair_created_at, now),
+                market_cap_usd=_field(current, "market_cap_usd"),
+                first_seen_market_cap_usd=_field(first, "market_cap_usd"),
+                market_cap_acceleration_ratio=_ratio(
+                    _field(current, "market_cap_usd"), _field(first, "market_cap_usd")
+                ),
+                price_change_percent=_change(
+                    _field(current, "price_usd"), _field(first, "price_usd")
+                ),
+                volume_acceleration_ratio=_ratio(
+                    _field(current, "volume_5m_usd"), _field(first, "volume_5m_usd")
+                ),
+                buys=int(getattr(current, "buys_5m", 0) or 0),
+                sells=int(getattr(current, "sells_5m", 0) or 0),
+                holder_growth=_delta(
+                    getattr(current, "holder_count", None),
+                    getattr(first, "holder_count", None),
+                ),
+                liquidity_usd=_field(current, "liquidity_usd"),
+                liquidity_change_percent=_change(
+                    _field(current, "liquidity_usd"), _field(first, "liquidity_usd")
+                ),
+                route_available=bool(getattr(current, "route_available", False)),
+                rugged=bool(getattr(current, "rugged", False)),
+                hard_blockers=tuple(getattr(candidate, "hard_blockers", ()) or ()),
+            ),
+            config=self.config,
+        )
+
     def _authenticity(
         self,
         wallet_activity: tuple[Any, ...],
@@ -782,8 +882,10 @@ class LabEvaluation:
     """The complete lab view of one candidate at one instant."""
 
     __slots__ = (
+        "actionability",
         "authenticity",
         "evaluation",
+        "fast_watch",
         "identity",
         "lifecycle",
         "mint",
@@ -803,6 +905,8 @@ class LabEvaluation:
         smart_money: SmartMoneyAssessment,
         reentry: ReentryAssessment | None,
         position: PaperPosition | None,
+        actionability: Actionability | None = None,
+        fast_watch: FastWatchVerdict | None = None,
     ) -> None:
         self.mint = mint
         self.identity = identity
@@ -812,6 +916,8 @@ class LabEvaluation:
         self.smart_money = smart_money
         self.reentry = reentry
         self.position = position
+        self.actionability = actionability or Actionability()
+        self.fast_watch = fast_watch or FastWatchVerdict()
 
     @property
     def decision(self) -> TradeDecision:
@@ -919,6 +1025,18 @@ def _change(current: Decimal | None, base: Decimal | None) -> Decimal | None:
     if current is None or base is None or base <= 0:
         return None
     return ((current - base) / base * HUNDRED).quantize(Decimal("0.01"))
+
+
+def _ratio(current: Decimal | None, base: Decimal | None) -> Decimal | None:
+    if current is None or base is None or base <= 0:
+        return None
+    return (current / base).quantize(Decimal("0.01"))
+
+
+def _delta(current: int | None, base: int | None) -> int | None:
+    if current is None or base is None:
+        return None
+    return current - base
 
 
 def _age(started_at: int | None, now: int) -> int | None:

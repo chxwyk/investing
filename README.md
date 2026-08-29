@@ -7,6 +7,60 @@ transactions, and mirrors every newly detected hot-wallet swap in PAPER mode. PA
 as either a forced source-price observation ledger or an executable Jupiter quote-shadow
 trial; the two answer different questions and are labeled separately.
 
+Version 2.37.0 attacks the bottleneck that replaced intelligence: the system was often seeing
+tokens too late, and then keeping stale ones next to fresh ones.
+
+The headline latency number turned out to be partly a measurement artifact. `SOURCE → FIRST SEEN`
+was computed against *pair creation* time, so a pair that a trending feed surfaced hours after it
+was created reported an ~19-hour "ingestion latency" that no loop could produce. Every timing now
+carries a quality grade — REALTIME, APPROXIMATE, HISTORICAL or UNKNOWN — and only realtime-graded
+samples feed the percentiles. Historical samples are still counted and shown, labelled as what
+they are. No timestamp is rewritten. `/fomo latency` additionally reports per-source statistics
+and a full pipeline breakdown (source → first seen → fast watch → qualified → paper decision →
+simulated fill) so the genuinely slow stage is visible rather than inferred.
+
+There was also real latency to remove. First-seen was previously persisted only *after*
+`analyze_runner` had finished its DEX, tracker-risk and quote work, so enrichment time was being
+counted as ingestion time. A cheap discovery ledger now records the mint the instant the radar
+detects it, before any enrichment, and never lets that timestamp move later. Never-seen mints are
+also processed ahead of rechecks, so a backlog cannot push a genuinely new token to the next poll.
+
+**FAST WATCH** surfaces early acceleration from cheap evidence — pair age, market-cap and volume
+acceleration, price velocity, buy/sell pressure, holder and liquidity growth — without waiting for
+wallet forensics, tracker risk or social enrichment. It is research visibility only: the verdict
+type's `entry_eligible` is a structural `False`, the card lists the mandatory evidence it did not
+wait for, and every PAPER entry gate is unchanged. A candidate that sat in a queue is re-checked
+for freshness immediately before publication, so nothing publishes as "early" after the move.
+
+**Current actionability** answers the second question the opportunity score never did: is this
+still worth surfacing *now*? Historical opportunity is still stored and still drives research, but
+the current radar ranks by current edge, and a candidate that is materially negative since first
+seen with weakening flow — the JELLY case — is classified DETERIORATED and suppressed from the
+current radar. Suppressed is never deleted: those tokens remain in `/fomo results`, `/fomo
+quality`, lifecycle, replay, calibration and every forward observation, which is where their
+value is. EDGE_CONSUMED is distinguished from mere weakness, and re-entry still requires the
+existing RETRACED → COOLDOWN → REENTRY_WATCH → REENTRY_QUALIFIED evidence.
+
+Three confirmed production bugs are fixed. A pre-v2.36 mint queried with `/fomo lifecycle` used to
+re-initialise as `FIRST_DISCOVERY • FRESH` because no lifecycle row existed; it now reconstructs
+from the runner's own candidate rows, snapshots, alert events and stage events, recovering the
+real first-seen, first-surface market cap, historical peak, alert and qualification counts.
+Missing evidence stays UNKNOWN/PARTIAL and is never invented, repeated lookups can only move the
+earliest timestamp earlier, and a genuinely unseen mint is still FIRST_DISCOVERY. `/fomo
+opportunities` and `/fomo lab mode:test` were failing with Discord HTTP 400 / 50035 because the
+6000-character budget is per *message* while each card was clamped individually; one shared
+renderer now budgets the whole message with headroom, trims optional detail before identity, mint,
+decision, safety and WHY NOT ENTRY, falls back to compact and then minimal cards, and makes
+exactly one emergency retry — the v2.35.1 guarantee that an interaction always resolves is
+preserved. Buyer counts now distinguish five populations explicitly: raw on-chain buyers (never
+sampled here, so *unavailable* rather than `0`), tracked wallets, independent tracked wallets,
+verified buyers (where `0` is a real observation) and wallet clusters.
+
+Provider diagnostics were also misleading. `runner_forensics` is an own-RPC feature, not billable
+Solana Tracker traffic, and its cache hits — served by the per-mint forensic payload and the
+persistent `wallet_funding_edges` table — were never counted, which is why `/fomo quality`
+reported `cache 0` for a feature that mostly serves from cache. The hits are now recorded.
+
 Version 2.36.1 makes the `/fomo opportunities` card's numbers match the evidence behind them.
 Confidence was derived from the organic-demand score alone, so a 100/100 organic score rendered
 `100%` confidence even when economic authenticity was UNKNOWN, the bounded SOL activity sample
@@ -892,6 +946,26 @@ The bot needs these Discord application permissions:
 No privileged Discord gateway intents are required.
 
 ## Railway deployment
+
+### v2.37.0 Railway changes
+
+Every new setting has a safe code default, so **no Railway variable has to be added**. Nothing
+here enables live trading; there is still no live-execution path.
+
+**ADD:** none required.  **CHANGE:** none required.
+
+**OPTIONAL:**
+
+```text
+FOMO_FAST_WATCH_ENABLED=true             # research-only early WATCH visibility
+FOMO_FAST_WATCH_MIN_ACTIONABILITY=55
+FOMO_CURRENT_RADAR_SUPPRESS_STALE=true   # keep deteriorated tokens out of the current radar
+FOMO_DISCOVERY_SOURCE_NAME=dexscreener_trending
+```
+
+Schema change is one additive table, `runner_discovery` (`CREATE TABLE IF NOT EXISTS`), holding
+the cheap-discovery ledger and per-stage pipeline times. No existing table, column or row is
+dropped, renamed or rewritten.
 
 ### v2.36.0 Railway changes
 

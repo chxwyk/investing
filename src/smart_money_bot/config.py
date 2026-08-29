@@ -207,6 +207,12 @@ class Settings:
     fomo_social_posts_per_account: int
     fomo_social_daily_request_budget: int
 
+    # --- discovery speed / current actionability (v2.37) -----------------
+    fomo_discovery_source_name: str
+    fomo_fast_watch_enabled: bool
+    fomo_fast_watch_min_actionability: Decimal
+    fomo_current_radar_suppress_stale: bool
+
     news_radar_enabled: bool
     x_news_stream_enabled: bool
     x_news_stream_rule: str
@@ -514,6 +520,17 @@ class Settings:
             fomo_social_radar_enabled=_bool("FOMO_SOCIAL_RADAR_ENABLED", False),
             fomo_social_posts_per_account=_int("FOMO_SOCIAL_POSTS_PER_ACCOUNT", 10),
             fomo_social_daily_request_budget=_int("FOMO_SOCIAL_DAILY_REQUEST_BUDGET", 40),
+            fomo_discovery_source_name=(
+                os.getenv("FOMO_DISCOVERY_SOURCE_NAME", "dexscreener_trending").strip()
+                or "dexscreener_trending"
+            ),
+            fomo_fast_watch_enabled=_bool("FOMO_FAST_WATCH_ENABLED", True),
+            fomo_fast_watch_min_actionability=_decimal(
+                "FOMO_FAST_WATCH_MIN_ACTIONABILITY", "55"
+            ),
+            fomo_current_radar_suppress_stale=_bool(
+                "FOMO_CURRENT_RADAR_SUPPRESS_STALE", True
+            ),
             news_radar_enabled=_bool("NEWS_RADAR_ENABLED", True),
             x_news_stream_enabled=_bool("X_NEWS_STREAM_ENABLED", False),
             x_news_stream_rule=os.getenv("X_NEWS_STREAM_RULE", DEFAULT_X_NEWS_RULE).strip(),
@@ -884,6 +901,10 @@ class Settings:
             raise ValueError("FOMO_SOCIAL_POSTS_PER_ACCOUNT must be between 1 and 100")
         if not 0 <= self.fomo_social_daily_request_budget <= 10_000:
             raise ValueError("FOMO_SOCIAL_DAILY_REQUEST_BUDGET must be between 0 and 10000")
+        if not 0 <= self.fomo_fast_watch_min_actionability <= 100:
+            raise ValueError("FOMO_FAST_WATCH_MIN_ACTIONABILITY must be between 0 and 100")
+        if not self.fomo_discovery_source_name or len(self.fomo_discovery_source_name) > 64:
+            raise ValueError("FOMO_DISCOVERY_SOURCE_NAME must be 1-64 characters")
         if len(self.x_news_stream_rule) > 1024:
             raise ValueError("X_NEWS_STREAM_RULE cannot exceed 1024 characters")
         if not 15 <= self.news_poll_seconds <= 3600:

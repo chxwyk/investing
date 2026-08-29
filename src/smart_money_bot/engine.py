@@ -46,8 +46,16 @@ from .errors import (
     UnknownLaunchResultError,
 )
 from .executor import ExecutionManager
+from .lab.actionability import RankedCandidate as LabRankedCandidate
+from .lab.actionability import rank_by_current_edge
 from .lab.config import lab_config_from_settings
 from .lab.exits import ExitContext as LabExitContext
+from .lab.latency import HISTORICAL as LAB_HISTORICAL
+from .lab.latency import UNKNOWN as LAB_UNKNOWN
+from .lab.latency import LatencySample as LabLatencySample
+from .lab.latency import pipeline_breakdown as lab_pipeline_breakdown
+from .lab.latency import slowest_stage as lab_slowest_stage
+from .lab.latency import summarize_sources as summarize_lab_sources
 from .lab.regime import RegimeSample as LabRegimeSample
 from .lab_runtime import LabEvaluation, LabRuntime
 from .lab_store import LabStore
@@ -1226,6 +1234,30 @@ class SmartMoneyEngine:
                 await self.notifier.on_error("Proactive X radar", exc)
             await asyncio.sleep(self.settings.x_radar_poll_seconds)
 
+    async def _record_discovery(self, mint: str, *, now: int) -> None:
+        """Write the cheap-discovery timestamp; never let it break a scan."""
+
+        if self.database.connection is None:
+            return
+        try:
+            await self.database.record_discovery(
+                mint=mint,
+                source_name=self.settings.fomo_discovery_source_name,
+                source_event_at=None,
+                now=now,
+                source_is_realtime=True,
+            )
+        except Exception:
+            logger.exception("Could not persist cheap discovery for %s", mint)
+
+    async def _mark_discovery_stage(self, mint: str, stage: str, *, at: int) -> None:
+        if self.database.connection is None:
+            return
+        try:
+            await self.database.mark_discovery_stage(mint=mint, stage=stage, at=at)
+        except Exception:
+            logger.exception("Could not record %s stage for %s", stage, mint)
+
     async def _run_fomo_radar(self) -> None:
         """Fast public nomination lane; the digest remains a separate slow summary."""
 
@@ -1239,9 +1271,17 @@ class SmartMoneyEngine:
                     if now - self._fomo_radar_seen.get(mint, 0)
                     >= self.settings.fomo_radar_recheck_seconds
                 ]
+                # Never-seen mints go first.  A backlog of rechecks used to be
+                # able to consume the whole per-scan budget and push a genuinely
+                # new token to the next poll, which is pure added latency.
+                due.sort(key=lambda mint: mint in self._fomo_radar_seen)
                 selected = due[: self.settings.fomo_radar_max_candidates_per_scan]
                 for mint in selected:
                     self._fomo_radar_seen[mint] = now
+                    # Persist first-seen the instant cheap discovery detects the
+                    # mint.  Everything below this line is enrichment, and none
+                    # of it may delay the timestamp we measure ingestion with.
+                    await self._record_discovery(mint, now=now)
                     if self.settings.coin_callouts_enabled:
                         self._queue_coin_callout(mint)
                 if self.settings.fomo_runner_enabled:
@@ -1810,6 +1850,10 @@ class SmartMoneyEngine:
             (*INFRASTRUCTURE_ADDRESSES, *self.settings.fomo_runner_excluded_funders)
         )
         counter = [0]
+        # Cache hits are counted alongside real calls so the provider diagnostic
+        # reflects the caching that actually happens.  Declared here so the
+        # error path can report it too.
+        cache_hits = [0]
         try:
             largest_rows, supply_row = await asyncio.gather(
                 self.rpc.get_token_largest_accounts(mint),
@@ -1844,11 +1888,16 @@ class SmartMoneyEngine:
             stored_edges = await self.database.cached_funding_edges(list(owner_supply))
             semaphore = asyncio.Semaphore(4)
             new_edges: list[dict[str, Any]] = []
+            # The trace is already heavily cached, by the per-mint forensic
+            # payload and by the persistent wallet_funding_edges table.  Those
+            # hits were never counted, which is why `/fomo quality` reported
+            # "cache 0" for a feature that mostly serves from cache.
 
             async def trace(owner: str, supply_percent: Decimal) -> RunnerFundingObservation:
                 bought_at = buyer_first_seen_at.get(owner)
                 prior = cached_observations.get(owner)
                 if prior is not None:
+                    cache_hits[0] += 1
                     return replace(
                         prior,
                         supply_percent=supply_percent,
@@ -1861,6 +1910,7 @@ class SmartMoneyEngine:
                     )
                 edge = stored_edges.get(owner)
                 if edge and edge.get("trace_complete"):
+                    cache_hits[0] += 1
                     first_activity = edge.get("first_activity_at")
                     return RunnerFundingObservation(
                         wallet=owner,
@@ -1932,7 +1982,10 @@ class SmartMoneyEngine:
             )
             await self.database.store_funding_edges(new_edges)
             await self._record_provider_call(
-                "solana_rpc", "runner_forensics", calls=counter[0]
+                "solana_rpc",
+                "runner_forensics",
+                calls=counter[0],
+                cache_hits=cache_hits[0],
             )
             result = summarize_forensics(
                 observations,
@@ -1962,7 +2015,11 @@ class SmartMoneyEngine:
             )
         except (RpcError, ValueError, TypeError) as exc:
             await self._record_provider_call(
-                "solana_rpc", "runner_forensics", calls=counter[0], errors=1
+                "solana_rpc",
+                "runner_forensics",
+                calls=counter[0],
+                cache_hits=cache_hits[0],
+                errors=1,
             )
             return RunnerForensics(
                 available=False,
@@ -2273,22 +2330,33 @@ class SmartMoneyEngine:
                 logger.exception("Lab evaluation failed for %s", candidate.mint)
                 continue
             results.append((candidate, evaluation))
-        results.sort(key=self._lab_rank_key, reverse=True)
+        # Rank by CURRENT edge, not by the historical opportunity score: a token
+        # that once scored 86 but has collapsed must fall below a genuinely
+        # accelerating new setup.
+        ranked = rank_by_current_edge(
+            [
+                LabRankedCandidate(
+                    mint=candidate.mint,
+                    actionability=evaluation.actionability,
+                    expected_net_edge_percent=evaluation.decision.expected_net_edge_percent,
+                    historical_opportunity_score=candidate.quality.opportunity_score,
+                    decision=str(evaluation.decision.decision),
+                    lifecycle_state=evaluation.lifecycle.state,
+                )
+                for candidate, evaluation in results
+            ]
+        )
+        order = {item.mint: index for index, item in enumerate(ranked)}
+        results.sort(key=lambda row: order.get(row[0].mint, len(order)))
+        if self.settings.fomo_current_radar_suppress_stale:
+            # Suppressed is never deleted: these rows stay in results, quality,
+            # lifecycle, replay and every forward observation.
+            current = [
+                row for row in results if not row[1].actionability.suppressed
+            ]
+            if current:
+                results = current
         return tuple(results[:limit])
-
-    @staticmethod
-    def _lab_rank_key(row: tuple[RunnerCandidate, LabEvaluation]) -> tuple[int, Decimal, Decimal]:
-        candidate, evaluation = row
-        decision_rank = {
-            "ENTRY": 5,
-            "REENTRY_QUALIFIED": 4,
-            "WAIT": 3,
-            "REENTRY_WATCH": 2,
-            "COOLDOWN": 1,
-            "REJECT": 0,
-        }.get(str(evaluation.decision.decision), 0)
-        edge = evaluation.decision.expected_net_edge_percent or Decimal("0")
-        return decision_rank, edge, candidate.quality.opportunity_score
 
     async def lab_trades(self, *, limit: int = 10) -> tuple[object, ...]:
         await self.initialize()
@@ -3255,6 +3323,52 @@ class SmartMoneyEngine:
             "baseline_status": (
                 "collecting — compare RunnerScore with age/volume/price-gain baselines "
                 "after at least 30 completed 1h observations"
+            ),
+        }
+
+    async def discovery_latency(self, *, limit: int = 100) -> dict[str, object]:
+        """Source-specific latency with an honest timing grade per sample.
+
+        The old global number treated pair-creation time as a realtime discovery
+        event, so an old pair appearing on a trending feed produced an
+        ~19-hour "ingestion latency".  Timings are now graded, and only
+        realtime-grade samples feed the percentiles.
+        """
+
+        await self.initialize()
+        rows = await self.database.discovery_latency_rows(limit=limit)
+        samples = [
+            LabLatencySample(
+                mint=str(row["mint"]),
+                source_name=str(row.get("source_name") or "unknown"),
+                source_event_at=_first_int(
+                    row.get("source_event_at"),
+                    row.get("pair_created_at"),
+                    row.get("chain_created_at"),
+                ),
+                ingested_at=_first_int(row.get("ingested_at")),
+                first_seen_at=_first_int(row.get("first_seen_at")),
+                first_watch_at=_first_int(row.get("first_watch_at")),
+                first_qualified_at=_first_int(row.get("first_qualified_at")),
+                first_discord_at=_first_int(row.get("first_discord_visible_at")),
+                first_paper_decision_at=_first_int(row.get("first_paper_decision_at")),
+                simulated_fill_at=_first_int(row.get("simulated_fill_at")),
+                source_is_realtime=bool(row.get("source_is_realtime", 1)),
+            )
+            for row in rows
+        ]
+        breakdown = lab_pipeline_breakdown(samples)
+        return {
+            "samples": len(samples),
+            "sources": summarize_lab_sources(samples),
+            "pipeline": breakdown,
+            "slowest_stage": lab_slowest_stage(breakdown),
+            "realtime_samples": sum(1 for item in samples if item.counts_as_realtime),
+            "historical_samples": sum(
+                1 for item in samples if item.timing_quality == LAB_HISTORICAL
+            ),
+            "unknown_samples": sum(
+                1 for item in samples if item.timing_quality == LAB_UNKNOWN
             ),
         }
 
@@ -5693,3 +5807,16 @@ class SmartMoneyEngine:
             "launch_lab_min_score": self.settings.launch_lab_min_score,
             "j7_public_wallet_configured": bool(self.pump_launcher.j7.wallet_address),
         }
+
+
+def _first_int(*values: object) -> int | None:
+    """First usable integer among the candidates, else None."""
+
+    for value in values:
+        if value is None or value == "":
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return None

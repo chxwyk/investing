@@ -25,6 +25,7 @@ from typing import Any
 import aiosqlite
 
 from .database import Database
+from .lab.backfill import LegacyEvidence, LegacyObservation, reconstruct_lifecycle
 from .lab.config import STRATEGY_VERSION
 from .lab.decision import TradeDecision, decision_from_json, decision_to_json
 from .lab.exits import (
@@ -61,13 +62,26 @@ class LabStore:
     # ------------------------------------------------------------------
     # lifecycle
     # ------------------------------------------------------------------
-    async def load_lifecycle(self, mint: str, *, now: int | None = None) -> TokenLifecycle:
-        """Return the persisted lifecycle, or a genuinely new one.
+    async def load_lifecycle(
+        self,
+        mint: str,
+        *,
+        now: int | None = None,
+        backfill: bool = True,
+    ) -> TokenLifecycle:
+        """Return the persisted lifecycle, reconstructing pre-v2.36 history.
 
-        A missing row is the *only* way a mint becomes FIRST_DISCOVERY, so a
-        restart can never reset an existing token's history.
+        A missing row used to mean FIRST_DISCOVERY unconditionally, which made
+        every token the runner observed before the lifecycle tables existed look
+        brand new.  Now a missing row first consults the runner's own historical
+        tables; only a mint with genuinely no persisted history becomes
+        FIRST_DISCOVERY.
+
+        The reconstruction is written back, so it happens once per mint and a
+        restart reads the stored record instead of rebuilding it.
         """
 
+        moment = now if now is not None else int(time.time())
         cursor = await self._db.execute(
             "SELECT payload_json FROM lab_token_lifecycle WHERE mint = ?", (mint,)
         )
@@ -77,7 +91,151 @@ class LabStore:
                 return lifecycle_from_json(row["payload_json"])
             except (ValueError, json.JSONDecodeError):
                 pass
-        return new_lifecycle(mint, now=now if now is not None else int(time.time()))
+        if backfill:
+            recovered = await self.backfill_lifecycle(mint, now=moment)
+            if recovered is not None:
+                return recovered
+        return new_lifecycle(mint, now=moment)
+
+    async def backfill_lifecycle(
+        self,
+        mint: str,
+        *,
+        now: int,
+        persist: bool = True,
+    ) -> TokenLifecycle | None:
+        """Reconstruct and store lifecycle memory from legacy runner history.
+
+        Idempotent: a second call reads the row written by the first, and
+        ``merge_backfill`` can only move the earliest timestamps earlier and the
+        high-water marks higher, so repeating it never rewrites history.
+        """
+
+        evidence = await self.legacy_evidence(mint)
+        if evidence is None:
+            return None
+        result = reconstruct_lifecycle(evidence, now=now)
+        if result.lifecycle is None:
+            return None
+        record = result.lifecycle
+        if persist:
+            await self.save_lifecycle(record, now=now)
+        return record
+
+    async def legacy_evidence(self, mint: str) -> LegacyEvidence | None:
+        """Gather everything the pre-v2.36 runner tables persisted for a mint."""
+
+        cursor = await self._db.execute(
+            """
+            SELECT first_seen_at, radar_first_seen_at, first_discord_visible_at,
+                   entry_eligible_at, strong_alert_at, last_seen_at,
+                   first_price_usd, first_market_cap_usd,
+                   first_visible_market_cap_usd, entry_market_cap_usd,
+                   peak_market_cap_usd
+            FROM runner_candidates WHERE mint = ?
+            """,
+            (mint,),
+        )
+        candidate = await cursor.fetchone()
+
+        cursor = await self._db.execute(
+            """
+            SELECT SUM(send_count) AS alerts, MIN(first_sent_at) AS first_at,
+                   MAX(last_sent_at) AS last_at
+            FROM runner_alert_events WHERE mint = ?
+            """,
+            (mint,),
+        )
+        alerts = await cursor.fetchone()
+
+        cursor = await self._db.execute(
+            """
+            SELECT stage, decided_at, safety_status
+            FROM runner_stage_events WHERE mint = ?
+            ORDER BY decided_at ASC LIMIT 200
+            """,
+            (mint,),
+        )
+        stage_rows = await cursor.fetchall()
+
+        cursor = await self._db.execute(
+            """
+            SELECT captured_at, snapshot_json FROM runner_snapshots
+            WHERE mint = ? ORDER BY captured_at ASC LIMIT 400
+            """,
+            (mint,),
+        )
+        snapshot_rows = await cursor.fetchall()
+
+        if not candidate and not stage_rows and not snapshot_rows and not (
+            alerts and alerts["alerts"]
+        ):
+            return None
+
+        observations: list[LegacyObservation] = []
+        for snapshot in snapshot_rows:
+            try:
+                payload = json.loads(snapshot["snapshot_json"])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            observations.append(
+                LegacyObservation(
+                    observed_at=int(snapshot["captured_at"] or 0),
+                    price_usd=_decimal_or_none(payload.get("price_usd")),
+                    market_cap_usd=_decimal_or_none(payload.get("market_cap_usd")),
+                    liquidity_usd=_decimal_or_none(payload.get("liquidity_usd")),
+                )
+            )
+
+        qualified_stages = {"QUALIFIED_RESEARCH", "HEATING_UP", "ENTRY_CANDIDATE", "STRONG_RUNNER"}
+        qualified_rows = [
+            row for row in stage_rows if str(row["stage"] or "") in qualified_stages
+        ]
+        safety_history = tuple(
+            str(row["safety_status"])
+            for row in stage_rows
+            if row["safety_status"]
+        )[-20:]
+
+        return LegacyEvidence(
+            mint=mint,
+            first_seen_at=_int_or_none(candidate["first_seen_at"]) if candidate else None,
+            radar_first_seen_at=(
+                _int_or_none(candidate["radar_first_seen_at"]) if candidate else None
+            ),
+            first_discord_visible_at=(
+                _int_or_none(candidate["first_discord_visible_at"]) if candidate else None
+            ),
+            entry_eligible_at=_int_or_none(candidate["entry_eligible_at"]) if candidate else None,
+            strong_alert_at=_int_or_none(candidate["strong_alert_at"]) if candidate else None,
+            last_seen_at=_int_or_none(candidate["last_seen_at"]) if candidate else None,
+            first_price_usd=_decimal_or_none(candidate["first_price_usd"]) if candidate else None,
+            first_market_cap_usd=(
+                _decimal_or_none(candidate["first_market_cap_usd"]) if candidate else None
+            ),
+            first_visible_market_cap_usd=(
+                _decimal_or_none(candidate["first_visible_market_cap_usd"])
+                if candidate
+                else None
+            ),
+            entry_market_cap_usd=(
+                _decimal_or_none(candidate["entry_market_cap_usd"]) if candidate else None
+            ),
+            peak_market_cap_usd=(
+                _decimal_or_none(candidate["peak_market_cap_usd"]) if candidate else None
+            ),
+            alert_count=int((alerts["alerts"] if alerts else 0) or 0),
+            first_alert_at=_int_or_none(alerts["first_at"]) if alerts else None,
+            last_alert_at=_int_or_none(alerts["last_at"]) if alerts else None,
+            qualified_at=(
+                _int_or_none(qualified_rows[0]["decided_at"]) if qualified_rows else None
+            ),
+            qualification_count=len(qualified_rows),
+            observations=tuple(observations),
+            safety_history=safety_history,
+        )
 
     async def save_lifecycle(self, record: TokenLifecycle, *, now: int | None = None) -> None:
         moment = now if now is not None else int(time.time())
@@ -979,4 +1137,13 @@ def _decimal_or_none(value: Any) -> Decimal | None:
     try:
         return Decimal(str(value))
     except Exception:
+        return None
+
+
+def _int_or_none(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
         return None
