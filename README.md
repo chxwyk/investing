@@ -7,6 +7,23 @@ transactions, and mirrors every newly detected hot-wallet swap in PAPER mode. PA
 as either a forced source-price observation ledger or an executable Jupiter quote-shadow
 trial; the two answer different questions and are labeled separately.
 
+Version 2.36.1 makes the `/fomo opportunities` card's numbers match the evidence behind them.
+Confidence was derived from the organic-demand score alone, so a 100/100 organic score rendered
+`100%` confidence even when economic authenticity was UNKNOWN, the bounded SOL activity sample
+was missing and safety was not PASS. Confidence is now ceilinged by the weakest evidence
+supporting it — partial or unknown evidence quality, unknown/partial authenticity, an unsampled
+activity profile, a non-PASS safety verdict, a weak or absent buyer trace, or degraded provider
+data each impose a cap, and the strictest wins — with the ceiling and its reasons persisted on
+the decision and shown on the card. The card could also print "14 independent buyer clusters"
+beside "0 raw buyers": two different populations, since verified buyers come from tracked-wallet
+swaps while independence is measured over the bounded holder trace. Independence is now always
+reported against the population it was measured over (`14 of 14 traced`) and an unobserved
+verified-buyer count says so instead of claiming zero, with the impossible pair unconstructable
+by type. A high organic score with unknown or partial authenticity is now explicitly labelled
+raw/unverified so it cannot be read as confirmed authentic demand. No score, threshold,
+lifecycle rule, PAPER strategy, provider budget or Discord command changed, and SAFETY
+FAIL/UNKNOWN remain fail-closed for PAPER entry.
+
 Version 2.36.0 turns the Fomo runner into an autonomous **PAPER-only research laboratory**.
 Nothing in it can move real funds: the whole `smart_money_bot.lab` package contains no wallet,
 no signer and no live route, and `lab.LIVE_EXECUTION_ENABLED` is a hard `False` verified by the
