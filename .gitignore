@@ -1,0 +1,23 @@
+# Python build and cache artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Local runtime state — never commit a runner database; it holds the
+# forward-observation history the calibration commands read.
+*.db
+*.db-wal
+*.db-shm
+.env
+.env.*
