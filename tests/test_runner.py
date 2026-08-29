@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from smart_money_bot import bot as bot_module
 from smart_money_bot.bot import (
     FomoCommands,
     FomoRunnerLabView,
@@ -16,6 +17,7 @@ from smart_money_bot.bot import (
     RunnerXVerificationConfirmationView,
     SmartMoneyBot,
     _runner_digest_embed,
+    _runner_embed,
     _runner_forensic_embed,
     _runner_fresh_embed,
 )
@@ -37,6 +39,7 @@ from smart_money_bot.models import (
     TokenRiskSnapshot,
     XSocialSnapshot,
 )
+from smart_money_bot.quality import STAGE_RAW, STAGE_SILENT_WATCH
 from smart_money_bot.runner import (
     assess_runner_safety,
     build_funding_clusters,
@@ -1563,3 +1566,182 @@ def test_high_signal_with_failed_safety_is_unsafe_momentum_not_entry() -> None:
     assert candidate.safety.status == "FAIL"
     assert candidate.safety.entry_eligible is False
     assert candidate.state == "⚠️ UNSAFE MOMENTUM"
+
+
+# --- v2.35.1 `/fomo lab mode:test` permanent-spinner regression ---------------
+
+
+def _unqualified_cached_candidate(now: int):
+    """A real observed candidate that production rightly refuses to surface."""
+
+    return replace(
+        _candidate(now=now, graduated_at=now - 60),
+        stage=STAGE_RAW,
+        score=Decimal("5"),
+        hard_blockers=("liquidity pulled",),
+        first_seen_at=now - 60,
+        generated_at=now,
+    )
+
+
+def _lab_interaction() -> SimpleNamespace:
+    return SimpleNamespace(
+        user=SimpleNamespace(id=1),
+        response=SimpleNamespace(send_message=AsyncMock(), defer=AsyncMock()),
+        edit_original_response=AsyncMock(),
+    )
+
+
+def _lab_commands(settings, engine) -> FomoCommands:
+    commands = FomoCommands(SimpleNamespace(settings=settings, engine=engine))
+    commands._require_admin = AsyncMock(return_value=True)
+    return commands
+
+
+@pytest.mark.asyncio
+async def test_fomo_lab_test_mode_displays_cached_silent_watch_candidate(settings) -> None:
+    """A silent-watch observation renders immediately; it never reaches the live path."""
+
+    now = int(time.time())
+    silent = replace(_candidate(now=now), stage=STAGE_SILENT_WATCH, generated_at=now)
+    engine = SimpleNamespace(
+        runner_lab_cached_candidates=AsyncMock(return_value=(silent,)),
+        runner_lab_candidates=AsyncMock(),
+    )
+    interaction = _lab_interaction()
+
+    await FomoCommands.lab.callback(_lab_commands(settings, engine), interaction, mode="test")
+
+    engine.runner_lab_candidates.assert_not_awaited()
+    interaction.edit_original_response.assert_awaited_once()
+    kwargs = interaction.edit_original_response.await_args.kwargs
+    assert kwargs["embed"] is not None
+    assert MINT in kwargs["embed"].description
+    assert "SILENT WATCH" in kwargs["embed"].description
+    assert isinstance(kwargs["view"], FomoRunnerLabView)
+
+
+@pytest.mark.asyncio
+async def test_fomo_lab_test_mode_displays_rejected_unqualified_candidate(settings) -> None:
+    """Test mode inspects real rejected candidates without weakening production."""
+
+    now = int(time.time())
+    rejected = _unqualified_cached_candidate(now)
+    engine = SmartMoneyEngine(settings)
+    engine.initialize = AsyncMock()
+    engine.database.recent_runner_candidate_payloads = AsyncMock(
+        return_value=[runner_candidate_to_json(rejected)]
+    )
+
+    shown = await engine.runner_lab_cached_candidates(research_test=True)
+    withheld = await engine.runner_lab_cached_candidates(research_test=False)
+
+    assert [item.mint for item in shown] == [rejected.mint]
+    assert shown[0].stage == STAGE_RAW
+    # Production qualification is unchanged: the same row stays hidden.
+    assert withheld == ()
+
+
+@pytest.mark.asyncio
+async def test_fomo_lab_test_mode_makes_no_provider_calls_when_cache_exists(settings) -> None:
+    now = int(time.time())
+    engine = SmartMoneyEngine(settings)
+    engine.initialize = AsyncMock()
+    engine.database.recent_runner_candidate_payloads = AsyncMock(
+        return_value=[runner_candidate_to_json(_unqualified_cached_candidate(now))]
+    )
+    engine.dex_screener.trending_mints = AsyncMock()
+    engine.analyze_runner = AsyncMock()
+    engine.database.recent_observed_token_mints = AsyncMock()
+    interaction = _lab_interaction()
+
+    await FomoCommands.lab.callback(_lab_commands(settings, engine), interaction, mode="test")
+
+    engine.dex_screener.trending_mints.assert_not_awaited()
+    engine.analyze_runner.assert_not_awaited()
+    engine.database.recent_observed_token_mints.assert_not_awaited()
+    assert interaction.edit_original_response.await_args.kwargs["embed"] is not None
+
+
+@pytest.mark.asyncio
+async def test_fomo_lab_resolves_deferred_response_when_discord_rejects_card(
+    settings,
+) -> None:
+    """A rejected card degrades to visible text instead of a permanent spinner."""
+
+    now = int(time.time())
+    engine = SimpleNamespace(
+        runner_lab_cached_candidates=AsyncMock(
+            return_value=(replace(_candidate(now=now), stage=STAGE_SILENT_WATCH),)
+        ),
+        runner_lab_candidates=AsyncMock(),
+    )
+    interaction = _lab_interaction()
+    interaction.edit_original_response = AsyncMock(
+        side_effect=[RuntimeError("400 Bad Request (embeds)"), None]
+    )
+
+    await FomoCommands.lab.callback(_lab_commands(settings, engine), interaction, mode="test")
+
+    assert interaction.edit_original_response.await_count == 2
+    fallback = interaction.edit_original_response.await_args_list[1].kwargs
+    assert fallback["embed"] is None
+    assert fallback["view"] is None
+    assert "Discord rejected the rendered card" in fallback["content"]
+
+
+@pytest.mark.asyncio
+async def test_fomo_lab_always_resolves_when_render_raises(settings) -> None:
+    """Any unexpected failure after the defer still replaces the spinner."""
+
+    engine = SimpleNamespace(
+        runner_lab_cached_candidates=AsyncMock(side_effect=BufferError("boom")),
+        runner_lab_candidates=AsyncMock(),
+    )
+    interaction = _lab_interaction()
+
+    await FomoCommands.lab.callback(_lab_commands(settings, engine), interaction, mode="test")
+
+    interaction.edit_original_response.assert_awaited()
+    content = interaction.edit_original_response.await_args.kwargs["content"]
+    assert "BufferError" in content
+    assert "No buy or launch was attempted" in content
+
+
+@pytest.mark.asyncio
+async def test_fomo_lab_hard_deadline_replaces_spinner_with_visible_error(
+    settings, monkeypatch
+) -> None:
+    """A stage that hangs past the hard deadline reports visibly, never spins forever."""
+
+    monkeypatch.setattr(bot_module, "FOMO_LAB_TOTAL_DEADLINE_SECONDS", 0.05)
+
+    async def never_returns(**_kwargs):
+        await asyncio.sleep(30)
+
+    engine = SimpleNamespace(
+        runner_lab_cached_candidates=AsyncMock(side_effect=never_returns),
+        runner_lab_candidates=AsyncMock(),
+    )
+    interaction = _lab_interaction()
+
+    await FomoCommands.lab.callback(_lab_commands(settings, engine), interaction, mode="test")
+
+    interaction.edit_original_response.assert_awaited_once()
+    kwargs = interaction.edit_original_response.await_args.kwargs
+    assert "hard deadline" in kwargs["content"]
+    assert kwargs["embed"] is None
+    assert kwargs["view"] is None
+
+
+def test_runner_embed_clamps_attacker_controlled_token_metadata() -> None:
+    """On-chain metadata cannot push the card past Discord's embed limits."""
+
+    junk = replace(_candidate(), stage=STAGE_RAW, name="A" * 5_000, symbol="B" * 400)
+
+    embed = _runner_embed(junk, research_test=True)
+
+    assert len(embed.description) <= bot_module.DISCORD_EMBED_DESCRIPTION_LIMIT
+    assert len(embed) <= bot_module.DISCORD_EMBED_TOTAL_LIMIT
+    assert len(embed.title) <= bot_module.DISCORD_EMBED_TITLE_LIMIT
+    assert junk.mint in embed.description

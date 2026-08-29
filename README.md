@@ -39,6 +39,16 @@ funding clusters. `/fomo forensic` and `/fomo calibration` expose the evidence r
 runner card links the exact mint with Fomo first; no runner button buys, sells, signs, calls J7,
 or spends SOL.
 
+Version 2.35.1 fixes `/fomo lab mode:test` remaining on Discord's "Investing is thinking...".
+Token name and symbol come from on-chain metadata, so an unvetted RAW_DISCOVERY/SILENT_WATCH
+observation — exactly what test mode is meant to inspect — could push the rendered card past
+Discord's embed limits. Discord rejected the edit and the error escaped the response path,
+stranding the deferred interaction. The runner card is now clamped to Discord's documented
+limits, every `/fomo lab` exit routes through a resolver that degrades a rejected card to
+visible text, and a hard 60-second deadline guarantees the spinner is always replaced by a card
+or an error. An unreadable persisted row no longer blanks the cached observation pool. No
+scoring, quality threshold, discovery, safety, alert threshold, or buy path changed.
+
 Version 2.33.3 immediately acknowledges every `/fomo lab` invocation before any database or
 provider work. Test mode renders a real cached runner observation without contacting live
 providers, while empty-cache refreshes and timeouts visibly replace the original ephemeral

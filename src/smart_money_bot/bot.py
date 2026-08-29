@@ -175,6 +175,42 @@ def _token_view(mint: str, fomo_referral_code: str | None = None) -> discord.ui.
     return view
 
 
+# Cache read (5s) plus the bounded live refresh (40s) must both fit inside the
+# outer deadline, so a slow stage still produces its own specific message.
+FOMO_LAB_CACHE_DEADLINE_SECONDS = 5
+FOMO_LAB_REFRESH_DEADLINE_SECONDS = 40
+FOMO_LAB_TOTAL_DEADLINE_SECONDS = 60
+
+DISCORD_EMBED_TITLE_LIMIT = 256
+DISCORD_EMBED_DESCRIPTION_LIMIT = 4096
+DISCORD_EMBED_FIELD_VALUE_LIMIT = 1024
+DISCORD_EMBED_TOTAL_LIMIT = 6000
+RUNNER_TOKEN_NAME_LIMIT = 80
+RUNNER_TOKEN_SYMBOL_LIMIT = 20
+
+
+def _clamp_embed(embed: discord.Embed) -> discord.Embed:
+    """Keep a rendered card inside Discord's documented embed limits.
+
+    Token ``name``/``symbol`` come from on-chain metadata, so an unvetted
+    RAW_DISCOVERY/SILENT_WATCH candidate can carry an arbitrarily long name.
+    Discord rejects an oversized embed with HTTP 400, which used to escape the
+    `/fomo lab` response path and leave the deferred interaction parked on
+    "Investing is thinking...". Trimming here keeps the card renderable instead
+    of failing the whole interaction.
+    """
+
+    if embed.title and len(embed.title) > DISCORD_EMBED_TITLE_LIMIT:
+        embed.title = embed.title[:DISCORD_EMBED_TITLE_LIMIT]
+    if embed.description and len(embed.description) > DISCORD_EMBED_DESCRIPTION_LIMIT:
+        embed.description = embed.description[: DISCORD_EMBED_DESCRIPTION_LIMIT - 1] + "…"
+    # Fields are individually capped at the call sites; the running total is
+    # not, so drop trailing detail until the whole card fits.
+    while len(embed) > DISCORD_EMBED_TOTAL_LIMIT and embed.fields:
+        embed.remove_field(len(embed.fields) - 1)
+    return embed
+
+
 def _runner_dex_url(candidate: RunnerCandidate) -> str:
     parsed = urlparse(candidate.pair_url)
     if (
@@ -1549,9 +1585,10 @@ def _runner_embed(
     embed = discord.Embed(
         title=title[:256],
         description=(
-            f"**[{candidate.name or 'Unknown token'}]"
+            f"**[{(candidate.name or 'Unknown token')[:RUNNER_TOKEN_NAME_LIMIT]}]"
             f"({_fomo_coin_url(candidate.mint, fomo_referral_code)})** "
-            f"`${candidate.symbol or 'UNKNOWN'}`\n`{candidate.mint}`\n\n"
+            f"`${(candidate.symbol or 'UNKNOWN')[:RUNNER_TOKEN_SYMBOL_LIMIT]}`"
+            f"\n`{candidate.mint}`\n\n"
             f"Candidate `{index + 1}/{total}` • stage "
             f"**{STAGE_LABELS.get(candidate.stage, candidate.stage)}**\n"
             f"Opportunity **{candidate.quality.opportunity_score:.0f}/100** • momentum "
@@ -1753,7 +1790,7 @@ def _runner_embed(
     embed.set_footer(
         text=("SHADOW RESEARCH • existing token • no J7 • no auto-buy • no profit promise")
     )
-    return embed
+    return _clamp_embed(embed)
 
 
 def _runner_digest_embed(
@@ -4530,16 +4567,83 @@ class FomoCommands(
         if not await self._require_admin(interaction):
             return
         await interaction.response.defer(thinking=True, ephemeral=True)
-        research_test = mode == "test"
+        # Every exit below must replace the deferred response. An exception that
+        # escapes this callback leaves Discord parked on "Investing is
+        # thinking..." forever, which is exactly the v2.33.2/v2.33.3 regression.
+        try:
+            async with asyncio.timeout(FOMO_LAB_TOTAL_DEADLINE_SECONDS):
+                await self._lab_response(interaction, research_test=mode == "test")
+        except TimeoutError:
+            await self._resolve_lab(
+                interaction,
+                content=(
+                    "Fomo Runner Lab exceeded its "
+                    f"{FOMO_LAB_TOTAL_DEADLINE_SECONDS}-second hard deadline and was "
+                    "cancelled. No X credits, SOL, buy, or J7 launch was used."
+                ),
+            )
+        except Exception as exc:
+            await self._resolve_lab(
+                interaction,
+                content=(
+                    "Fomo Runner Lab failed unexpectedly: "
+                    f"`{type(exc).__name__}`. No buy or launch was attempted."
+                ),
+            )
+
+    async def _resolve_lab(
+        self,
+        interaction: discord.Interaction,
+        *,
+        content: str | None = None,
+        embed: discord.Embed | None = None,
+        view: discord.ui.View | None = None,
+    ) -> None:
+        """Replace the deferred response, degrading to text if the card is rejected.
+
+        Discord can refuse a card (oversized embed, malformed component) with
+        HTTP 400.  Letting that propagate would strand the spinner, so fall back
+        to a visible plain-text explanation instead.
+        """
+
+        try:
+            await interaction.edit_original_response(
+                content=content, embed=embed, view=view
+            )
+            return
+        except Exception:
+            if embed is None and view is None:
+                # Nothing left to degrade to; the interaction itself is gone.
+                logger.exception("Fomo Runner Lab could not resolve its deferred response")
+                return
+            logger.exception("Fomo Runner Lab card was rejected by Discord")
+        with suppress(Exception):
+            await interaction.edit_original_response(
+                content=(
+                    "Fomo Runner Lab found a real candidate but Discord rejected the "
+                    "rendered card. Nothing was fabricated and no buy or launch was "
+                    "attempted."
+                ),
+                embed=None,
+                view=None,
+            )
+
+    async def _lab_response(
+        self,
+        interaction: discord.Interaction,
+        *,
+        research_test: bool,
+    ) -> None:
         if research_test:
             try:
-                async with asyncio.timeout(5):
+                async with asyncio.timeout(FOMO_LAB_CACHE_DEADLINE_SECONDS):
                     cached = await self.bot.engine.runner_lab_cached_candidates(
                         research_test=True,
                         max_age_seconds=86_400,
                     )
             except TimeoutError:
-                await interaction.edit_original_response(
+                await self._resolve_lab(
+                    interaction,
                     content=(
                         "Fomo Runner Lab could not read the saved runner pool within "
                         "five seconds. No provider, X, buy, SOL, or J7 action was used."
@@ -4549,7 +4653,8 @@ class FomoCommands(
                 )
                 return
             except Exception as exc:
-                await interaction.edit_original_response(
+                await self._resolve_lab(
+                    interaction,
                     content=(
                         "Fomo Runner Lab could not read the saved runner pool: "
                         f"`{type(exc).__name__}`. No buy or launch was attempted."
@@ -4565,24 +4670,27 @@ class FomoCommands(
                     owner_id=interaction.user.id,
                     research_test=True,
                 )
-                await interaction.edit_original_response(
+                await self._resolve_lab(
+                    interaction,
                     content=None,
                     embed=view.embed(),
                     view=view,
                 )
                 return
-            await interaction.edit_original_response(
+            await self._resolve_lab(
+                interaction,
                 content="Refreshing one real public candidate...",
                 embed=None,
                 view=None,
             )
         try:
-            async with asyncio.timeout(40):
+            async with asyncio.timeout(FOMO_LAB_REFRESH_DEADLINE_SECONDS):
                 candidates = await self.bot.engine.runner_lab_candidates(
                     research_test=research_test
                 )
         except TimeoutError:
-            await interaction.edit_original_response(
+            await self._resolve_lab(
+                interaction,
                 content=(
                     "Fomo Runner Lab timed out while live providers were responding. "
                     "The command was safely cancelled; no X credits, SOL, buy, or J7 "
@@ -4594,7 +4702,8 @@ class FomoCommands(
             )
             return
         except Exception as exc:
-            await interaction.edit_original_response(
+            await self._resolve_lab(
+                interaction,
                 content=(
                     "Fomo Runner Lab could not complete the current public-data refresh: "
                     f"`{type(exc).__name__}`. No buy or launch was attempted."
@@ -4604,7 +4713,8 @@ class FomoCommands(
             )
             return
         if not candidates:
-            await interaction.edit_original_response(
+            await self._resolve_lab(
+                interaction,
                 content=(
                     "No real public Solana token with usable current market data was "
                     "returned. Nothing was fabricated and no X request or buy was made."
@@ -4619,7 +4729,8 @@ class FomoCommands(
             owner_id=interaction.user.id,
             research_test=research_test,
         )
-        await interaction.edit_original_response(
+        await self._resolve_lab(
+            interaction,
             content=None,
             embed=view.embed(),
             view=view,

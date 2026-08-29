@@ -2062,7 +2062,9 @@ class SmartMoneyEngine:
         for raw in rows:
             try:
                 item = runner_candidate_from_json(raw)
-            except (KeyError, TypeError, ValueError):
+            except Exception:
+                # One unreadable legacy row must not blank the whole observation
+                # pool; `/fomo lab mode:test` still has to show the rest.
                 continue
             if not item.current.market_cap_usd and not item.current.price_usd:
                 continue
