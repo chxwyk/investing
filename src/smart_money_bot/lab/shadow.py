@@ -124,6 +124,7 @@ S_IMPACT_TOO_HIGH = "SHADOW_PRICE_IMPACT_UNTRADEABLE"
 S_RUGGED = "SHADOW_RUG_EVIDENCE"
 S_BEFORE_EXPERIMENT = "SHADOW_BEFORE_EXPERIMENT_START"
 S_NO_AVERAGE_DOWN = "SHADOW_NO_AVERAGE_DOWN"
+S_FAMILY_DISABLED = "SHADOW_FAMILY_DISABLED_ON_FORWARD_RESULTS"
 
 HUMAN_SHADOW_REASONS: dict[str, str] = {
     S_ACCEPTED: "Signal accepted — simulating a $10 buy",
@@ -147,6 +148,10 @@ HUMAN_SHADOW_REASONS: dict[str, str] = {
     S_RUGGED: "Rug evidence is already present",
     S_BEFORE_EXPERIMENT: "Observation predates the forward experiment checkpoint",
     S_NO_AVERAGE_DOWN: "Shadow never adds to an existing position",
+    S_FAMILY_DISABLED: (
+        "This signal family has lost money and rugged often enough, over a large "
+        "enough forward sample, to stop trading it"
+    ),
 }
 
 
@@ -669,6 +674,7 @@ def evaluate_shadow_entry(
     fill_source: str | None = None,
     experiment_started_at: int | None = None,
     breakers: BreakerStatus | None = None,
+    family_enabled: bool = True,
     config: ShadowConfig = DEFAULT_SHADOW_CONFIG,
 ) -> ShadowEntryDecision:
     """Decide whether this signal opens a $10 simulated position.
@@ -702,6 +708,10 @@ def evaluate_shadow_entry(
         return refuse(S_DISABLED)
     if signal.family not in SIGNAL_FAMILIES:
         return refuse(S_UNKNOWN_FAMILY)
+    if not family_enabled:
+        # Forward evidence, not opinion, retired this family.  The refusal is
+        # still recorded, so the demotion stays auditable and reversible.
+        return refuse(S_FAMILY_DISABLED)
     if experiment_started_at is not None and decided_at < experiment_started_at:
         # Section 41: the forward experiment starts at deployment.  A historical
         # observation may be replayed, never booked as a live shadow trade.

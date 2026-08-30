@@ -982,6 +982,9 @@ class Database:
             """
         )
         await self._migrate_pump_launch_status_constraint()
+        await self._ensure_column(
+            "provider_call_usage", "calls_skipped", "INTEGER NOT NULL DEFAULT 0"
+        )
         await self._ensure_column("tracked_traders", "source", "TEXT NOT NULL DEFAULT 'manual'")
         await self._ensure_column("discovery_wallets", "realized_pnl_7d", "REAL NOT NULL DEFAULT 0")
         await self._ensure_column("discovery_wallets", "roi_7d_percent", "REAL NOT NULL DEFAULT 0")
@@ -4884,11 +4887,17 @@ class Database:
         calls: int = 1,
         cache_hits: int = 0,
         errors: int = 0,
+        calls_skipped: int = 0,
     ) -> None:
         """Attribute provider cost to the feature that spent it.
 
         Uncapped on purpose: this is accounting, not a budget gate.  The paid
         daily caps stay in ``api_usage_daily``.
+
+        ``calls_skipped`` is counted separately from ``cache_hits`` on purpose:
+        a call a breaker refused during an outage is a saving, but it is not a
+        cache hit, and folding the two together would inflate the cache-hit rate
+        exactly when a provider is failing.
         """
 
         now = int(time.time())
@@ -4896,15 +4905,27 @@ class Database:
             await self.db.execute(
                 """
                 INSERT INTO provider_call_usage(
-                    provider, feature, usage_day, calls, cache_hits, errors, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    provider, feature, usage_day, calls, cache_hits, errors,
+                    calls_skipped, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(provider, feature, usage_day) DO UPDATE SET
                     calls = provider_call_usage.calls + excluded.calls,
                     cache_hits = provider_call_usage.cache_hits + excluded.cache_hits,
                     errors = provider_call_usage.errors + excluded.errors,
+                    calls_skipped =
+                        provider_call_usage.calls_skipped + excluded.calls_skipped,
                     updated_at = excluded.updated_at
                 """,
-                (provider, feature, usage_day, calls, cache_hits, errors, now),
+                (
+                    provider,
+                    feature,
+                    usage_day,
+                    calls,
+                    cache_hits,
+                    errors,
+                    calls_skipped,
+                    now,
+                ),
             )
             await self.db.commit()
 
@@ -4912,7 +4933,8 @@ class Database:
         if usage_day is None:
             cursor = await self.db.execute(
                 """
-                SELECT provider, feature, usage_day, calls, cache_hits, errors
+                SELECT provider, feature, usage_day, calls, cache_hits, errors,
+                       calls_skipped
                 FROM provider_call_usage
                 ORDER BY usage_day DESC, calls DESC
                 LIMIT 200
@@ -4921,7 +4943,8 @@ class Database:
         else:
             cursor = await self.db.execute(
                 """
-                SELECT provider, feature, usage_day, calls, cache_hits, errors
+                SELECT provider, feature, usage_day, calls, cache_hits, errors,
+                       calls_skipped
                 FROM provider_call_usage
                 WHERE usage_day = ?
                 ORDER BY calls DESC

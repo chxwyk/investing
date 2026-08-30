@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import os
 import tempfile
 import time
@@ -226,11 +227,12 @@ async def main() -> None:
 
     await check_paper_laboratory()
     await check_shadow_auto_trader()
+    await check_profit_optimization()
 
     print(
         "SELF-CHECK PASSED: detector, scoring, database, discovery rotation, "
-        "paper P&L, risk gate, PAPER laboratory, discovery-speed, realtime-alpha "
-        "and SHADOW auto-trader invariants"
+        "paper P&L, risk gate, PAPER laboratory, discovery-speed, realtime-alpha, "
+        "SHADOW auto-trader and profit-optimization invariants"
     )
 
 
@@ -736,6 +738,161 @@ async def check_shadow_auto_trader() -> None:
         await database.close()
         with suppress(FileNotFoundError):
             os.unlink(path)
+
+
+async def check_profit_optimization() -> None:
+    """The invariants that keep the bot from wasting money on itself.
+
+    Every one of these traces to something observed in production: a paid
+    provider hammered every minute after its plan ran out, a failure logged with
+    no message at all, and a shared exit rule that would half-sell healthy
+    positions for the duration of that outage.
+    """
+
+    import ast
+    import inspect
+
+    from smart_money_bot.errors import describe_exception
+    from smart_money_bot.lab.config import DEFAULT_LAB_CONFIG
+    from smart_money_bot.lab.exits import EXIT_SAFETY_EMERGENCY, ExitContext, open_position
+    from smart_money_bot.lab.forward import (
+        MIN_SAMPLE,
+        VERDICT_DISABLED,
+        VERDICT_INSUFFICIENT,
+        WEIGHT_CEILING,
+        WEIGHT_FLOOR,
+        calibrate_families,
+    )
+    from smart_money_bot.lab.providers import (
+        BACKOFF_SECONDS,
+        PROVIDER_FEATURES,
+        ProviderState,
+        record_failure,
+    )
+    from smart_money_bot.lab.shadow import DEFAULT_SHADOW_CONFIG, FAMILY_CATALYST_WATCH
+    from smart_money_bot.lab.shadow_exits import (
+        SHADOW_SAFETY_MONITOR,
+        RunnerEvidence,
+        plan_shadow_exit,
+    )
+    from smart_money_bot.lab.shadow_metrics import ShadowTradeRecord
+
+    # A provider that is failing must be called less, not more.
+    state = ProviderState(name="solana_tracker")
+    state = record_failure(state, now=0.0, status=403, message="Insufficient credits")
+    assert state.is_degraded(now=0.0), "a credit failure must open a backoff window"
+    assert BACKOFF_SECONDS[-1] <= 3_600, "backoff must stay bounded"
+    unknown_record = record_failure(ProviderState(name="p"), now=0.0, status=404)
+    assert not unknown_record.is_degraded(now=0.0), "a 404 is not a credit failure"
+
+    # Core detection must survive without Solana Tracker.
+    tracker_features = [
+        item for item in PROVIDER_FEATURES if item.provider == "solana_tracker"
+    ]
+    assert tracker_features, "the provider map must describe Solana Tracker"
+    assert all(
+        not item.essential and item.on_chain_fallback for item in tracker_features
+    ), "Solana Tracker must be optional enrichment with an on-chain fallback"
+
+    # The refresh throttle must not disengage when the pool is empty.
+    from smart_money_bot import engine as engine_module
+
+    tree = ast.parse(inspect.getsource(engine_module))
+    refresh = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "refresh_discovery"
+    )
+    conditions = " ".join(
+        ast.unparse(node) for node in ast.walk(refresh) if isinstance(node, ast.BoolOp)
+    )
+    assert "self._candidate_pool" not in conditions, (
+        "the discovery throttle must not depend on a non-empty candidate pool"
+    )
+
+    # A failure with no message must still say what failed.
+    assert describe_exception(TimeoutError()).startswith("TimeoutError"), (
+        "a timeout must never log as an empty string"
+    )
+
+    # A provider outage is not a token failure.
+    position = open_position(
+        position_id="p",
+        mint="mint",
+        now=1_000,
+        decision_price_usd=Decimal("0.001"),
+        size_usd=Decimal("10"),
+        config=DEFAULT_SHADOW_CONFIG.exit_config(),
+    )
+    healthy = ExitContext(
+        now=1_600,
+        price_usd=Decimal("0.00105"),
+        liquidity_usd=Decimal("42000"),
+        entry_liquidity_usd=Decimal("40000"),
+        momentum_score=Decimal("70"),
+        organic_score=Decimal("65"),
+        buys=140,
+        sells=40,
+        safety_status="UNKNOWN",
+        route_available=True,
+    )
+    unguarded = plan_shadow_exit(position, healthy, RunnerEvidence())
+    guarded = plan_shadow_exit(
+        position, healthy, RunnerEvidence(safety_provider_degraded=True)
+    )
+    assert unguarded.plan.reason_code == EXIT_SAFETY_EMERGENCY
+    assert guarded.plan.reason_code == SHADOW_SAFETY_MONITOR, (
+        "a provider outage must not be read as a token failure"
+    )
+    confirmed = plan_shadow_exit(
+        position,
+        dataclasses.replace(healthy, safety_status="FAIL"),
+        RunnerEvidence(safety_provider_degraded=True, safety_confirmed_fail=True),
+    )
+    assert confirmed.plan.final and confirmed.plan.fraction == Decimal("1"), (
+        "a confirmed hard safety failure must still exit immediately and in full"
+    )
+
+    # Forward weights must be bounded, and a tiny sample must do nothing.
+    def _trade(family: str, net: str, index: int, reason: str = "") -> ShadowTradeRecord:
+        return ShadowTradeRecord(
+            position_id=f"{family}{index}",
+            mint="mint",
+            family=family,
+            opened_at=1_000,
+            closed_at=1_000 + index,
+            size_usd=Decimal("10"),
+            realized_net_pnl_usd=Decimal(net),
+            close_reason=reason,
+            open=False,
+        )
+
+    lucky = [_trade(FAMILY_CATALYST_WATCH, "90", 1)]
+    weights = calibrate_families(lucky, as_of=999_999)
+    assert weights[FAMILY_CATALYST_WATCH].verdict == VERDICT_INSUFFICIENT
+    assert weights[FAMILY_CATALYST_WATCH].weight == Decimal("1"), (
+        "one lucky coin must not move the ranking"
+    )
+    assert MIN_SAMPLE >= 10
+
+    rugging = [
+        _trade(FAMILY_CATALYST_WATCH, "-6", index, "SAFETY_DETERIORATION")
+        for index in range(1, 31)
+    ]
+    disabled = calibrate_families(rugging, as_of=999_999)[FAMILY_CATALYST_WATCH]
+    assert disabled.verdict == VERDICT_DISABLED and not disabled.enabled, (
+        "a family that loses money and rugs must be retired"
+    )
+    for entry in calibrate_families(rugging, as_of=999_999).values():
+        assert WEIGHT_FLOOR <= entry.weight <= WEIGHT_CEILING
+
+    # The experiment and the strict floor are untouched.
+    assert DEFAULT_SHADOW_CONFIG.bankroll_usd == Decimal("100")
+    assert DEFAULT_SHADOW_CONFIG.position_usd == Decimal("10")
+    assert DEFAULT_SHADOW_CONFIG.max_concurrent_positions == 5
+    assert DEFAULT_SHADOW_CONFIG.max_total_exposure_usd == Decimal("50")
+    assert DEFAULT_LAB_CONFIG.normal_position_usd == Decimal("5")
+    assert DEFAULT_LAB_CONFIG.min_independent_buyers == 12
 
 
 if __name__ == "__main__":

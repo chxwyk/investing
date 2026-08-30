@@ -73,6 +73,8 @@ from .lab.catalyst import (
 from .lab.config import lab_config_from_settings
 from .lab.exits import ExitContext as LabExitContext
 from .lab.fastwatch import evaluate_fast_watch, signals_from_candidate, still_current
+from .lab.forward import EdgeInputs as ForwardEdgeInputs
+from .lab.forward import PingVerdict, forward_edge_score, should_ping
 from .lab.latency import HISTORICAL as LAB_HISTORICAL
 from .lab.latency import UNKNOWN as LAB_UNKNOWN
 from .lab.latency import LatencySample as LabLatencySample
@@ -90,6 +92,13 @@ from .lab.notable import (
     build_consensus,
     decide_ping,
 )
+from .lab.providers import (
+    PROVIDER_FEATURES,
+    ProviderState,
+    build_provider_report,
+)
+from .lab.providers import backoff_seconds as provider_backoff_seconds
+from .lab.providers import cost_per_signals as provider_cost_per_signals
 from .lab.regime import RegimeSample as LabRegimeSample
 from .lab.registry import account_tier
 from .lab.shadow import (
@@ -533,6 +542,17 @@ class SmartMoneyEngine:
         self._weekly_pool: list[WindowCandidate] = []
         self._candidate_pool = []
         self._social_nominations: list[SocialNomination] = []
+        # Time of the last discovery *attempt*, successful or not.  The refresh
+        # budget is spent by attempts, not by successes, so this — not the last
+        # success — is what the throttle has to measure.
+        self.last_discovery_attempt_at: int | None = None
+        self._discovery_retry_at = 0
+        self._discovery_consecutive_failures = 0
+        # A stalled enrichment pass starves every downstream lane, so it is
+        # counted rather than only logged.
+        self.runner_analysis_timeouts = 0
+        self.runner_analysis_errors = 0
+        self.forward_pings_withheld = 0
 
     def _x_usage_day(self) -> str:
         return datetime.now(ZoneInfo(self.settings.x_daily_search_timezone)).date().isoformat()
@@ -580,6 +600,12 @@ class SmartMoneyEngine:
             )
         raw_refresh = await self.database.get_setting("discovery_last_refresh")
         self.last_discovery_refresh_at = int(raw_refresh) if raw_refresh else None
+        # A restart must not reset the spend clock, or a crash loop would
+        # re-open the budget on every boot.
+        raw_attempt = await self.database.get_setting("discovery_last_attempt")
+        self.last_discovery_attempt_at = (
+            int(raw_attempt) if raw_attempt else self.last_discovery_refresh_at
+        )
         raw_weekly = await self.database.get_setting("discovery_7d_last_refresh")
         self.last_weekly_refresh_at = int(raw_weekly) if raw_weekly else None
         raw_rotation = await self.database.get_setting("rotation_last_refresh")
@@ -752,8 +778,11 @@ class SmartMoneyEngine:
                     if not daily_locked:
                         try:
                             await self.refresh_discovery()
+                            self._discovery_consecutive_failures = 0
+                            self._discovery_retry_at = 0
                         except DiscoveryError as exc:
                             self.last_error = f"Discovery: {exc}"
+                            self._note_discovery_failure()
                             await self.notifier.on_error("Refreshing wallet discovery", exc)
                         try:
                             await self.rotate_wallets()
@@ -783,6 +812,19 @@ class SmartMoneyEngine:
                 await self.notifier.on_error("Daily paper profit/loss guard", exc)
             await asyncio.sleep(self.settings.paper_daily_profit_check_seconds)
 
+    def _note_discovery_failure(self) -> None:
+        """Back off after a failed discovery refresh.
+
+        The provider client backs off its own HTTP calls; this backs off the
+        *caller*, so a failure that never reaches HTTP (an empty feed, a parse
+        error) cannot spin either.
+        """
+
+        self._discovery_consecutive_failures += 1
+        self._discovery_retry_at = int(time.time()) + provider_backoff_seconds(
+            self._discovery_consecutive_failures
+        )
+
     async def refresh_discovery(self, *, force: bool = False) -> DiscoveryRefresh | None:
         if not self.settings.auto_discovery_enabled or self.discovery is None:
             return None
@@ -791,12 +833,25 @@ class SmartMoneyEngine:
         now = int(time.time())
         if (
             not force
-            and self._candidate_pool
-            and self.last_discovery_refresh_at is not None
-            and now - self.last_discovery_refresh_at
+            # The candidate pool is deliberately NOT part of this condition any
+            # more.  Requiring a non-empty pool disengaged the throttle exactly
+            # when the provider was failing, so a plan that was out of credits
+            # was retried every poll — production ran ~1,440 failing paid
+            # requests a day against a ~40-request budget.  Time since the last
+            # *attempt* is what bounds the spend.
+            and self.last_discovery_attempt_at is not None
+            and now - self.last_discovery_attempt_at
             < self.settings.effective_discovery_refresh_seconds
         ):
             return None
+        if not force and now < self._discovery_retry_at:
+            # A failure adds its own backoff on top of the budget window, so a
+            # provider that is down is not retried on the budget's schedule
+            # either.  It only ever lengthens the wait, never shortens it.
+            return None
+        self.last_discovery_attempt_at = now
+        with suppress(Exception):
+            await self.database.set_setting("discovery_last_attempt", str(now))
 
         async with self._discovery_lock:
             refresh_weekly = (
@@ -1401,13 +1456,27 @@ class SmartMoneyEngine:
                         mint: str,
                         radar_seen_at: int = now,
                     ) -> RunnerCandidate | None:
+                        budget = self.settings.fomo_runner_analysis_budget_seconds
                         try:
-                            async with asyncio.timeout(30):
+                            async with asyncio.timeout(budget):
                                 return await self.analyze_runner(
                                     mint,
                                     radar_seen_at=radar_seen_at,
                                 )
+                        except TimeoutError:
+                            # Say which budget was blown.  Production logged
+                            # these as an empty message, which made a systemic
+                            # enrichment stall look like nothing at all.
+                            self.runner_analysis_timeouts += 1
+                            logger.warning(
+                                "Fomo fresh analysis %s exceeded its %ss budget; "
+                                "the candidate was skipped this pass",
+                                mint[:8],
+                                budget,
+                            )
+                            return None
                         except Exception as exc:
+                            self.runner_analysis_errors += 1
                             await self.notifier.on_error(
                                 f"Fomo fresh analysis {mint[:8]}", exc
                             )
@@ -2149,6 +2218,13 @@ class SmartMoneyEngine:
             route_available=current.route_available,
             price_impact_percent=current.sell_route_price_impact_percent,
         )
+        # Section 8: a provider that is down makes safety UNKNOWN, which is a
+        # statement about the provider and not about the token.  Passing that
+        # distinction through is what stops an outage from half-selling every
+        # profitable shadow position.
+        safety_degraded = self.tracker_token_risk.degraded or (
+            self.discovery is not None and getattr(self.discovery, "degraded", False)
+        )
         evidence = ShadowRunnerEvidence(
             independent_buyer_growth=(
                 current.verified_unique_buyers - first.verified_unique_buyers
@@ -2159,6 +2235,8 @@ class SmartMoneyEngine:
                 else None
             ),
             route_quality="OK" if current.route_available else "POOR",
+            safety_provider_degraded=bool(safety_degraded),
+            safety_confirmed_fail=candidate.safety.status == "FAIL",
         )
         for position in positions:
             before = len(position.position.exits)
@@ -2230,6 +2308,24 @@ class SmartMoneyEngine:
                 cache_hits=int(usage["cache_hits"] or 0),
                 errors=int(usage["errors"] or 0),
             )
+        # Discovery is the lane that ran ~1,440 failing requests a day, so its
+        # spend is now accounted for alongside everything else rather than being
+        # invisible until someone reads the logs.
+        if self.discovery is not None and hasattr(self.discovery, "usage_snapshot"):
+            discovery_usage = self.discovery.usage_snapshot()
+            if (
+                discovery_usage["calls"]
+                or discovery_usage["errors"]
+                or discovery_usage["calls_skipped"]
+            ):
+                self.discovery.reset_usage()
+                await self._record_provider_call(
+                    "solana_tracker",
+                    "wallet_discovery",
+                    calls=int(discovery_usage["calls"] or 0),
+                    errors=int(discovery_usage["errors"] or 0),
+                    calls_skipped=int(discovery_usage["calls_skipped"] or 0),
+                )
 
     async def _resolve_wallet_origin(
         self,
@@ -2567,10 +2663,13 @@ class SmartMoneyEngine:
         calls: int = 1,
         cache_hits: int = 0,
         errors: int = 0,
+        calls_skipped: int = 0,
     ) -> None:
         """Attribute provider spend to a feature; never let accounting break a scan."""
 
-        if self.database.connection is None or not (calls or cache_hits or errors):
+        if self.database.connection is None or not (
+            calls or cache_hits or errors or calls_skipped
+        ):
             return
         try:
             await self.database.record_provider_call(
@@ -2580,6 +2679,7 @@ class SmartMoneyEngine:
                 calls=calls,
                 cache_hits=cache_hits,
                 errors=errors,
+                calls_skipped=calls_skipped,
             )
         except Exception:  # pragma: no cover - accounting is never load-bearing
             logger.debug("provider accounting write failed", exc_info=True)
@@ -2898,6 +2998,119 @@ class SmartMoneyEngine:
         await self.initialize()
         return await self.shadow.counterfactuals(position_id)
 
+    # --- profit-first dashboard (sections 21-24) ------------------------
+
+    async def profit_summary(self) -> dict[str, Any]:
+        """`/fomo profit` — is the $100 shadow account making money? (§21)"""
+
+        await self.initialize()
+        report = await self.shadow.account()
+        status = await self.shadow.status()
+        weights = await self.shadow.family_weights()
+        exits = await self.shadow.exit_quality()
+
+        ranked = [
+            (name, item)
+            for name, item in report.by_family.items()
+            if item.expectancy_usd is not None
+        ]
+        ranked.sort(
+            key=lambda pair: pair[1].expectancy_usd or Decimal("0"), reverse=True
+        )
+        signals = self.fast_alerts_published
+        calls = await self._provider_call_total()
+        return {
+            "report": report,
+            "status": status,
+            "weights": weights,
+            "exits": exits,
+            "best_family": ranked[0][0] if ranked else "",
+            "worst_family": ranked[-1][0] if len(ranked) > 1 else "",
+            "best_exit_reason": exits.best_reason,
+            "worst_exit_reason": exits.worst_reason,
+            "premature_exit_rate_percent": exits.premature_rate_percent,
+            "provider_calls": calls,
+            "signals_published": signals,
+            "provider_calls_per_100_signals": provider_cost_per_signals(calls, signals),
+        }
+
+    async def profit_signals(self) -> dict[str, Any]:
+        """`/fomo profit signals` — families ranked by forward record (§22)."""
+
+        await self.initialize()
+        report = await self.shadow.account()
+        return {
+            "report": report,
+            "weights": await self.shadow.family_weights(),
+        }
+
+    async def profit_exits(self) -> Any:
+        """`/fomo profit exits` — which exit rules cost the most money (§23)."""
+
+        await self.initialize()
+        return await self.shadow.exit_quality()
+
+    async def profit_providers(self) -> list[dict[str, Any]]:
+        """`/fomo profit providers` — where the money goes (§24)."""
+
+        await self.initialize()
+        rows = await self.database.provider_call_rows()
+        totals: dict[str, dict[str, int]] = {}
+        for row in rows:
+            name = str(row.get("provider") or "unknown")
+            bucket = totals.setdefault(
+                name, {"calls": 0, "cache_hits": 0, "errors": 0, "calls_skipped": 0}
+            )
+            bucket["calls"] += int(row.get("calls") or 0)
+            bucket["cache_hits"] += int(row.get("cache_hits") or 0)
+            bucket["errors"] += int(row.get("errors") or 0)
+            bucket["calls_skipped"] = bucket.get("calls_skipped", 0) + int(
+                row.get("calls_skipped") or 0
+            )
+
+        live: dict[str, dict[str, Any]] = {}
+        if self.discovery is not None and hasattr(self.discovery, "usage_snapshot"):
+            live["solana_tracker"] = self.discovery.usage_snapshot()
+        risk = self.tracker_token_risk.usage_snapshot()
+        if risk.get("degraded"):
+            live.setdefault("solana_tracker", {})["degraded"] = True
+
+        payload: list[dict[str, Any]] = []
+        for name in sorted({*totals, *live, *(item.provider for item in PROVIDER_FEATURES)}):
+            counters = totals.get(
+                name, {"calls": 0, "cache_hits": 0, "errors": 0, "calls_skipped": 0}
+            )
+            state = ProviderState(
+                name=name,
+                calls=counters["calls"],
+                cache_hits=counters["cache_hits"],
+                errors=counters["errors"],
+                calls_skipped=(
+                    counters.get("calls_skipped", 0)
+                    + int(live.get(name, {}).get("calls_skipped") or 0)
+                ),
+                degraded_until=(
+                    time.monotonic() + int(live.get(name, {}).get(
+                        "degraded_seconds_remaining"
+                    ) or 0)
+                ),
+                consecutive_failures=int(
+                    live.get(name, {}).get("credit_failures") or 0
+                ),
+                last_error=str(live.get(name, {}).get("last_error") or ""),
+            )
+            payload.append(
+                {
+                    "report": build_provider_report(state, now=time.monotonic()),
+                    "live": live.get(name, {}),
+                }
+            )
+        return payload
+
+    async def _provider_call_total(self) -> int:
+        rows = await self.database.provider_call_rows()
+        return sum(int(row.get("calls") or 0) for row in rows)
+
     async def shadow_latest_counterfactuals(self) -> tuple[str, str, tuple[Any, ...]]:
         await self.initialize()
         return await self.shadow.latest_counterfactuals()
@@ -3104,6 +3317,34 @@ class SmartMoneyEngine:
             )
         return published
 
+    async def _forward_ping_verdict(
+        self,
+        *,
+        family: str,
+        edge_inputs: ForwardEdgeInputs,
+        independent_confirmations: int,
+        still_early: bool = True,
+        move_already_made_percent: Decimal | None = None,
+        now: int,
+    ) -> PingVerdict:
+        """Section 18: an interruption has to earn itself.
+
+        This only ever *withholds* a ping the existing rules already allowed —
+        it can never create one — so the ping surface can only get quieter and
+        more selective as forward evidence accumulates.
+        """
+
+        weights = await self.shadow.cached_family_weights(now=now)
+        edge = forward_edge_score(edge_inputs, weights=weights)
+        return should_ping(
+            edge,
+            family=family,
+            independent_confirmations=independent_confirmations,
+            still_early=still_early,
+            move_already_made_percent=move_already_made_percent,
+            weights=weights,
+        )
+
     def _fomo_url(self, mint: str) -> str:
         """The same canonical Fomo coin link every other card already uses."""
 
@@ -3264,6 +3505,36 @@ class SmartMoneyEngine:
         ping = decide_ping(signal, consensus=consensus, config=self._lab_config)
         if not self.settings.fomo_notable_ping_enabled:
             ping = replace(ping, ping=False, urgent=False)
+        if ping.ping and self.settings.fomo_forward_ping_gate_enabled:
+            # A famous wallet is not by itself a reason to interrupt someone.
+            verdict = await self._forward_ping_verdict(
+                family=(
+                    FAMILY_NOTABLE_EARLY
+                    if signal.may_chase()
+                    else FAMILY_NOTABLE_LATE
+                ),
+                edge_inputs=ForwardEdgeInputs(
+                    family=FAMILY_NOTABLE_EARLY,
+                    freshness_seconds=signal.signal_age_seconds,
+                    liquidity_usd=_engine_decimal(context.get("liquidity_usd")),
+                    route_available=bool(context.get("route_available", True)),
+                    notable_lead_percent=signal.move_since_trader_entry_percent,
+                ),
+                independent_confirmations=max(
+                    1, getattr(consensus, "independent_wallets", 1)
+                ),
+                still_early=signal.may_chase(),
+                move_already_made_percent=signal.move_since_trader_entry_percent,
+                now=now,
+            )
+            if not verdict.ping:
+                ping = replace(
+                    ping,
+                    ping=False,
+                    urgent=False,
+                    reason="; ".join(verdict.blockers[:2]) or ping.reason,
+                )
+                self.forward_pings_withheld += 1
 
         alert = build_notable_trader_alert(
             signal=signal,
@@ -3603,6 +3874,42 @@ class SmartMoneyEngine:
             return False
         if not self.settings.fomo_catalyst_ping_enabled:
             decision = replace(decision, ping=False)
+        if decision.ping and self.settings.fomo_forward_ping_gate_enabled:
+            # A real story still has to be confirmed by the market before it is
+            # allowed to interrupt anyone (sections 5, 18).
+            verdict = await self._forward_ping_verdict(
+                family={
+                    "BREAKING_CATALYST": FAMILY_BREAKING_CATALYST,
+                    "CATALYST_WATCH": FAMILY_CATALYST_WATCH,
+                    "CONFLUENCE_WATCH": FAMILY_CONFLUENCE_WATCH,
+                }.get(decision.kind, FAMILY_CATALYST_WATCH),
+                edge_inputs=ForwardEdgeInputs(
+                    family=FAMILY_CONFLUENCE_WATCH,
+                    freshness_seconds=inputs.token_age_seconds,
+                    liquidity_usd=(
+                        candidate.current.liquidity_usd if candidate is not None else None
+                    ),
+                    independent_buyers=inputs.independent_notable_wallets or None,
+                    organic_score=inputs.organic_score,
+                    actionability_score=inputs.current_actionability,
+                    catalyst_confidence=str(event.confidence),
+                    route_available=(
+                        candidate.current.route_available if candidate is not None else True
+                    ),
+                ),
+                independent_confirmations=max(
+                    event.independent_confirmations,
+                    inputs.independent_notable_wallets,
+                ),
+                now=now,
+            )
+            if not verdict.ping:
+                decision = replace(
+                    decision,
+                    ping=False,
+                    ping_reason="; ".join(verdict.blockers[:2]),
+                )
+                self.forward_pings_withheld += 1
         current = candidate.current if candidate is not None else None
         name, symbol = ("", "")
         if candidate is not None:

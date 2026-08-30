@@ -30,6 +30,7 @@ except ImportError:  # pragma: no cover - exercised by the minimal-runtime self-
 
 from .constants import BOT_VERSION
 from .database import Database
+from .lab.exit_regret import ExitRecord
 from .lab.exits import ExitJournalEntry
 from .lab.shadow import (
     SHADOW_EXPERIMENT_VERSION,
@@ -392,6 +393,50 @@ class ShadowStore:
             (limit,),
         )
         return [dict(row) for row in await cursor.fetchall()]
+
+    async def exit_records(self, *, limit: int = 500) -> list[ExitRecord]:
+        """Every persisted exit, with the price it actually sold at.
+
+        The price lives in the journal payload rather than a column, so it is
+        read from there: an exit cannot be scored against what happened next
+        without knowing what it got.
+        """
+
+        cursor = await self._db.execute(
+            """
+            SELECT position_id, mint, family, occurred_at, reason_code,
+                   fraction_sold, net_pnl_usd, final, payload_json
+            FROM shadow_exits
+            ORDER BY occurred_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        records: list[ExitRecord] = []
+        for row in await cursor.fetchall():
+            try:
+                payload = json.loads(row["payload_json"])
+            except json.JSONDecodeError:
+                payload = {}
+            price = _decimal_or_none(
+                payload.get("quote_price_usd") if isinstance(payload, dict) else None
+            )
+            if price is None or price <= 0:
+                continue
+            records.append(
+                ExitRecord(
+                    position_id=str(row["position_id"]),
+                    mint=str(row["mint"]),
+                    family=str(row["family"] or ""),
+                    reason_code=str(row["reason_code"]),
+                    occurred_at=int(row["occurred_at"]),
+                    exit_price_usd=price,
+                    fraction_sold=_decimal(row["fraction_sold"]),
+                    net_pnl_usd=_decimal(row["net_pnl_usd"]),
+                    final=bool(row["final"]),
+                )
+            )
+        return records
 
     # ------------------------------------------------------------------
     # observations — the one stream every counterfactual reads (section 54)

@@ -2,12 +2,20 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from .config import Settings
 from .errors import DiscoveryError
+from .lab.providers import (
+    CREDIT_STATUSES,
+    ProviderState,
+    record_failure,
+    record_skip,
+    record_success,
+)
 from .models import DiscoveryCandidate
 
 logger = logging.getLogger(__name__)
@@ -105,6 +113,38 @@ class SolanaTrackerClient:
         self.api_key = api_key.strip()
         self.timeout = aiohttp.ClientTimeout(total=timeout_seconds)
         self._session: Any = None
+        # Production ran ~1,440 failing paid requests a day against a ~40-request
+        # budget because nothing here backed off when the plan ran out of
+        # credits.  A failing provider is now called less, not more.
+        self._health = ProviderState(name="solana_tracker")
+
+    @property
+    def health(self) -> ProviderState:
+        return self._health
+
+    @property
+    def degraded(self) -> bool:
+        return self._health.is_degraded(now=time.monotonic())
+
+    def usage_snapshot(self) -> dict[str, Any]:
+        state = self._health
+        now = time.monotonic()
+        return {
+            "calls": state.calls,
+            "cache_hits": state.cache_hits,
+            "errors": state.errors,
+            "calls_skipped": state.calls_skipped,
+            "credit_failures": state.credit_failures,
+            "degraded": state.is_degraded(now=now),
+            "health": state.health(now=now),
+            "degraded_seconds_remaining": max(0, int(state.degraded_until - now)),
+            "last_error": state.last_error,
+        }
+
+    def reset_usage(self) -> None:
+        """Zero the counters without clearing an open backoff window."""
+
+        self._health = replace(self._health, calls=0, cache_hits=0, errors=0, calls_skipped=0)
 
     async def _get_session(self) -> Any:
         if self._session is None or self._session.closed:
@@ -199,27 +239,62 @@ class SolanaTrackerClient:
         )
 
     async def _request(self, path: str, *, params: dict[str, str]) -> Any:
+        now = time.monotonic()
+        if self._health.is_degraded(now=now):
+            # The plan is out of credits or throttled.  It will not refill inside
+            # a retry loop, so the honest thing is to stop calling and say so.
+            self._health = record_skip(self._health)
+            remaining = max(0, int(self._health.degraded_until - now))
+            raise DiscoveryError(
+                f"Solana Tracker is in a {self._health.health(now=now).lower()} backoff "
+                f"window for another {remaining}s: {self._health.last_error}"
+            )
+
         session = await self._get_session()
         url = f"{self.BASE_URL}{path}"
         headers = {"x-api-key": self.api_key}
         for attempt in range(3):
             try:
                 async with session.get(url, params=params, headers=headers) as response:
-                    if (response.status == 429 or response.status >= 500) and attempt < 2:
+                    if (
+                        response.status not in CREDIT_STATUSES
+                        and response.status >= 500
+                        and attempt < 2
+                    ):
                         await asyncio.sleep(2**attempt)
                         continue
                     body = await response.text()
                     if response.status >= 400:
-                        raise DiscoveryError(f"Solana Tracker HTTP {response.status}: {body[:500]}")
+                        message = f"Solana Tracker HTTP {response.status}: {body[:500]}"
+                        # A 404 means "no such record", not "no credits"; only a
+                        # credit status opens a backoff window.
+                        self._health = record_failure(
+                            self._health,
+                            now=time.monotonic(),
+                            status=response.status,
+                            message=message,
+                        )
+                        raise DiscoveryError(message)
                     try:
-                        return await response.json(content_type=None)
+                        payload = await response.json(content_type=None)
                     except ValueError as exc:
+                        self._health = record_failure(
+                            self._health,
+                            now=time.monotonic(),
+                            message="Solana Tracker returned invalid JSON",
+                        )
                         raise DiscoveryError("Solana Tracker returned invalid JSON") from exc
+                    self._health = record_success(self._health, now=time.monotonic())
+                    return payload
             except (TimeoutError, self._aiohttp.ClientError) as exc:
                 if attempt < 2:
                     await asyncio.sleep(2**attempt)
                     continue
-                raise DiscoveryError(f"Solana Tracker request failed: {exc}") from exc
+                message = f"Solana Tracker request failed: {exc}"
+                self._health = record_failure(
+                    self._health, now=time.monotonic(), message=message
+                )
+                raise DiscoveryError(message) from exc
         raise DiscoveryError("Solana Tracker request exhausted retries")
 
 

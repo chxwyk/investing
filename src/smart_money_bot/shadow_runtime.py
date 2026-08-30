@@ -27,6 +27,7 @@ from .constants import BOT_VERSION
 from .lab.bankroll import BankrollState, BreakerInputs, BreakerStatus, apply_entry
 from .lab.bankroll import apply_exit as apply_bankroll_exit
 from .lab.costs import leg_costs
+from .lab.exit_regret import ExitQualityReport, score_exit, summarize_exit_quality
 from .lab.exits import (
     ExitContext,
     ExitPlan,
@@ -35,6 +36,7 @@ from .lab.exits import (
     observe,
     open_position,
 )
+from .lab.forward import FamilyWeight, calibrate_families, family_enabled
 from .lab.shadow import (
     DEFAULT_SHADOW_CONFIG,
     SHADOW_EXPERIMENT_VERSION,
@@ -119,6 +121,10 @@ class ShadowRuntime:
         self.entries_opened = 0
         self.exits_recorded = 0
         self.signals_refused = 0
+        # Forward weights are recomputed from closed trades rather than stored,
+        # and cached briefly so a busy radar does not re-derive them per signal.
+        self._weights: dict[str, FamilyWeight] = {}
+        self._weights_refreshed_at = 0
 
     # ------------------------------------------------------------------
     # experiment checkpoint
@@ -351,10 +357,12 @@ class ShadowRuntime:
 
         state = await self.bankroll()
         exposure = await self._exposure(signal)
+        weights = await self.cached_family_weights(now=moment)
         decision = evaluate_shadow_entry(
             signal,
             state,
             exposure,
+            family_enabled=family_enabled(weights, signal.family),
             route_price_impact_percent=(
                 quote.price_impact_percent if quote is not None else None
             ),
@@ -908,6 +916,74 @@ class ShadowRuntime:
         position_id = str(rows[0].get("position_id") or "")
         results = await self.counterfactuals(position_id)
         return position_id, str(rows[0].get("family") or ""), results
+
+    async def exit_quality(
+        self,
+        *,
+        horizon_seconds: int | None = None,
+    ) -> ExitQualityReport:
+        """Which exit rules are defending the account and which are leaking.
+
+        Reads only persisted exits and the observation stream those positions
+        already recorded, so this costs no provider request no matter how many
+        exits are scored (section 54).
+        """
+
+        records = await self.store.exit_records()
+        if not records:
+            return ExitQualityReport()
+        by_position: dict[str, list[Any]] = {}
+        for record in records:
+            if record.position_id not in by_position:
+                by_position[record.position_id] = await self.store.observations(
+                    record.position_id
+                )
+        scores = [
+            score_exit(
+                record,
+                by_position.get(record.position_id, []),
+                **(
+                    {"horizon_seconds": horizon_seconds}
+                    if horizon_seconds is not None
+                    else {}
+                ),
+            )
+            for record in records
+        ]
+        return summarize_exit_quality(scores)
+
+    async def cached_family_weights(
+        self,
+        *,
+        now: int,
+        max_age_seconds: int = 300,
+    ) -> dict[str, FamilyWeight]:
+        """Weights, refreshed at most every few minutes.
+
+        Recomputing per signal would read the whole closed book on every radar
+        tick for a number that moves on the timescale of days.
+        """
+
+        if self._weights and now - self._weights_refreshed_at < max_age_seconds:
+            return self._weights
+        self._weights_refreshed_at = now
+        self._weights = await self.family_weights(as_of=now)
+        return self._weights
+
+    async def family_weights(
+        self,
+        *,
+        as_of: int | None = None,
+    ) -> dict[str, FamilyWeight]:
+        """Bounded, versioned forward weights per signal family (sections 3, 15).
+
+        Recomputed from closed trades rather than stored, so a weight can never
+        drift away from the evidence that justifies it, and every one carries the
+        ``as_of`` that makes it replayable.
+        """
+
+        moment = as_of if as_of is not None else int(time.time())
+        return calibrate_families(await self.trade_records(), as_of=moment)
 
     async def status(self) -> dict[str, Any]:
         """The `/smartmoney status` and `/fomo realtime` extension (section 38)."""

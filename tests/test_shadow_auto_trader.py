@@ -2202,12 +2202,9 @@ def test_no_shadow_engine_method_reaches_a_provider_client() -> None:
     forbids — so the boundary is asserted, not just documented.
     """
 
-    import re
-
     from smart_money_bot import engine as engine_module
 
-    source = inspect.getsource(engine_module)
-    methods = (
+    methods = {
         "_shadow_signal",
         "_run_shadow_signal",
         "_shadow_signal_task",
@@ -2222,27 +2219,50 @@ def test_no_shadow_engine_method_reaches_a_provider_client() -> None:
         "shadow_status",
         "shadow_counterfactuals",
         "shadow_latest_counterfactuals",
-    )
-    clients = (
-        "self.jupiter",
-        "self.dex",
-        "self.rpc",
-        "self.tracker",
-        "self.x_client",
-        "self.discovery",
-        "self.launch",
-        "self.executor",
-        "aiohttp",
-    )
+    }
+    clients = {
+        "jupiter",
+        "dex",
+        "rpc",
+        "tracker",
+        "tracker_token_risk",
+        "x_client",
+        "discovery",
+        "launch",
+        "executor",
+    }
 
-    for name in methods:
-        match = re.search(rf"\n    (?:async )?def {re.escape(name)}\(", source)
-        assert match, f"{name} is missing from the engine"
-        start = match.start()
-        following = re.search(r"\n    (?:async )?def ", source[start + 10 :])
-        body = source[start : start + 10 + following.start()] if following else source[start:]
-        leaked = [client for client in clients if client in body]
-        assert not leaked, f"{name} must not call a provider: {leaked}"
+    tree = ast.parse(inspect.getsource(engine_module))
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        if node.name not in methods:
+            continue
+        found.add(node.name)
+        for inner in ast.walk(node):
+            # An *awaited* method on a provider client is a network call.
+            # Reading a client's in-process health flag is not, and section 8
+            # requires exactly that read — so the check is on calls, not on
+            # every mention of the attribute.
+            if not isinstance(inner, ast.Await):
+                continue
+            call = inner.value
+            if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute):
+                continue
+            owner = call.func.value
+            if (
+                isinstance(owner, ast.Attribute)
+                and isinstance(owner.value, ast.Name)
+                and owner.value.id == "self"
+                and owner.attr in clients
+            ):
+                raise AssertionError(
+                    f"{node.name} awaits a provider call: self.{owner.attr}."
+                    f"{call.func.attr}()"
+                )
+
+    assert found == methods, f"missing from the engine: {sorted(methods - found)}"
 
 
 def test_the_strict_paper_strategy_modules_are_untouched_by_shadow() -> None:

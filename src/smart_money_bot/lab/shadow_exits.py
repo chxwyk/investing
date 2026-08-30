@@ -37,6 +37,7 @@ from .costs import leg_costs
 from .exits import (
     EXIT_MILESTONE,
     EXIT_MOON_BAG,
+    EXIT_SAFETY_EMERGENCY,
     HOLD_NO_TRIGGER,
     ExitContext,
     ExitPlan,
@@ -56,6 +57,7 @@ SHADOW_RUNNER_PARTIAL = "SHADOW_RUNNER_PARTIAL_TAKE"
 SHADOW_PRINCIPAL_RECOVERY = "SHADOW_PRINCIPAL_RECOVERY"
 HOLD_SHADOW_RUNNER = "SHADOW_HEALTHY_RUNNER_HOLD"
 SHADOW_STALE_OBSERVATION = "SHADOW_STALE_OBSERVATION"
+SHADOW_SAFETY_MONITOR = "SHADOW_SAFETY_UNKNOWN_MONITORING"
 
 #: Reasons the overlay must never touch: they are emergencies or protection of
 #: a profit that has already started giving back.
@@ -101,6 +103,11 @@ class RunnerEvidence:
     catalyst_fresh: bool = False
     actionability_state: str = ""
     route_quality: str = ""
+    #: A safety provider is unavailable, so "UNKNOWN" says nothing about the
+    #: token (section 8).  This is emphatically NOT a confirmed failure.
+    safety_provider_degraded: bool = False
+    #: A provider actively confirmed the token is unsafe.  Only this exits.
+    safety_confirmed_fail: bool = False
 
 
 #: No extra runner evidence beyond what the exit context already carries.
@@ -386,8 +393,20 @@ def plan_shadow_exit(
             why=why,
         )
 
-    # 1. Emergencies and profit protection are never overridden (section 12).
+    # 1. Emergencies and profit protection are never overridden (section 12) —
+    #    with one exception the production log made unavoidable.
     if base.reason_code in PROTECTED_REASONS:
+        rescued = _rescue_provider_outage(base, context, evidence, health)
+        if rescued is not None:
+            return result(
+                rescued,
+                (
+                    "safety is UNKNOWN because a provider is unavailable, not "
+                    "because the token failed",
+                    "route, liquidity and flow are still healthy — monitoring "
+                    "instead of selling",
+                ),
+            )
         return result(base, (f"protective exit: {base.reason_code.lower().replace('_', ' ')}",))
 
     price = context.price_usd
@@ -536,6 +555,67 @@ def plan_shadow_exit(
     )
 
 
+def _rescue_provider_outage(
+    base: ExitPlan,
+    context: ExitContext,
+    evidence: RunnerEvidence,
+    health: RunnerHealth,
+) -> ExitPlan | None:
+    """Stop a dead provider from being read as a dead token (section 8).
+
+    The shared exit engine de-risks 50% whenever safety reads ``UNKNOWN`` while a
+    position is in profit.  That is right when the evidence is genuinely missing.
+    It is wrong when a *provider* is down: production ran for hours with Solana
+    Tracker returning ``403 Insufficient credits``, which would have half-sold
+    every profitable shadow position for a reason that had nothing to do with any
+    token.
+
+    So a partial safety de-risk is downgraded to monitoring only when all of
+    these hold:
+
+    * the safety verdict is ``UNKNOWN``, never ``FAIL`` — a confirmed failure
+      still exits immediately and in full,
+    * the reason it is unknown is a named provider outage,
+    * a sell route still exists and liquidity has not collapsed, and
+    * buy flow is not reversing.
+
+    Anything less and the original defensive plan stands.  This never touches
+    STRICT PAPER: it lives in the shadow overlay and the strict entry gates are
+    unchanged.
+    """
+
+    if base.reason_code != EXIT_SAFETY_EMERGENCY:
+        return None
+    if base.final or context.safety_status == "FAIL":
+        # A confirmed hard fail is never rescued.
+        return None
+    if evidence.safety_confirmed_fail:
+        return None
+    if not evidence.safety_provider_degraded:
+        return None
+    if not context.route_available:
+        return None
+
+    liquidity_change = context.liquidity_change_percent
+    if liquidity_change is not None and liquidity_change <= Decimal("-25"):
+        return None
+    ratio = context.buy_sell_ratio
+    if ratio is not None and ratio < Decimal("1"):
+        return None
+    if health.weak:
+        return None
+
+    return ExitPlan(
+        fraction=ZERO,
+        reason_code=SHADOW_SAFETY_MONITOR,
+        final=False,
+        notes=(
+            "safety provider unavailable — evidence is UNKNOWN, not FAIL",
+            "route, liquidity and buy flow still healthy",
+        ),
+    )
+
+
 def _principal_recovery_fraction(
     position: PaperPosition,
     price: Decimal,
@@ -591,6 +671,7 @@ def shadow_exit_priority(reason_code: str) -> int:
         SHADOW_PRINCIPAL_RECOVERY: 8,
         SHADOW_RUNNER_PARTIAL: 9,
         SHADOW_STALE_OBSERVATION: 9,
+        SHADOW_SAFETY_MONITOR: 12,
         "TIME_STOP": 10,
         EXIT_MOON_BAG: 11,
         HOLD_SHADOW_RUNNER: 12,

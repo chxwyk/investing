@@ -233,6 +233,8 @@ class Settings:
     # --- SHADOW auto-trader (v2.39) --------------------------------------
     # Safe code defaults cover every value below, so a deployment does not need
     # to define any of these Railway variables to run the shadow experiment.
+    fomo_runner_analysis_budget_seconds: int
+    fomo_forward_ping_gate_enabled: bool
     fomo_shadow_auto_enabled: bool
     fomo_shadow_publish_cards: bool
     fomo_shadow_bankroll_usd: Decimal
@@ -591,6 +593,10 @@ class Settings:
             fomo_alert_enrichment_delay_seconds=_int(
                 "FOMO_ALERT_ENRICHMENT_DELAY_SECONDS", 45
             ),
+            fomo_runner_analysis_budget_seconds=_int(
+                "FOMO_RUNNER_ANALYSIS_BUDGET_SECONDS", 30
+            ),
+            fomo_forward_ping_gate_enabled=_bool("FOMO_FORWARD_PING_GATE_ENABLED", True),
             fomo_shadow_auto_enabled=_bool("FOMO_SHADOW_AUTO_ENABLED", True),
             fomo_shadow_publish_cards=_bool("FOMO_SHADOW_PUBLISH_CARDS", True),
             fomo_shadow_bankroll_usd=_decimal("FOMO_SHADOW_BANKROLL_USD", "100"),
@@ -998,6 +1004,10 @@ class Settings:
         # The SHADOW experiment only produces comparable per-family expectancy
         # if every entry is the same size, so a misconfigured stake fails loudly
         # here instead of quietly producing an uninterpretable sample.
+        if not 5 <= self.fomo_runner_analysis_budget_seconds <= 300:
+            raise ValueError(
+                "FOMO_RUNNER_ANALYSIS_BUDGET_SECONDS must be between 5 and 300"
+            )
         if self.fomo_shadow_position_usd <= 0:
             raise ValueError("FOMO_SHADOW_POSITION_USD must be positive")
         if self.fomo_shadow_max_position_usd != self.fomo_shadow_position_usd:

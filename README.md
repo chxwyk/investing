@@ -7,7 +7,32 @@ transactions, and mirrors every newly detected hot-wallet swap in PAPER mode. PA
 as either a forced source-price observation ledger or an executable Jupiter quote-shadow
 trial; the two answer different questions and are labeled separately.
 
-Version 2.39.0 adds the **SHADOW auto-trader**: a completely simulated $100 account that
+Version 2.40.0 is a **profit-first forward optimization**. It builds nothing new for its own
+sake; every change traces either to a failure observed in the production logs or to a number the
+account was leaking. Three things came straight out of a live log window:
+
+* **A paid provider was being hammered while it was down.** Solana Tracker returned
+  `HTTP 403 Insufficient credits` on *every* discovery refresh, once a minute, indefinitely —
+  roughly 1,440 failing paid requests a day against an intended budget of about 40. Two defects
+  combined: the refresh throttle only engaged when the candidate pool was **non-empty**, so it
+  disengaged exactly when the provider was failing, and the discovery client had no backoff at
+  all. Both are fixed, and a failing provider is now called *less*, not more.
+* **Failures were logging as nothing.** Dozens of `Fomo fresh analysis 55sWLQ39: ` lines with
+  nothing after the colon — all of them `TimeoutError`, whose `str()` is empty. The one fact an
+  operator needed (a 30-second analysis budget was being blown, starving every downstream lane)
+  was the one fact the log omitted.
+* **A provider outage would have been read as a token failure.** The shared exit engine de-risks
+  50% whenever safety reads `UNKNOWN` while a position is in profit. With Tracker 403ing for
+  hours, that would have half-sold every profitable shadow position for a reason that had nothing
+  to do with any token. Section 8's rule is now enforced: a *confirmed* hard failure still exits
+  immediately and in full; a provider outage with a healthy route, healthy liquidity and healthy
+  flow is monitored instead.
+
+On top of those, forward results — not opinion — now decide which signal families are ranked,
+pinged and traded, with **bounded, versioned, auditable** weights that shrink toward the pool and
+do nothing at all below a minimum sample. One coin doing 10x cannot move the ranking.
+
+Version 2.39.0 added the **SHADOW auto-trader**: a completely simulated $100 account that
 automatically buys **exactly $10** whenever an eligible research signal appears, manages the
 position with the existing staged exit engine plus a **$2 NET meaningful-profit objective**, sells
 realistically, and records the NET result per signal family. It exists to answer one question with
@@ -1016,6 +1041,88 @@ The bot needs these Discord application permissions:
 
 No privileged Discord gateway intents are required.
 
+## Profit-first forward optimization (v2.40)
+
+The objective of this release is one number: **forward NET expectancy**. Not more alerts, not more
+coins, not more API calls.
+
+### Cost: a failing provider is called less, not more
+
+`SolanaTrackerClient` now carries the same breaker its risk-lookup sibling already had. A credit
+status (401/402/403/429) opens an exponential backoff window — 60s, 5m, 15m, 30m, capped at an
+hour — and every call inside that window is refused locally and **counted**, so the saving is
+visible on the dashboard. A 404 is deliberately *not* a credit failure: "this token is unknown"
+must not starve the pipeline.
+
+The caller backs off too. `refresh_discovery` now throttles on the last *attempt* rather than the
+last success, and persists that timestamp so a crash loop cannot re-open the budget on every boot.
+
+| | before | after |
+| --- | --- | --- |
+| Refresh attempts while the plan is exhausted | every 60s, forever | first attempt, then exponential backoff |
+| Failing requests per day (observed) | ~1,440 | a handful |
+| Where the spend shows up | only in the error log | `/fomo profit providers` |
+
+### Solana Tracker is optional enrichment
+
+The provider map is written down in code and surfaced in `/fomo profit providers`, including
+whether each feature is essential and whether a cheaper on-chain path exists. Both Tracker
+features — wallet discovery and token-risk enrichment — are marked **optional with an on-chain
+fallback**. Only DEX market data and Solana RPC are marked essential, because those genuinely have
+no substitute. When Tracker is unavailable the evidence reads `UNKNOWN`, never `PASS`, and never
+`FAIL`.
+
+### A dead provider is not a dead token
+
+This is the false-exit fix, and it was live. A partial safety de-risk is downgraded to *monitoring*
+only when **all** of these hold: the verdict is `UNKNOWN` rather than `FAIL`, the reason is a named
+provider outage, a sell route still exists, liquidity has not collapsed, and buy flow is not
+reversing. Anything less and the original defensive plan stands. A confirmed hard failure is never
+rescued. STRICT PAPER entry safety is untouched — the rescue lives in the shadow overlay and a test
+asserts the strict entry module has never heard of it.
+
+### Forward results decide which families are worth trading
+
+`calibrate_families` turns closed forward trades into a bounded multiplier per signal family:
+
+* below **10 closed trades** a family's weight is exactly `1.0` and says `INSUFFICIENT_SAMPLE`,
+* above it, the measured expectancy is shrunk toward the pooled mean by `n / (n + 20)`,
+* the result is clamped to `0.5 … 1.5`, whatever the data says,
+* and retiring a family from SHADOW needs a much bigger claim: **25+ closed trades**, negative
+  shrunk expectancy *and* a 40%+ severe-failure rate.
+
+Every weight records its sample, raw expectancy, shrunk expectancy, pooled mean, shrinkage factor,
+severe-failure rate, the `as_of` it was computed at, and a calibration version — so any ranking
+decision can be re-derived by hand. Weights only ever move ranking, publication priority and
+shadow eligibility; a test asserts they never touch a safety gate, a liquidity floor or a cost
+model.
+
+### Current edge outranks historical opportunity
+
+`forward_edge_score` ranks what is worth surfacing *now*: current actionability (30%), freshness,
+expected NET edge, independent buyers, route quality, catalyst confidence, notable-wallet lead and
+flow — multiplied by the family's forward weight. The historical opportunity score contributes at
+most **10 of 100 points**, so a spent setup cannot keep sitting beside a fresh one on past glory.
+
+### Pings have to earn themselves
+
+The forward ping gate is strictly subtractive: it can only withhold a ping the existing rules
+already allowed, never create one. A ping now needs current edge ≥ 70, at least two independent
+confirmations, and a family the forward data has not demoted — and is refused outright if the move
+has already happened. Volume, a famous wallet or one viral post are explicitly not enough. Nothing
+is hidden as a result: everything still publishes to the live radar.
+
+### Exits are measured against what actually happened next
+
+`/fomo profit exits` scores every persisted exit against the observation stream that followed it
+within an hour, and classifies each as **premature** (the token ran 25%+ past the exit),
+**good defensive** (it fell 15%+ further) or neutral. Per exit reason it reports count, average NET,
+premature rate, defensive rate, upside given up, loss avoided and **net regret** — with the rule
+leaking the most money sorted first. That is the number that says which exit rule to fix.
+
+This lookahead is evaluation only and structurally confined: `score_exit` is a pure function taking
+observations explicitly, and a test asserts no module in the live exit path imports it.
+
 ## SHADOW auto-trader (v2.39)
 
 The strict PAPER laboratory answers *"is this a trade I would defend?"*. It is deliberately hard
@@ -1117,6 +1224,25 @@ transaction, an order execution call or a swap. The test suite and the self-chec
 module's AST and assert it.
 
 ## Railway deployment
+
+### v2.40.0 Railway changes
+
+Every new setting has a safe code default, so **no Railway variable has to be added**. Nothing here
+enables live trading or real-money execution.
+
+**ADD:** none required.  **CHANGE:** none required.
+
+**OPTIONAL:**
+
+```text
+FOMO_FORWARD_PING_GATE_ENABLED=true       # pings must clear the forward-edge bar
+FOMO_RUNNER_ANALYSIS_BUDGET_SECONDS=30    # per-mint enrichment budget; timeouts are now named
+```
+
+**Worth knowing without changing anything:** if `SOLANA_TRACKER_API_KEY` is out of credits, the bot
+now backs off instead of retrying every minute, keeps running on DEX data and public RPC, and
+reports the outage as `UNKNOWN` evidence rather than failing tokens. `/fomo profit providers` shows
+the health, the wasted calls and the calls the breaker skipped.
 
 ### v2.39.0 Railway changes
 
@@ -1533,6 +1659,19 @@ Mutation commands require Discord Administrator or a role listed in
 Every one of these is read-only research. They show `WAIT`, `REJECT`, `COOLDOWN` and
 `REENTRY_WATCH` candidates on purpose; seeing a candidate never makes it entry eligible.
 
+### Profit dashboard (v2.40, admin only)
+
+| Command | What it answers |
+| --- | --- |
+| `/fomo profit` | **Is the simulated account making money?** Bankroll, NET PnL, ROI, expectancy per $10 trade, profit factor, max drawdown, best and worst signal family, premature exit rate, and provider calls per 100 published signals. |
+| `/fomo profit view:signals` | Every signal family ranked by measured forward expectancy, with sample, NET, profit factor, drawdown, severe-failure rate and the bounded ranking weight the forward data earned it. |
+| `/fomo profit view:exits` | Every exit rule scored against what happened next: count, average NET, premature rate, defensive rate, upside given up, loss avoided and net regret — worst offender first. |
+| `/fomo profit view:providers` | Per provider: calls, cache hits, errors, calls the breaker skipped, health, whether it is essential, and whether a cheaper on-chain path exists. |
+
+Provider cost is reported as **calls**, not dollars: request pricing differs per plan, and inventing
+a dollar figure the bot cannot verify is exactly the kind of fabricated number the rest of this
+codebase refuses to produce.
+
 ### SHADOW auto-trader (v2.39, admin only)
 
 | Command | What it answers |
@@ -1714,5 +1853,14 @@ does *not* dump an accelerating one, that capture efficiency and profit giveback
 correctly, that counterfactuals and entry decisions cannot read the future, and that no shadow
 module contains a signer, a wallet, an RPC client or a swap submission path.
 
+The v2.40 suite adds the profit-first work: that a credit failure opens a bounded backoff and a
+404 does not, that the refresh throttle no longer depends on a non-empty candidate pool, that a
+timeout never logs as an empty string, that a provider outage is monitored rather than sold while a
+confirmed failure still exits in full, that one lucky coin cannot move the ranking, that a losing
+family is demoted and a losing *and rugging* family is retired, that weights stay bounded and
+auditable, that historical opportunity cannot outrank current edge, that the ping gate can only
+withhold, and that exit regret never reaches a live decision.
+
 `python tests/run_selfcheck.py` re-asserts the non-negotiables — including the $10 entry size, the
-$100/5/$50 caps, the STRICT PAPER separation and `SHADOW_REAL_MONEY_SPEND = 0` — without pytest.
+$100/5/$50 caps, the STRICT PAPER separation, `SHADOW_REAL_MONEY_SPEND = 0`, the provider backoff,
+the outage-is-not-a-failure rule and the small-sample protection — without pytest.

@@ -45,10 +45,11 @@ from .discord_render import (
     send_cards,
 )
 from .engine import SmartMoneyEngine
-from .errors import DiscoveryError, JupiterError, PumpLaunchError
+from .errors import DiscoveryError, JupiterError, PumpLaunchError, describe_exception
 from .fast_alerts import LANE_URGENT, EnrichmentUpdate, FastAlert
 from .lab.decision import Decision
 from .lab.evidence import buyer_evidence, organic_demand_text
+from .lab.exit_regret import ExitQualityReport
 from .lab.exits import PaperPosition
 from .lab.identity import (
     NO_DESCRIPTION,
@@ -58,6 +59,7 @@ from .lab.identity import (
     short_money,
 )
 from .lab.lifecycle import TokenLifecycle
+from .lab.providers import ProviderReport
 from .lab.registry import (
     IDEA_ONLY_ACCOUNTS,
     TIER_A_ACCOUNTS,
@@ -3323,7 +3325,7 @@ class SmartMoneyBot(commands.Bot):
         await self._send_alert(embed, ping_user=True)
 
     async def on_error(self, context: str, error: Exception) -> None:
-        logger.error("%s: %s", context, error)
+        logger.error("%s: %s", context, describe_exception(error))
 
 
 class SmartMoneyCommands(
@@ -5408,6 +5410,241 @@ def _shadow_policies_embed(
     return _clamp_embed(embed)
 
 
+def _profit_summary_embed(payload: dict[str, object]) -> discord.Embed:
+    """`/fomo profit` — the money answer, nothing buried (section 21)."""
+
+    report = payload["report"]
+    assert isinstance(report, ShadowAccountReport)
+    exits = payload["exits"]
+    net = report.total_net_pnl_usd
+    colour = 0x27AE60 if net > 0 else 0xC0392B if net < 0 else 0x7F8C8D
+    verdict = "MAKING MONEY" if net > 0 else "LOSING MONEY" if net < 0 else "FLAT"
+
+    embed = discord.Embed(
+        title=f"💰 SHADOW ACCOUNT — {verdict}",
+        description=(
+            f"**Bankroll {_shadow_money(report.starting_bankroll_usd)} → "
+            f"{_shadow_money(report.current_bankroll_usd)}**\n"
+            f"NET PnL `{_shadow_signed(net)}` • ROI `{report.roi_percent:+.2f}%` • "
+            f"expectancy per $10 trade `{_pending_money(report.expectancy_usd)}`\n"
+            "**REAL MONEY SPENT: $0.00** — simulation only"
+        ),
+        colour=colour,
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(
+        name="Quality",
+        value=(
+            f"Profit factor `{_pending(report.profit_factor)}` • max drawdown "
+            f"`{report.max_drawdown_percent:.2f}%`\n"
+            f"Closed `{report.closed_trades}` • win rate "
+            f"`{_pending(report.win_rate_percent, '%')}` • open "
+            f"`{report.open_positions}`"
+        )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+        inline=False,
+    )
+    embed.add_field(
+        name="Signal families",
+        value=(
+            f"Best `{_family_label(payload.get('best_family'))}`\n"
+            f"Worst `{_family_label(payload.get('worst_family'))}`"
+        )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+        inline=False,
+    )
+    embed.add_field(
+        name="Exits",
+        value=(
+            f"Premature exit rate "
+            f"`{_pending(payload.get('premature_exit_rate_percent'), '%')}`\n"
+            f"Most expensive rule `{payload.get('worst_exit_reason') or 'none yet'}`\n"
+            f"Best defensive rule `{payload.get('best_exit_reason') or 'none yet'}`\n"
+            f"Net exit regret `{_shadow_signed(getattr(exits, 'net_regret_usd', None))}`"
+        )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+        inline=False,
+    )
+    embed.add_field(
+        name="Provider cost",
+        value=(
+            f"Recorded calls `{payload.get('provider_calls', 0)}` • signals published "
+            f"`{payload.get('signals_published', 0)}`\n"
+            f"Calls per 100 signals "
+            f"`{_pending(payload.get('provider_calls_per_100_signals'))}`"
+        )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+        inline=False,
+    )
+    if not report.sufficient_sample:
+        embed.add_field(
+            name="⚠️ " + SAMPLE_TOO_SMALL,
+            value=(
+                "Too few closed forward trades to conclude anything. Every number "
+                "above is reported as measured; none has been tuned to look better."
+            ),
+            inline=False,
+        )
+    embed.set_footer(text="💰 Forward NET dollars • simulation only • no real money")
+    return _clamp_embed(embed)
+
+
+def _family_label(value: object) -> str:
+    text = str(value or "")
+    return FAMILY_LABELS.get(text, text) if text else "not enough data"
+
+
+def _profit_signals_embed(payload: dict[str, object]) -> discord.Embed:
+    """`/fomo profit signals` — ranked by forward record, not by hype (§22)."""
+
+    report = payload["report"]
+    assert isinstance(report, ShadowAccountReport)
+    weights = payload["weights"]
+    assert isinstance(weights, dict)
+
+    embed = discord.Embed(
+        title="💰 SIGNAL FAMILIES — RANKED BY FORWARD NET",
+        description=(
+            "Ranked by measured forward expectancy. A family with too small a "
+            "sample keeps a neutral weight — one coin doing 10x cannot move this."
+        ),
+        colour=0x9B59B6,
+        timestamp=discord.utils.utcnow(),
+    )
+    rows = [
+        (name, cohort, weights.get(name))
+        for name, cohort in report.by_family.items()
+    ]
+    rows.sort(
+        key=lambda item: (
+            item[1].expectancy_usd if item[1].expectancy_usd is not None else Decimal("-999")
+        ),
+        reverse=True,
+    )
+    if not rows:
+        embed.add_field(
+            name="No forward trades yet",
+            value="Nothing has closed, so no family can be ranked.",
+            inline=False,
+        )
+    for name, cohort, weight in rows[:9]:
+        verdict = getattr(weight, "verdict", "INSUFFICIENT_SAMPLE")
+        multiplier = getattr(weight, "weight", Decimal("1"))
+        embed.add_field(
+            name=f"{FAMILY_LABELS.get(name, name)} — {verdict.replace('_', ' ').lower()}",
+            value=(
+                f"Sample `{cohort.trades}` (closed `{cohort.trades - cohort.open_trades}`) "
+                f"• NET `{_shadow_signed(cohort.net_pnl_usd)}`\n"
+                f"Expectancy `{_pending_money(cohort.expectancy_usd)}` • profit factor "
+                f"`{_pending(cohort.profit_factor)}` • drawdown "
+                f"`{_shadow_money(cohort.max_drawdown_usd)}`\n"
+                f"Severe failures "
+                f"`{_pending(getattr(weight, 'severe_failure_percent', None), '%')}` • "
+                f"ranking weight `{multiplier}`"
+            )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+            inline=False,
+        )
+    embed.set_footer(
+        text="Weights are bounded 0.5-1.5, shrunk toward the pool, and never touch a safety gate"
+    )
+    return _clamp_embed(embed)
+
+
+def _profit_exits_embed(report: ExitQualityReport) -> discord.Embed:
+    """`/fomo profit exits` — which rules leak money (section 23)."""
+
+    leaking = report.exits_are_leaking
+    embed = discord.Embed(
+        title="💰 EXIT QUALITY — WHAT THE RULES COST",
+        description=(
+            f"Scored `{report.scored}` of `{report.exits}` exits against what "
+            "happened next.\n"
+            f"Premature `{_pending(report.premature_rate_percent, '%')}` • good "
+            f"defensive `{_pending(report.defensive_rate_percent, '%')}`\n"
+            f"Upside given up `{_shadow_money(report.total_upside_missed_usd)}` • loss "
+            f"avoided `{_shadow_money(report.total_loss_avoided_usd)}`\n"
+            f"**Net exit regret {_shadow_signed(report.net_regret_usd)}** — "
+            + ("the exits are leaking" if leaking else "the exits are defending")
+        ),
+        colour=0xC0392B if leaking else 0x27AE60,
+        timestamp=discord.utils.utcnow(),
+    )
+    if not report.by_reason:
+        embed.add_field(
+            name="No scored exits yet",
+            value=(
+                "An exit can only be judged once observations exist after it. "
+                "Nothing is being guessed."
+            ),
+            inline=False,
+        )
+    for reason, row in list(report.by_reason.items())[:8]:
+        embed.add_field(
+            name=f"{reason} — {row.verdict.replace('_', ' ').lower()}",
+            value=(
+                f"Count `{row.count}` (scored `{row.scored}`) • average NET "
+                f"`{_pending_money(row.average_net_usd)}`\n"
+                f"Premature `{_pending(row.premature_rate_percent, '%')}` • defensive "
+                f"`{_pending(row.defensive_rate_percent, '%')}`\n"
+                f"Upside missed `{_shadow_money(row.upside_missed_usd)}` • loss avoided "
+                f"`{_shadow_money(row.loss_avoided_usd)}` • net regret "
+                f"`{_shadow_signed(row.net_regret_usd)}`"
+            )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+            inline=False,
+        )
+    embed.set_footer(text="Post-exit data is evaluation only — it never reaches a live decision")
+    return _clamp_embed(embed)
+
+
+def _profit_providers_embed(rows: list[dict[str, object]]) -> discord.Embed:
+    """`/fomo profit providers` — where the money is wasted (section 24)."""
+
+    embed = discord.Embed(
+        title="💰 PROVIDER COST AND HEALTH",
+        description=(
+            "Recorded calls, cache hits, errors and whether a cheaper on-chain "
+            "path exists. A provider that is failing is now called *less*, not more."
+        ),
+        colour=0x34495E,
+        timestamp=discord.utils.utcnow(),
+    )
+    for item in rows[:8]:
+        report = item["report"]
+        assert isinstance(report, ProviderReport)
+        essential = "ESSENTIAL" if report.essential else "optional"
+        health = report.health
+        marker = "🟢" if health == "HEALTHY" else "🟡" if health == "DEGRADED" else "🔴"
+        replaceable = report.replaceable_features
+        embed.add_field(
+            name=f"{marker} {report.provider} — {health.lower()} • {essential}",
+            value=(
+                f"Calls `{report.calls}` • cache `{report.cache_hits}` "
+                f"(`{_pending(report.cache_hit_rate_percent, '%')}`) • errors "
+                f"`{report.errors}` (`{_pending(report.error_rate_percent, '%')}`)\n"
+                f"Calls skipped by the breaker `{report.calls_skipped}`"
+                + (
+                    f" • backing off for `{report.degraded_seconds_remaining}s`"
+                    if report.degraded_seconds_remaining
+                    else ""
+                )
+                + (
+                    "\nOn-chain fallback exists for: "
+                    + ", ".join(replaceable)
+                    if replaceable
+                    else ""
+                )
+                + (f"\nLast error: `{report.last_error[:160]}`" if report.last_error else "")
+            )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+            inline=False,
+        )
+    if not rows:
+        embed.add_field(
+            name="No provider usage recorded yet",
+            value="Nothing has been spent since the last accounting flush.",
+            inline=False,
+        )
+    embed.set_footer(
+        text="Call counts are measured; dollar pricing differs per plan and is never invented"
+    )
+    return _clamp_embed(embed)
+
+
 def _lab_exits_embed(rows: tuple[dict[str, object], ...]) -> discord.Embed:
     embed = discord.Embed(
         title="FOMO PAPER EXIT JOURNAL",
@@ -6683,6 +6920,51 @@ class FomoCommands(
         await interaction.response.defer(thinking=True, ephemeral=True)
         payload = await self.bot.engine.lab_performance()
         await self._resolve_lab(interaction, embed=_lab_performance_embed(payload))
+
+    @app_commands.command(
+        name="profit",
+        description="Is the simulated account making money? Profit first, diagnostics after.",
+    )
+    @app_commands.describe(
+        view=(
+            "summary: the money answer • signals: families by forward NET • "
+            "exits: which rules cost money • providers: where spend goes"
+        )
+    )
+    async def profit(
+        self,
+        interaction: discord.Interaction,
+        view: Literal["summary", "signals", "exits", "providers"] = "summary",
+    ) -> None:
+        """`/fomo profit` and its three diagnostic views (sections 21-24)."""
+
+        if not await self._require_admin(interaction):
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        try:
+            if view == "signals":
+                payload = await self.bot.engine.profit_signals()
+                await self._resolve_lab(interaction, embed=_profit_signals_embed(payload))
+                return
+            if view == "exits":
+                report = await self.bot.engine.profit_exits()
+                await self._resolve_lab(interaction, embed=_profit_exits_embed(report))
+                return
+            if view == "providers":
+                rows = await self.bot.engine.profit_providers()
+                await self._resolve_lab(interaction, embed=_profit_providers_embed(rows))
+                return
+            payload = await self.bot.engine.profit_summary()
+            await self._resolve_lab(interaction, embed=_profit_summary_embed(payload))
+        except Exception as exc:
+            await self._resolve_lab(
+                interaction,
+                content=(
+                    "The profit report failed: "
+                    f"`{type(exc).__name__}`. Nothing was bought; the shadow "
+                    "experiment is simulation only and spends $0.00."
+                ),
+            )
 
     @app_commands.command(
         name="shadow",
