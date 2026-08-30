@@ -49,6 +49,8 @@ NOTABLE_DISTRIBUTION = "NOTABLE_DISTRIBUTION"
 BREAKING_CATALYST = "BREAKING_CATALYST"
 CATALYST_WATCH = "CATALYST_WATCH"
 CONFLUENCE_WATCH = "CONFLUENCE_WATCH"
+SHADOW_ENTRY = "SHADOW_AUTO_ENTRY"
+SHADOW_EXIT = "SHADOW_AUTO_EXIT"
 
 ALERT_CLASSES: tuple[str, ...] = (
     FAST_WATCH,
@@ -58,15 +60,43 @@ ALERT_CLASSES: tuple[str, ...] = (
     BREAKING_CATALYST,
     CATALYST_WATCH,
     CONFLUENCE_WATCH,
+    SHADOW_ENTRY,
+    SHADOW_EXIT,
 )
 
 #: Classes that may interrupt the user.  A late observation never does — it is
 #: published, clearly marked, and left for the user to read on their own time.
+#: A simulated shadow fill never does either: it is a record, not news.
 PINGABLE: frozenset[str] = frozenset(
     {NOTABLE_TRADER_EARLY, BREAKING_CATALYST, CONFLUENCE_WATCH}
 )
 
+# --- the two visibility layers (sections 27-29) ------------------------------
+#: Everything worth reading goes somewhere.  LANE_RADAR is the quiet feed a user
+#: can scan on their own time; LANE_URGENT is the small set that has earned an
+#: interruption.  Nothing is dropped merely because it did not earn a ping —
+#: that is exactly the "either everything pings me or I never see it" problem
+#: section 29 forbids.
+LANE_RADAR = "RADAR"
+LANE_URGENT = "URGENT"
+
+LANES: tuple[str, ...] = (LANE_RADAR, LANE_URGENT)
+
+#: Classes that belong in the urgent lane when they fire at all.
+URGENT_CLASSES: frozenset[str] = frozenset(
+    {NOTABLE_TRADER_EARLY, BREAKING_CATALYST, CONFLUENCE_WATCH, CATALYST_WATCH}
+)
+
 RESEARCH_ONLY_FOOTER = "⚠ RESEARCH ONLY — NOT ENTRY ELIGIBLE • deep validation still running"
+SHADOW_FOOTER = "🧪 SIMULATION ONLY — REAL MONEY $0.00 • no wallet, no signer, no swap"
+
+
+def _family_field(family: str, why: Sequence[str]) -> CardField:
+    """Section 30: every alert states its family and why it is being shown."""
+
+    lines = [f"**{family.replace('_', ' ')}**"]
+    lines.extend(f"• {item}" for item in list(why)[:5])
+    return CardField("WHY YOU'RE SEEING THIS", "\n".join(lines), P_WHY_SURFACED)
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,10 +114,16 @@ class FastAlert:
     #: The Solana mint this card is about, when it is about one at all.  An
     #: event-only catalyst card has none, and must not be given token links.
     token_mint: str = ""
+    #: Which visibility layer this card belongs to (sections 27-29).
+    lane: str = LANE_RADAR
+    #: The shadow signal family, when this card came from one.
+    family: str = ""
 
     def __post_init__(self) -> None:
         if self.kind not in ALERT_CLASSES:
             raise ValueError(f"unknown fast alert class: {self.kind}")
+        if self.lane not in LANES:
+            raise ValueError(f"unknown fast alert lane: {self.lane}")
 
     @property
     def entry_eligible(self) -> bool:
@@ -181,11 +217,7 @@ def build_fast_watch_alert(
             ),
             P_DEMAND,
         ),
-        CardField(
-            "WHY WATCHING",
-            "\n".join(f"• {item}" for item in reasons[:5]) or "• early acceleration",
-            P_WHY_SURFACED,
-        ),
+        _family_field(FAST_WATCH, reasons or ("early acceleration",)),
         CardField(
             "SAFETY",
             f"**UNKNOWN / pending**\nMissing: {pending}",
@@ -226,6 +258,8 @@ def build_fast_watch_alert(
         ping=False,
         fingerprint=f"watch-{int(getattr(verdict, 'score', ZERO))}",
         token_mint=mint,
+        lane=LANE_RADAR,
+        family=FAST_WATCH,
     )
 
 
@@ -313,6 +347,14 @@ def build_notable_trader_alert(
             )
         )
 
+    why = [
+        f"{signal.display_name} ({signal.reputation_state}) bought {_money(trade.amount_usd)}",
+        f"observed {age_text} after the signal • {signal.freshness()}",
+    ]
+    if consensus is not None and consensus.independent_wallets > 1:
+        why.append(f"{consensus.independent_wallets} independent notable wallets agree")
+    fields.append(_family_field(kind, why))
+
     warnings = signal.warnings()
     if warnings:
         fields.append(CardField("WARNINGS", "\n".join(warnings), P_WARNINGS))
@@ -346,6 +388,10 @@ def build_notable_trader_alert(
         ping_reason=getattr(ping_decision, "reason", ""),
         fingerprint=signal.freshness(),
         token_mint=trade.mint,
+        # A late observation is published quietly rather than hidden: it goes to
+        # the live radar, where it can still be useful research.
+        lane=LANE_RADAR if late else LANE_URGENT,
+        family=kind,
     )
 
 
@@ -432,6 +478,13 @@ def build_catalyst_alert(
     fields.append(
         CardField("SAFETY", "**UNKNOWN / pending** — research only", P_SAFETY)
     )
+    fields.append(
+        _family_field(
+            kind,
+            tuple(alert.reasons)
+            or (f"{event.confidence} confidence external event detected",),
+        )
+    )
     if alert.warnings:
         fields.append(CardField("WARNINGS", "\n".join(alert.warnings), P_WARNINGS))
 
@@ -457,6 +510,13 @@ def build_catalyst_alert(
             CONFLUENCE_WATCH: 0x9B59B6,
         }[kind],
     )
+    urgent = kind in {BREAKING_CATALYST, CONFLUENCE_WATCH} or (
+        # A high-quality CATALYST WATCH earns the urgent lane even though it
+        # does not earn an @ mention (section 27B).
+        kind == CATALYST_WATCH
+        and str(event.confidence) in {"CONFIRMED", "HIGH"}
+        and event.independent_confirmations >= 2
+    )
     return FastAlert(
         kind=kind,
         mint=mint or event.event_id,
@@ -466,6 +526,206 @@ def build_catalyst_alert(
         ping_reason=getattr(alert, "ping_reason", ""),
         fingerprint=f"{event.confidence}:{event.priority}",
         token_mint=mint,
+        lane=LANE_URGENT if urgent else LANE_RADAR,
+        family=kind,
+    )
+
+
+def build_shadow_entry_alert(
+    *,
+    mint: str,
+    name: str,
+    symbol: str,
+    fomo_url: str,
+    family: str,
+    family_label: str,
+    why: Sequence[str],
+    size_usd: Decimal,
+    fill_market_cap_usd: Decimal | None,
+    fill_price_usd: Decimal | None,
+    venue: str,
+    fill_source: str,
+    graduation_state: str,
+    modeled_cost_usd: Decimal,
+    net_objective_usd: Decimal,
+    signal_to_fill_seconds: int | None = None,
+    image_url: str = "",
+    position_id: str = "",
+) -> FastAlert:
+    """🧪 SHADOW AUTO-ENTRY (section 31).
+
+    States the real money figure explicitly, every time, because a card that
+    looks like a trade must never be mistaken for one.
+    """
+
+    fill_note = {
+        "EXECUTABLE_QUOTE": "executable quote",
+        "SIMULATED_VENUE_STATE": "simulated from live venue state",
+        "FALLBACK_PENALISED": "⚠ penalised fallback price — not an executable fill",
+    }.get(fill_source, fill_source or "unknown")
+
+    fields = [
+        CardField(
+            "SIMULATED BUY",
+            (
+                f"Amount `${size_usd:.2f}` • fill MC `{_money(fill_market_cap_usd)}`\n"
+                f"Fill price `{fill_price_usd if fill_price_usd is not None else 'unknown'}`\n"
+                f"Modeled costs `-${modeled_cost_usd:.4f}`"
+            ),
+            P_DECISION,
+        ),
+        CardField(
+            "ROUTE",
+            (
+                f"Venue `{venue}` • {fill_note}\n"
+                f"Pump state `{graduation_state}`"
+                + (
+                    f"\nSignal → simulated fill `{signal_to_fill_seconds}s`"
+                    if signal_to_fill_seconds is not None
+                    else ""
+                )
+            ),
+            P_LIQUIDITY,
+        ),
+        CardField(
+            "MANAGEMENT",
+            (
+                f"NET meaningful-profit objective `+${net_objective_usd:.2f}`\n"
+                "Runner management **ACTIVE** — a healthy runner is not dumped at "
+                "the objective\n"
+                "**REAL MONEY: $0.00**"
+            ),
+            P_EDGE,
+        ),
+        _family_field(family_label or family, why),
+        CardField("LINKS", _links(mint, fomo_url), P_LIQUIDITY),
+    ]
+
+    spec = CardSpec(
+        title="🧪 SHADOW AUTO-ENTRY",
+        description=(
+            f"**{name}** `${symbol}`\n`{mint}`\n"
+            f"Signal **{family_label or family}** • simulated buy `${size_usd:.2f}`\n"
+            f"{_links(mint, fomo_url)}"
+        ),
+        compact_description=(
+            f"🧪 SHADOW BUY `${size_usd:.2f}` **{name}** `${symbol}`\n`{mint}`\n"
+            f"{family_label or family} • fill MC `{_money(fill_market_cap_usd)}` • "
+            "REAL MONEY $0.00"
+        ),
+        fields=tuple(fields),
+        footer=SHADOW_FOOTER,
+        thumbnail_url=image_url,
+        colour=0x1ABC9C,
+    )
+    return FastAlert(
+        kind=SHADOW_ENTRY,
+        mint=mint,
+        alert_key=f"{SHADOW_ENTRY}:{position_id or mint}",
+        spec=spec,
+        ping=False,
+        fingerprint=f"shadow-entry-{family}",
+        token_mint=mint,
+        lane=LANE_RADAR,
+        family=family,
+    )
+
+
+def build_shadow_exit_alert(
+    *,
+    mint: str,
+    name: str,
+    symbol: str,
+    fomo_url: str,
+    family: str,
+    family_label: str,
+    size_usd: Decimal,
+    entry_market_cap_usd: Decimal | None,
+    exit_market_cap_usd: Decimal | None,
+    gross_pnl_usd: Decimal,
+    cost_usd: Decimal,
+    net_pnl_usd: Decimal,
+    peak_net_pnl_usd: Decimal,
+    given_back_usd: Decimal,
+    exit_reason: str,
+    venue: str,
+    fraction_sold: Decimal,
+    final: bool,
+    remaining_fraction: Decimal = ZERO,
+    why: Sequence[str] = (),
+    image_url: str = "",
+    position_id: str = "",
+    sequence: int = 1,
+) -> FastAlert:
+    """🧪 SHADOW AUTO-EXIT (section 32).
+
+    Publishes the loss as plainly as the win: peak NET and profit given back are
+    always shown, so a slow exit is visible rather than averaged away.
+    """
+
+    verdict = "PARTIAL" if not final else "CLOSED"
+    fields = [
+        CardField(
+            "RESULT",
+            (
+                f"Simulated investment `${size_usd:.2f}`\n"
+                f"Entry MC `{_money(entry_market_cap_usd)}` → exit MC "
+                f"`{_money(exit_market_cap_usd)}`\n"
+                f"Gross `${gross_pnl_usd:+.4f}` • costs `-${cost_usd:.4f}` • "
+                f"**NET `${net_pnl_usd:+.4f}`**"
+            ),
+            P_DECISION,
+        ),
+        CardField(
+            "PEAK vs FINAL",
+            (
+                f"Peak NET `${peak_net_pnl_usd:+.4f}`\n"
+                f"Profit given back `${given_back_usd:.4f}`"
+            ),
+            P_EDGE,
+        ),
+        CardField(
+            "EXIT",
+            (
+                f"Reason `{exit_reason}` • {verdict}\n"
+                f"Sold `{fraction_sold * 100:.0f}%` of the remainder • still holding "
+                f"`{remaining_fraction * 100:.0f}%`\n"
+                f"Venue `{venue}`\n"
+                "**REAL MONEY: $0.00**"
+            ),
+            P_LIQUIDITY,
+        ),
+        _family_field(family_label or family, why or (f"exit reason: {exit_reason}",)),
+        CardField("LINKS", _links(mint, fomo_url), P_LIQUIDITY),
+    ]
+
+    spec = CardSpec(
+        title="🧪 SHADOW AUTO-EXIT",
+        description=(
+            f"**{name}** `${symbol}`\n`{mint}`\n"
+            f"Signal **{family_label or family}** • NET `${net_pnl_usd:+.4f}`\n"
+            f"{_links(mint, fomo_url)}"
+        ),
+        compact_description=(
+            f"🧪 SHADOW SELL **{name}** `${symbol}`\n`{mint}`\n"
+            f"NET `${net_pnl_usd:+.4f}` • peak `${peak_net_pnl_usd:+.4f}` • "
+            f"{exit_reason} • REAL MONEY $0.00"
+        ),
+        fields=tuple(fields),
+        footer=SHADOW_FOOTER,
+        thumbnail_url=image_url,
+        colour=0x27AE60 if net_pnl_usd >= 0 else 0xC0392B,
+    )
+    return FastAlert(
+        kind=SHADOW_EXIT,
+        mint=mint,
+        alert_key=f"{SHADOW_EXIT}:{position_id or mint}:{sequence}",
+        spec=spec,
+        ping=False,
+        fingerprint=f"shadow-exit-{exit_reason}",
+        token_mint=mint,
+        lane=LANE_RADAR,
+        family=family,
     )
 
 

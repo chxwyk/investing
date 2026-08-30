@@ -230,6 +230,26 @@ class Settings:
     fomo_alert_enrichment_enabled: bool
     fomo_alert_enrichment_delay_seconds: int
 
+    # --- SHADOW auto-trader (v2.39) --------------------------------------
+    # Safe code defaults cover every value below, so a deployment does not need
+    # to define any of these Railway variables to run the shadow experiment.
+    fomo_shadow_auto_enabled: bool
+    fomo_shadow_publish_cards: bool
+    fomo_shadow_bankroll_usd: Decimal
+    fomo_shadow_position_usd: Decimal
+    fomo_shadow_max_position_usd: Decimal
+    fomo_shadow_max_positions: int
+    fomo_shadow_max_exposure_usd: Decimal
+    fomo_shadow_net_profit_objective_usd: Decimal
+    fomo_shadow_daily_loss_cap_usd: Decimal
+    fomo_shadow_max_price_impact_percent: Decimal
+    fomo_shadow_max_signal_age_seconds: int
+    fomo_shadow_max_fill_latency_ms: int
+    fomo_shadow_allow_fallback_fill: bool
+    fomo_shadow_min_forward_sample: int
+    fomo_live_radar_channel_id: int | None
+    fomo_urgent_channel_id: int | None
+
     news_radar_enabled: bool
     x_news_stream_enabled: bool
     x_news_stream_rule: str
@@ -571,6 +591,26 @@ class Settings:
             fomo_alert_enrichment_delay_seconds=_int(
                 "FOMO_ALERT_ENRICHMENT_DELAY_SECONDS", 45
             ),
+            fomo_shadow_auto_enabled=_bool("FOMO_SHADOW_AUTO_ENABLED", True),
+            fomo_shadow_publish_cards=_bool("FOMO_SHADOW_PUBLISH_CARDS", True),
+            fomo_shadow_bankroll_usd=_decimal("FOMO_SHADOW_BANKROLL_USD", "100"),
+            fomo_shadow_position_usd=_decimal("FOMO_SHADOW_POSITION_USD", "10"),
+            fomo_shadow_max_position_usd=_decimal("FOMO_SHADOW_MAX_POSITION_USD", "10"),
+            fomo_shadow_max_positions=_int("FOMO_SHADOW_MAX_POSITIONS", 5),
+            fomo_shadow_max_exposure_usd=_decimal("FOMO_SHADOW_MAX_EXPOSURE_USD", "50"),
+            fomo_shadow_net_profit_objective_usd=_decimal(
+                "FOMO_SHADOW_NET_PROFIT_OBJECTIVE_USD", "2"
+            ),
+            fomo_shadow_daily_loss_cap_usd=_decimal("FOMO_SHADOW_DAILY_LOSS_CAP_USD", "15"),
+            fomo_shadow_max_price_impact_percent=_decimal(
+                "FOMO_SHADOW_MAX_PRICE_IMPACT_PERCENT", "12"
+            ),
+            fomo_shadow_max_signal_age_seconds=_int("FOMO_SHADOW_MAX_SIGNAL_AGE_SECONDS", 900),
+            fomo_shadow_max_fill_latency_ms=_int("FOMO_SHADOW_MAX_FILL_LATENCY_MS", 30_000),
+            fomo_shadow_allow_fallback_fill=_bool("FOMO_SHADOW_ALLOW_FALLBACK_FILL", True),
+            fomo_shadow_min_forward_sample=_int("FOMO_SHADOW_MIN_FORWARD_SAMPLE", 30),
+            fomo_live_radar_channel_id=_optional_int("FOMO_LIVE_RADAR_CHANNEL_ID"),
+            fomo_urgent_channel_id=_optional_int("FOMO_URGENT_CHANNEL_ID"),
             news_radar_enabled=_bool("NEWS_RADAR_ENABLED", True),
             x_news_stream_enabled=_bool("X_NEWS_STREAM_ENABLED", False),
             x_news_stream_rule=os.getenv("X_NEWS_STREAM_RULE", DEFAULT_X_NEWS_RULE).strip(),
@@ -955,6 +995,40 @@ class Settings:
             raise ValueError("FOMO_FAST_WATCH_COOLDOWN_SECONDS must be between 0 and 86400")
         if not 0 <= self.fomo_fast_watch_max_per_hour <= 500:
             raise ValueError("FOMO_FAST_WATCH_MAX_PER_HOUR must be between 0 and 500")
+        # The SHADOW experiment only produces comparable per-family expectancy
+        # if every entry is the same size, so a misconfigured stake fails loudly
+        # here instead of quietly producing an uninterpretable sample.
+        if self.fomo_shadow_position_usd <= 0:
+            raise ValueError("FOMO_SHADOW_POSITION_USD must be positive")
+        if self.fomo_shadow_max_position_usd != self.fomo_shadow_position_usd:
+            raise ValueError(
+                "FOMO_SHADOW_MAX_POSITION_USD must equal FOMO_SHADOW_POSITION_USD — "
+                "every shadow entry is the same size by design"
+            )
+        if self.fomo_shadow_bankroll_usd < self.fomo_shadow_position_usd:
+            raise ValueError("FOMO_SHADOW_BANKROLL_USD cannot be smaller than one entry")
+        if not 1 <= self.fomo_shadow_max_positions <= 25:
+            raise ValueError("FOMO_SHADOW_MAX_POSITIONS must be between 1 and 25")
+        if self.fomo_shadow_max_exposure_usd < self.fomo_shadow_position_usd:
+            raise ValueError("FOMO_SHADOW_MAX_EXPOSURE_USD cannot be below one entry")
+        if self.fomo_shadow_max_exposure_usd > self.fomo_shadow_bankroll_usd:
+            raise ValueError("FOMO_SHADOW_MAX_EXPOSURE_USD cannot exceed the shadow bankroll")
+        if self.fomo_shadow_net_profit_objective_usd <= 0:
+            raise ValueError("FOMO_SHADOW_NET_PROFIT_OBJECTIVE_USD must be positive")
+        if self.fomo_shadow_daily_loss_cap_usd <= 0:
+            raise ValueError("FOMO_SHADOW_DAILY_LOSS_CAP_USD must be positive")
+        if not 0 < self.fomo_shadow_max_price_impact_percent <= 100:
+            raise ValueError("FOMO_SHADOW_MAX_PRICE_IMPACT_PERCENT must be between 0 and 100")
+        if not 30 <= self.fomo_shadow_max_signal_age_seconds <= 86_400:
+            raise ValueError(
+                "FOMO_SHADOW_MAX_SIGNAL_AGE_SECONDS must be between 30 and 86400"
+            )
+        if not 100 <= self.fomo_shadow_max_fill_latency_ms <= 600_000:
+            raise ValueError(
+                "FOMO_SHADOW_MAX_FILL_LATENCY_MS must be between 100 and 600000"
+            )
+        if not 1 <= self.fomo_shadow_min_forward_sample <= 10_000:
+            raise ValueError("FOMO_SHADOW_MIN_FORWARD_SAMPLE must be between 1 and 10000")
         if self.fomo_notable_min_trade_usd < 0:
             raise ValueError("FOMO_NOTABLE_MIN_TRADE_USD cannot be negative")
         if not 60 <= self.fomo_notable_max_signal_age_seconds <= 86_400:

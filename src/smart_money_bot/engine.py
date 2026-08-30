@@ -54,6 +54,8 @@ from .fast_alerts import (
     build_catalyst_alert,
     build_fast_watch_alert,
     build_notable_trader_alert,
+    build_shadow_entry_alert,
+    build_shadow_exit_alert,
     enrichment_from_evidence,
 )
 from .lab.actionability import RankedCandidate as LabRankedCandidate
@@ -90,7 +92,26 @@ from .lab.notable import (
 )
 from .lab.regime import RegimeSample as LabRegimeSample
 from .lab.registry import account_tier
+from .lab.shadow import (
+    FAMILY_BREAKING_CATALYST,
+    FAMILY_CATALYST_WATCH,
+    FAMILY_CONFLUENCE_WATCH,
+    FAMILY_FAST_WATCH,
+    FAMILY_FRESH_RUNNER,
+    FAMILY_LABELS,
+    FAMILY_NOTABLE_EARLY,
+    FAMILY_NOTABLE_LATE,
+    FAMILY_QUALIFIED_RESEARCH,
+    FAMILY_STRICT_PAPER,
+    ShadowSignal,
+    ShadowTimestamps,
+    shadow_config_from_settings,
+    why_you_are_seeing_this,
+)
+from .lab.shadow_exits import RunnerEvidence as ShadowRunnerEvidence
 from .lab.smartmoney import WalletReputation
+from .lab.venues import classify_graduation
+from .lab_runtime import QUALIFIED_STAGES as LAB_QUALIFIED_STAGES
 from .lab_runtime import LabEvaluation, LabRuntime
 from .lab_store import LabStore
 from .launch import (
@@ -175,6 +196,8 @@ from .runner import (
     summarize_forensics,
 )
 from .scoring import rank_traders
+from .shadow_runtime import ShadowRuntime
+from .shadow_store import ShadowStore
 from .social import (
     PumpProfileDiscovery,
     SocialNomination,
@@ -471,6 +494,22 @@ class SmartMoneyEngine:
         )
         self.lab_enabled = settings.fomo_lab_engine_enabled
         self._lab_regime_refreshed_at = 0
+        # --- SHADOW auto-trader (v2.39) ----------------------------------
+        # A second, independent strategy family.  It shares the runner's
+        # evidence but never its bankroll, its positions or its eligibility, and
+        # like the lab it holds no signer, no wallet and no live route.
+        self._shadow_config = shadow_config_from_settings(settings)
+        self.shadow_store = ShadowStore(self.database)
+        self.shadow = ShadowRuntime(
+            self.shadow_store,
+            config=self._shadow_config,
+            enabled=settings.fomo_shadow_auto_enabled,
+        )
+        self.shadow_enabled = settings.fomo_shadow_auto_enabled
+        # The experiment can run without publishing its own cards, so an
+        # operator can quieten the feed without losing the forward sample.
+        self.shadow_cards_enabled = settings.fomo_shadow_publish_cards
+        self._shadow_sweep_at = 0
         self.runner_last_evaluated_at: int | None = None
         self.runner_last_candidate_mint: str | None = None
         self.runner_last_fast_watch_mint: str | None = None
@@ -554,6 +593,11 @@ class SmartMoneyEngine:
                 role="CHAMPION",
                 config_hash=self._lab_config.config_hash(),
             )
+        if self.shadow_enabled:
+            # Written once and never rewritten: this timestamp is what makes the
+            # forward experiment enforceable (sections 41, 42).
+            with suppress(Exception):
+                await self.shadow.start_experiment()
         self._initialized = True
 
     async def start(self) -> None:
@@ -1752,13 +1796,92 @@ class SmartMoneyEngine:
                 metadata=self._lab_metadata(callout),
                 surfaced=candidate.first_discord_visible_at is not None,
             )
+            paper_position = None
             if self.settings.fomo_lab_auto_paper_enabled:
-                await self.lab.maybe_open_position(result, now=now)
+                paper_position = await self.lab.maybe_open_position(result, now=now)
             await self._manage_lab_position(candidate, now=now)
+            await self._run_shadow_cycle(
+                candidate, result, now=now, strict_entry=paper_position is not None
+            )
             return result
         except Exception:
             logger.exception("PAPER laboratory cycle failed for %s", candidate.mint)
             return None
+
+    async def _run_shadow_cycle(
+        self,
+        candidate: RunnerCandidate,
+        result: LabEvaluation,
+        *,
+        now: int,
+        strict_entry: bool,
+    ) -> None:
+        """Advance the shadow experiment for one freshly evaluated candidate.
+
+        The two research-lane families that have no fast-alert path of their own
+        enter here, and every open shadow position for this mint is advanced by
+        the same observation.  Like the strict lab, this spends no provider
+        budget: it reads evidence the runner already collected, and it never
+        raises into the pipeline.
+
+        A STRICT PAPER entry produces its *own* shadow cohort so the two
+        families can be compared on identical terms — it never makes the strict
+        decision depend on anything shadow did, and shadow eligibility never
+        reaches the strict engine.
+        """
+
+        if not self.shadow_enabled or self.database.connection is None:
+            return
+        try:
+            if strict_entry:
+                await self._run_shadow_signal(
+                    self._shadow_signal(
+                        candidate,
+                        family=FAMILY_STRICT_PAPER,
+                        now=now,
+                        why=tuple(result.evaluation.decision.reason_codes[:4]),
+                    ),
+                    now=now,
+                    observed_route_impact_percent=(
+                        candidate.current.route_price_impact_percent
+                    ),
+                )
+            elif candidate.stage in LAB_QUALIFIED_STAGES:
+                await self._run_shadow_signal(
+                    self._shadow_signal(
+                        candidate,
+                        family=FAMILY_QUALIFIED_RESEARCH,
+                        now=now,
+                        why=tuple(candidate.why_surfaced[:4])
+                        or ("the research funnel qualified this candidate",),
+                        signal_at=candidate.qualified_at,
+                    ),
+                    now=now,
+                    observed_route_impact_percent=(
+                        candidate.current.route_price_impact_percent
+                    ),
+                )
+            await self._manage_shadow_positions(candidate, now=now)
+            await self._sweep_stale_shadow_positions(now=now)
+        except Exception:
+            logger.exception("SHADOW cycle failed for %s", candidate.mint)
+
+    async def _sweep_stale_shadow_positions(self, *, now: int) -> None:
+        """Close shadow positions the pipeline has stopped seeing.
+
+        A token that falls out of the radar would otherwise keep an open $10
+        position forever and leave the account headline reporting an unrealized
+        number nobody could still trade out of.  Throttled, because the sweep
+        reads the whole open book and nothing about it is urgent.
+        """
+
+        if now - self._shadow_sweep_at < 300:
+            return
+        self._shadow_sweep_at = now
+        for position, assessment in await self.shadow.sweep_stale_positions(now=now):
+            await self._publish_shadow_exit(
+                position, assessment, candidate=None, now=now
+            )
 
     async def _refresh_lab_regime(self, *, now: int, max_age_seconds: int = 86_400) -> None:
         """Recompute the bounded market regime from already-persisted outcomes.
@@ -1838,6 +1961,261 @@ class SmartMoneyEngine:
                 price_impact_percent=current.sell_route_price_impact_percent,
             ),
         )
+
+    # ------------------------------------------------------------------
+    # SHADOW auto-trader (v2.39): SIGNAL -> $10 SIMULATED BUY -> MANAGE -> SELL
+    # ------------------------------------------------------------------
+
+    def _shadow_signal(
+        self,
+        candidate: RunnerCandidate,
+        *,
+        family: str,
+        now: int,
+        why: tuple[str, ...] = (),
+        signal_at: int | None = None,
+        catalyst_state: str = "",
+        token_event_confidence: str = "",
+        notable_evidence: str = "",
+        event_at: int | None = None,
+        first_credible_source: str = "",
+        catalyst_alert_at: int | None = None,
+    ) -> ShadowSignal:
+        """Project an already-analysed candidate onto one shadow signal.
+
+        Reads only evidence the runner already collected, so producing a shadow
+        signal costs no provider request (section 54).  Nothing here may consult
+        anything observed after ``now``.
+        """
+
+        current = candidate.current
+        first = candidate.first
+        moment = signal_at or candidate.radar_first_seen_at or candidate.first_seen_at or now
+        return ShadowSignal(
+            mint=candidate.mint,
+            family=family,
+            timestamps=ShadowTimestamps(
+                signal_at=moment,
+                source_event_at=candidate.chain_created_at or candidate.pair_created_at,
+                first_seen_at=candidate.first_seen_at,
+                discord_at=candidate.first_discord_visible_at,
+                decision_at=now,
+            ),
+            name=candidate.name or candidate.symbol or "Unknown token",
+            symbol=candidate.symbol or "?",
+            price_usd=current.price_usd,
+            market_cap_usd=current.market_cap_usd,
+            liquidity_usd=current.liquidity_usd,
+            volume_usd=current.volume_5m_usd,
+            buys=current.buys_5m,
+            sells=current.sells_5m,
+            independent_buyers=candidate.quality.demand.estimated_independent_buyers,
+            organic_score=candidate.quality.organic_score,
+            momentum_score=candidate.quality.momentum_score,
+            safety_status=candidate.safety.status,
+            catalyst_state=catalyst_state,
+            token_event_confidence=token_event_confidence,
+            notable_wallet_evidence=notable_evidence,
+            smart_wallet_entries=candidate.estimated_independent_smart_wallets,
+            route_available=current.route_available,
+            rugged=bool(current.rugged),
+            lifecycle_state=candidate.stage,
+            graduation_state=classify_graduation(
+                graduated_at=candidate.graduated_at,
+                graduation_source=candidate.graduation_source,
+                pool_liquidity_usd=current.liquidity_usd,
+            ),
+            detection_market_cap_usd=first.market_cap_usd,
+            event_at=event_at,
+            first_credible_source=first_credible_source,
+            mint_created_at=candidate.chain_created_at or candidate.pair_created_at,
+            catalyst_alert_at=catalyst_alert_at,
+            why=why or why_you_are_seeing_this(
+                ShadowSignal(mint=candidate.mint, family=family)
+            ),
+        )
+
+    async def _run_shadow_signal(
+        self,
+        signal: ShadowSignal,
+        *,
+        now: int,
+        observed_route_impact_percent: Decimal | None = None,
+        image_url: str = "",
+    ) -> bool:
+        """Consider one signal and publish the entry card when it fills.
+
+        Never raises into the pipeline: the shadow experiment is research, and a
+        failure inside it must not take down discovery, alerts or the strict
+        PAPER lab.
+        """
+
+        if not self.shadow_enabled or self.database.connection is None:
+            return False
+        try:
+            return await self._shadow_signal_task(
+                signal,
+                now=now,
+                observed_route_impact_percent=observed_route_impact_percent,
+                image_url=image_url,
+            )
+        except Exception:
+            logger.exception("SHADOW signal evaluation failed for %s", signal.mint)
+            return False
+
+    async def _shadow_signal_task(
+        self,
+        signal: ShadowSignal,
+        *,
+        now: int,
+        observed_route_impact_percent: Decimal | None = None,
+        image_url: str = "",
+    ) -> bool:
+        decision, position = await self.shadow.consider_signal(
+            signal,
+            now=now,
+            observed_route_impact_percent=observed_route_impact_percent,
+        )
+        if position is None:
+            return False
+
+        paper = position.position
+        alert = build_shadow_entry_alert(
+            mint=signal.mint,
+            name=signal.name,
+            symbol=signal.symbol,
+            fomo_url=self._fomo_url(signal.mint),
+            family=signal.family,
+            family_label=FAMILY_LABELS.get(signal.family, signal.family),
+            why=signal.why or why_you_are_seeing_this(signal),
+            size_usd=decision.size_usd,
+            fill_market_cap_usd=paper.entry_market_cap_usd,
+            fill_price_usd=paper.entry_price_usd,
+            venue=position.venue,
+            fill_source=position.fill_source,
+            graduation_state=position.graduation_state,
+            modeled_cost_usd=paper.entry_costs.total_cost_usd,
+            net_objective_usd=self._shadow_config.net_profit_objective_usd,
+            signal_to_fill_seconds=(
+                max(0, now - signal.timestamps.signal_at)
+                if signal.timestamps.signal_at
+                else None
+            ),
+            image_url=image_url,
+            position_id=paper.position_id,
+        )
+        if self.shadow_cards_enabled:
+            await self._publish_fast_alert(alert, now=now)
+        return True
+
+    async def _manage_shadow_positions(
+        self, candidate: RunnerCandidate, *, now: int
+    ) -> None:
+        """Advance every open shadow position for this mint by one observation.
+
+        A mint can carry one position per signal family, so each is advanced
+        independently and each keeps its own cohort attribution.
+        """
+
+        if not self.shadow_enabled or self.database.connection is None:
+            return
+        try:
+            positions = await self.shadow_store.open_positions_for_mint(
+                candidate.mint, strategy_version=self._shadow_config.strategy_version
+            )
+        except Exception:
+            logger.exception("Could not load shadow positions for %s", candidate.mint)
+            return
+        if not positions:
+            return
+
+        current = candidate.current
+        first = candidate.first
+        context = LabExitContext(
+            now=now,
+            price_usd=current.price_usd,
+            market_cap_usd=current.market_cap_usd,
+            liquidity_usd=current.liquidity_usd,
+            entry_liquidity_usd=first.liquidity_usd,
+            momentum_score=candidate.quality.momentum_score,
+            organic_score=candidate.quality.organic_score,
+            buys=current.buys_5m,
+            sells=current.sells_5m,
+            volume_usd=current.volume_5m_usd,
+            entry_volume_usd=first.volume_5m_usd,
+            cluster_supply_percent=candidate.quality.demand.cluster_supply_percent,
+            entry_cluster_supply_percent=None,
+            safety_status=candidate.safety.status,
+            route_available=current.route_available,
+            price_impact_percent=current.sell_route_price_impact_percent,
+        )
+        evidence = ShadowRunnerEvidence(
+            independent_buyer_growth=(
+                current.verified_unique_buyers - first.verified_unique_buyers
+            ),
+            volume_ratio=(
+                (current.volume_5m_usd / first.volume_5m_usd)
+                if first.volume_5m_usd
+                else None
+            ),
+            route_quality="OK" if current.route_available else "POOR",
+        )
+        for position in positions:
+            before = len(position.position.exits)
+            try:
+                updated, assessment = await self.shadow.manage_position(
+                    position, context, evidence
+                )
+                if len(updated.position.exits) <= before:
+                    continue
+                await self._publish_shadow_exit(
+                    updated, assessment, candidate=candidate, now=now
+                )
+            except Exception:
+                logger.exception(
+                    "SHADOW position management failed for %s", position.position_id
+                )
+                continue
+
+    async def _publish_shadow_exit(
+        self,
+        position: Any,
+        assessment: Any,
+        *,
+        candidate: RunnerCandidate | None,
+        now: int,
+    ) -> bool:
+        if not self.shadow_cards_enabled:
+            return False
+        journal = position.position.exits[-1]
+        net_now = assessment.net.total_net_usd
+        alert = build_shadow_exit_alert(
+            mint=position.mint,
+            name=(candidate.name if candidate else "") or position.mint[:8],
+            symbol=(candidate.symbol if candidate else "") or "?",
+            fomo_url=self._fomo_url(position.mint),
+            family=position.family,
+            family_label=FAMILY_LABELS.get(position.family, position.family),
+            size_usd=position.position.size_usd,
+            entry_market_cap_usd=position.position.entry_market_cap_usd,
+            exit_market_cap_usd=(
+                candidate.current.market_cap_usd if candidate is not None else None
+            ),
+            gross_pnl_usd=journal.realized_gross_pnl_usd,
+            cost_usd=journal.costs.total_cost_usd,
+            net_pnl_usd=journal.realized_net_pnl_usd,
+            peak_net_pnl_usd=position.peak_net_pnl_usd,
+            given_back_usd=max(Decimal("0"), position.peak_net_pnl_usd - net_now),
+            exit_reason=journal.reason_code,
+            venue=position.venue,
+            fraction_sold=journal.fraction_sold,
+            final=journal.final,
+            remaining_fraction=position.position.remaining_fraction,
+            why=assessment.why,
+            position_id=position.position_id,
+            sequence=journal.sequence,
+        )
+        return await self._publish_fast_alert(alert, now=now)
 
     async def _flush_provider_usage(self) -> None:
         """Drain in-memory client counters into per-feature daily accounting."""
@@ -2481,6 +2859,49 @@ class SmartMoneyEngine:
             "decision": evaluation.decision,
         }
 
+    # --- SHADOW reports (sections 33-38, 44) ---------------------------
+
+    async def shadow_account(self) -> Any:
+        """The `/fomo shadow` headline: is the $100 account making money?"""
+
+        await self.initialize()
+        return await self.shadow.account()
+
+    async def shadow_open_trades(self) -> list[dict[str, Any]]:
+        await self.initialize()
+        return await self.shadow.open_trades()
+
+    async def shadow_venues(self) -> tuple[Any, ...]:
+        await self.initialize()
+        return await self.shadow.venues()
+
+    async def shadow_status(self) -> dict[str, Any]:
+        await self.initialize()
+        status = await self.shadow.status()
+        status["live_radar_channel_id"] = self.settings.fomo_live_radar_channel_id
+        status["urgent_channel_id"] = self.settings.fomo_urgent_channel_id
+        status["fast_watch_enabled"] = self.settings.fomo_fast_watch_publish_enabled
+        status["cards_enabled"] = self.shadow_cards_enabled
+        return status
+
+    async def shadow_refusals(self, *, since: int = 0) -> dict[str, int]:
+        await self.initialize()
+        return await self.shadow.refusals(since=since)
+
+    async def shadow_counterfactuals(self, position_id: str) -> tuple[Any, ...]:
+        """All twelve alternative exit policies for one simulated trade.
+
+        Runs entirely on persisted observations, so it costs zero provider
+        requests no matter how many policies are compared (section 54).
+        """
+
+        await self.initialize()
+        return await self.shadow.counterfactuals(position_id)
+
+    async def shadow_latest_counterfactuals(self) -> tuple[str, str, tuple[Any, ...]]:
+        await self.initialize()
+        return await self.shadow.latest_counterfactuals()
+
     async def lab_status(self) -> dict[str, object]:
         """Operational state of the laboratory, for the status card."""
 
@@ -2534,6 +2955,16 @@ class SmartMoneyEngine:
                 event_type="FRESH",
             )
             return False
+        await self._run_shadow_signal(
+            self._shadow_signal(
+                candidate,
+                family=FAMILY_FRESH_RUNNER,
+                now=now,
+                why=tuple(candidate.why_surfaced[:4]) or ("fresh pair with real activity",),
+            ),
+            now=now,
+            observed_route_impact_percent=candidate.current.route_price_impact_percent,
+        )
         visible_at = int(time.time())
         await self.database.mark_runner_visible(
             mint=candidate.mint,
@@ -2656,6 +3087,21 @@ class SmartMoneyEngine:
             self._fast_watch_published[candidate.mint] = now
             self._fast_watch_times.append(now)
             self._schedule_alert_enrichment(alert)
+            # The same verdict that earned the radar card also feeds the shadow
+            # experiment, so "would a $10 buy on FAST WATCH have made money?"
+            # is answerable from forward data rather than from opinion.
+            await self._run_shadow_signal(
+                self._shadow_signal(
+                    candidate,
+                    family=FAMILY_FAST_WATCH,
+                    now=now,
+                    why=tuple(verdict.reasons),
+                ),
+                now=now,
+                observed_route_impact_percent=(
+                    candidate.current.route_price_impact_percent
+                ),
+            )
         return published
 
     def _fomo_url(self, mint: str) -> str:
@@ -2830,7 +3276,63 @@ class SmartMoneyEngine:
         published = await self._publish_fast_alert(alert, now=now)
         if published:
             self._schedule_alert_enrichment(alert)
+            await self._run_shadow_notable(signal, alert=alert, context=context, now=now)
         return published
+
+    async def _run_shadow_notable(
+        self,
+        signal: NotableSignal,
+        *,
+        alert: FastAlert,
+        context: dict[str, Any],
+        now: int,
+    ) -> bool:
+        """Feed a notable-wallet observation to the shadow experiment.
+
+        Early and late observations are separate cohorts on purpose: the whole
+        question section 18 asks is whether smart-money intelligence arrives
+        early enough to be worth acting on, and blending them would hide the
+        answer.
+        """
+
+        trade = signal.trade
+        family = (
+            FAMILY_NOTABLE_EARLY if alert.kind == "NOTABLE_TRADER_EARLY"
+            else FAMILY_NOTABLE_LATE
+        )
+        price = signal.current_price_usd or trade.entry_price_usd
+        shadow_signal = ShadowSignal(
+            mint=trade.mint,
+            family=family,
+            timestamps=ShadowTimestamps(
+                signal_at=trade.chain_time or trade.observed_at or now,
+                source_event_at=trade.chain_time,
+                first_seen_at=trade.observed_at,
+                decision_at=now,
+            ),
+            name=str(context.get("name") or "Unknown token"),
+            symbol=str(context.get("symbol") or "?"),
+            price_usd=price,
+            market_cap_usd=signal.current_market_cap_usd,
+            liquidity_usd=_engine_decimal(context.get("liquidity_usd")),
+            safety_status="UNKNOWN",
+            notable_wallet_evidence=(
+                f"{signal.display_name} ({signal.reputation_state}) bought "
+                f"{trade.amount_usd}"
+            ),
+            smart_wallet_entries=1,
+            route_available=bool(context.get("route_available", True)),
+            rugged=bool(context.get("rugged", False)),
+            trader_entry_market_cap_usd=trade.entry_market_cap_usd,
+            detection_market_cap_usd=signal.detection_market_cap_usd,
+            why=(
+                f"{signal.display_name} ({signal.reputation_state}) entered",
+                f"observed {trade.detection_delay_seconds}s after the chain event"
+                if trade.detection_delay_seconds is not None
+                else f"freshness {signal.freshness()}",
+            ),
+        )
+        return await self._run_shadow_signal(shadow_signal, now=now)
 
     def _queue_notable_alert(self, swap: DetectedSwap, trader: TrackedTrader) -> None:
         """Run the fast alert beside the pipeline, never in front of it."""
@@ -2913,6 +3415,11 @@ class SmartMoneyEngine:
                         "symbol": candidate.symbol or "?",
                         "price_usd": candidate.current.price_usd,
                         "market_cap_usd": candidate.current.market_cap_usd,
+                        # Read from the same persisted row, so the shadow lane
+                        # can judge route feasibility without a provider call.
+                        "liquidity_usd": candidate.current.liquidity_usd,
+                        "route_available": candidate.current.route_available,
+                        "rugged": candidate.current.rugged,
                     }
         return {}
 
@@ -3140,6 +3647,33 @@ class SmartMoneyEngine:
         published = await self._publish_fast_alert(alert, now=now)
         if published and mint:
             self._schedule_alert_enrichment(alert)
+            if candidate is not None:
+                family = {
+                    "BREAKING_CATALYST": FAMILY_BREAKING_CATALYST,
+                    "CATALYST_WATCH": FAMILY_CATALYST_WATCH,
+                    "CONFLUENCE_WATCH": FAMILY_CONFLUENCE_WATCH,
+                }.get(alert.kind, FAMILY_CATALYST_WATCH)
+                await self._run_shadow_signal(
+                    self._shadow_signal(
+                        candidate,
+                        family=family,
+                        now=now,
+                        why=tuple(decision.reasons[:4]),
+                        catalyst_state=str(event.confidence),
+                        token_event_confidence=(
+                            link.connection if link is not None else "NO_EVIDENCE"
+                        ),
+                        event_at=event.occurred_at or event.detected_at,
+                        first_credible_source=next(
+                            (item.name for item in event.sources if item.is_primary), ""
+                        ),
+                        catalyst_alert_at=now,
+                    ),
+                    now=now,
+                    observed_route_impact_percent=(
+                        candidate.current.route_price_impact_percent
+                    ),
+                )
         return published
 
     async def evaluate_catalyst_token(
@@ -6688,3 +7222,14 @@ def _first_int(*values: object) -> int | None:
         except (TypeError, ValueError):
             continue
     return None
+
+
+def _engine_decimal(value: Any) -> Decimal | None:
+    """Coerce a persisted value to :class:`Decimal`, or ``None`` when unusable."""
+
+    if value is None or value == "":
+        return None
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return None

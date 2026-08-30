@@ -832,6 +832,153 @@ class Database:
                 payload_json TEXT NOT NULL,
                 resolved_at INTEGER NOT NULL
             );
+
+            -- SHADOW auto-trader (v2.39).  All additive; the strict PAPER lab
+            -- tables above are untouched, and the two strategy families never
+            -- share a row, a bankroll or a position.
+
+            -- The forward-experiment checkpoint (section 42).  Every live
+            -- result is attributable to the exact experiment that produced it.
+            CREATE TABLE IF NOT EXISTS shadow_experiment (
+                experiment_version TEXT PRIMARY KEY,
+                started_at INTEGER NOT NULL,
+                starting_bankroll_usd REAL NOT NULL,
+                position_usd REAL NOT NULL,
+                max_positions INTEGER NOT NULL,
+                max_exposure_usd REAL NOT NULL,
+                net_objective_usd REAL NOT NULL,
+                config_hash TEXT NOT NULL DEFAULT '',
+                bot_version TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                updated_at INTEGER NOT NULL
+            );
+
+            -- Simulated $10 positions.  The partial unique index is the
+            -- duplicate-entry lock: one open shadow position per mint per
+            -- signal family, which survives a restart and a replayed signal.
+            CREATE TABLE IF NOT EXISTS shadow_positions (
+                position_id TEXT PRIMARY KEY,
+                mint TEXT NOT NULL,
+                family TEXT NOT NULL,
+                strategy_version TEXT NOT NULL,
+                experiment_version TEXT NOT NULL DEFAULT '',
+                opened_at INTEGER NOT NULL,
+                closed_at INTEGER,
+                size_usd REAL NOT NULL,
+                entry_price_usd REAL NOT NULL,
+                entry_market_cap_usd REAL,
+                realized_net_pnl_usd REAL NOT NULL DEFAULT 0,
+                peak_net_pnl_usd REAL NOT NULL DEFAULT 0,
+                close_reason TEXT NOT NULL DEFAULT '',
+                venue TEXT NOT NULL DEFAULT 'UNKNOWN',
+                fill_source TEXT NOT NULL DEFAULT '',
+                graduation_state TEXT NOT NULL DEFAULT 'UNKNOWN',
+                config_hash TEXT NOT NULL DEFAULT '',
+                signal_json TEXT NOT NULL DEFAULT '{}',
+                payload_json TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_shadow_positions_open_unique
+                ON shadow_positions(mint, family, strategy_version)
+                WHERE closed_at IS NULL;
+            CREATE INDEX IF NOT EXISTS idx_shadow_positions_recent
+                ON shadow_positions(opened_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_shadow_positions_family
+                ON shadow_positions(family, opened_at DESC);
+
+            -- The shadow partial-exit journal.  (position_id, sequence) makes a
+            -- retried exit idempotent instead of double-selling.
+            CREATE TABLE IF NOT EXISTS shadow_exits (
+                position_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                mint TEXT NOT NULL,
+                family TEXT NOT NULL DEFAULT '',
+                occurred_at INTEGER NOT NULL,
+                reason_code TEXT NOT NULL,
+                fraction_sold REAL NOT NULL,
+                gross_proceeds_usd REAL NOT NULL,
+                total_cost_usd REAL NOT NULL,
+                net_pnl_usd REAL NOT NULL,
+                venue TEXT NOT NULL DEFAULT 'UNKNOWN',
+                final INTEGER NOT NULL DEFAULT 0,
+                payload_json TEXT NOT NULL,
+                PRIMARY KEY (position_id, sequence)
+            );
+            CREATE INDEX IF NOT EXISTS idx_shadow_exits_recent
+                ON shadow_exits(occurred_at DESC);
+
+            -- One simulated shadow bankroll, kept apart from the strict lab's.
+            CREATE TABLE IF NOT EXISTS shadow_bankroll (
+                strategy_version TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            -- The single post-entry observation stream every counterfactual
+            -- reads (section 54).  One row per position per observation, so
+            -- twelve policies cost zero extra provider requests.
+            CREATE TABLE IF NOT EXISTS shadow_observations (
+                position_id TEXT NOT NULL,
+                observed_at INTEGER NOT NULL,
+                price_usd REAL NOT NULL,
+                market_cap_usd REAL,
+                liquidity_usd REAL,
+                volume_usd REAL,
+                momentum_score REAL,
+                organic_score REAL,
+                buys INTEGER NOT NULL DEFAULT 0,
+                sells INTEGER NOT NULL DEFAULT 0,
+                independent_buyers INTEGER,
+                safety_status TEXT NOT NULL DEFAULT 'UNKNOWN',
+                route_available INTEGER NOT NULL DEFAULT 1,
+                smart_money_distributing INTEGER NOT NULL DEFAULT 0,
+                smart_money_accumulating INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (position_id, observed_at)
+            );
+            CREATE INDEX IF NOT EXISTS idx_shadow_observations_time
+                ON shadow_observations(position_id, observed_at);
+
+            -- Simulated fills per venue, for the venue comparison (section 24).
+            CREATE TABLE IF NOT EXISTS shadow_venue_fills (
+                position_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                venue TEXT NOT NULL,
+                side TEXT NOT NULL,
+                filled_at INTEGER NOT NULL,
+                notional_usd REAL NOT NULL DEFAULT 0,
+                fill_price_usd REAL,
+                reference_price_usd REAL,
+                price_impact_percent REAL NOT NULL DEFAULT 0,
+                slippage_bps INTEGER NOT NULL DEFAULT 0,
+                fee_bps INTEGER NOT NULL DEFAULT 0,
+                quote_latency_ms INTEGER NOT NULL DEFAULT 0,
+                cost_usd REAL NOT NULL DEFAULT 0,
+                net_pnl_usd REAL NOT NULL DEFAULT 0,
+                deterioration_percent REAL,
+                fill_source TEXT NOT NULL DEFAULT '',
+                graduation_state TEXT NOT NULL DEFAULT 'UNKNOWN',
+                considered_json TEXT NOT NULL DEFAULT '[]',
+                PRIMARY KEY (position_id, sequence, side)
+            );
+            CREATE INDEX IF NOT EXISTS idx_shadow_venue_fills_venue
+                ON shadow_venue_fills(venue, filled_at DESC);
+
+            -- Refused shadow signals, so "why did nothing happen?" is always
+            -- answerable and a rejected signal is never silently lost.
+            CREATE TABLE IF NOT EXISTS shadow_signal_log (
+                signal_key TEXT PRIMARY KEY,
+                mint TEXT NOT NULL,
+                family TEXT NOT NULL,
+                decided_at INTEGER NOT NULL,
+                accepted INTEGER NOT NULL DEFAULT 0,
+                reason_code TEXT NOT NULL DEFAULT '',
+                size_usd REAL NOT NULL DEFAULT 0,
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_shadow_signal_log_recent
+                ON shadow_signal_log(decided_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_shadow_signal_log_family
+                ON shadow_signal_log(family, decided_at DESC);
             """
         )
         await self._migrate_pump_launch_status_constraint()

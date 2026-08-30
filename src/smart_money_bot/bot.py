@@ -46,7 +46,7 @@ from .discord_render import (
 )
 from .engine import SmartMoneyEngine
 from .errors import DiscoveryError, JupiterError, PumpLaunchError
-from .fast_alerts import EnrichmentUpdate, FastAlert
+from .fast_alerts import LANE_URGENT, EnrichmentUpdate, FastAlert
 from .lab.decision import Decision
 from .lab.evidence import buyer_evidence, organic_demand_text
 from .lab.exits import PaperPosition
@@ -65,6 +65,8 @@ from .lab.registry import (
     TIER_C_ACCOUNTS,
 )
 from .lab.replay import SAMPLE_TOO_SMALL, PerformanceReport
+from .lab.shadow import FAMILY_LABELS, SIGNAL_FAMILIES
+from .lab.shadow_metrics import CounterfactualResult, ShadowAccountReport, VenueReport
 from .lab_runtime import LabEvaluation
 from .launch import (
     NO_X_LAUNCH_VERDICT,
@@ -2919,6 +2921,9 @@ class SmartMoneyBot(commands.Bot):
             channel_id = int(raw)
         except ValueError:
             return None
+        return await self._channel(channel_id)
+
+    async def _channel(self, channel_id: int) -> discord.abc.Messageable | None:
         channel = self.get_channel(channel_id)
         if channel is not None:
             return channel
@@ -2926,6 +2931,26 @@ class SmartMoneyBot(commands.Bot):
             return await self.fetch_channel(channel_id)
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             return None
+
+    async def _lane_channel(self, lane: str) -> discord.abc.Messageable | None:
+        """Route a fast alert to its visibility layer (sections 27-29).
+
+        Both channel variables are optional.  When one is not configured the
+        card falls back to the existing alert channel rather than disappearing,
+        so a deployment that defines nothing keeps exactly today's behaviour and
+        nothing is ever silently dropped.
+        """
+
+        configured = (
+            self.settings.fomo_urgent_channel_id
+            if lane == LANE_URGENT
+            else self.settings.fomo_live_radar_channel_id
+        )
+        if configured:
+            channel = await self._channel(configured)
+            if channel is not None:
+                return channel
+        return await self._alert_channel()
 
     async def _send_alert(
         self,
@@ -3135,7 +3160,7 @@ class SmartMoneyBot(commands.Bot):
         observation is published quietly rather than interrupting anyone.
         """
 
-        channel = await self._alert_channel()
+        channel = await self._lane_channel(alert.lane)
         if channel is None:
             return False
         alert_user_id = self.settings.discord_alert_user_id
@@ -4277,6 +4302,24 @@ class SmartMoneyCommands(
         await interaction.response.defer(thinking=True, ephemeral=True)
         status = await self.bot.engine.status()
         s = self.bot.settings
+        shadow_text = ""
+        with suppress(Exception):
+            shadow = await self.bot.engine.shadow_status()
+            shadow_text = (
+                "**SHADOW auto-trader:** "
+                f"{'ON' if shadow['enabled'] else 'OFF'}"
+                + (" (PAUSED)" if shadow["paused"] else "")
+                + f" • {_shadow_money(shadow['position_size_usd'])} per simulated entry"
+                f" • bankroll {_shadow_money(shadow['starting_bankroll_usd'])} → "
+                f"{_shadow_money(shadow['current_bankroll_usd'])}\n"
+                f"**SHADOW book:** open {shadow['open_positions']}/"
+                f"{shadow['max_positions']} • exposure "
+                f"{_shadow_money(shadow['open_exposure_usd'])}/"
+                f"{_shadow_money(shadow['max_exposure_usd'])} • NET objective "
+                f"+{_shadow_money(shadow['net_objective_usd'])}\n"
+                "**SHADOW real money:** DISABLED — "
+                f"SHADOW_REAL_MONEY_SPEND = ${shadow['real_money_spend_usd']}\n"
+            )
         daily_lock = status["paper_daily_profit_lock"]
         assert isinstance(daily_lock, PaperDailyLockStatus)
         last_scan = f"<t:{status['last_scan']}:R>" if status["last_scan"] else "not completed yet"
@@ -4546,6 +4589,7 @@ class SmartMoneyCommands(
             + (f"{realtime_age}s ago" if isinstance(realtime_age, int) else "no event yet")
             + "\n"
             "**Live autonomous execution:** DISABLED (research and PAPER only)\n"
+            f"{shadow_text}"
             f"**Last scan:** {last_scan}\n"
             f"**Last error:** {status['last_error'] or 'none'}"
         )
@@ -5021,6 +5065,349 @@ def _lab_performance_embed(payload: dict[str, object]) -> discord.Embed:
     return _clamp_embed(embed)
 
 
+def _shadow_money(value: object) -> str:
+    if value is None:
+        return "pending"
+    return f"${Decimal(str(value)):,.2f}"
+
+
+def _shadow_signed(value: object) -> str:
+    if value is None:
+        return "pending"
+    amount = Decimal(str(value))
+    return f"{'-' if amount < 0 else '+'}${abs(amount):,.2f}"
+
+
+def _shadow_headline_embed(
+    report: ShadowAccountReport,
+    status: dict[str, object] | None = None,
+) -> discord.Embed:
+    """`/fomo shadow` — the account answer first, diagnostics after (section 44)."""
+
+    net = report.total_net_pnl_usd
+    colour = 0x27AE60 if net > 0 else 0xC0392B if net < 0 else 0x7F8C8D
+    verdict = (
+        "THE $100 SHADOW ACCOUNT IS UP"
+        if net > 0
+        else "THE $100 SHADOW ACCOUNT IS DOWN"
+        if net < 0
+        else "THE $100 SHADOW ACCOUNT IS FLAT"
+    )
+    embed = discord.Embed(
+        title=f"🧪 {verdict}",
+        description=(
+            f"**{_shadow_money(report.starting_bankroll_usd)} → "
+            f"{_shadow_money(report.current_bankroll_usd)}**  "
+            f"({_shadow_signed(net)}, `{report.roi_percent:+.2f}%`)\n"
+            f"Realized NET `{_shadow_signed(report.realized_net_pnl_usd)}` • unrealized NET "
+            f"`{_shadow_signed(report.unrealized_net_pnl_usd)}`\n"
+            "**REAL MONEY SPENT: $0.00** — simulation only"
+        ),
+        colour=colour,
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(
+        name="Book",
+        value=(
+            f"Per trade `$10.00` • open `{report.open_positions}` • exposure "
+            f"`{_shadow_money(report.open_exposure_usd)}`\n"
+            f"Cash `{_shadow_money(report.cash_usd)}`"
+        )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+        inline=False,
+    )
+    embed.add_field(
+        name="Closed trades",
+        value=(
+            f"Closed `{report.closed_trades}` • wins `{report.wins}` • losses "
+            f"`{report.losses}` • win rate "
+            f"`{_pending(report.win_rate_percent, '%')}`\n"
+            f"Profit factor `{_pending(report.profit_factor)}` • expectancy "
+            f"`{_pending_money(report.expectancy_usd)}` • max drawdown "
+            f"`{report.max_drawdown_percent:.2f}%`"
+        )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+        inline=False,
+    )
+    live = status or {}
+    embed.add_field(
+        name="Timing",
+        value=(
+            f"Last entry {_relative_age(live.get('last_entry_at'))} • last exit "
+            f"{_relative_age(live.get('last_exit_at'))}\n"
+            f"+$2 NET hit rate `{_pending(report.objective_hit_rate_percent, '%')}`"
+        )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+        inline=False,
+    )
+    if live.get("paused"):
+        reasons = live.get("paused_reasons") or ()
+        embed.add_field(
+            name="🛑 CIRCUIT BREAKER ACTIVE",
+            value=(
+                "No new shadow entries are being opened.\n"
+                + ("\n".join(f"• {item}" for item in reasons) or "• trading paused")
+            )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+            inline=False,
+        )
+    if not report.sufficient_sample:
+        embed.add_field(
+            name="⚠️ " + SAMPLE_TOO_SMALL,
+            value=(
+                "Not enough completed forward trades to judge whether these signals "
+                "have positive expectancy. Nothing has been tuned to make this look "
+                "better, and no losing trade has been excluded."
+            ),
+            inline=False,
+        )
+    embed.set_footer(
+        text="🧪 SIMULATION ONLY • $10 per entry • no wallet, no signer, no swap"
+    )
+    return _clamp_embed(embed)
+
+
+def _pending(value: object, suffix: str = "") -> str:
+    return "pending" if value is None else f"{value}{suffix}"
+
+
+def _pending_money(value: object) -> str:
+    """A dollar figure, or an honest "pending" when there is no sample yet."""
+
+    return "pending" if value is None else _shadow_signed(value)
+
+
+def _shadow_timing_line(row: dict[str, object]) -> str:
+    """Was the intelligence early enough? (sections 18, 19)
+
+    Only rendered when the evidence exists, so an ordinary market signal is not
+    padded with empty catalyst fields.
+    """
+
+    parts: list[str] = []
+    latency = row.get("signal_to_fill_seconds")
+    if latency is not None:
+        parts.append(f"signal → fill `{latency}s`")
+
+    notable = row.get("notable_timing")
+    trader_to_bot = getattr(notable, "trader_to_bot_percent", None)
+    if trader_to_bot is not None:
+        bot_to_fill = getattr(notable, "bot_to_fill_percent", None)
+        parts.append(
+            f"trader → bot `{trader_to_bot:+.2f}%`"
+            + (f" • bot → fill `{bot_to_fill:+.2f}%`" if bot_to_fill is not None else "")
+        )
+
+    catalyst = row.get("catalyst_timing")
+    event_to_bot = getattr(catalyst, "event_to_bot_seconds", None)
+    if event_to_bot is not None:
+        mint_to_bot = getattr(catalyst, "mint_to_bot_seconds", None)
+        parts.append(
+            f"event → bot `{event_to_bot}s`"
+            + (f" • mint → bot `{mint_to_bot}s`" if mint_to_bot is not None else "")
+        )
+    return ("\n" + " • ".join(parts)) if parts else ""
+
+
+def _shadow_trades_embed(rows: list[dict[str, object]]) -> discord.Embed:
+    """`/fomo shadow view:trades` — open $10 positions and why each is held."""
+
+    embed = discord.Embed(
+        title="🧪 OPEN SHADOW POSITIONS — $10 SIMULATED EACH",
+        description=(
+            f"`{len(rows)}` open simulated position(s). **REAL MONEY: $0.00**"
+            if rows
+            else "No open simulated positions. **REAL MONEY: $0.00**"
+        ),
+        colour=0x1ABC9C,
+        timestamp=discord.utils.utcnow(),
+    )
+    for row in rows[:8]:
+        symbol = str(row.get("symbol") or "?")
+        objective = "✅ +$2 NET met" if row.get("objective_met") else "below the +$2 objective"
+        embed.add_field(
+            name=f"${symbol} — {row.get('label')}",
+            value=(
+                f"`{_short(str(row.get('mint')))}` • opened "
+                f"{_relative_age(row.get('opened_at'))}\n"
+                f"Invested `$10.00` • NET `{_shadow_signed(row.get('net_pnl_usd'))}` "
+                f"(realized `{_shadow_signed(row.get('realized_net_usd'))}`)\n"
+                f"Entry MC `{_shadow_money(row.get('entry_market_cap_usd'))}` • MFE "
+                f"`{row.get('mfe_percent')}%` • MAE `{row.get('mae_percent')}%`\n"
+                f"Peak NET `{_shadow_signed(row.get('peak_net_usd'))}` • given back "
+                f"`{_shadow_money(row.get('giveback_usd'))}` • from peak "
+                f"`{_pending(row.get('drawdown_from_peak_percent'), '%')}`\n"
+                f"Still holding `{Decimal(str(row.get('remaining_fraction') or 0)) * 100:.0f}%` "
+                f"• {objective}\n"
+                f"Route `{row.get('venue')}` ({row.get('fill_source')}) • Pump state "
+                f"`{row.get('graduation_state')}`"
+                + _shadow_timing_line(row)
+            )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+            inline=False,
+        )
+    embed.set_footer(text="🧪 SIMULATION ONLY • no wallet, no signer, no swap")
+    return _clamp_embed(embed)
+
+
+def _shadow_results_embed(report: ShadowAccountReport) -> discord.Embed:
+    """`/fomo shadow view:results` — the full forward record, per family."""
+
+    embed = discord.Embed(
+        title="🧪 SHADOW RESULTS — FORWARD NET EXPECTANCY",
+        description=(
+            f"**{_shadow_money(report.starting_bankroll_usd)} → "
+            f"{_shadow_money(report.current_bankroll_usd)}** "
+            f"({_shadow_signed(report.total_net_pnl_usd)}, `{report.roi_percent:+.2f}%`)\n"
+            f"Trades `{report.closed_trades}` closed • `{report.open_positions}` open • "
+            f"total modeled cost `{_shadow_money(report.total_cost_usd)}`"
+        ),
+        colour=0x9B59B6,
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(
+        name="Distribution",
+        value=(
+            f"Win rate `{_pending(report.win_rate_percent, '%')}` • average "
+            f"`{_pending_money(report.average_trade_usd)}` • median "
+            f"`{_pending_money(report.median_trade_usd)}`\n"
+            f"Average winner `{_pending_money(report.average_winner_usd)}` • average loser "
+            f"`{_pending_money(report.average_loser_usd)}`\n"
+            f"Profit factor `{_pending(report.profit_factor)}` • expectancy "
+            f"`{_pending_money(report.expectancy_usd)}` • max drawdown "
+            f"`{report.max_drawdown_percent:.2f}%`"
+        )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+        inline=False,
+    )
+    milestones = " • ".join(
+        f"+{name}% `{value}%`" for name, value in report.milestone_hit_rates.items()
+    )
+    embed.add_field(
+        name="Reach and capture",
+        value=(
+            f"+$2 NET hit rate `{_pending(report.objective_hit_rate_percent, '%')}`\n"
+            f"{milestones or 'collecting'}\n"
+            f"Average MFE `{_pending(report.average_mfe_percent, '%')}` • average MAE "
+            f"`{_pending(report.average_mae_percent, '%')}`\n"
+            f"Capture efficiency `{_pending(report.capture_efficiency_percent, '%')}` • "
+            f"profit given back `{_shadow_money(report.profit_giveback_usd)}`"
+        )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+        inline=False,
+    )
+    for family in SIGNAL_FAMILIES:
+        cohort = report.by_family.get(family)
+        if cohort is None:
+            continue
+        embed.add_field(
+            name=FAMILY_LABELS.get(family, family),
+            value=(
+                f"Trades `{cohort.trades}` (open `{cohort.open_trades}`) • wins "
+                f"`{cohort.wins}` • losses `{cohort.losses}`\n"
+                f"NET `{_shadow_signed(cohort.net_pnl_usd)}` • ROI "
+                f"`{_pending(cohort.roi_percent, '%')}` • profit factor "
+                f"`{_pending(cohort.profit_factor)}`\n"
+                f"Expectancy `{_pending_money(cohort.expectancy_usd)}` • max drawdown "
+                f"`{_shadow_money(cohort.max_drawdown_usd)}` • MFE "
+                f"`{_pending(cohort.average_mfe_percent, '%')}` • MAE "
+                f"`{_pending(cohort.average_mae_percent, '%')}`"
+            )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+            inline=False,
+        )
+    if not report.by_family:
+        embed.add_field(
+            name="Signal families",
+            value="No shadow trades yet — nothing to attribute to any family.",
+            inline=False,
+        )
+    if not report.sufficient_sample:
+        embed.add_field(
+            name="⚠️ " + SAMPLE_TOO_SMALL,
+            value=(
+                "Forward sample is too small to conclude anything. Rugs, illiquid "
+                "exits and route failures are all included; no losing trade has "
+                "been removed."
+            ),
+            inline=False,
+        )
+    embed.set_footer(text="🧪 SIMULATION ONLY • NET after every modeled cost")
+    return _clamp_embed(embed)
+
+
+def _shadow_venues_embed(reports: tuple[VenueReport, ...]) -> discord.Embed:
+    """`/fomo shadow view:venues` — the same $10 trade, priced per venue."""
+
+    embed = discord.Embed(
+        title="🧪 SHADOW VENUE COMPARISON",
+        description=(
+            "Fill quality for the same simulated $10 trade across every venue that "
+            "priced it. **REAL MONEY: $0.00**"
+        ),
+        colour=0x34495E,
+        timestamp=discord.utils.utcnow(),
+    )
+    if not reports:
+        embed.add_field(
+            name="No simulated fills yet",
+            value="Nothing has been routed, so there is nothing to compare.",
+            inline=False,
+        )
+    for item in reports[:8]:
+        embed.add_field(
+            name=item.venue,
+            value=(
+                f"Fills `{item.fills}` (executable `{item.executable_fills}` • "
+                f"penalised fallback `{item.fallback_fills}`)\n"
+                f"Average slippage `{_pending(item.average_slippage_bps)}bps` • impact "
+                f"`{_pending(item.average_impact_percent, '%')}`\n"
+                f"Average quote latency `{_pending(item.average_latency_ms)}ms` • fill vs "
+                f"reference `{_pending(item.average_deterioration_percent, '%')}`\n"
+                f"Total modeled cost `{_shadow_money(item.total_cost_usd)}` • NET "
+                f"`{_shadow_signed(item.net_pnl_usd)}`"
+            )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+            inline=False,
+        )
+    embed.set_footer(text="🧪 SIMULATION ONLY • routes are priced, never submitted")
+    return _clamp_embed(embed)
+
+
+def _shadow_policies_embed(
+    position_id: str,
+    family: str,
+    results: tuple[CounterfactualResult, ...],
+) -> discord.Embed:
+    """`/fomo shadow view:policies` — what other exit rules would have done (§15).
+
+    Computed entirely from persisted observations, so comparing twelve policies
+    costs exactly as many provider requests as comparing one: none.
+    """
+
+    embed = discord.Embed(
+        title="🧪 COUNTERFACTUAL EXIT POLICIES",
+        description=(
+            (
+                f"Most recent shadow trade `{_short(position_id)}` "
+                f"({FAMILY_LABELS.get(family, family)})\n"
+                "Every policy replays the same persisted observations. Future "
+                "prices are evaluation only — none of this could have changed an "
+                "earlier decision."
+            )
+            if results
+            else "No shadow trade has enough persisted observations to compare yet."
+        ),
+        colour=0x8E44AD,
+        timestamp=discord.utils.utcnow(),
+    )
+    ordered = sorted(results, key=lambda item: item.net_pnl_usd, reverse=True)
+    if ordered:
+        embed.add_field(
+            name="NET on the same $10",
+            value="\n".join(
+                f"`{item.policy}` {_shadow_signed(item.net_pnl_usd)} "
+                f"({item.net_return_percent:+.2f}%)"
+                + ("" if item.traded else " — never traded")
+                for item in ordered
+            )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+            inline=False,
+        )
+    embed.set_footer(text="🧪 SIMULATION ONLY • zero extra provider requests")
+    return _clamp_embed(embed)
+
+
 def _lab_exits_embed(rows: tuple[dict[str, object], ...]) -> discord.Embed:
     embed = discord.Embed(
         title="FOMO PAPER EXIT JOURNAL",
@@ -5370,7 +5757,39 @@ def _notable_embed(rows: tuple[dict, ...], *, mint: str = "") -> discord.Embed:
     return _clamp_embed(embed)
 
 
-def _realtime_embed(status: dict[str, object], alerts: tuple[dict, ...]) -> discord.Embed:
+def _shadow_status_lines(status: dict[str, object]) -> str:
+    """The SHADOW block shared by `/fomo realtime` and `/smartmoney status` (§38)."""
+
+    on = bool(status.get("enabled"))
+    paused = bool(status.get("paused"))
+    reasons = ", ".join(str(item) for item in (status.get("paused_reasons") or ()))
+    radar = status.get("live_radar_channel_id")
+    urgent = status.get("urgent_channel_id")
+    return (
+        f"SHADOW AUTO-TRADER **{'ON' if on else 'OFF'}**"
+        + (f" — PAUSED ({reasons or 'circuit breaker'})" if paused else "")
+        + f"\nPosition size `{_shadow_money(status.get('position_size_usd'))}` • bankroll "
+        f"`{_shadow_money(status.get('starting_bankroll_usd'))}` → "
+        f"`{_shadow_money(status.get('current_bankroll_usd'))}`\n"
+        f"Max positions `{status.get('max_positions')}` • max exposure "
+        f"`{_shadow_money(status.get('max_exposure_usd'))}` • NET objective "
+        f"`+{_shadow_money(status.get('net_objective_usd'))}`\n"
+        f"Open `{status.get('open_positions')}` • exposure "
+        f"`{_shadow_money(status.get('open_exposure_usd'))}` • refused signals "
+        f"`{status.get('signals_refused', 0)}`\n"
+        f"Last SHADOW entry {_relative_age(status.get('last_entry_at'))} • last exit "
+        f"{_relative_age(status.get('last_exit_at'))}\n"
+        f"Live Radar `{'#' + str(radar) if radar else 'alert channel fallback'}` • "
+        f"Urgent Alpha `{'#' + str(urgent) if urgent else 'alert channel fallback'}`\n"
+        "**REAL MONEY: DISABLED — SHADOW_REAL_MONEY_SPEND = $0.00**"
+    )
+
+
+def _realtime_embed(
+    status: dict[str, object],
+    alerts: tuple[dict, ...],
+    shadow: dict[str, object] | None = None,
+) -> discord.Embed:
     connected = bool(status.get("stream_connected"))
     age = status.get("stream_last_event_age")
     embed = discord.Embed(
@@ -5409,6 +5828,12 @@ def _realtime_embed(status: dict[str, object], alerts: tuple[dict, ...]) -> disc
         ),
         inline=False,
     )
+    if shadow is not None:
+        embed.add_field(
+            name="Shadow auto-trader",
+            value=_shadow_status_lines(shadow)[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+            inline=False,
+        )
     if alerts:
         embed.add_field(
             name="Most recent",
@@ -6260,6 +6685,68 @@ class FomoCommands(
         await self._resolve_lab(interaction, embed=_lab_performance_embed(payload))
 
     @app_commands.command(
+        name="shadow",
+        description="The $100 / $10-per-trade SHADOW auto-trader. Simulation only.",
+    )
+    @app_commands.describe(
+        view=(
+            "account: the headline • trades: open $10 positions • results: "
+            "per-family record • venues: fill quality • policies: counterfactuals"
+        )
+    )
+    async def shadow(
+        self,
+        interaction: discord.Interaction,
+        view: Literal["account", "trades", "results", "venues", "policies"] = "account",
+    ) -> None:
+        """`/fomo shadow` and its three detail views.
+
+        A Discord subcommand *group* cannot itself be invoked, so the account
+        dashboard section 33 asks for is the default of one command rather than
+        a group with no default. `/fomo shadow` therefore answers "is the $100
+        account making money?" immediately, and `view:` reaches the rest.
+        """
+
+        if not await self._require_admin(interaction):
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        try:
+            if view == "trades":
+                rows = await self.bot.engine.shadow_open_trades()
+                await self._resolve_lab(interaction, embed=_shadow_trades_embed(rows))
+                return
+            if view == "results":
+                report = await self.bot.engine.shadow_account()
+                await self._resolve_lab(interaction, embed=_shadow_results_embed(report))
+                return
+            if view == "venues":
+                reports = await self.bot.engine.shadow_venues()
+                await self._resolve_lab(interaction, embed=_shadow_venues_embed(reports))
+                return
+            if view == "policies":
+                pid, family, results = (
+                    await self.bot.engine.shadow_latest_counterfactuals()
+                )
+                await self._resolve_lab(
+                    interaction, embed=_shadow_policies_embed(pid, family, results)
+                )
+                return
+            report = await self.bot.engine.shadow_account()
+            status = await self.bot.engine.shadow_status()
+            await self._resolve_lab(
+                interaction, embed=_shadow_headline_embed(report, status)
+            )
+        except Exception as exc:
+            await self._resolve_lab(
+                interaction,
+                content=(
+                    "The shadow auto-trader report failed: "
+                    f"`{type(exc).__name__}`. Nothing was bought; the shadow "
+                    "experiment is simulation only and spends $0.00."
+                ),
+            )
+
+    @app_commands.command(
         name="exits",
         description="The immutable simulated partial/full exit journal.",
     )
@@ -6389,7 +6876,12 @@ class FomoCommands(
         await interaction.response.defer(thinking=True, ephemeral=True)
         status = self.bot.engine.realtime_status()
         alerts = await self.bot.engine.fast_alert_feed(limit=8)
-        await self._resolve_lab(interaction, embed=_realtime_embed(status, alerts))
+        shadow = None
+        with suppress(Exception):
+            shadow = await self.bot.engine.shadow_status()
+        await self._resolve_lab(
+            interaction, embed=_realtime_embed(status, alerts, shadow)
+        )
 
     @app_commands.command(
         name="sources",

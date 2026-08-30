@@ -225,10 +225,12 @@ async def main() -> None:
             await database.close()
 
     await check_paper_laboratory()
+    await check_shadow_auto_trader()
 
     print(
         "SELF-CHECK PASSED: detector, scoring, database, discovery rotation, "
-        "paper P&L, risk gate, PAPER laboratory, discovery-speed and realtime-alpha invariants"
+        "paper P&L, risk gate, PAPER laboratory, discovery-speed, realtime-alpha "
+        "and SHADOW auto-trader invariants"
     )
 
 
@@ -561,6 +563,179 @@ async def check_paper_laboratory() -> None:
     assert fast.FAST_WATCH not in fast.PINGABLE
     assert fast.NOTABLE_TRADER_LATE not in fast.PINGABLE
     assert fast.CATALYST_WATCH not in fast.PINGABLE
+
+
+async def check_shadow_auto_trader() -> None:
+    """The non-negotiables of the $100 / $10 forward experiment.
+
+    These are the claims the whole experiment rests on: every entry is exactly
+    $10, the book cannot exceed 5 positions or $50, the two strategy families
+    never share state, and nothing in the shadow path can spend real money.
+    """
+
+    import ast
+    import importlib
+    import inspect
+    from contextlib import suppress
+
+    from smart_money_bot.database import Database
+    from smart_money_bot.lab.bankroll import BankrollState
+    from smart_money_bot.lab.config import DEFAULT_LAB_CONFIG
+    from smart_money_bot.lab.shadow import (
+        DEFAULT_SHADOW_CONFIG,
+        SHADOW_REAL_MONEY_SPEND,
+        SIGNAL_FAMILIES,
+        ShadowConfig,
+        ShadowExposure,
+        ShadowSignal,
+        ShadowTimestamps,
+        evaluate_shadow_entry,
+    )
+    from smart_money_bot.lab.venues import (
+        FILL_FALLBACK_PENALISED,
+        BondingCurveState,
+        bonding_curve_quote,
+    )
+    from smart_money_bot.shadow_runtime import ShadowRuntime
+    from smart_money_bot.shadow_store import ShadowStore
+
+    config = DEFAULT_SHADOW_CONFIG
+    assert config.position_usd == Decimal("10"), "every shadow entry must be exactly $10"
+    assert config.min_position_usd == Decimal("10"), "there is no $5 shadow entry"
+    assert config.max_position_usd == Decimal("10"), "no signal may buy more than $10"
+    assert config.bankroll_usd == Decimal("100")
+    assert config.max_concurrent_positions == 5
+    assert config.max_total_exposure_usd == Decimal("50")
+    assert config.max_token_exposure_usd == Decimal("10")
+    assert config.net_profit_objective_usd == Decimal("2")
+
+    # A misconfigured stake must fail loudly, never silently skew the cohorts.
+    try:
+        ShadowConfig(position_usd=Decimal("5"))
+    except ValueError:
+        pass
+    else:  # pragma: no cover - the guard above must raise
+        raise AssertionError("a $5 shadow configuration must be refused")
+
+    assert not SHADOW_REAL_MONEY_SPEND, "SHADOW_REAL_MONEY_SPEND must be zero"
+
+    # No shadow module may reach a signer, a wallet or a swap submission.
+    forbidden = {
+        "Keypair",
+        "sign_message",
+        "sign_versioned_transaction",
+        "VersionedTransaction",
+        "execute_order",
+        "load_keypair",
+        "JupiterClient",
+    }
+    for module_name in (
+        "smart_money_bot.lab.shadow",
+        "smart_money_bot.lab.shadow_exits",
+        "smart_money_bot.lab.shadow_metrics",
+        "smart_money_bot.lab.venues",
+        "smart_money_bot.shadow_runtime",
+        "smart_money_bot.shadow_store",
+    ):
+        module = importlib.import_module(module_name)
+        tree = ast.parse(inspect.getsource(module))
+        names = {
+            node.id if isinstance(node, ast.Name) else node.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Name | ast.Attribute)
+        }
+        leaked = names & forbidden
+        assert not leaked, f"{module_name} must not reference {leaked}"
+
+    # STRICT PAPER and SHADOW are different strategy families.
+    assert DEFAULT_SHADOW_CONFIG.strategy_version != DEFAULT_LAB_CONFIG.strategy_version
+
+    def signal(mint: str, family: str) -> ShadowSignal:
+        return ShadowSignal(
+            mint=mint,
+            family=family,
+            timestamps=ShadowTimestamps(signal_at=1_000, decision_at=1_000),
+            price_usd=Decimal("0.001"),
+            market_cap_usd=Decimal("60000"),
+            liquidity_usd=Decimal("40000"),
+            buys=80,
+            sells=20,
+            route_available=True,
+        )
+
+    state = BankrollState(
+        starting_usd=Decimal("100"),
+        cash_usd=Decimal("100"),
+        peak_equity_usd=Decimal("100"),
+    )
+    for family in SIGNAL_FAMILIES:
+        decision = evaluate_shadow_entry(signal("mint-a", family), state)
+        assert decision.accepted, f"{family} must be able to open a shadow trade"
+        assert decision.size_usd == Decimal("10"), f"{family} must deploy exactly $10"
+
+    # Only $7 left is refused honestly, never rounded into a fake $10 trade.
+    thin = BankrollState(
+        starting_usd=Decimal("100"),
+        cash_usd=Decimal("7"),
+        open_exposure_usd=Decimal("40"),
+        peak_equity_usd=Decimal("47"),
+    )
+    refused = evaluate_shadow_entry(
+        signal("mint-b", SIGNAL_FAMILIES[0]),
+        thin,
+        ShadowExposure(open_positions=4, open_exposure_usd=Decimal("40")),
+    )
+    assert not refused.accepted and refused.size_usd == Decimal("0")
+
+    # A completed bonding curve refuses to invent a price for a $10 buy.
+    completed = bonding_curve_quote(
+        BondingCurveState(
+            virtual_sol_reserves=Decimal("32"),
+            virtual_token_reserves=Decimal("1073000000"),
+            complete=True,
+            sol_price_usd=Decimal("150"),
+        ),
+        side="BUY",
+        notional_usd=Decimal("10"),
+    )
+    assert not completed.usable, "a graduated curve must not price a bonding-curve buy"
+
+    # A fallback price is always labelled, never presented as an executable fill.
+    from smart_money_bot.lab.venues import fallback_quote
+
+    fallback = fallback_quote(
+        side="BUY", notional_usd=Decimal("10"), observed_price_usd=Decimal("0.001")
+    )
+    assert fallback.source == FILL_FALLBACK_PENALISED
+    assert fallback.fill_price_usd > Decimal("0.001")
+
+    # End to end: the book stops at 5 positions and $50, and the strict PAPER
+    # tables stay empty throughout.
+    path = tempfile.mktemp(suffix=".db")
+    database = Database(path, Decimal("1000"))
+    await database.connect()
+    try:
+        runtime = ShadowRuntime(ShadowStore(database))
+        await runtime.start_experiment(now=900)
+        for index in range(7):
+            await runtime.consider_signal(
+                signal(f"mint-{index}", SIGNAL_FAMILIES[0]), now=1_000 + index
+            )
+        book = await runtime.bankroll()
+        assert book.open_positions == 5, "the shadow book must stop at five positions"
+        assert book.open_exposure_usd == Decimal("50"), "exposure must stop at $50"
+        assert book.cash_usd == Decimal("50")
+
+        cursor = await database.db.execute("SELECT COUNT(*) AS total FROM lab_positions")
+        assert (await cursor.fetchone())["total"] == 0, "SHADOW must not touch STRICT PAPER"
+
+        status = await runtime.status()
+        assert status["live_execution_enabled"] is False
+        assert not status["real_money_spend_usd"]
+    finally:
+        await database.close()
+        with suppress(FileNotFoundError):
+            os.unlink(path)
 
 
 if __name__ == "__main__":

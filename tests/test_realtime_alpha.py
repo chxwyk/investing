@@ -71,6 +71,7 @@ from smart_money_bot.lab.notable import (
     decide_ping,
     exit_liquidity_warning,
 )
+from smart_money_bot.lab.shadow import DEFAULT_SHADOW_CONFIG
 from smart_money_bot.lab.smartmoney import WalletReputation
 
 D = Decimal
@@ -860,6 +861,10 @@ def _engine(database, notifier, **settings):
     engine.fast_alerts_suppressed = 0
     engine.last_fast_alert_at = None
     engine.last_fast_alert_kind = ""
+    # The shadow experiment rides alongside the fast lane; these tests assert
+    # the fast lane's own behaviour, so the shadow trader is present but off.
+    engine.shadow_enabled = False
+    engine._shadow_config = DEFAULT_SHADOW_CONFIG
     defaults = {
         "fomo_fast_watch_enabled": True,
         "fomo_fast_watch_publish_enabled": True,

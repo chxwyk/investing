@@ -7,7 +7,20 @@ transactions, and mirrors every newly detected hot-wallet swap in PAPER mode. PA
 as either a forced source-price observation ledger or an executable Jupiter quote-shadow
 trial; the two answer different questions and are labeled separately.
 
-Version 2.38.0 turns the research pipeline into a **real-time alpha engine**, and closes the one
+Version 2.39.0 adds the **SHADOW auto-trader**: a completely simulated $100 account that
+automatically buys **exactly $10** whenever an eligible research signal appears, manages the
+position with the existing staged exit engine plus a **$2 NET meaningful-profit objective**, sells
+realistically, and records the NET result per signal family. It exists to answer one question with
+forward evidence instead of opinion — *if the bot had automatically bought $10 every time it saw
+one of these signals, would the $100 be worth more or less now?*
+
+**No real money, structurally.** The shadow package contains no signer, no keypair, no RPC client,
+no transaction builder and no swap submission path; `SHADOW_REAL_MONEY_SPEND` is zero and the test
+suite proves it by walking each module's syntax tree. STRICT PAPER is untouched: it keeps every
+gate it had, the two families use different strategy versions, different bankrolls and different
+tables, and shadow eligibility can never reach the strict engine.
+
+Version 2.38.0 turned the research pipeline into a **real-time alpha engine**, and closed the one
 gap the v2.37 report named explicitly: FAST WATCH was implemented and tested but nothing
 published it, so it never reached Discord. It does now.
 
@@ -18,11 +31,20 @@ and **edit the same message** rather than sending a second ping. Every alert row
 SQLite *before* the notifier is called, so a restart, a duplicated stream event or a retried
 coroutine cannot re-publish or re-ping the same observation.
 
-Seven alert classes exist — `FAST_WATCH`, `NOTABLE_TRADER_EARLY`, `NOTABLE_TRADER_LATE`,
-`NOTABLE_DISTRIBUTION`, `BREAKING_CATALYST`, `CATALYST_WATCH` and `CONFLUENCE_WATCH` — and every
-one of them carries `entry_eligible = False` structurally. Only three may interrupt the user
+Nine alert classes exist — `FAST_WATCH`, `NOTABLE_TRADER_EARLY`, `NOTABLE_TRADER_LATE`,
+`NOTABLE_DISTRIBUTION`, `BREAKING_CATALYST`, `CATALYST_WATCH`, `CONFLUENCE_WATCH`,
+`SHADOW_AUTO_ENTRY` and `SHADOW_AUTO_EXIT` — and every one of them carries
+`entry_eligible = False` structurally. Only three may interrupt the user
 (`NOTABLE_TRADER_EARLY`, `BREAKING_CATALYST`, `CONFLUENCE_WATCH`); a late observation is still
-published, quantified and visible, but it never pings. **Speed changes what you see, never what
+published, quantified and visible, but it never pings.
+
+**Two visibility layers, so nothing has to be hidden to stay quiet.** v2.39 splits *where* a card
+goes from *whether it pings*. `FOMO_URGENT_CHANNEL_ID` receives the genuinely urgent classes;
+`FOMO_LIVE_RADAR_CHANNEL_ID` receives everything else worth reading — FAST WATCH, fresh runners,
+late notable observations, ordinary catalysts and every shadow fill. Both variables are optional
+and fall back to the existing alert channel, so a deployment that defines neither keeps exactly
+today's behaviour. Every card now names its **signal family** and states **why you're seeing
+this**. **Speed changes what you see, never what
 the bot is allowed to do:** the PAPER entry gates, the fail-closed safety rules and the cost
 floors are untouched, and there is still no live-execution path anywhere in the repository.
 
@@ -475,6 +497,10 @@ unless four separate controls are deliberately configured.
 - Tracks equity, realized/unrealized P&L, win rate, maximum drawdown, profit factor,
   average win/loss, expectancy, and rolling 24-hour realized P&L.
 - Optionally executes personal-wallet **spot** swaps through Jupiter Swap API V2.
+- Runs a fully simulated **$100 SHADOW auto-trader** that automatically buys exactly $10 on every
+  eligible research signal, manages the position toward a $2 NET meaningful-profit objective while
+  letting a healthy runner keep running, sells realistically, and reports NET expectancy per signal
+  family. It spends $0.00 and has no signing path of any kind.
 
 ## What it deliberately does not do
 
@@ -488,6 +514,12 @@ unless four separate controls are deliberately configured.
   obtained public wallet addresses remain usable without scraping.
 - It does not promise profit. The paper scoreboard exists specifically to prove or reject
   the strategy with evidence.
+- The SHADOW auto-trader does not spend, sign, submit, or hold anything. There is no wallet, no
+  keypair, no RPC client and no swap submission path in it, and its route logic prices trades
+  without ever being able to place one. A future live executor could reuse the route selection,
+  but no such executor exists in this repository and nothing here is connected to one.
+- SHADOW does not cherry-pick. Rugs, illiquid exits, route failures and penalised fallback fills
+  are all recorded at their real cost; no losing trade is ever excluded from a report.
 - It does not trade perpetual futures, borrow funds, or use leverage.
 - It never asks for a seed phrase in Discord or chat.
 - The v2.36 PAPER research laboratory does not execute anything. The `smart_money_bot.lab`
@@ -984,7 +1016,142 @@ The bot needs these Discord application permissions:
 
 No privileged Discord gateway intents are required.
 
+## SHADOW auto-trader (v2.39)
+
+The strict PAPER laboratory answers *"is this a trade I would defend?"*. It is deliberately hard
+to satisfy, and that is correct — but it means the forward sample grows slowly, and it cannot tell
+you whether the **signals themselves** are worth acting on.
+
+SHADOW answers a different, purely empirical question:
+
+> What would have happened if the bot had automatically bought **$10** the moment this signal
+> appeared?
+
+### The rules, and why they are rigid
+
+| Rule | Value | Why |
+| --- | --- | --- |
+| Starting bankroll | `$100` | One number an operator can hold in their head. |
+| Every accepted entry | `$10` — exactly | A variable stake makes per-family expectancy uncomparable. |
+| Maximum concurrent positions | `5` | Survival modelling applies to fake money too. |
+| Maximum total exposure | `$50` | Half the bankroll is never at risk at once. |
+| Maximum per-token exposure | `$10` | One position per token; no averaging down, ever. |
+| Meaningful NET profit objective | `+$2` | On a $10 stake, "+25%" can be under a dollar after costs. |
+
+`position_usd`, `min_position_usd` and `max_position_usd` are all $10 by construction, and
+`ShadowConfig` raises if they disagree. If only $7 of simulated bankroll remains, the entry is
+**refused honestly** with `SHADOW_INSUFFICIENT_BANKROLL_FOR_FULL_SIZE` rather than booked as a
+smaller trade that would quietly corrupt every expectancy number in the report.
+
+### It is a separate strategy family, not a looser mode
+
+STRICT PAPER and SHADOW never share a bankroll row, a position row, an exit journal or a strategy
+version. `smart_money_bot.lab.shadow` does not import the strict entry engine, and the strict
+engine does not know shadow exists — both directions are asserted by tests that walk the modules'
+syntax trees. SHADOW may simulate a trade STRICT PAPER refuses; that is the entire point of the
+experiment, and it can never make STRICT PAPER accept anything.
+
+### The $2 NET objective is not "sell at +$2"
+
+The staged exit engine — the ladder, break-even arming, trailing protection, momentum decay, flow
+reversal, smart-money distribution, liquidity deterioration, safety failure, the hard stop and the
+time stop — is **reused unchanged**, not reimplemented. What v2.39 adds on top is the question a
+percentage ladder cannot express: *has this cleared $2 NET, and is the runner still healthy?*
+
+* Every emergency still fires first and unmodified. Safety failure, a liquidity collapse, a dead
+  route and the hard stop are never overridden by a profit figure.
+* Below `+$2 NET`, the staged engine decides alone, so a breaking setup still de-risks and a loser
+  still stops out.
+* At `+$2 NET` with **weak** structure, most of the position is secured.
+* At `+$2 NET` with **mixed** structure, half is secured.
+* At `+$2 NET` with a **healthy, accelerating** runner, a *small* slice is taken and meaningful
+  exposure keeps running.
+* Past three times the objective, principal is recovered and a funded moon bag runs on.
+
+"NET" always means after platform fees, network fees, priority fees, price impact and slippage on
+**both** legs, so a held position and a closed one are measured on identical terms.
+
+### Fills come from routes that could have filled them
+
+Every simulated buy and sell is priced against whichever venue actually offered the best
+executable path at that moment — the Pump bonding curve (constant-product, with its published
+fee), a PumpSwap/AMM pool sized by its own depth, or an executable aggregator quote. A position
+that enters on the bonding curve can still exit after graduation, because the sell is routed
+again from scratch.
+
+Three fill provenances exist and are always persisted and displayed:
+
+1. `EXECUTABLE_QUOTE` — a real quote the bot obtained.
+2. `SIMULATED_VENUE_STATE` — arithmetic on live on-chain venue state.
+3. `FALLBACK_PENALISED` — nothing executable was available; the observed price is used, charged an
+   explicit penalty, and **labelled everywhere** so no report can treat it as real.
+
+A completed bonding curve refuses to price a curve buy instead of inventing one. When the evidence
+says there is **no route at all**, no fallback is offered: pricing an exit off the last chart print
+when the market is gone is exactly the fantasy fill the contract forbids, so the failure is
+recorded as a failure.
+
+### What it learns
+
+Per trade: realized NET, maximum favourable and adverse excursion, **peak NET versus final NET**
+(profit given back), and **capture efficiency** — realized NET as a share of the best NET that was
+actually available after entry. A $10 position that realized +$3 out of an available +$11.70
+captured 25.6%, and that number is the honest way to ask whether the exits are too slow.
+
+Future peak data is **evaluation only**. It is computed after the fact from persisted observations
+and can never reach an earlier decision; the no-look-ahead tests assert that entry decisions and
+runner-health assessments read no field that postdates them.
+
+Twelve exit policies are compared on the **same single observation stream** — the existing staged
+strategy, the $2-NET dynamic strategy, fixed +10/+20/+25/+50/+100%, a trailing runner, the staged
+ladder, momentum-adaptive, smart-money-aware, and a no-trade baseline. Because they all replay
+persisted rows, comparing twelve policies costs exactly as many provider requests as comparing
+one: **none**.
+
+### It cannot spend real money
+
+`SHADOW_REAL_MONEY_SPEND` is `Decimal("0")`, and the invariant is structural rather than
+aspirational. No shadow module imports `solders`, `aiohttp`, the market client, the RPC client or
+the executor, and none references a keypair, a private key, a message signer, a versioned
+transaction, an order execution call or a swap. The test suite and the self-check both parse each
+module's AST and assert it.
+
 ## Railway deployment
+
+### v2.39.0 Railway changes
+
+Every new setting has a safe code default, so **no Railway variable has to be added**. The shadow
+experiment runs at $100 / $10 / 5 positions / $50 exposure out of the box. Nothing here enables
+live trading, live wallet copy, automatic J7 execution or automatic SOL spending; there is still
+no live-execution path anywhere in the repository.
+
+**ADD:** none required.  **CHANGE:** none required.
+
+**OPTIONAL:**
+
+```text
+FOMO_SHADOW_AUTO_ENABLED=true               # the $10 simulated auto-trader
+FOMO_SHADOW_PUBLISH_CARDS=true              # entry/exit cards; false keeps the experiment quiet
+FOMO_SHADOW_BANKROLL_USD=100
+FOMO_SHADOW_POSITION_USD=10                 # every entry is exactly this, never $5
+FOMO_SHADOW_MAX_POSITION_USD=10             # must equal FOMO_SHADOW_POSITION_USD
+FOMO_SHADOW_MAX_POSITIONS=5
+FOMO_SHADOW_MAX_EXPOSURE_USD=50
+FOMO_SHADOW_NET_PROFIT_OBJECTIVE_USD=2
+FOMO_SHADOW_DAILY_LOSS_CAP_USD=15
+FOMO_SHADOW_MAX_PRICE_IMPACT_PERCENT=12
+FOMO_SHADOW_MAX_SIGNAL_AGE_SECONDS=900      # how old a signal may be when acted on
+FOMO_SHADOW_MAX_FILL_LATENCY_MS=30000       # how stale the quote may be at the fill
+FOMO_SHADOW_ALLOW_FALLBACK_FILL=true        # penalised, always labelled, never a real fill
+FOMO_SHADOW_MIN_FORWARD_SAMPLE=30
+FOMO_LIVE_RADAR_CHANNEL_ID=                 # optional; falls back to the alert channel
+FOMO_URGENT_CHANNEL_ID=                     # optional; falls back to the alert channel
+```
+
+`FOMO_SHADOW_POSITION_USD` and `FOMO_SHADOW_MAX_POSITION_USD` must be equal — a variable stake
+would make the per-family expectancy numbers uncomparable, which is the one thing this experiment
+exists to measure, so an unequal pair fails at startup rather than producing a sample nobody can
+interpret. There is **no $5 default anywhere** in the shadow strategy.
 
 ### v2.38.0 Railway changes
 
@@ -1366,6 +1533,30 @@ Mutation commands require Discord Administrator or a role listed in
 Every one of these is read-only research. They show `WAIT`, `REJECT`, `COOLDOWN` and
 `REENTRY_WATCH` candidates on purpose; seeing a candidate never makes it entry eligible.
 
+### SHADOW auto-trader (v2.39, admin only)
+
+| Command | What it answers |
+| --- | --- |
+| `/fomo shadow` | **Is the $100 shadow account making money?** Current bankroll, realized and unrealized NET, ROI, open positions, exposure, win rate, profit factor, expectancy, max drawdown, and whether a circuit breaker is holding new entries. |
+| `/fomo shadow view:trades` | Every open $10 position: signal family, entry MC, NET PnL, MFE, MAE, peak NET, profit given back, how much is still held, the route it filled on, and why it is still being held. |
+| `/fomo shadow view:results` | The full forward record — win rate, average/median trade, average winner and loser, profit factor, expectancy, drawdown, the +$2 NET hit rate, +10/+20/+25/+50/+100/+200/+500% reach, capture efficiency and profit giveback — **separated by signal family**, never blended. |
+| `/fomo shadow view:venues` | Fill quality for the same simulated $10 trade per venue: fills, average slippage, price impact, quote latency, total modeled cost and NET result. |
+| `/fomo shadow view:policies` | What eleven alternative exit policies would have realized on the same persisted observations, plus the no-trade baseline. Costs zero provider requests. |
+
+A Discord subcommand *group* cannot itself be invoked, so `/fomo shadow` is one command with a
+`view:` option rather than a group with no default. That keeps the account answer one keystroke
+away, which is the point of section 44: **the headline is never buried under diagnostics.**
+
+Nine signal families are tracked as separate cohorts — `FAST_WATCH`, `FRESH_RUNNER`,
+`NOTABLE_TRADER_EARLY`, `NOTABLE_TRADER_LATE`, `BREAKING_CATALYST`, `CATALYST_WATCH`,
+`CONFLUENCE_WATCH`, `QUALIFIED_RESEARCH` and `STRICT_PAPER_ENTRY` — because a blended number
+cannot tell you whether to keep watching FAST WATCH or only notable wallets.
+
+`/smartmoney status` and `/fomo realtime` both carry the shadow block: whether it is on, the $10
+position size, the bankroll, the position and exposure caps, the NET objective, how long ago the
+last simulated entry and exit fired, which channels the two lanes publish to, and
+**REAL MONEY: DISABLED — SHADOW_REAL_MONEY_SPEND = $0.00**.
+
 ### Real-time alpha lane (v2.38, admin only)
 
 | Command | What it answers |
@@ -1514,3 +1705,14 @@ admission, wallet rotation auditing, forward PAPER evidence, WebSocket derivatio
 detection, score behavior, Swap V2 quote parsing, entry-drift and price-impact rejection,
 quote-based round trips, readiness metrics, raw-lot caps, hard/trailing/time exits, risk
 gating, database migration, and live-mode locking.
+
+The v2.39 suite adds the SHADOW auto-trader: that every signal family deploys exactly $10 and
+never $5, that the book stops at 5 positions and $50, that a restart or a replayed signal cannot
+duplicate a position, that a completed bonding curve refuses to price a curve buy, that a missing
+route is recorded rather than filled at a chart price, that `+$2 NET` secures a broken runner and
+does *not* dump an accelerating one, that capture efficiency and profit giveback are computed
+correctly, that counterfactuals and entry decisions cannot read the future, and that no shadow
+module contains a signer, a wallet, an RPC client or a swap submission path.
+
+`python tests/run_selfcheck.py` re-asserts the non-negotiables — including the $10 entry size, the
+$100/5/$50 caps, the STRICT PAPER separation and `SHADOW_REAL_MONEY_SPEND = 0` — without pytest.

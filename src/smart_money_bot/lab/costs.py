@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
+from typing import Protocol
 
 from .config import DEFAULT_LAB_CONFIG, LabConfig
 from .decision import EvidenceQuality
@@ -17,6 +18,21 @@ from .decision import EvidenceQuality
 ZERO = Decimal("0")
 CENT = Decimal("0.000001")
 BPS = Decimal("10000")
+
+
+class CostModel(Protocol):
+    """The fee inputs a cost calculation actually reads.
+
+    :class:`~smart_money_bot.lab.config.LabConfig` satisfies this, and so does
+    the SHADOW configuration, so both strategy families share one cost model
+    instead of maintaining two copies of the same arithmetic.  It is a
+    read-only structural contract: nothing here can widen what a caller may do.
+    """
+
+    platform_fee_bps: int
+    network_fee_usd: Decimal
+    priority_fee_usd: Decimal
+    slippage_bps: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,7 +81,7 @@ def estimate_round_trip_cost(
     buy_price_impact_percent: Decimal | None = None,
     sell_price_impact_percent: Decimal | None = None,
     slippage_bps: int | None = None,
-    config: LabConfig = DEFAULT_LAB_CONFIG,
+    config: CostModel = DEFAULT_LAB_CONFIG,
 ) -> RoundTripCost:
     """Both legs, always.  A position that cannot exit has no edge to model."""
 
@@ -227,7 +243,7 @@ def leg_costs(
     *,
     price_impact_percent: Decimal | None = None,
     slippage_bps: int | None = None,
-    config: LabConfig = DEFAULT_LAB_CONFIG,
+    config: CostModel = DEFAULT_LAB_CONFIG,
 ) -> RealizedPnl:
     """Costs for one leg (buy or sell) of a simulated trade."""
 
