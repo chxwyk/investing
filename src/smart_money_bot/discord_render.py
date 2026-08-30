@@ -377,3 +377,77 @@ def describe_render(
         total_characters=_total(embeds),
         notes=notes,
     )
+
+
+async def send_cards(
+    channel: Any,
+    specs: Sequence[CardSpec],
+    *,
+    content: str | None = None,
+    view: Any = None,
+    allowed_mentions: Any = None,
+    fallback_text: str,
+    budget: int = SAFE_MESSAGE_BUDGET,
+) -> Any:
+    """Publish cards to a channel with the same guarantees as an interaction.
+
+    ``resolve_with_cards`` covers slash-command replies; a fast alert is not a
+    reply, it is an unsolicited channel post, and it needs the identical
+    escalation so an oversized card degrades to a compact one instead of
+    vanishing.  Returns the sent message when Discord accepted it (the handle
+    stage-2 enrichment later edits) or ``None`` when nothing could be posted.
+    """
+
+    embeds, notes = render_message(specs, budget=budget)
+    note_line = f"⚠️ {' • '.join(notes)}" if notes else ""
+    body = "\n".join(part for part in (content or "", note_line) if part) or None
+    kwargs: dict[str, Any] = {}
+    if allowed_mentions is not None:
+        kwargs["allowed_mentions"] = allowed_mentions
+    try:
+        return await channel.send(content=body, embeds=embeds, view=view, **kwargs)
+    except Exception as error:  # noqa: BLE001 - a failed alert must still degrade
+        if is_embed_too_large(error):
+            logger.warning("Discord refused the budgeted fast alert: %s", error)
+        else:
+            logger.exception("Fast alert could not be delivered")
+
+    try:
+        minimal, _ = render_message(
+            [minimal_spec(spec) for spec in specs[:1]],
+            budget=MINIMAL_MESSAGE_BUDGET,
+        )
+        return await channel.send(content=content, embeds=minimal, **kwargs)
+    except Exception:  # noqa: BLE001 - fall through to plain text
+        logger.exception("Minimal fast alert was also rejected")
+
+    try:
+        return await channel.send(content=fallback_text, **kwargs)
+    except Exception:  # noqa: BLE001 - the channel itself is unreachable
+        logger.exception("Fast alert could not be published at all")
+        return None
+
+
+async def edit_cards(
+    message: Any,
+    specs: Sequence[CardSpec],
+    *,
+    content: str | None = None,
+    budget: int = SAFE_MESSAGE_BUDGET,
+) -> bool:
+    """Edit an already-published card in place (stage-2 enrichment).
+
+    Enrichment must never become a second ping, so it edits rather than posts.
+    A failed edit is not escalated to a new message: the original alert is
+    already visible and correct, only less complete.
+    """
+
+    embeds, notes = render_message(specs, budget=budget)
+    note_line = f"⚠️ {' • '.join(notes)}" if notes else ""
+    body = "\n".join(part for part in (content or "", note_line) if part) or None
+    try:
+        await message.edit(content=body, embeds=embeds)
+        return True
+    except Exception:  # noqa: BLE001 - the first-stage card still stands
+        logger.exception("Fast alert enrichment could not be applied")
+        return False

@@ -228,7 +228,7 @@ async def main() -> None:
 
     print(
         "SELF-CHECK PASSED: detector, scoring, database, discovery rotation, "
-        "paper P&L, risk gate, PAPER laboratory and discovery-speed invariants"
+        "paper P&L, risk gate, PAPER laboratory, discovery-speed and realtime-alpha invariants"
     )
 
 
@@ -365,6 +365,202 @@ async def check_paper_laboratory() -> None:
     embeds, _ = render_message([card] * 5)
     total = sum(len(item) for item in embeds)
     assert total <= SAFE_MESSAGE_BUDGET <= MESSAGE_EMBED_LIMIT
+
+    # --- v2.38 invariants -------------------------------------------------
+    from smart_money_bot import fast_alerts as fast
+    from smart_money_bot.lab.catalyst import (
+        CONNECTION_OFFICIAL,
+        M_CIRCULAR_SOURCING,
+        CatalystEvent,
+        ConfluenceInputs,
+        EventSource,
+        assess_event,
+        assess_token_link,
+        classify_catalyst_alert,
+    )
+    from smart_money_bot.lab.fastwatch import still_current
+    from smart_money_bot.lab.notable import (
+        EDGE_CONSUMED,
+        ONCHAIN_ONLY,
+        NotableSignal,
+        NotableTrade,
+        NotableWallet,
+        build_consensus,
+        decide_ping,
+    )
+
+    # FAST WATCH now has a publication path, and it is still not entry eligible.
+    watch_alert = fast.build_fast_watch_alert(
+        mint=TOKEN,
+        name="Token",
+        symbol="TKN",
+        fomo_url="https://fomo.biz/token/x",
+        verdict=watch,
+        age_seconds=300,
+        market_cap_usd=Decimal("90000"),
+        first_seen_market_cap_usd=Decimal("60000"),
+        liquidity_usd=Decimal("30000"),
+        move_since_first_seen_percent=Decimal("50"),
+        momentum_score=Decimal("70"),
+        organic_score=None,
+        buys=90,
+        sells=20,
+    )
+    assert watch_alert.entry_eligible is False, "a published FAST WATCH cannot be an entry"
+    assert watch_alert.may_ping is False, "FAST WATCH must never interrupt the user"
+    assert any(item.name == "SAFETY" for item in watch_alert.spec.fields)
+
+    # A queued candidate cannot publish as "early" after the move happened.
+    queued_ok, queued_reason = still_current(hot, first_seen_at=hot.now - 3_600)
+    assert queued_ok is False and "queued" in queued_reason
+
+    # An unmapped wallet is never given an identity.
+    anon = NotableWallet(wallet=WALLET, provenance=ONCHAIN_ONLY, anonymous_index=17)
+    assert anon.identified is False and anon.display_name() == "Wallet #17"
+    try:
+        NotableWallet(wallet=WALLET, label="Someone", provenance=ONCHAIN_ONLY)
+    except ValueError:
+        pass
+    else:  # pragma: no cover - the guard must hold
+        raise AssertionError("an anonymous wallet must never carry a public label")
+
+    # Lateness is quantified and published, and a late signal is never chased.
+    late_trade = NotableTrade(
+        wallet=WALLET,
+        mint=TOKEN,
+        signature="sig",
+        chain_time=1_000,
+        observed_at=1_004,
+        entry_market_cap_usd=Decimal("48000"),
+    )
+    late_signal = NotableSignal(
+        trade=late_trade,
+        wallet_profile=anon,
+        detection_market_cap_usd=Decimal("50000"),
+        current_market_cap_usd=Decimal("500000"),
+        now=1_030,
+    )
+    assert late_signal.freshness() == EDGE_CONSUMED
+    assert late_signal.may_chase() is False
+    assert decide_ping(late_signal).ping is False
+    late_card = fast.build_notable_trader_alert(
+        signal=late_signal, fomo_url="u", name="Token", symbol="TKN"
+    )
+    assert late_card.kind == fast.NOTABLE_TRADER_LATE
+    assert late_card.may_ping is False and late_card.entry_eligible is False
+
+    # A funded swarm is one actor, never several confirmations.
+    swarm = [
+        NotableSignal(
+            trade=NotableTrade(
+                wallet=f"w{index}",
+                mint=TOKEN,
+                signature=f"s{index}",
+                chain_time=1_000,
+                observed_at=1_002,
+                entry_market_cap_usd=Decimal("48000"),
+            ),
+            wallet_profile=anon,
+            current_market_cap_usd=Decimal("54000"),
+            now=1_030,
+        )
+        for index in range(4)
+    ]
+    clustered = build_consensus(swarm, cluster_of={f"w{i}": "funder" for i in range(4)})
+    assert clustered.raw_wallets == 4 and clustered.independent_wallets == 1
+    assert clustered.is_independent_consensus is False
+
+    # A quoted repost is not an independent confirmation.
+    primary = EventSource(
+        name="Official",
+        published_at=900,
+        is_primary=True,
+        account_verified=True,
+        tier="TIER_A_OFFICIAL",
+        content_hash="p",
+    )
+    quoting = EventSource(
+        name="Repost", published_at=940, quotes_source="Official", content_hash="q"
+    )
+    circular = assess_event(
+        CatalystEvent(
+            event_id="evt",
+            headline="Exchange lists a Solana memecoin",
+            detected_at=1_000,
+            occurred_at=900,
+            sources=(primary, quoting),
+            crypto_relevance=Decimal("90"),
+        ),
+        now=1_000,
+    )
+    assert circular.independent_confirmations == 0
+    assert M_CIRCULAR_SOURCING in circular.markers
+
+    # A verified event is never evidence that a token is real.
+    verified = assess_event(
+        CatalystEvent(
+            event_id="evt2",
+            headline="Exchange lists a Solana memecoin",
+            detected_at=1_000,
+            occurred_at=900,
+            sources=(
+                primary,
+                EventSource(name="A", published_at=930, account_verified=True, content_hash="a"),
+                EventSource(name="B", published_at=935, account_verified=True, content_hash="b"),
+            ),
+            discussion_velocity=Decimal("80"),
+            novelty=Decimal("90"),
+            crypto_relevance=Decimal("95"),
+        ),
+        now=1_000,
+    )
+    link = assess_token_link(
+        mint=TOKEN,
+        event=verified,
+        name_similarity=Decimal("100"),
+        minted_after_event=True,
+        seconds_after_event=120,
+    )
+    assert link.connection != CONNECTION_OFFICIAL
+    assert link.official is False, "only the event's own source can make a link OFFICIAL"
+
+    # Confluence raises priority, never eligibility.
+    convergence = classify_catalyst_alert(
+        ConfluenceInputs(
+            event=verified,
+            link=assess_token_link(
+                mint=TOKEN,
+                event=verified,
+                name_similarity=Decimal("100"),
+                minted_after_event=True,
+                seconds_after_event=90,
+            ),
+            token_age_seconds=180,
+            independent_notable_wallets=3,
+            proven_early_wallets=2,
+            earliest_notable_entry_market_cap_usd=Decimal("40000"),
+            current_market_cap_usd=Decimal("52000"),
+            independent_buyers_accelerating=True,
+            liquidity_growing=True,
+            current_actionability=Decimal("75"),
+            safety_status="PASS",
+        ),
+        now=1_000,
+    )
+    assert convergence.entry_eligible is False, "confluence must never authorise an entry"
+    assert any("EVENT VERIFIED" in item for item in convergence.warnings)
+
+    # A degraded provider becomes UNKNOWN, never PASS by omission.
+    degraded = fast.enrichment_from_evidence(
+        alert_key="k", safety_status="PASS", provider_degraded="Solana Tracker"
+    )
+    safety_field = next(item for item in degraded.fields if item.name == "SAFETY")
+    assert "UNKNOWN" in safety_field.value and "**PASS**" not in safety_field.value
+
+    # Only the three urgent classes may interrupt the user.
+    assert fast.FAST_WATCH not in fast.PINGABLE
+    assert fast.NOTABLE_TRADER_LATE not in fast.PINGABLE
+    assert fast.CATALYST_WATCH not in fast.PINGABLE
 
 
 if __name__ == "__main__":

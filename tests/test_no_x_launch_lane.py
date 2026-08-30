@@ -49,6 +49,9 @@ async def test_no_x_candidate_alert_never_auto_launches() -> None:
         news_x_verify_min_score=70,
         news_dex_match_enabled=True,
         news_max_alerts_per_hour=30,
+        # This lane is about launch candidates, not catalysts; the v2.38
+        # catalyst path is exercised by its own tests.
+        fomo_catalyst_alerts_enabled=False,
     )
     engine.x_social = SimpleNamespace(search_enabled=False)
     engine.news_matcher = SimpleNamespace(

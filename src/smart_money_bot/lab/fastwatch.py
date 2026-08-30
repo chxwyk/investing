@@ -214,3 +214,70 @@ def still_current(
         if move <= max_adverse_move_percent:
             return False, f"already {move.quantize(Decimal('0.01'))}% below first seen"
     return True, ""
+
+
+def _decimal_field(source: object, name: str) -> Decimal | None:
+    value = getattr(source, name, None)
+    return value if isinstance(value, Decimal) else None
+
+
+def _pct(current: Decimal | None, base: Decimal | None) -> Decimal | None:
+    if current is None or base is None or base <= 0:
+        return None
+    return ((current - base) / base * Decimal("100")).quantize(Decimal("0.01"))
+
+
+def _rate(current: Decimal | None, base: Decimal | None) -> Decimal | None:
+    if current is None or base is None or base <= 0:
+        return None
+    return (current / base).quantize(Decimal("0.01"))
+
+
+def _gap(current: int | None, base: int | None) -> int | None:
+    if current is None or base is None:
+        return None
+    return current - base
+
+
+def signals_from_candidate(candidate: object, *, now: int) -> FastWatchSignals:
+    """Project a runner candidate onto the cheap FAST WATCH signal set.
+
+    Deliberately structural (``getattr`` only) so the publication path, the lab
+    runtime and the tests all read the same evidence from the same fields, and
+    so nothing here can reach for a provider.
+    """
+
+    current = getattr(candidate, "current", None)
+    first = getattr(candidate, "first", None)
+    started = getattr(candidate, "pair_created_at", None) or getattr(
+        candidate, "graduated_at", None
+    )
+    age = max(0, now - started) if started and now else None
+    return FastWatchSignals(
+        now=now,
+        pair_age_seconds=age,
+        market_cap_usd=_decimal_field(current, "market_cap_usd"),
+        first_seen_market_cap_usd=_decimal_field(first, "market_cap_usd"),
+        market_cap_acceleration_ratio=_rate(
+            _decimal_field(current, "market_cap_usd"),
+            _decimal_field(first, "market_cap_usd"),
+        ),
+        price_change_percent=_pct(
+            _decimal_field(current, "price_usd"), _decimal_field(first, "price_usd")
+        ),
+        volume_acceleration_ratio=_rate(
+            _decimal_field(current, "volume_5m_usd"), _decimal_field(first, "volume_5m_usd")
+        ),
+        buys=int(getattr(current, "buys_5m", 0) or 0),
+        sells=int(getattr(current, "sells_5m", 0) or 0),
+        holder_growth=_gap(
+            getattr(current, "holder_count", None), getattr(first, "holder_count", None)
+        ),
+        liquidity_usd=_decimal_field(current, "liquidity_usd"),
+        liquidity_change_percent=_pct(
+            _decimal_field(current, "liquidity_usd"), _decimal_field(first, "liquidity_usd")
+        ),
+        route_available=bool(getattr(current, "route_available", False)),
+        rugged=bool(getattr(current, "rugged", False)),
+        hard_blockers=tuple(getattr(candidate, "hard_blockers", ()) or ()),
+    )

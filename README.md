@@ -7,7 +7,46 @@ transactions, and mirrors every newly detected hot-wallet swap in PAPER mode. PA
 as either a forced source-price observation ledger or an executable Jupiter quote-shadow
 trial; the two answer different questions and are labeled separately.
 
-Version 2.37.0 attacks the bottleneck that replaced intelligence: the system was often seeing
+Version 2.38.0 turns the research pipeline into a **real-time alpha engine**, and closes the one
+gap the v2.37 report named explicitly: FAST WATCH was implemented and tested but nothing
+published it, so it never reached Discord. It does now.
+
+The architecture is **DETECT → PERSIST → NOTIFY → ENRICH**, not "wait for every provider, then
+maybe notify three minutes later". A stage-1 card is built only from evidence already in hand and
+published immediately; deep forensics, safety, route quality and social confirmation arrive later
+and **edit the same message** rather than sending a second ping. Every alert row is reserved in
+SQLite *before* the notifier is called, so a restart, a duplicated stream event or a retried
+coroutine cannot re-publish or re-ping the same observation.
+
+Seven alert classes exist — `FAST_WATCH`, `NOTABLE_TRADER_EARLY`, `NOTABLE_TRADER_LATE`,
+`NOTABLE_DISTRIBUTION`, `BREAKING_CATALYST`, `CATALYST_WATCH` and `CONFLUENCE_WATCH` — and every
+one of them carries `entry_eligible = False` structurally. Only three may interrupt the user
+(`NOTABLE_TRADER_EARLY`, `BREAKING_CATALYST`, `CONFLUENCE_WATCH`); a late observation is still
+published, quantified and visible, but it never pings. **Speed changes what you see, never what
+the bot is allowed to do:** the PAPER entry gates, the fail-closed safety rules and the cost
+floors are untouched, and there is still no live-execution path anywhere in the repository.
+
+**Notable-trader intelligence** watches the existing wallet stream and publishes what it actually
+observed: how much was bought, the trader's entry market cap, the bot's detection market cap, the
+current market cap, both moves, and how many seconds after the chain event the bot saw it. Identity
+is never inferred. A wallet without a verified public mapping stays anonymous behind a stable,
+meaningless handle (`Wallet #17`), and the type system enforces it — an `ONCHAIN_ONLY` wallet that
+is handed a public label raises. Four wallets funded from one upstream account are reported as one
+actor, not four confirmations. A signal whose move is already spent grades `EDGE_CONSUMED`, is
+published with the lateness spelled out, and is never chased.
+
+**Catalyst intelligence** grades a real-world event on its own source integrity — primary source,
+genuinely independent confirmations, circular sourcing, duplicate aggregator spam, possible
+impersonation, staleness — entirely separately from any token. A verified event is never evidence
+that a token is real: the token↔event connection is its own graded question, and `OFFICIAL`
+requires the event's own authoritative source to have published the exact mint. Everything else
+is labelled `NOT OFFICIAL`, however good the name match.
+
+**Confluence** is where a credible catalyst, a plausibly related fresh token, independent
+`PROVEN_EARLY` wallets and accelerating independent demand line up at the same moment. It raises
+priority and nothing else — a `CONFLUENCE_WATCH` with `SAFETY PASS` is still not entry eligible.
+
+Version 2.37.0 attacked the bottleneck that replaced intelligence: the system was often seeing
 tokens too late, and then keeping stale ones next to fresh ones.
 
 The headline latency number turned out to be partly a measurement artifact. `SOURCE → FIRST SEEN`
@@ -947,6 +986,38 @@ No privileged Discord gateway intents are required.
 
 ## Railway deployment
 
+### v2.38.0 Railway changes
+
+Every new setting has a safe code default, so **no Railway variable has to be added**. Nothing
+here enables live trading, live wallet copy, automatic J7 execution or automatic SOL spending;
+there is still no live-execution path.
+
+**ADD:** none required.  **CHANGE:** none required.
+
+**OPTIONAL:**
+
+```text
+FOMO_FAST_WATCH_PUBLISH_ENABLED=true      # publish the FAST WATCH card (research only)
+FOMO_FAST_WATCH_MIN_SCORE=55
+FOMO_FAST_WATCH_MAX_QUEUE_AGE_SECONDS=300 # nothing publishes as "early" after this
+FOMO_FAST_WATCH_COOLDOWN_SECONDS=1800
+FOMO_FAST_WATCH_MAX_PER_HOUR=12
+FOMO_NOTABLE_ALERTS_ENABLED=true
+FOMO_NOTABLE_MIN_TRADE_USD=250
+FOMO_NOTABLE_PING_ENABLED=false           # pings stay OFF by default
+FOMO_NOTABLE_MAX_SIGNAL_AGE_SECONDS=900
+FOMO_CATALYST_ALERTS_ENABLED=true
+FOMO_CATALYST_MAX_EVENT_AGE_SECONDS=3600
+FOMO_CATALYST_PING_ENABLED=false          # pings stay OFF by default
+FOMO_CONFLUENCE_ALERTS_ENABLED=true
+FOMO_ALERT_ENRICHMENT_ENABLED=true        # stage 2 edits the card in place
+FOMO_ALERT_ENRICHMENT_DELAY_SECONDS=45
+```
+
+Schema changes are five additive tables — `notable_wallets`, `notable_wallet_events`,
+`catalyst_events`, `catalyst_token_links` and `fast_alerts` — all `CREATE TABLE IF NOT EXISTS`.
+No existing table, column or row is dropped, renamed or rewritten.
+
 ### v2.37.0 Railway changes
 
 Every new setting has a safe code default, so **no Railway variable has to be added**. Nothing
@@ -1294,6 +1365,20 @@ Mutation commands require Discord Administrator or a role listed in
 
 Every one of these is read-only research. They show `WAIT`, `REJECT`, `COOLDOWN` and
 `REENTRY_WATCH` candidates on purpose; seeing a candidate never makes it entry eligible.
+
+### Real-time alpha lane (v2.38, admin only)
+
+| Command | What it answers |
+| --- | --- |
+| `/fomo realtime` | Is the wallet stream connected, which alert lanes are on, how many alerts were published versus suppressed, and how long ago the last one fired? |
+| `/fomo notable` | What public wallet activity did the realtime lane actually observe, with size, entry market cap, chain-event age and detection delay? |
+| `/fomo catalysts` | Which real-world events currently grade as credible, with their source-integrity markers? |
+| `/fomo catalyst <mint>` | How strongly is this exact mint connected to a graded event — and is that connection OFFICIAL or merely a name match? |
+| `/fomo confluence` | Where do independent wallets, a graded event and current market evidence agree right now? |
+
+These are visibility, not eligibility. `/fomo realtime` reports **live autonomous execution:
+DISABLED** because that is a structural fact about the build, not a toggle. `/smartmoney status`
+carries the same realtime block.
 
 ### Clean PAPER controls and manual exits
 

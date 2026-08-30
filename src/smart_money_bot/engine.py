@@ -6,6 +6,7 @@ import json
 import logging
 import time
 from collections import deque
+from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import replace
 from datetime import datetime, timedelta
@@ -29,6 +30,7 @@ from .constants import (
     INFRASTRUCTURE_ADDRESSES,
     PAPER_DEMO_ENTRY_PRICE_USD,
     PAPER_DEMO_MINT,
+    fomo_coin_url,
 )
 from .database import Database
 from .detector import SwapDetector
@@ -46,17 +48,49 @@ from .errors import (
     UnknownLaunchResultError,
 )
 from .executor import ExecutionManager
+from .fast_alerts import (
+    EnrichmentUpdate,
+    FastAlert,
+    build_catalyst_alert,
+    build_fast_watch_alert,
+    build_notable_trader_alert,
+    enrichment_from_evidence,
+)
 from .lab.actionability import RankedCandidate as LabRankedCandidate
 from .lab.actionability import rank_by_current_edge
+from .lab.catalyst import (
+    CatalystAlert,
+    CatalystEvent,
+    ConfluenceInputs,
+    EventSource,
+    TokenEventLink,
+    assess_event,
+    assess_token_link,
+    classify_catalyst_alert,
+)
 from .lab.config import lab_config_from_settings
 from .lab.exits import ExitContext as LabExitContext
+from .lab.fastwatch import evaluate_fast_watch, signals_from_candidate, still_current
 from .lab.latency import HISTORICAL as LAB_HISTORICAL
 from .lab.latency import UNKNOWN as LAB_UNKNOWN
 from .lab.latency import LatencySample as LabLatencySample
 from .lab.latency import pipeline_breakdown as lab_pipeline_breakdown
 from .lab.latency import slowest_stage as lab_slowest_stage
 from .lab.latency import summarize_sources as summarize_lab_sources
+from .lab.notable import (
+    ADMIN_DEFINED,
+    ONCHAIN_ONLY,
+    PROVENANCE,
+    NotableConsensus,
+    NotableSignal,
+    NotableTrade,
+    NotableWallet,
+    build_consensus,
+    decide_ping,
+)
 from .lab.regime import RegimeSample as LabRegimeSample
+from .lab.registry import account_tier
+from .lab.smartmoney import WalletReputation
 from .lab_runtime import LabEvaluation, LabRuntime
 from .lab_store import LabStore
 from .launch import (
@@ -197,6 +231,12 @@ class Notifier(Protocol):
 
     async def on_runner_fresh(self, candidate: RunnerCandidate) -> bool: ...
 
+    async def on_fast_alert(self, alert: FastAlert) -> bool: ...
+
+    async def on_fast_alert_enrichment(
+        self, alert: FastAlert, update: EnrichmentUpdate
+    ) -> bool: ...
+
     async def on_runner_risk_escalation(
         self, candidate: RunnerCandidate, changes: tuple[str, ...]
     ) -> bool: ...
@@ -255,6 +295,14 @@ class NullNotifier:
         return False
 
     async def on_runner_fresh(self, candidate: RunnerCandidate) -> bool:
+        return False
+
+    async def on_fast_alert(self, alert: FastAlert) -> bool:
+        return False
+
+    async def on_fast_alert_enrichment(
+        self, alert: FastAlert, update: EnrichmentUpdate
+    ) -> bool:
         return False
 
     async def on_runner_risk_escalation(
@@ -396,6 +444,20 @@ class SmartMoneyEngine:
         }
         self._fomo_radar_seen: dict[str, int] = {}
         self._runner_last_alert: dict[str, tuple[int, Decimal]] = {}
+        # --- realtime alpha engine (v2.38) state -------------------------
+        self._fast_watch_published: dict[str, int] = {}
+        self._fast_watch_times: deque[int] = deque()
+        self._fast_alerts: dict[str, FastAlert] = {}
+        self._enrichment_tasks: set[asyncio.Task[None]] = set()
+        self._notable_tasks: set[asyncio.Task[None]] = set()
+        self._catalyst_sources: dict[str, list[EventSource]] = {}
+        self._catalyst_headlines: dict[str, tuple[int, str]] = {}
+        self._notable_recent: dict[str, list[NotableSignal]] = {}
+        self._notable_anonymous_index: dict[str, int] = {}
+        self.fast_alerts_published = 0
+        self.fast_alerts_suppressed = 0
+        self.last_fast_alert_at: int | None = None
+        self.last_fast_alert_kind: str = ""
         self._quality_config = quality_config_from_settings(settings)
         self._lab_config = lab_config_from_settings(settings)
         self.lab_store = LabStore(self.database)
@@ -556,11 +618,12 @@ class SmartMoneyEngine:
                 )
 
     async def close(self) -> None:
-        for task in self._news_match_tasks:
-            task.cancel()
-        if self._news_match_tasks:
-            await asyncio.gather(*self._news_match_tasks, return_exceptions=True)
-        self._news_match_tasks.clear()
+        for pending in (self._news_match_tasks, self._notable_tasks, self._enrichment_tasks):
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            pending.clear()
         for task in (
             self._news_stream_task,
             self._news_rss_task,
@@ -1202,6 +1265,11 @@ class SmartMoneyEngine:
             return
 
         await self.notifier.on_swap(swap, trader)
+        # Realtime alpha lane: surface the observation immediately, on its own
+        # task, so a slow public lookup can never delay the existing execution
+        # pipeline.  It is research visibility only and can never open a
+        # position.
+        self._queue_notable_alert(swap, trader)
         if mode is ExecutionMode.PAPER and self.settings.paper_mirror_raw_swaps:
             await self._mirror_paper_swap(swap, trader)
         else:
@@ -1312,6 +1380,7 @@ class SmartMoneyEngine:
                         reverse=True,
                     )
                     for candidate in candidates:
+                        await self._maybe_publish_fast_watch(candidate)
                         await self._maybe_publish_fresh(candidate)
                         await self._maybe_publish_runner(candidate)
                         self._start_runner_fast_watch(candidate)
@@ -2473,6 +2542,794 @@ class SmartMoneyEngine:
         )
         return True
 
+    # ------------------------------------------------------------------
+    # Realtime alpha engine (v2.38): DETECT -> PERSIST -> NOTIFY -> ENRICH
+    # ------------------------------------------------------------------
+
+    async def _publish_fast_alert(self, alert: FastAlert, *, now: int) -> bool:
+        """Persist the claim, then notify.  Never the other way round.
+
+        The database reservation is what makes a restart, a duplicated stream
+        event or a retried coroutine unable to re-publish or re-ping the same
+        observation.  Nothing here can authorise an entry: every
+        :class:`FastAlert` is ``entry_eligible = False`` by construction.
+        """
+
+        if alert.entry_eligible:  # pragma: no cover - structurally impossible
+            raise AssertionError("a fast alert can never be entry eligible")
+        if self.database.connection is None:
+            return False
+        try:
+            reserved = await self.database.reserve_fast_alert(
+                alert_key=alert.alert_key,
+                kind=alert.kind,
+                mint=alert.mint,
+                now=now,
+                fingerprint=alert.fingerprint,
+                pinged=alert.may_ping,
+            )
+        except Exception:
+            logger.exception("Could not reserve fast alert %s", alert.alert_key)
+            return False
+        if not reserved:
+            self.fast_alerts_suppressed += 1
+            return False
+        self._fast_alerts[alert.alert_key] = alert
+        sent = await self.notifier.on_fast_alert(alert)
+        if sent is False:
+            self._fast_alerts.pop(alert.alert_key, None)
+            with suppress(Exception):
+                await self.database.release_fast_alert(alert.alert_key)
+            return False
+        self.fast_alerts_published += 1
+        self.last_fast_alert_at = now
+        self.last_fast_alert_kind = alert.kind
+        return True
+
+    def _fast_watch_rate_limited(self, now: int) -> bool:
+        while self._fast_watch_times and now - self._fast_watch_times[0] >= 3600:
+            self._fast_watch_times.popleft()
+        return len(self._fast_watch_times) >= self.settings.fomo_fast_watch_max_per_hour
+
+    async def _maybe_publish_fast_watch(self, candidate: RunnerCandidate) -> bool:
+        """Close the v2.37 gap: FAST WATCH now actually reaches Discord.
+
+        The verdict was implemented and tested in v2.37 but nothing published
+        it, so early acceleration stayed invisible.  It publishes here as
+        research visibility only — ``entry_eligible`` is a hard ``False``, the
+        missing evidence is named on the card, and the PAPER entry gates are
+        untouched.
+        """
+
+        if not (
+            self.settings.fomo_fast_watch_enabled
+            and self.settings.fomo_fast_watch_publish_enabled
+        ):
+            return False
+        now = int(time.time())
+        last = self._fast_watch_published.get(candidate.mint)
+        if last is not None and now - last < self.settings.fomo_fast_watch_cooldown_seconds:
+            return False
+        if self._fast_watch_rate_limited(now):
+            self.fast_alerts_suppressed += 1
+            return False
+
+        signals = signals_from_candidate(candidate, now=now)
+        verdict = evaluate_fast_watch(
+            signals,
+            min_score=self.settings.fomo_fast_watch_min_score,
+            config=self._lab_config,
+        )
+        if not verdict.watch:
+            return False
+        # A candidate that sat in a queue must not publish as "early" after the
+        # move already happened.
+        current, reason = still_current(
+            signals,
+            first_seen_at=candidate.radar_first_seen_at or candidate.first_seen_at,
+            max_queue_age_seconds=self.settings.fomo_fast_watch_max_queue_age_seconds,
+        )
+        if not current:
+            logger.info("FAST WATCH suppressed for %s: %s", candidate.mint[:8], reason)
+            self.fast_alerts_suppressed += 1
+            return False
+
+        alert = build_fast_watch_alert(
+            mint=candidate.mint,
+            name=candidate.name or candidate.symbol or "Unknown token",
+            symbol=candidate.symbol or "?",
+            fomo_url=self._fomo_url(candidate.mint),
+            verdict=verdict,
+            age_seconds=signals.pair_age_seconds,
+            market_cap_usd=signals.market_cap_usd,
+            first_seen_market_cap_usd=signals.first_seen_market_cap_usd,
+            liquidity_usd=signals.liquidity_usd,
+            move_since_first_seen_percent=signals.price_change_percent,
+            momentum_score=candidate.quality.momentum_score or None,
+            organic_score=candidate.quality.organic_score or None,
+            buys=signals.buys,
+            sells=signals.sells,
+            now=now,
+        )
+        published = await self._publish_fast_alert(alert, now=now)
+        if published:
+            self._fast_watch_published[candidate.mint] = now
+            self._fast_watch_times.append(now)
+            self._schedule_alert_enrichment(alert)
+        return published
+
+    def _fomo_url(self, mint: str) -> str:
+        """The same canonical Fomo coin link every other card already uses."""
+
+        return fomo_coin_url(mint, self.settings.fomo_referral_code)
+
+    # --- notable wallet intelligence -----------------------------------
+
+    async def _notable_wallet(
+        self, address: str, *, alias: str = ""
+    ) -> NotableWallet | None:
+        """Resolve a wallet to a *verified* public identity, or an honest anon.
+
+        An identity is never inferred.  An operator-defined alias is an
+        admin-defined label and is used as one; anything else stays anonymous
+        with a stable handle, and no attempt is made to work out who it is.
+        """
+
+        rows = (
+            await self.database.notable_wallet_rows(enabled_only=True)
+            if self.database.connection is not None
+            else []
+        )
+        for row in rows:
+            if str(row.get("wallet")) != address:
+                continue
+            provenance = str(row.get("provenance") or ONCHAIN_ONLY)
+            if provenance not in PROVENANCE:
+                provenance = ONCHAIN_ONLY
+            label = str(row.get("label") or "")
+            if provenance == ONCHAIN_ONLY:
+                label = ""
+            return NotableWallet(
+                wallet=address,
+                label=label,
+                provenance=provenance,
+                verification_source=str(row.get("verification_source") or ""),
+                confidence=Decimal(str(row.get("confidence") or "0")),
+                category=str(row.get("category") or "trader"),
+                enabled=bool(row.get("enabled", 1)),
+                last_verified_at=row.get("last_verified_at"),
+                anonymous_index=row.get("anonymous_index"),
+            )
+        if alias:
+            # The operator named this wallet when they added it to the tracked
+            # set; that is a documented, admin-defined mapping, not a guess.
+            return NotableWallet(
+                wallet=address,
+                label=alias,
+                provenance=ADMIN_DEFINED,
+                verification_source="operator-tracked wallet",
+                category="trader",
+            )
+        return NotableWallet(
+            wallet=address,
+            provenance=ONCHAIN_ONLY,
+            anonymous_index=self._anonymous_index(address),
+        )
+
+    def _anonymous_index(self, address: str) -> int:
+        """A stable, meaningless handle number.  It identifies nobody."""
+
+        index = self._notable_anonymous_index.get(address)
+        if index is None:
+            index = len(self._notable_anonymous_index) + 1
+            self._notable_anonymous_index[address] = index
+        return index
+
+    async def _wallet_reputation(self, address: str) -> WalletReputation | None:
+        try:
+            return (await self.lab_store.load_reputations([address])).get(address)
+        except Exception:
+            logger.exception("Could not load reputation for a notable wallet")
+            return None
+
+    async def _maybe_publish_notable(
+        self, swap: DetectedSwap, trader: TrackedTrader
+    ) -> bool:
+        """The realtime notable-wallet fast path (sections 5-11).
+
+        Persist the observation immediately, publish a small card built only
+        from evidence already in hand, and let stage-2 enrichment fill the rest
+        in place.  Lateness is quantified and published, never hidden, and a
+        late observation never earns a ping.
+        """
+
+        if not self.settings.fomo_notable_alerts_enabled or swap.side is not Side.BUY:
+            return False
+        if (
+            swap.usd_value is None
+            or swap.usd_value < self.settings.fomo_notable_min_trade_usd
+        ):
+            return False
+        now = int(time.time())
+
+        # PERSIST first: a slow provider must never delay the record, and a
+        # replayed stream event must never produce a second row.
+        try:
+            fresh = await self.database.record_notable_event(
+                signature=swap.signature,
+                wallet=swap.trader_address,
+                mint=swap.token_mint,
+                side=swap.side.value,
+                chain_time=swap.block_time,
+                observed_at=now,
+                amount_usd=float(swap.usd_value),
+                entry_price_usd=(
+                    float(swap.token_price_usd) if swap.token_price_usd is not None else None
+                ),
+            )
+        except Exception:
+            logger.exception("Could not persist a notable wallet event")
+            return False
+        if not fresh:
+            return False
+
+        context = await self._cached_token_context(swap.token_mint)
+        # The trader's entry market cap comes from the trade's own executed
+        # price; the detection market cap must be a *live* reading, never the
+        # last persisted one, or a cached number minutes old would be published
+        # as "now" and manufacture a move that did not happen.
+        entry_market_cap = self._entry_market_cap(swap, context)
+        detection_market_cap: Decimal | None = None
+        with suppress(Exception):
+            async with asyncio.timeout(3):
+                snapshot = await self.dex_screener.snapshot(swap.token_mint)
+            if snapshot.available:
+                detection_market_cap = snapshot.market_cap_usd
+        if detection_market_cap is None:
+            # No live reading in the budget: the honest statement is that the
+            # bot arrived at the trade's own level, which is what a detection
+            # seconds after the chain event means.  Enrichment refreshes it.
+            detection_market_cap = entry_market_cap
+
+        profile = await self._notable_wallet(swap.trader_address, alias=trader.alias)
+        if profile is None:
+            return False
+        trade = NotableTrade(
+            wallet=swap.trader_address,
+            mint=swap.token_mint,
+            signature=swap.signature,
+            side=swap.side.value,
+            chain_time=swap.block_time,
+            observed_at=now,
+            amount_usd=swap.usd_value,
+            entry_price_usd=swap.token_price_usd,
+            entry_market_cap_usd=entry_market_cap,
+        )
+        signal = NotableSignal(
+            trade=trade,
+            wallet_profile=profile,
+            reputation=await self._wallet_reputation(swap.trader_address),
+            detection_market_cap_usd=detection_market_cap,
+            current_price_usd=swap.token_price_usd,
+            current_market_cap_usd=detection_market_cap,
+            now=now,
+        )
+        consensus = self._notable_consensus(signal, now=now)
+        ping = decide_ping(signal, consensus=consensus, config=self._lab_config)
+        if not self.settings.fomo_notable_ping_enabled:
+            ping = replace(ping, ping=False, urgent=False)
+
+        alert = build_notable_trader_alert(
+            signal=signal,
+            fomo_url=self._fomo_url(swap.token_mint),
+            name=str(context.get("name") or "Unknown token"),
+            symbol=str(context.get("symbol") or "?"),
+            consensus=consensus if consensus.raw_wallets > 1 else None,
+            ping_decision=ping,
+        )
+        published = await self._publish_fast_alert(alert, now=now)
+        if published:
+            self._schedule_alert_enrichment(alert)
+        return published
+
+    def _queue_notable_alert(self, swap: DetectedSwap, trader: TrackedTrader) -> None:
+        """Run the fast alert beside the pipeline, never in front of it."""
+
+        if not self.settings.fomo_notable_alerts_enabled or swap.side is not Side.BUY:
+            return
+        task = asyncio.create_task(
+            self._notable_alert_task(swap, trader),
+            name=f"notable-{swap.signature[:8]}",
+        )
+        self._notable_tasks.add(task)
+        task.add_done_callback(self._notable_tasks.discard)
+
+    async def _notable_alert_task(self, swap: DetectedSwap, trader: TrackedTrader) -> None:
+        try:
+            await self._maybe_publish_notable(swap, trader)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - an alert must never break a scan
+            await self.notifier.on_error("Notable wallet fast alert", exc)
+
+    @staticmethod
+    def _entry_market_cap(swap: DetectedSwap, context: dict[str, Any]) -> Decimal | None:
+        """The trader's entry market cap, derived from two measured values.
+
+        Circulating supply is implied by the last persisted price and market cap
+        for this mint, so the trade's own executed price gives the market cap at
+        the moment the trader entered.  When either measurement is missing the
+        answer stays ``None`` and the card says "unknown" — it is never filled
+        in with the detection-time market cap, which would silently claim the
+        trader entered where the bot arrived.
+        """
+
+        price = context.get("price_usd")
+        market_cap = context.get("market_cap_usd")
+        entry_price = swap.token_price_usd
+        if not (price and market_cap and entry_price) or price <= 0:
+            return None
+        supply = Decimal(market_cap) / Decimal(price)
+        return (Decimal(entry_price) * supply).quantize(Decimal("0.01"))
+
+    def _notable_consensus(self, signal: NotableSignal, *, now: int) -> NotableConsensus:
+        """Cluster-adjusted consensus over the recent notable buys of one mint.
+
+        Each remembered signal keeps its *own* wallet profile and reputation, so
+        a PROVEN_EARLY count can never be manufactured by reusing one wallet's
+        history for another.
+        """
+
+        window = max(60, self.settings.fomo_notable_max_signal_age_seconds)
+        recent = [
+            item
+            for item in self._notable_recent.get(signal.trade.mint, [])
+            if now - item.trade.observed_at <= window
+            and item.trade.wallet != signal.trade.wallet
+        ]
+        recent.append(signal)
+        self._notable_recent[signal.trade.mint] = recent[-20:]
+        if len(self._notable_recent) > 500:
+            self._notable_recent = dict(list(self._notable_recent.items())[-250:])
+        return build_consensus(
+            recent,
+            current_market_cap_usd=signal.current_market_cap_usd,
+        )
+
+    async def _cached_token_context(self, mint: str) -> dict[str, Any]:
+        """Identity and last-known market values from what we already stored.
+
+        Deliberately free: the fast path reads the persisted runner row rather
+        than spending a provider call before it publishes.
+        """
+
+        with suppress(Exception):
+            payload = await self.database.runner_candidate_payload(mint)
+            if payload:
+                candidate = runner_candidate_from_json(payload)
+                if candidate is not None:
+                    return {
+                        "name": candidate.name or candidate.symbol or "Unknown token",
+                        "symbol": candidate.symbol or "?",
+                        "price_usd": candidate.current.price_usd,
+                        "market_cap_usd": candidate.current.market_cap_usd,
+                    }
+        return {}
+
+    async def _cached_token_names(self, mint: str) -> tuple[str, str]:
+        context = await self._cached_token_context(mint)
+        return (
+            str(context.get("name") or "Unknown token"),
+            str(context.get("symbol") or "?"),
+        )
+
+    # --- catalyst and confluence ---------------------------------------
+
+    def _catalyst_key(self, alert: NewsAlert) -> str:
+        terms = sorted({item.casefold() for item in alert.narrative_terms if item})
+        if not terms:
+            return ""
+        return hashlib.sha256("|".join(terms).encode()).hexdigest()[:16]
+
+    def _event_source(self, alert: NewsAlert) -> EventSource:
+        """Grade one publication of a claim.  Primary is never assumed."""
+
+        handle = (alert.author or alert.source).strip()
+        tier = account_tier(handle)
+        return EventSource(
+            name=handle or alert.source or "unknown",
+            url=alert.url,
+            published_at=alert.created_at or alert.received_at,
+            # Primary means the authoritative account itself published it.  A
+            # verified Tier-A account is the only thing we treat that way, and
+            # an absent primary demotes the event rather than being assumed.
+            is_primary=bool(alert.author_verified and tier == "TIER_A_OFFICIAL"),
+            account_verified=alert.author_verified,
+            tier=tier,
+            content_hash=hashlib.sha256(
+                (alert.headline or alert.summary or alert.url).casefold().encode()
+            ).hexdigest()[:16],
+        )
+
+    async def observe_catalyst(
+        self, alert: NewsAlert, *, now: int | None = None
+    ) -> CatalystEvent | None:
+        """Fold one news observation into a graded, persisted catalyst event."""
+
+        if not self.settings.fomo_catalyst_alerts_enabled:
+            return None
+        key = self._catalyst_key(alert)
+        if not key:
+            return None
+        moment = now if now is not None else int(time.time())
+        horizon = self.settings.fomo_catalyst_max_event_age_seconds
+        self._catalyst_headlines = {
+            event_id: value
+            for event_id, value in self._catalyst_headlines.items()
+            if moment - value[0] <= horizon
+        }
+        self._catalyst_sources = {
+            event_id: sources
+            for event_id, sources in self._catalyst_sources.items()
+            if event_id in self._catalyst_headlines
+        }
+        first_seen, headline = self._catalyst_headlines.get(
+            key, (moment, alert.headline or alert.summary or alert.url)
+        )
+        self._catalyst_headlines[key] = (first_seen, headline)
+        sources = self._catalyst_sources.setdefault(key, [])
+        candidate = self._event_source(alert)
+        if not any(
+            item.name == candidate.name and item.content_hash == candidate.content_hash
+            for item in sources
+        ):
+            sources.append(candidate)
+
+        event = assess_event(
+            CatalystEvent(
+                event_id=key,
+                headline=headline,
+                detected_at=first_seen,
+                occurred_at=min(
+                    (item.published_at for item in sources if item.published_at), default=None
+                ),
+                sources=tuple(sources),
+                discussion_velocity=self._discussion_velocity(sources, first_seen, moment),
+                novelty=self._event_novelty(first_seen, moment, horizon=horizon),
+                crypto_relevance=Decimal(str(alert.score)) if alert.score else None,
+            ),
+            now=moment,
+            max_age_seconds=horizon,
+        )
+        await self._store_catalyst_event(event, now=moment)
+        return event
+
+    async def _store_catalyst_event(self, event: CatalystEvent, *, now: int) -> None:
+        """Persist the graded event.  A token link is meaningless without it."""
+
+        with suppress(Exception):
+            await self.database.store_catalyst_event(
+                event_id=event.event_id,
+                headline=event.headline,
+                detected_at=event.detected_at,
+                occurred_at=event.occurred_at,
+                confidence=event.confidence,
+                priority=event.priority,
+                markers_json=json.dumps(list(event.markers)),
+                payload_json=json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "name": item.name,
+                                "url": item.url,
+                                "published_at": item.published_at,
+                                "is_primary": item.is_primary,
+                                "tier": item.tier,
+                            }
+                            for item in event.sources
+                        ],
+                        "independent_confirmations": event.independent_confirmations,
+                    }
+                ),
+                now=now,
+            )
+
+    @staticmethod
+    def _discussion_velocity(
+        sources: Sequence[EventSource], first_seen: int, now: int
+    ) -> Decimal | None:
+        """How fast distinct outlets are picking the story up — measured, not guessed.
+
+        Counts distinct source names over the elapsed window.  Three separate
+        outlets inside a minute is a fast-moving story; one over an hour is not.
+        """
+
+        distinct = len({item.name.casefold() for item in sources if item.name})
+        if distinct <= 0:
+            return None
+        minutes = max(Decimal("1"), Decimal(max(60, now - first_seen)) / 60)
+        rate = Decimal(distinct) / minutes
+        return min(Decimal("100"), (rate * 40).quantize(Decimal("0.01")))
+
+    @staticmethod
+    def _event_novelty(first_seen: int, now: int, *, horizon: int) -> Decimal:
+        """How new this story is to us, measured from our own first observation.
+
+        Deliberately not a judgement about how surprising the news is: it is the
+        age of the claim in our own records, decaying to zero at the retention
+        horizon, so a story we have been carrying for an hour stops presenting
+        itself as breaking.
+        """
+
+        age = max(0, now - first_seen)
+        if age <= 300:
+            return Decimal("100")
+        if age >= horizon:
+            return Decimal("0")
+        remaining = Decimal(horizon - age) / Decimal(max(1, horizon - 300))
+        return (remaining * 100).quantize(Decimal("0.01"))
+
+    async def _maybe_publish_catalyst(
+        self,
+        event: CatalystEvent,
+        *,
+        now: int,
+        mint: str = "",
+        link: TokenEventLink | None = None,
+        candidate: RunnerCandidate | None = None,
+        confluence: ConfluenceInputs | None = None,
+    ) -> bool:
+        """BREAKING CATALYST / CATALYST WATCH / CONFLUENCE WATCH."""
+
+        if not self.settings.fomo_catalyst_alerts_enabled:
+            return False
+        inputs = confluence or ConfluenceInputs(event=event, link=link)
+        decision: CatalystAlert = classify_catalyst_alert(
+            inputs, now=now, config=self._lab_config
+        )
+        if not decision.alerts:
+            return False
+        if (
+            decision.kind == "CONFLUENCE_WATCH"
+            and not self.settings.fomo_confluence_alerts_enabled
+        ):
+            return False
+        if not self.settings.fomo_catalyst_ping_enabled:
+            decision = replace(decision, ping=False)
+        current = candidate.current if candidate is not None else None
+        name, symbol = ("", "")
+        if candidate is not None:
+            name = candidate.name or candidate.symbol or "Unknown token"
+            symbol = candidate.symbol or "?"
+        elif mint:
+            name, symbol = await self._cached_token_names(mint)
+        alert = build_catalyst_alert(
+            alert=decision,
+            event=event,
+            link=link,
+            mint=mint,
+            name=name,
+            symbol=symbol,
+            fomo_url=self._fomo_url(mint) if mint else "",
+            token_age_seconds=inputs.token_age_seconds,
+            market_cap_usd=getattr(current, "market_cap_usd", None),
+            liquidity_usd=getattr(current, "liquidity_usd", None),
+            notable_summary=(
+                f"Independent notable wallets `{inputs.independent_notable_wallets}`"
+                if inputs.independent_notable_wallets
+                else ""
+            ),
+        )
+        if mint and link is not None:
+            # The link row is joined against the event row, so persist the event
+            # first regardless of which entry point produced it.
+            await self._store_catalyst_event(event, now=now)
+            with suppress(Exception):
+                await self.database.store_catalyst_link(
+                    event_id=event.event_id,
+                    mint=mint,
+                    connection=link.connection,
+                    name_similarity=(
+                        float(link.name_similarity) if link.name_similarity is not None else None
+                    ),
+                    seconds_after_event=link.seconds_after_event,
+                    official=link.official,
+                    payload_json=json.dumps({"notes": list(link.notes)}),
+                    now=now,
+                )
+        published = await self._publish_fast_alert(alert, now=now)
+        if published and mint:
+            self._schedule_alert_enrichment(alert)
+        return published
+
+    async def evaluate_catalyst_token(
+        self,
+        *,
+        mint: str,
+        event: CatalystEvent,
+        now: int | None = None,
+    ) -> bool:
+        """Correlate a fresh token with a graded event, then decide the alert."""
+
+        moment = now if now is not None else int(time.time())
+        payload = await self.database.runner_candidate_payload(mint)
+        candidate = runner_candidate_from_json(payload) if payload else None
+        if candidate is None:
+            return False
+        created = candidate.pair_created_at or candidate.chain_created_at
+        reference = event.occurred_at if event.occurred_at is not None else event.detected_at
+        # A token that existed *before* the event cannot have been created for
+        # it, so the sign of this difference matters and is never clamped away.
+        delta = created - reference if created else None
+        link = assess_token_link(
+            mint=mint,
+            event=event,
+            name_similarity=self._name_similarity(candidate, event),
+            minted_after_event=None if delta is None else delta >= 0,
+            seconds_after_event=delta if delta is not None and delta >= 0 else None,
+        )
+        evaluation = await self.lab.evaluate_candidate(candidate, now=moment)
+        inputs = ConfluenceInputs(
+            event=event,
+            link=link,
+            token_age_seconds=(
+                max(0, moment - created) if created else None
+            ),
+            independent_notable_wallets=candidate.estimated_independent_smart_wallets,
+            proven_early_wallets=evaluation.smart_money.proven_early,
+            current_market_cap_usd=candidate.current.market_cap_usd,
+            independent_buyers_accelerating=(
+                candidate.current.verified_unique_buyers > candidate.first.verified_unique_buyers
+            ),
+            liquidity_growing=(
+                candidate.current.liquidity_usd is not None
+                and candidate.first.liquidity_usd is not None
+                and candidate.current.liquidity_usd > candidate.first.liquidity_usd
+            ),
+            organic_score=candidate.quality.organic_score,
+            current_actionability=evaluation.actionability.score,
+            safety_status=candidate.safety.status,
+        )
+        return await self._maybe_publish_catalyst(
+            event,
+            now=moment,
+            mint=mint,
+            link=link,
+            candidate=candidate,
+            confluence=inputs,
+        )
+
+    @staticmethod
+    def _name_similarity(candidate: RunnerCandidate, event: CatalystEvent) -> Decimal | None:
+        """Token-name overlap with the headline, on the grader's 0-100 scale.
+
+        Evidence, never proof: a perfect name match still grades no higher than
+        PLAUSIBLE, because anyone can name a token after a real event.
+        """
+
+        name = (candidate.name or candidate.symbol or "").casefold()
+        if not name:
+            return None
+        words = {item for item in name.replace("-", " ").split() if len(item) >= 3}
+        if not words:
+            words = {name}
+        headline = event.headline.casefold()
+        hits = sum(1 for word in words if word in headline)
+        if not hits:
+            return Decimal("0")
+        return (Decimal(hits) / Decimal(len(words)) * Decimal("100")).quantize(Decimal("0.01"))
+
+    # --- stage 2: async enrichment in place ----------------------------
+
+    def _schedule_alert_enrichment(self, alert: FastAlert) -> None:
+        if not self.settings.fomo_alert_enrichment_enabled or not alert.mint:
+            return
+        task = asyncio.create_task(
+            self._enrich_fast_alert(alert),
+            name=f"fast-enrich-{alert.mint[:8]}",
+        )
+        self._enrichment_tasks.add(task)
+        task.add_done_callback(self._enrichment_tasks.discard)
+
+    async def _enrich_fast_alert(self, alert: FastAlert) -> None:
+        """Stage 2: edit the published card with real evidence, never re-ping.
+
+        A degraded provider becomes an explicit UNKNOWN on the card.  Missing
+        evidence never becomes PASS, and enrichment can never make a fast alert
+        entry eligible.
+        """
+
+        await asyncio.sleep(self.settings.fomo_alert_enrichment_delay_seconds)
+        degraded = ""
+        candidate: RunnerCandidate | None = None
+        try:
+            candidate = await self.analyze_runner(alert.mint, refresh_market=True)
+        except (DiscoveryError, JupiterError, RpcError, ValueError) as exc:
+            degraded = "market data"
+            logger.info("Fast alert enrichment degraded for %s: %s", alert.mint[:8], exc)
+        except Exception:
+            degraded = "market data"
+            logger.exception("Fast alert enrichment failed for %s", alert.mint[:8])
+
+        if candidate is None:
+            update = enrichment_from_evidence(
+                alert_key=alert.alert_key,
+                provider_degraded=degraded or "market data",
+            )
+        else:
+            evaluation = await self.lab.evaluate_candidate(candidate, now=int(time.time()))
+            update = enrichment_from_evidence(
+                alert_key=alert.alert_key,
+                safety_status=candidate.safety.status,
+                route_status=candidate.current.sell_route_status,
+                independent_wallets=candidate.estimated_independent_smart_wallets,
+                expected_net_edge_percent=evaluation.decision.expected_net_edge_percent,
+                cost_percent=evaluation.evaluation.edge.cost_percent,
+                provider_degraded=degraded,
+            )
+        await self.notifier.on_fast_alert_enrichment(alert, update)
+        with suppress(Exception):
+            await self.database.mark_fast_alert_enriched(
+                alert_key=alert.alert_key, now=int(time.time())
+            )
+
+    # --- read models for the Discord commands --------------------------
+
+    async def notable_activity(self, mint: str = "", *, limit: int = 20) -> tuple[dict, ...]:
+        if self.database.connection is None:
+            return ()
+        rows = (
+            await self.database.notable_events_for(mint, limit=limit)
+            if mint
+            else await self.database.recent_notable_events(limit=limit)
+        )
+        return tuple(rows)
+
+    async def catalyst_feed(self, *, limit: int = 10) -> tuple[dict, ...]:
+        if self.database.connection is None:
+            return ()
+        return tuple(await self.database.recent_catalyst_events(limit=limit))
+
+    async def catalyst_links(self, mint: str, *, limit: int = 10) -> tuple[dict, ...]:
+        if self.database.connection is None:
+            return ()
+        return tuple(await self.database.catalyst_links_for(mint, limit=limit))
+
+    async def fast_alert_feed(self, *, limit: int = 20) -> tuple[dict, ...]:
+        if self.database.connection is None:
+            return ()
+        return tuple(await self.database.recent_fast_alerts(limit=limit))
+
+    def realtime_status(self) -> dict[str, object]:
+        """What the realtime lane is actually doing right now (section 33)."""
+
+        now = int(time.time())
+        return {
+            "stream_connected": bool(getattr(self.stream, "connected", False)),
+            "stream_last_event_at": getattr(self.stream, "last_event_at", None),
+            "stream_last_event_age": (
+                now - int(getattr(self.stream, "last_event_at", 0) or 0)
+                if getattr(self.stream, "last_event_at", None)
+                else None
+            ),
+            "stream_subscriptions": int(getattr(self.stream, "subscription_count", 0) or 0),
+            "fast_watch_enabled": (
+                self.settings.fomo_fast_watch_enabled
+                and self.settings.fomo_fast_watch_publish_enabled
+            ),
+            "notable_alerts_enabled": self.settings.fomo_notable_alerts_enabled,
+            "notable_ping_enabled": self.settings.fomo_notable_ping_enabled,
+            "catalyst_alerts_enabled": self.settings.fomo_catalyst_alerts_enabled,
+            "confluence_alerts_enabled": self.settings.fomo_confluence_alerts_enabled,
+            "social_radar_enabled": self.settings.fomo_social_radar_enabled,
+            "enrichment_enabled": self.settings.fomo_alert_enrichment_enabled,
+            "alerts_published": self.fast_alerts_published,
+            "alerts_suppressed": self.fast_alerts_suppressed,
+            "last_alert_at": self.last_fast_alert_at,
+            "last_alert_kind": self.last_fast_alert_kind,
+            "live_execution": False,
+        }
+
     @staticmethod
     def _runner_risk_changes(
         previous: RunnerCandidate,
@@ -2754,6 +3611,7 @@ class SmartMoneyEngine:
                 refresh_market=True,
                 deep_forensics=deep,
             )
+            await self._maybe_publish_fast_watch(candidate)
             await self._maybe_publish_fresh(candidate)
             await self._maybe_publish_runner(candidate)
             elapsed = int(time.monotonic() - started_monotonic)
@@ -3859,11 +4717,21 @@ class SmartMoneyEngine:
         # A contract in a news/X post is only a nomination. Run the complete coin
         # verification pipeline first; never publish the headline as proof that the
         # token is safe, liquid, or authentically promoted.
+        event = await self.observe_catalyst(alert, now=now)
         if alert.token_mints:
             self._remember_news_event(alert, now=now)
             for mint in alert.token_mints:
                 self._queue_coin_callout(mint)
+            if event is not None and publish:
+                for mint in alert.token_mints:
+                    with suppress(Exception):
+                        await self.evaluate_catalyst_token(mint=mint, event=event, now=now)
             return
+        if event is not None and publish and not alert.token_mints:
+            # An event with no token yet is still worth surfacing on its own
+            # merits; the token half stays absent rather than being guessed.
+            with suppress(Exception):
+                await self._maybe_publish_catalyst(event, now=now)
         preliminary = score_launch_opportunity(
             alert,
             now=now,

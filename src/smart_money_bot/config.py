@@ -213,6 +213,23 @@ class Settings:
     fomo_fast_watch_min_actionability: Decimal
     fomo_current_radar_suppress_stale: bool
 
+    # --- realtime alpha engine (v2.38) -----------------------------------
+    fomo_fast_watch_publish_enabled: bool
+    fomo_fast_watch_min_score: Decimal
+    fomo_fast_watch_max_queue_age_seconds: int
+    fomo_fast_watch_cooldown_seconds: int
+    fomo_fast_watch_max_per_hour: int
+    fomo_notable_alerts_enabled: bool
+    fomo_notable_min_trade_usd: Decimal
+    fomo_notable_ping_enabled: bool
+    fomo_notable_max_signal_age_seconds: int
+    fomo_catalyst_alerts_enabled: bool
+    fomo_catalyst_max_event_age_seconds: int
+    fomo_catalyst_ping_enabled: bool
+    fomo_confluence_alerts_enabled: bool
+    fomo_alert_enrichment_enabled: bool
+    fomo_alert_enrichment_delay_seconds: int
+
     news_radar_enabled: bool
     x_news_stream_enabled: bool
     x_news_stream_rule: str
@@ -530,6 +547,29 @@ class Settings:
             ),
             fomo_current_radar_suppress_stale=_bool(
                 "FOMO_CURRENT_RADAR_SUPPRESS_STALE", True
+            ),
+            fomo_fast_watch_publish_enabled=_bool("FOMO_FAST_WATCH_PUBLISH_ENABLED", True),
+            fomo_fast_watch_min_score=_decimal("FOMO_FAST_WATCH_MIN_SCORE", "55"),
+            fomo_fast_watch_max_queue_age_seconds=_int(
+                "FOMO_FAST_WATCH_MAX_QUEUE_AGE_SECONDS", 300
+            ),
+            fomo_fast_watch_cooldown_seconds=_int("FOMO_FAST_WATCH_COOLDOWN_SECONDS", 1800),
+            fomo_fast_watch_max_per_hour=_int("FOMO_FAST_WATCH_MAX_PER_HOUR", 12),
+            fomo_notable_alerts_enabled=_bool("FOMO_NOTABLE_ALERTS_ENABLED", True),
+            fomo_notable_min_trade_usd=_decimal("FOMO_NOTABLE_MIN_TRADE_USD", "250"),
+            fomo_notable_ping_enabled=_bool("FOMO_NOTABLE_PING_ENABLED", False),
+            fomo_notable_max_signal_age_seconds=_int(
+                "FOMO_NOTABLE_MAX_SIGNAL_AGE_SECONDS", 900
+            ),
+            fomo_catalyst_alerts_enabled=_bool("FOMO_CATALYST_ALERTS_ENABLED", True),
+            fomo_catalyst_max_event_age_seconds=_int(
+                "FOMO_CATALYST_MAX_EVENT_AGE_SECONDS", 3600
+            ),
+            fomo_catalyst_ping_enabled=_bool("FOMO_CATALYST_PING_ENABLED", False),
+            fomo_confluence_alerts_enabled=_bool("FOMO_CONFLUENCE_ALERTS_ENABLED", True),
+            fomo_alert_enrichment_enabled=_bool("FOMO_ALERT_ENRICHMENT_ENABLED", True),
+            fomo_alert_enrichment_delay_seconds=_int(
+                "FOMO_ALERT_ENRICHMENT_DELAY_SECONDS", 45
             ),
             news_radar_enabled=_bool("NEWS_RADAR_ENABLED", True),
             x_news_stream_enabled=_bool("X_NEWS_STREAM_ENABLED", False),
@@ -905,6 +945,30 @@ class Settings:
             raise ValueError("FOMO_FAST_WATCH_MIN_ACTIONABILITY must be between 0 and 100")
         if not self.fomo_discovery_source_name or len(self.fomo_discovery_source_name) > 64:
             raise ValueError("FOMO_DISCOVERY_SOURCE_NAME must be 1-64 characters")
+        if not 0 <= self.fomo_fast_watch_min_score <= 100:
+            raise ValueError("FOMO_FAST_WATCH_MIN_SCORE must be between 0 and 100")
+        if not 30 <= self.fomo_fast_watch_max_queue_age_seconds <= 3600:
+            raise ValueError(
+                "FOMO_FAST_WATCH_MAX_QUEUE_AGE_SECONDS must be between 30 and 3600"
+            )
+        if not 0 <= self.fomo_fast_watch_cooldown_seconds <= 86_400:
+            raise ValueError("FOMO_FAST_WATCH_COOLDOWN_SECONDS must be between 0 and 86400")
+        if not 0 <= self.fomo_fast_watch_max_per_hour <= 500:
+            raise ValueError("FOMO_FAST_WATCH_MAX_PER_HOUR must be between 0 and 500")
+        if self.fomo_notable_min_trade_usd < 0:
+            raise ValueError("FOMO_NOTABLE_MIN_TRADE_USD cannot be negative")
+        if not 60 <= self.fomo_notable_max_signal_age_seconds <= 86_400:
+            raise ValueError(
+                "FOMO_NOTABLE_MAX_SIGNAL_AGE_SECONDS must be between 60 and 86400"
+            )
+        if not 60 <= self.fomo_catalyst_max_event_age_seconds <= 604_800:
+            raise ValueError(
+                "FOMO_CATALYST_MAX_EVENT_AGE_SECONDS must be between 60 and 604800"
+            )
+        if not 0 <= self.fomo_alert_enrichment_delay_seconds <= 900:
+            raise ValueError(
+                "FOMO_ALERT_ENRICHMENT_DELAY_SECONDS must be between 0 and 900"
+            )
         if len(self.x_news_stream_rule) > 1024:
             raise ValueError("X_NEWS_STREAM_RULE cannot exceed 1024 characters")
         if not 15 <= self.news_poll_seconds <= 3600:

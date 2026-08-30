@@ -735,6 +735,98 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_runner_discovery_source
                 ON runner_discovery(source_name, first_seen_at DESC);
 
+            -- Real-time alpha engine (v2.38).  All additive.
+
+            -- Verified public wallet mappings.  A wallet with ONCHAIN_ONLY
+            -- provenance is deliberately anonymous: it earns standing from
+            -- forward outcomes, never from a guessed identity.
+            CREATE TABLE IF NOT EXISTS notable_wallets (
+                wallet TEXT PRIMARY KEY,
+                label TEXT NOT NULL DEFAULT '',
+                provenance TEXT NOT NULL DEFAULT 'ONCHAIN_ONLY',
+                verification_source TEXT NOT NULL DEFAULT '',
+                confidence REAL NOT NULL DEFAULT 0,
+                category TEXT NOT NULL DEFAULT 'trader',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                anonymous_index INTEGER,
+                last_verified_at INTEGER,
+                updated_at INTEGER NOT NULL
+            );
+
+            -- One row per observed public trade by a monitored wallet.  Keyed by
+            -- signature so a retry or a restart cannot duplicate an alert.
+            CREATE TABLE IF NOT EXISTS notable_wallet_events (
+                signature TEXT NOT NULL,
+                wallet TEXT NOT NULL,
+                mint TEXT NOT NULL,
+                side TEXT NOT NULL DEFAULT 'BUY',
+                chain_time INTEGER NOT NULL DEFAULT 0,
+                observed_at INTEGER NOT NULL,
+                amount_usd REAL,
+                entry_price_usd REAL,
+                entry_market_cap_usd REAL,
+                detection_market_cap_usd REAL,
+                freshness TEXT NOT NULL DEFAULT 'FRESH',
+                alerted_at INTEGER,
+                message_id INTEGER,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                PRIMARY KEY (signature, wallet, mint)
+            );
+            CREATE INDEX IF NOT EXISTS idx_notable_events_recent
+                ON notable_wallet_events(observed_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_notable_events_mint
+                ON notable_wallet_events(mint, chain_time DESC);
+
+            -- Graded catalyst events, kept separate from any token claim.
+            CREATE TABLE IF NOT EXISTS catalyst_events (
+                event_id TEXT PRIMARY KEY,
+                headline TEXT NOT NULL,
+                detected_at INTEGER NOT NULL,
+                occurred_at INTEGER,
+                confidence TEXT NOT NULL DEFAULT 'UNVERIFIED',
+                priority TEXT NOT NULL DEFAULT 'NORMAL',
+                markers_json TEXT NOT NULL DEFAULT '[]',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_catalyst_recent
+                ON catalyst_events(detected_at DESC);
+
+            -- Token <-> event connection is a DIFFERENT question from event
+            -- confidence and is stored separately so the two can never merge.
+            CREATE TABLE IF NOT EXISTS catalyst_token_links (
+                event_id TEXT NOT NULL,
+                mint TEXT NOT NULL,
+                connection TEXT NOT NULL DEFAULT 'NO_EVIDENCE',
+                name_similarity REAL,
+                seconds_after_event INTEGER,
+                official INTEGER NOT NULL DEFAULT 0,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (event_id, mint)
+            );
+            CREATE INDEX IF NOT EXISTS idx_catalyst_links_mint
+                ON catalyst_token_links(mint, created_at DESC);
+
+            -- Published fast alerts, so a restart cannot re-ping and so a later
+            -- enrichment pass can edit the original message.
+            CREATE TABLE IF NOT EXISTS fast_alerts (
+                alert_key TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                mint TEXT NOT NULL,
+                published_at INTEGER NOT NULL,
+                message_id INTEGER,
+                channel_id INTEGER,
+                pinged INTEGER NOT NULL DEFAULT 0,
+                fingerprint TEXT NOT NULL DEFAULT '',
+                enriched_at INTEGER,
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_fast_alerts_recent
+                ON fast_alerts(published_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_fast_alerts_mint
+                ON fast_alerts(mint, published_at DESC);
+
             CREATE TABLE IF NOT EXISTS lab_token_identity (
                 mint TEXT PRIMARY KEY,
                 payload_json TEXT NOT NULL,
@@ -3940,6 +4032,302 @@ class Database:
             except Exception:
                 await self.db.rollback()
                 raise
+
+    async def reserve_fast_alert(
+        self,
+        *,
+        alert_key: str,
+        kind: str,
+        mint: str,
+        now: int,
+        fingerprint: str = "",
+        pinged: bool = False,
+    ) -> bool:
+        """Claim the right to publish one fast alert exactly once.
+
+        Returns ``False`` when this alert was already published, which is what
+        makes a restart or a retried coroutine unable to re-ping.
+        """
+
+        async with self._write_lock:
+            cursor = await self.db.execute(
+                """
+                INSERT OR IGNORE INTO fast_alerts (
+                    alert_key, kind, mint, published_at, pinged, fingerprint
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (alert_key, kind, mint, now, 1 if pinged else 0, fingerprint),
+            )
+            await self.db.commit()
+            return bool(cursor.rowcount)
+
+    async def attach_fast_alert_message(
+        self,
+        *,
+        alert_key: str,
+        message_id: int | None,
+        channel_id: int | None,
+    ) -> None:
+        """Remember where a fast alert landed so enrichment can edit it."""
+
+        async with self._write_lock:
+            await self.db.execute(
+                "UPDATE fast_alerts SET message_id = ?, channel_id = ? WHERE alert_key = ?",
+                (message_id, channel_id, alert_key),
+            )
+            await self.db.commit()
+
+    async def release_fast_alert(self, alert_key: str) -> None:
+        """Give back an unpublished reservation.
+
+        A card Discord refused was never seen, so holding its lock would
+        silence that alert permanently.  Releasing lets the next cycle retry;
+        a card that *was* delivered keeps its lock and can never re-ping.
+        """
+
+        async with self._write_lock:
+            await self.db.execute(
+                "DELETE FROM fast_alerts WHERE alert_key = ? AND message_id IS NULL",
+                (alert_key,),
+            )
+            await self.db.commit()
+
+    async def fast_alert_row(self, alert_key: str) -> dict[str, Any] | None:
+        cursor = await self.db.execute(
+            "SELECT * FROM fast_alerts WHERE alert_key = ?", (alert_key,)
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def mark_fast_alert_enriched(self, *, alert_key: str, now: int) -> None:
+        async with self._write_lock:
+            await self.db.execute(
+                "UPDATE fast_alerts SET enriched_at = ? WHERE alert_key = ?", (now, alert_key)
+            )
+            await self.db.commit()
+
+    async def recent_fast_alerts(self, *, limit: int = 20) -> list[dict[str, Any]]:
+        cursor = await self.db.execute(
+            "SELECT * FROM fast_alerts ORDER BY published_at DESC LIMIT ?", (limit,)
+        )
+        return [dict(row) for row in await cursor.fetchall()]
+
+    async def record_notable_event(
+        self,
+        *,
+        signature: str,
+        wallet: str,
+        mint: str,
+        side: str,
+        chain_time: int,
+        observed_at: int,
+        amount_usd: float | None = None,
+        entry_price_usd: float | None = None,
+        entry_market_cap_usd: float | None = None,
+        detection_market_cap_usd: float | None = None,
+        freshness: str = "FRESH",
+    ) -> bool:
+        """Persist a public wallet trade the instant it is observed.
+
+        This is the first thing that happens on the fast path, before any
+        enrichment, so a slow provider can never delay the record or the alert.
+        """
+
+        async with self._write_lock:
+            cursor = await self.db.execute(
+                """
+                INSERT OR IGNORE INTO notable_wallet_events (
+                    signature, wallet, mint, side, chain_time, observed_at,
+                    amount_usd, entry_price_usd, entry_market_cap_usd,
+                    detection_market_cap_usd, freshness
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    signature,
+                    wallet,
+                    mint,
+                    side,
+                    chain_time,
+                    observed_at,
+                    amount_usd,
+                    entry_price_usd,
+                    entry_market_cap_usd,
+                    detection_market_cap_usd,
+                    freshness,
+                ),
+            )
+            await self.db.commit()
+            return bool(cursor.rowcount)
+
+    async def notable_events_for(self, mint: str, *, limit: int = 25) -> list[dict[str, Any]]:
+        cursor = await self.db.execute(
+            """
+            SELECT * FROM notable_wallet_events
+            WHERE mint = ? ORDER BY chain_time DESC LIMIT ?
+            """,
+            (mint, limit),
+        )
+        return [dict(row) for row in await cursor.fetchall()]
+
+    async def recent_notable_events(self, *, limit: int = 25) -> list[dict[str, Any]]:
+        cursor = await self.db.execute(
+            "SELECT * FROM notable_wallet_events ORDER BY observed_at DESC LIMIT ?", (limit,)
+        )
+        return [dict(row) for row in await cursor.fetchall()]
+
+    async def upsert_notable_wallet(
+        self,
+        *,
+        wallet: str,
+        label: str,
+        provenance: str,
+        verification_source: str,
+        confidence: float,
+        category: str,
+        enabled: bool,
+        anonymous_index: int | None,
+        last_verified_at: int | None,
+        now: int,
+    ) -> None:
+        async with self._write_lock:
+            await self.db.execute(
+                """
+                INSERT INTO notable_wallets (
+                    wallet, label, provenance, verification_source, confidence,
+                    category, enabled, anonymous_index, last_verified_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(wallet) DO UPDATE SET
+                    label = excluded.label,
+                    provenance = excluded.provenance,
+                    verification_source = excluded.verification_source,
+                    confidence = excluded.confidence,
+                    category = excluded.category,
+                    enabled = excluded.enabled,
+                    anonymous_index = COALESCE(
+                        notable_wallets.anonymous_index, excluded.anonymous_index
+                    ),
+                    last_verified_at = excluded.last_verified_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    wallet,
+                    label,
+                    provenance,
+                    verification_source,
+                    confidence,
+                    category,
+                    1 if enabled else 0,
+                    anonymous_index,
+                    last_verified_at,
+                    now,
+                ),
+            )
+            await self.db.commit()
+
+    async def notable_wallet_rows(self, *, enabled_only: bool = True) -> list[dict[str, Any]]:
+        query = "SELECT * FROM notable_wallets"
+        if enabled_only:
+            query += " WHERE enabled = 1"
+        cursor = await self.db.execute(query + " ORDER BY wallet")
+        return [dict(row) for row in await cursor.fetchall()]
+
+    async def store_catalyst_event(
+        self,
+        *,
+        event_id: str,
+        headline: str,
+        detected_at: int,
+        occurred_at: int | None,
+        confidence: str,
+        priority: str,
+        markers_json: str,
+        payload_json: str,
+        now: int,
+    ) -> None:
+        async with self._write_lock:
+            await self.db.execute(
+                """
+                INSERT INTO catalyst_events (
+                    event_id, headline, detected_at, occurred_at, confidence,
+                    priority, markers_json, payload_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(event_id) DO UPDATE SET
+                    confidence = excluded.confidence,
+                    priority = excluded.priority,
+                    markers_json = excluded.markers_json,
+                    payload_json = excluded.payload_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    event_id,
+                    headline,
+                    detected_at,
+                    occurred_at,
+                    confidence,
+                    priority,
+                    markers_json,
+                    payload_json,
+                    now,
+                ),
+            )
+            await self.db.commit()
+
+    async def store_catalyst_link(
+        self,
+        *,
+        event_id: str,
+        mint: str,
+        connection: str,
+        name_similarity: float | None,
+        seconds_after_event: int | None,
+        official: bool,
+        payload_json: str,
+        now: int,
+    ) -> None:
+        async with self._write_lock:
+            await self.db.execute(
+                """
+                INSERT INTO catalyst_token_links (
+                    event_id, mint, connection, name_similarity,
+                    seconds_after_event, official, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(event_id, mint) DO UPDATE SET
+                    connection = excluded.connection,
+                    name_similarity = excluded.name_similarity,
+                    seconds_after_event = excluded.seconds_after_event,
+                    official = excluded.official,
+                    payload_json = excluded.payload_json
+                """,
+                (
+                    event_id,
+                    mint,
+                    connection,
+                    name_similarity,
+                    seconds_after_event,
+                    1 if official else 0,
+                    payload_json,
+                    now,
+                ),
+            )
+            await self.db.commit()
+
+    async def recent_catalyst_events(self, *, limit: int = 10) -> list[dict[str, Any]]:
+        cursor = await self.db.execute(
+            "SELECT * FROM catalyst_events ORDER BY detected_at DESC LIMIT ?", (limit,)
+        )
+        return [dict(row) for row in await cursor.fetchall()]
+
+    async def catalyst_links_for(self, mint: str, *, limit: int = 10) -> list[dict[str, Any]]:
+        cursor = await self.db.execute(
+            """
+            SELECT l.*, e.headline, e.confidence, e.priority, e.detected_at
+            FROM catalyst_token_links AS l
+            JOIN catalyst_events AS e ON e.event_id = l.event_id
+            WHERE l.mint = ? ORDER BY l.created_at DESC LIMIT ?
+            """,
+            (mint, limit),
+        )
+        return [dict(row) for row in await cursor.fetchall()]
 
     async def record_discovery(
         self,

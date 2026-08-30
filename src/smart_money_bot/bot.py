@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import csv
 import io
+import json
 import logging
 import time
 from contextlib import suppress
@@ -18,7 +19,12 @@ from discord.ext import commands
 from solders.pubkey import Pubkey
 
 from .config import Settings
-from .constants import BOT_VERSION, PAPER_DEMO_ENTRY_PRICE_USD, PAPER_DEMO_MINT
+from .constants import (
+    BOT_VERSION,
+    PAPER_DEMO_ENTRY_PRICE_USD,
+    PAPER_DEMO_MINT,
+    fomo_coin_url,
+)
 from .discord_render import (
     P_ABOUT,
     P_DEMAND,
@@ -34,10 +40,13 @@ from .discord_render import (
     CardField,
     CardSpec,
     build_embed,
+    edit_cards,
     resolve_with_cards,
+    send_cards,
 )
 from .engine import SmartMoneyEngine
 from .errors import DiscoveryError, JupiterError, PumpLaunchError
+from .fast_alerts import EnrichmentUpdate, FastAlert
 from .lab.decision import Decision
 from .lab.evidence import buyer_evidence, organic_demand_text
 from .lab.exits import PaperPosition
@@ -143,19 +152,11 @@ def _split_discord_text(text: str, *, limit: int = 1900) -> tuple[str, ...]:
     return tuple(chunks) or ("No status data was produced.",)
 
 
-FOMO_SOLANA_CHAIN_ID = "1399811149"
 PAPER_DEMO_ENTRY_PRICE = Decimal(PAPER_DEMO_ENTRY_PRICE_USD)
 
 
 def _fomo_coin_url(mint: str, referral_code: str | None = None) -> str:
-    query = {
-        "address": mint,
-        "chainId": FOMO_SOLANA_CHAIN_ID,
-    }
-    if referral_code:
-        query["r"] = referral_code
-    query["source"] = "share_link"
-    return f"https://fomo.family/coin?{urlencode(query)}"
+    return fomo_coin_url(mint, referral_code)
 
 
 def _token_view(mint: str, fomo_referral_code: str | None = None) -> discord.ui.View:
@@ -2879,6 +2880,9 @@ class SmartMoneyBot(commands.Bot):
         self.engine = SmartMoneyEngine(settings, notifier=self)
         self._engine_started = False
         self._last_unmatched_sell_alert: dict[str, int] = {}
+        # Published fast-alert messages, so stage-2 enrichment edits the
+        # original card instead of sending a second ping.
+        self._fast_alert_messages: dict[str, discord.Message] = {}
 
     async def setup_hook(self) -> None:
         await self.engine.initialize()
@@ -3122,6 +3126,62 @@ class SmartMoneyBot(commands.Bot):
             ping_user=True,
             view=RunnerAlertView(self, candidate),
         )
+
+    async def on_fast_alert(self, alert: FastAlert) -> bool:
+        """Publish a stage-1 fast alert through the shared safe renderer.
+
+        The card is research visibility only.  It carries no buy control, and
+        a ping happens only for the classes that earned one — a late
+        observation is published quietly rather than interrupting anyone.
+        """
+
+        channel = await self._alert_channel()
+        if channel is None:
+            return False
+        alert_user_id = self.settings.discord_alert_user_id
+        should_ping = alert.may_ping and alert_user_id is not None
+        message = await send_cards(
+            channel,
+            [alert.spec],
+            content=f"<@{alert_user_id}>" if should_ping else None,
+            view=(
+                _token_view(alert.token_mint, self.settings.fomo_referral_code)
+                if alert.token_mint
+                else None
+            ),
+            allowed_mentions=(
+                discord.AllowedMentions(users=True, roles=False, everyone=False)
+                if should_ping
+                else discord.AllowedMentions.none()
+            ),
+            fallback_text=(
+                f"{alert.kind.replace('_', ' ')} • `{alert.token_mint or alert.mint}` — "
+                "the card exceeded Discord's limits. Research only; nothing was bought."
+            ),
+        )
+        if message is None:
+            return False
+        self._fast_alert_messages[alert.alert_key] = message
+        if len(self._fast_alert_messages) > 200:
+            for key in list(self._fast_alert_messages)[:100]:
+                self._fast_alert_messages.pop(key, None)
+        with suppress(Exception):
+            await self.engine.database.attach_fast_alert_message(
+                alert_key=alert.alert_key,
+                message_id=getattr(message, "id", None),
+                channel_id=getattr(getattr(message, "channel", None), "id", None),
+            )
+        return True
+
+    async def on_fast_alert_enrichment(
+        self, alert: FastAlert, update: EnrichmentUpdate
+    ) -> bool:
+        """Stage 2 edits the original card.  It never sends a second ping."""
+
+        message = self._fast_alert_messages.get(alert.alert_key)
+        if message is None:
+            return False
+        return await edit_cards(message, [update.apply(alert.spec)])
 
     async def on_runner_fresh(self, candidate: RunnerCandidate) -> bool:
         return await self._send_alert(
@@ -4347,6 +4407,19 @@ class SmartMoneyCommands(
             if observation_mode
             else _raw_entry_gate_status(s.paper_raw_entry_filter_enabled)
         )
+        realtime = self.bot.engine.realtime_status()
+        realtime_age = realtime.get("stream_last_event_age")
+        realtime_lanes = " • ".join(
+            f"{label} {'ON' if realtime.get(key) else 'OFF'}"
+            for label, key in (
+                ("fast watch", "fast_watch_enabled"),
+                ("notable", "notable_alerts_enabled"),
+                ("catalyst", "catalyst_alerts_enabled"),
+                ("confluence", "confluence_alerts_enabled"),
+                ("social radar", "social_radar_enabled"),
+                ("enrichment", "enrichment_enabled"),
+            )
+        )
         pump_verified = status["rotation_verified_pump_wallets"]
         pump_verified_text = str(pump_verified) if pump_verified is not None else "not checked yet"
         text = (
@@ -4458,6 +4531,21 @@ class SmartMoneyCommands(
             f"**Five-minute rotation:** {rotation_refresh}\n"
             f"**Realtime wallet stream:** {stream_status} • "
             f"{status['stream_commitment']} trigger\n"
+            f"**Realtime alpha lanes:** {realtime_lanes}\n"
+            f"**Realtime alerts:** published "
+            f"{realtime['alerts_published']} • suppressed "
+            f"{realtime['alerts_suppressed']} • last "
+            f"{realtime['last_alert_kind'] or 'none'}"
+            + (
+                f" ({int(time.time()) - int(realtime['last_alert_at'])}s ago)"
+                if realtime["last_alert_at"]
+                else ""
+            )
+            + "\n"
+            "**Last realtime stream event:** "
+            + (f"{realtime_age}s ago" if isinstance(realtime_age, int) else "no event yet")
+            + "\n"
+            "**Live autonomous execution:** DISABLED (research and PAPER only)\n"
             f"**Last scan:** {last_scan}\n"
             f"**Last error:** {status['last_error'] or 'none'}"
         )
@@ -5079,6 +5167,260 @@ def _lab_smartmoney_embed(payload: dict[str, object]) -> discord.Embed:
     )
     embed.set_footer(
         text="Smart money can strengthen a valid setup; it can never rescue an invalid one"
+    )
+    return _clamp_embed(embed)
+
+
+def _relative_age(timestamp: object) -> str:
+    try:
+        moment = int(timestamp)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return "unknown"
+    if moment <= 0:
+        return "unknown"
+    seconds = max(0, int(time.time()) - moment)
+    if seconds < 90:
+        return f"{seconds}s ago"
+    if seconds < 5_400:
+        return f"{seconds // 60}m ago"
+    if seconds < 172_800:
+        return f"{seconds // 3600}h ago"
+    return f"{seconds // 86_400}d ago"
+
+
+def _catalyst_feed_embed(rows: tuple[dict, ...]) -> discord.Embed:
+    """Events graded on their own evidence, with no token claim attached."""
+
+    embed = discord.Embed(
+        title="CATALYST FEED",
+        description=(
+            "Real-world events graded on source integrity alone.\n"
+            "**An event being real is never evidence that a token is real** — the "
+            "token↔event connection is a separate, independently graded question, "
+            "and no catalyst can make anything entry eligible."
+        ),
+        colour=0xF1C40F,
+        timestamp=discord.utils.utcnow(),
+    )
+    if not rows:
+        embed.add_field(
+            name="No graded events yet",
+            value=(
+                "Nothing has cleared the event grader in the retention window. "
+                "Nothing is inferred to fill the gap."
+            ),
+            inline=False,
+        )
+        return _clamp_embed(embed)
+    for row in rows[:8]:
+        markers = ""
+        raw_markers = row.get("markers_json")
+        if raw_markers:
+            with suppress(ValueError, TypeError):
+                parsed = json.loads(str(raw_markers))
+                if parsed:
+                    markers = "\n⚠ " + ", ".join(
+                        str(item).replace("_", " ").lower() for item in parsed
+                    )
+        confirmations = ""
+        raw_payload = row.get("payload_json")
+        if raw_payload:
+            with suppress(ValueError, TypeError):
+                payload = json.loads(str(raw_payload))
+                confirmations = (
+                    f" • independent confirmations "
+                    f"`{payload.get('independent_confirmations', 0)}`"
+                )
+        embed.add_field(
+            name=str(row.get("headline") or "untitled event")[:DISCORD_EMBED_TITLE_LIMIT],
+            value=(
+                f"Confidence **{row.get('confidence')}** • priority "
+                f"**{row.get('priority')}**{confirmations}\n"
+                f"Detected {_relative_age(row.get('detected_at'))}{markers}"
+            )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+            inline=False,
+        )
+    embed.set_footer(text="EVENT VERIFIED ≠ TOKEN VERIFIED • research only")
+    return _clamp_embed(embed)
+
+
+def _catalyst_link_embed(mint: str, rows: tuple[dict, ...]) -> discord.Embed:
+    embed = discord.Embed(
+        title=f"CATALYST LINK — {_short(mint)}",
+        description=f"`{mint}`",
+        colour=0xF1C40F,
+        timestamp=discord.utils.utcnow(),
+    )
+    if not rows:
+        embed.add_field(
+            name="No event connection recorded",
+            value=(
+                "No graded event has been correlated with this mint. A missing "
+                "connection stays missing; it is never upgraded by a name match alone."
+            ),
+            inline=False,
+        )
+        return _clamp_embed(embed)
+    for row in rows[:8]:
+        similarity = row.get("name_similarity")
+        delay = row.get("seconds_after_event")
+        embed.add_field(
+            name=str(row.get("headline") or row.get("event_id"))[:DISCORD_EMBED_TITLE_LIMIT],
+            value=(
+                f"Connection **{str(row.get('connection') or 'NONE').replace('_', ' ')}**"
+                f"{' — OFFICIAL' if row.get('official') else ' — NOT OFFICIAL'}\n"
+                f"Event confidence `{row.get('confidence', 'UNKNOWN')}` • name similarity "
+                f"`{similarity if similarity is not None else 'unknown'}`\n"
+                f"Minted `{delay if delay is not None else '?'}s` after the event"
+            )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+            inline=False,
+        )
+    embed.set_footer(
+        text="A name match is a coincidence until the event's own source publishes the mint"
+    )
+    return _clamp_embed(embed)
+
+
+def _confluence_embed(rows: tuple[dict, ...]) -> discord.Embed:
+    """Where the realtime lanes currently agree — visibility, never eligibility."""
+
+    interesting = [
+        row
+        for row in rows
+        if str(row.get("kind")) in {"CONFLUENCE_WATCH", "BREAKING_CATALYST", "CATALYST_WATCH"}
+    ]
+    embed = discord.Embed(
+        title="CONFLUENCE WATCH",
+        description=(
+            "Where independent notable wallets, a graded event and current market "
+            "evidence line up at the same time.\n"
+            "**Confluence raises priority, never eligibility.** Safety, independence "
+            "and cost gates are unchanged, and none of these is entry eligible."
+        ),
+        colour=0x9B59B6,
+        timestamp=discord.utils.utcnow(),
+    )
+    if not interesting:
+        embed.add_field(
+            name="No current confluence",
+            value=(
+                "Nothing currently has multiple independent lanes agreeing. "
+                "Nothing is invented to fill the board."
+            ),
+            inline=False,
+        )
+        return _clamp_embed(embed)
+    for row in interesting[:8]:
+        embed.add_field(
+            name=f"{str(row.get('kind')).replace('_', ' ')} — {_short(str(row.get('mint')))}",
+            value=(
+                f"`{row.get('mint')}`\n"
+                f"Published {_relative_age(row.get('published_at'))}"
+                f"{' • pinged' if row.get('pinged') else ' • no ping'}"
+                f"{' • enriched' if row.get('enriched_at') else ' • enrichment pending'}"
+            )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+            inline=False,
+        )
+    embed.set_footer(text="RESEARCH ONLY — no automatic entry, no automatic spend")
+    return _clamp_embed(embed)
+
+
+def _notable_embed(rows: tuple[dict, ...], *, mint: str = "") -> discord.Embed:
+    embed = discord.Embed(
+        title=f"NOTABLE WALLET ACTIVITY{f' — {_short(mint)}' if mint else ''}",
+        description=(
+            "Public on-chain trades by monitored wallets, as observed.\n"
+            "Wallets without a verified public mapping stay anonymous: **no identity "
+            "is ever inferred, and no unknown wallet is deanonymized.**"
+        ),
+        colour=0x2ECC71,
+        timestamp=discord.utils.utcnow(),
+    )
+    if not rows:
+        embed.add_field(
+            name="Nothing observed yet",
+            value="The realtime lane has recorded no qualifying wallet activity.",
+            inline=False,
+        )
+        return _clamp_embed(embed)
+    for row in rows[:10]:
+        delay = None
+        chain_time = row.get("chain_time")
+        observed_at = row.get("observed_at")
+        if chain_time and observed_at:
+            delay = max(0, int(observed_at) - int(chain_time))
+        amount = row.get("amount_usd")
+        entry_cap = row.get("entry_market_cap_usd")
+        embed.add_field(
+            name=(
+                f"{str(row.get('side') or 'BUY')} {_short(str(row.get('mint')))} • "
+                f"wallet {_short(str(row.get('wallet')))}"
+            )[:DISCORD_EMBED_TITLE_LIMIT],
+            value=(
+                f"Size `{_money(Decimal(str(amount))) if amount is not None else 'unknown'}` • "
+                f"entry MC "
+                f"`{_money(Decimal(str(entry_cap))) if entry_cap is not None else 'unknown'}`\n"
+                f"Chain event {_relative_age(chain_time)} • observed "
+                f"`{delay if delay is not None else '?'}s` later • freshness "
+                f"`{row.get('freshness') or 'UNKNOWN'}`"
+            )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+            inline=False,
+        )
+    embed.set_footer(text="Visibility only — a copied wallet is never an automatic PAPER entry")
+    return _clamp_embed(embed)
+
+
+def _realtime_embed(status: dict[str, object], alerts: tuple[dict, ...]) -> discord.Embed:
+    connected = bool(status.get("stream_connected"))
+    age = status.get("stream_last_event_age")
+    embed = discord.Embed(
+        title="REALTIME ALPHA LANE",
+        description=(
+            f"Wallet stream **{'CONNECTED' if connected else 'DISCONNECTED'}** • "
+            f"subscriptions `{status.get('stream_subscriptions', 0)}`\n"
+            f"Last stream event: "
+            f"{f'`{age}s` ago' if isinstance(age, int) else '`no event yet`'}\n"
+            "**Live execution: DISABLED.** Nothing in this lane can buy, sell, sign, "
+            "spend SOL, or launch."
+        ),
+        colour=0x2ECC71 if connected else 0xE67E22,
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(
+        name="Lanes",
+        value=(
+            f"Fast watch `{'ON' if status.get('fast_watch_enabled') else 'OFF'}` • "
+            f"notable `{'ON' if status.get('notable_alerts_enabled') else 'OFF'}` "
+            f"(ping `{'ON' if status.get('notable_ping_enabled') else 'OFF'}`)\n"
+            f"Catalyst `{'ON' if status.get('catalyst_alerts_enabled') else 'OFF'}` • "
+            f"confluence `{'ON' if status.get('confluence_alerts_enabled') else 'OFF'}` • "
+            f"social radar `{'ON' if status.get('social_radar_enabled') else 'OFF'}`\n"
+            f"Async enrichment `{'ON' if status.get('enrichment_enabled') else 'OFF'}`"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Throughput",
+        value=(
+            f"Published `{status.get('alerts_published', 0)}` • suppressed "
+            f"`{status.get('alerts_suppressed', 0)}` (duplicate, stale or rate limited)\n"
+            f"Last alert `{status.get('last_alert_kind') or 'none'}` "
+            f"{_relative_age(status.get('last_alert_at'))}"
+        ),
+        inline=False,
+    )
+    if alerts:
+        embed.add_field(
+            name="Most recent",
+            value="\n".join(
+                f"• `{row.get('kind')}` {_short(str(row.get('mint')))} "
+                f"{_relative_age(row.get('published_at'))}"
+                for row in alerts[:6]
+            )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+            inline=False,
+        )
+    embed.set_footer(
+        text="Speed changes what you SEE, never what the bot is allowed to DO"
     )
     return _clamp_embed(embed)
 
@@ -5972,6 +6314,82 @@ class FomoCommands(
         await interaction.response.defer(thinking=True, ephemeral=True)
         payload = await self.bot.engine.lab_smart_money(exact_mint)
         await self._resolve_lab(interaction, embed=_lab_smartmoney_embed(payload))
+
+    @app_commands.command(
+        name="catalysts",
+        description="Recent graded real-world catalyst events and their source integrity.",
+    )
+    async def catalysts(self, interaction: discord.Interaction) -> None:
+        if not await self._require_admin(interaction):
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        rows = await self.bot.engine.catalyst_feed(limit=8)
+        await self._resolve_lab(interaction, embed=_catalyst_feed_embed(rows))
+
+    @app_commands.command(
+        name="catalyst",
+        description="How strongly one exact mint is connected to a real event.",
+    )
+    @app_commands.describe(mint="Exact Solana token mint; ticker searches are not accepted")
+    async def catalyst(self, interaction: discord.Interaction, mint: str) -> None:
+        if not await self._require_admin(interaction):
+            return
+        try:
+            exact_mint = str(Pubkey.from_string(mint.strip()))
+        except ValueError:
+            await interaction.response.send_message(
+                "Enter an exact valid Solana mint. Ticker searches are not accepted.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        rows = await self.bot.engine.catalyst_links(exact_mint, limit=8)
+        await self._resolve_lab(interaction, embed=_catalyst_link_embed(exact_mint, rows))
+
+    @app_commands.command(
+        name="confluence",
+        description="Where realtime wallets, events and market evidence currently agree.",
+    )
+    async def confluence(self, interaction: discord.Interaction) -> None:
+        if not await self._require_admin(interaction):
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        alerts = await self.bot.engine.fast_alert_feed(limit=25)
+        await self._resolve_lab(interaction, embed=_confluence_embed(alerts))
+
+    @app_commands.command(
+        name="notable",
+        description="Public wallet activity the realtime lane actually observed.",
+    )
+    @app_commands.describe(mint="Optional exact Solana mint to filter by")
+    async def notable(self, interaction: discord.Interaction, mint: str = "") -> None:
+        if not await self._require_admin(interaction):
+            return
+        exact_mint = ""
+        if mint.strip():
+            try:
+                exact_mint = str(Pubkey.from_string(mint.strip()))
+            except ValueError:
+                await interaction.response.send_message(
+                    "Enter an exact valid Solana mint. Ticker searches are not accepted.",
+                    ephemeral=True,
+                )
+                return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        rows = await self.bot.engine.notable_activity(exact_mint, limit=12)
+        await self._resolve_lab(interaction, embed=_notable_embed(rows, mint=exact_mint))
+
+    @app_commands.command(
+        name="realtime",
+        description="Live state of the realtime alpha lane: stream, alerts, suppressions.",
+    )
+    async def realtime(self, interaction: discord.Interaction) -> None:
+        if not await self._require_admin(interaction):
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        status = self.bot.engine.realtime_status()
+        alerts = await self.bot.engine.fast_alert_feed(limit=8)
+        await self._resolve_lab(interaction, embed=_realtime_embed(status, alerts))
 
     @app_commands.command(
         name="sources",

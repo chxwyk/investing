@@ -1,6 +1,8 @@
 """Chain constants used by the monitor and executor."""
 
-BOT_VERSION = "2.37.0"
+from urllib.parse import urlencode
+
+BOT_VERSION = "2.38.0"
 PAPER_DEMO_MINT = "PAPER-DEMO-ONLY"
 PAPER_DEMO_ENTRY_PRICE_USD = "1"
 
@@ -10,6 +12,24 @@ USDT_MINT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
 
 STABLE_MINTS = {USDC_MINT, USDT_MINT}
 QUOTE_MINTS = STABLE_MINTS | {WRAPPED_SOL_MINT}
+
+#: Solana's chain id in Fomo's public coin links.
+FOMO_SOLANA_CHAIN_ID = "1399811149"
+
+
+def fomo_coin_url(mint: str, referral_code: str | None = None) -> str:
+    """Build the one canonical public Fomo coin link.
+
+    Shared so every surface — cards, buttons, alerts — produces the identical
+    link.  It only ever opens the coin; it never places or authorises a trade.
+    """
+
+    query = {"address": mint, "chainId": FOMO_SOLANA_CHAIN_ID}
+    if referral_code:
+        query["r"] = referral_code
+    query["source"] = "share_link"
+    return f"https://fomo.family/coin?{urlencode(query)}"
+
 
 LIVE_ACK_TEXT = "I_UNDERSTAND_LIVE_TRADING_CAN_LOSE_ALL_FUNDS"
 PUMP_LAUNCH_ACK_TEXT = "I_UNDERSTAND_PUMP_LAUNCHES_SPEND_REAL_SOL"

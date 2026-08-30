@@ -41,7 +41,7 @@ from .lab.exits import (
     open_position,
     plan_exit,
 )
-from .lab.fastwatch import FastWatchSignals, FastWatchVerdict, evaluate_fast_watch
+from .lab.fastwatch import FastWatchVerdict, evaluate_fast_watch, signals_from_candidate
 from .lab.identity import TokenIdentity, build_token_identity, identity_from_payload
 from .lab.lifecycle import (
     LifecycleObservation,
@@ -637,40 +637,11 @@ class LabRuntime:
     def _fast_watch(self, candidate: Any, *, now: int) -> FastWatchVerdict:
         """Cheap early-acceleration verdict.  Never entry eligible."""
 
-        current = getattr(candidate, "current", None)
-        first = getattr(candidate, "first", None)
-        pair_created_at = getattr(candidate, "pair_created_at", None)
         return evaluate_fast_watch(
-            FastWatchSignals(
-                now=now,
-                pair_age_seconds=_age(pair_created_at, now),
-                market_cap_usd=_field(current, "market_cap_usd"),
-                first_seen_market_cap_usd=_field(first, "market_cap_usd"),
-                market_cap_acceleration_ratio=_ratio(
-                    _field(current, "market_cap_usd"), _field(first, "market_cap_usd")
-                ),
-                price_change_percent=_change(
-                    _field(current, "price_usd"), _field(first, "price_usd")
-                ),
-                volume_acceleration_ratio=_ratio(
-                    _field(current, "volume_5m_usd"), _field(first, "volume_5m_usd")
-                ),
-                buys=int(getattr(current, "buys_5m", 0) or 0),
-                sells=int(getattr(current, "sells_5m", 0) or 0),
-                holder_growth=_delta(
-                    getattr(current, "holder_count", None),
-                    getattr(first, "holder_count", None),
-                ),
-                liquidity_usd=_field(current, "liquidity_usd"),
-                liquidity_change_percent=_change(
-                    _field(current, "liquidity_usd"), _field(first, "liquidity_usd")
-                ),
-                route_available=bool(getattr(current, "route_available", False)),
-                rugged=bool(getattr(current, "rugged", False)),
-                hard_blockers=tuple(getattr(candidate, "hard_blockers", ()) or ()),
-            ),
+            signals_from_candidate(candidate, now=now),
             config=self.config,
         )
+
 
     def _authenticity(
         self,
