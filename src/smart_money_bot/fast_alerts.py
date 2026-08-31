@@ -25,12 +25,17 @@ from decimal import Decimal
 from typing import Any
 
 from .discord_render import (
+    P_ABOUT,
     P_DECISION,
     P_DEMAND,
+    P_DIAGNOSTICS,
     P_EDGE,
     P_IDENTITY,
+    P_LINKS,
     P_LIQUIDITY,
     P_SAFETY,
+    P_SMART_MONEY,
+    P_SOCIAL,
     P_WARNINGS,
     P_WHY_SURFACED,
     CardField,
@@ -53,6 +58,16 @@ EARLY_HEADS_UP = "EARLY_HEADS_UP"
 EARLY_RUNNER = "EARLY_RUNNER"
 SHADOW_ENTRY = "SHADOW_AUTO_ENTRY"
 SHADOW_EXIT = "SHADOW_AUTO_EXIT"
+# --- Trending-first classes (v2.42) ------------------------------------------
+# The primary universe is now Fomo Trending, so it gets its own card classes
+# rather than being squeezed into the graduated-runner ones.  TRENDING_HOT_WATCH
+# is deliberately absent from PINGABLE: a hot watch is a promise to look again
+# soon, not an interruption (section 44).
+TRENDING_ALPHA = "TRENDING_ALPHA"
+TRENDING_ACCELERATION_ALERT = "TRENDING_ACCELERATION"
+TRENDING_CONTINUATION_ALERT = "TRENDING_CONTINUATION"
+TRENDING_HOT_WATCH = "TRENDING_HOT_WATCH"
+OFF_TRENDING_EXCEPTION = "OFF_TRENDING_EXCEPTION"
 
 ALERT_CLASSES: tuple[str, ...] = (
     FAST_WATCH,
@@ -66,6 +81,11 @@ ALERT_CLASSES: tuple[str, ...] = (
     EARLY_RUNNER,
     SHADOW_ENTRY,
     SHADOW_EXIT,
+    TRENDING_ALPHA,
+    TRENDING_ACCELERATION_ALERT,
+    TRENDING_CONTINUATION_ALERT,
+    TRENDING_HOT_WATCH,
+    OFF_TRENDING_EXCEPTION,
 )
 
 #: Classes that may interrupt the user.  A late observation never does — it is
@@ -76,7 +96,16 @@ ALERT_CLASSES: tuple[str, ...] = (
 #: $31K.  EARLY_HEADS_UP deliberately does not — it is the quiet "watch this"
 #: tier, and it publishes to the radar instead.
 PINGABLE: frozenset[str] = frozenset(
-    {NOTABLE_TRADER_EARLY, BREAKING_CATALYST, CONFLUENCE_WATCH, EARLY_RUNNER}
+    {
+        NOTABLE_TRADER_EARLY,
+        BREAKING_CATALYST,
+        CONFLUENCE_WATCH,
+        EARLY_RUNNER,
+        TRENDING_ALPHA,
+        TRENDING_ACCELERATION_ALERT,
+        TRENDING_CONTINUATION_ALERT,
+        OFF_TRENDING_EXCEPTION,
+    }
 )
 
 # --- the two visibility layers (sections 27-29) ------------------------------
@@ -98,6 +127,13 @@ URGENT_CLASSES: frozenset[str] = frozenset(
         CONFLUENCE_WATCH,
         CATALYST_WATCH,
         EARLY_RUNNER,
+        # Trending is the primary universe (section 59), so its serious classes
+        # ride the urgent lane.  TRENDING_HOT_WATCH stays on the radar lane: it
+        # is a promise to look again soon, not an interruption.
+        TRENDING_ALPHA,
+        TRENDING_ACCELERATION_ALERT,
+        TRENDING_CONTINUATION_ALERT,
+        OFF_TRENDING_EXCEPTION,
     }
 )
 
@@ -166,6 +202,12 @@ def _money(value: Decimal | None) -> str:
 
 def _percent(value: Decimal | None) -> str:
     return "unknown" if value is None else f"{value:+.2f}%"
+
+
+def _percent_plain(value: Decimal | None) -> str:
+    """A share, not a change: no leading sign."""
+
+    return "unknown" if value is None else f"{value:.1f}%"
 
 
 def _links(mint: str, fomo_url: str) -> str:
@@ -1008,3 +1050,274 @@ def dedupe_alerts(alerts: Sequence[FastAlert]) -> tuple[FastAlert, ...]:
         seen.add(alert.alert_key)
         unique.append(alert)
     return tuple(unique)
+
+
+# --- Trending-first cards (v2.42, sections 10, 12, 60) -----------------------
+def build_trending_alert(
+    *,
+    mint: str,
+    name: str,
+    symbol: str,
+    fomo_url: str,
+    kind: str,
+    entry: Any,
+    event: Any,
+    score: Any,
+    holders: Any = None,
+    risk: Any = None,
+    about_summary: str = "",
+    project_claim: str = "",
+    external_verification: str = "",
+    story: str = "",
+    thesis_summary: str = "",
+    strongest_thesis: str = "",
+    social_summary: str = "",
+    notable_wallets: int = 0,
+    collision_warning: str = "",
+    source_caveat: str = "",
+    market_cap_velocity: Decimal | None = None,
+    promoted_from_hot_watch: bool = False,
+    image_url: str = "",
+    now: int = 0,
+) -> FastAlert:
+    """The FOMO TRENDING operator card (section 60).
+
+    Every claim on it is separated from its corroboration: the About text is a
+    claim, external verification is a fact, a thesis is an opinion, and the
+    Fomo verification badge is a badge.  The card is allowed to say LOOK NOW.
+    It is never allowed to say safe, guaranteed or free money (section 61).
+    """
+
+    velocity = getattr(event, "rank_velocity", None)
+    rank = getattr(entry, "current_rank", None)
+    previous_rank = getattr(velocity, "from_rank", None) if velocity else None
+    delta = getattr(velocity, "delta", 0) if velocity else 0
+    seconds_trending = entry.seconds_trending(now=now) if hasattr(entry, "seconds_trending") else 0
+    move = getattr(event, "move_since_entry_percent", None)
+
+    fields = [
+        CardField(
+            "TRENDING",
+            (
+                f"Rank `{'#' + str(rank) if rank else 'unranked'}`"
+                + (f" • was `#{previous_rank}`" if previous_rank else "")
+                + f" • velocity `{delta:+d}`\n"
+                f"Trending since `{seconds_trending}s` • stint `{getattr(entry, 'entries', 1)}` • "
+                f"health `{getattr(event, 'label', '')}`"
+            ),
+            P_DECISION,
+        ),
+        CardField(
+            "MARKET",
+            (
+                f"First Trending MC `{_money(getattr(entry, 'first_market_cap_usd', None))}` → "
+                f"now `{_money(getattr(entry, 'current_market_cap_usd', None))}`\n"
+                f"Move since entering Trending `{_percent(move)}`"
+                + (
+                    f" • acceleration `{market_cap_velocity:+}%/min`"
+                    if market_cap_velocity is not None
+                    else ""
+                )
+                + f"\nLiquidity `{_money(getattr(entry, 'liquidity_usd', None))}`"
+            ),
+            P_LIQUIDITY,
+        ),
+    ]
+
+    if holders is not None:
+        fields.append(
+            CardField(
+                "HOLDERS",
+                (
+                    "Count `"
+                    + (
+                        "unknown"
+                        if holders.holder_count is None
+                        else str(holders.holder_count)
+                    )
+                    + f"` • growth `{holders.growth_state}`"
+                    + (
+                        f" (+{holders.holders_added})"
+                        if holders.holders_added is not None
+                        else ""
+                    )
+                    + f"\nTop 10 `{_percent_plain(holders.top10_percent)}` • concentration "
+                    f"`{holders.concentration_trend}`"
+                ),
+                P_DEMAND,
+            )
+        )
+
+    if about_summary or project_claim:
+        fields.append(
+            CardField(
+                "ABOUT (the project's own claim)",
+                (
+                    (about_summary or "no description supplied")
+                    + (f"\n**Claim:** {project_claim}" if project_claim else "")
+                    + (
+                        f"\n**External verification:** {external_verification}"
+                        if external_verification
+                        else "\n**External verification:** UNVERIFIED"
+                    )
+                ),
+                P_ABOUT,
+            )
+        )
+
+    if story:
+        fields.append(CardField("STORY", story, P_SOCIAL))
+
+    if thesis_summary:
+        fields.append(
+            CardField(
+                "THESES",
+                thesis_summary
+                + (f"\n**Strongest:** {strongest_thesis}" if strongest_thesis else ""),
+                P_SOCIAL,
+            )
+        )
+
+    if social_summary:
+        fields.append(CardField("PUBLIC / J7", social_summary, P_SOCIAL))
+
+    if notable_wallets:
+        fields.append(
+            CardField("NOTABLE WALLETS", f"`{notable_wallets}` proven wallet(s)", P_SMART_MONEY)
+        )
+
+    if risk is not None:
+        fields.append(CardField("RISK", "\n".join(risk.operator_lines()), P_SAFETY))
+    else:
+        fields.append(
+            CardField("RISK", "Safety `UNKNOWN` — that is not a pass.", P_SAFETY)
+        )
+
+    reasons = tuple(getattr(score, "reasons", ()) or ())
+    fields.append(
+        CardField(
+            "WHY THIS PINGED",
+            "\n".join(f"• {reason.replace('_', ' ').title()}" for reason in reasons)
+            or "• no named reason — this card should not have been sent",
+            P_WHY_SURFACED,
+        )
+    )
+    fields.append(
+        CardField(
+            "SCORE",
+            f"Trending edge `{getattr(score, 'score', 0)}` • edge state "
+            f"`{getattr(score, 'edge_state', 'UNKNOWN')}`"
+            + (
+                f"\nLegacy opportunity score `{score.legacy_score}` (supporting context only)"
+                if getattr(score, "legacy_score", None) is not None
+                else ""
+            ),
+            P_DIAGNOSTICS,
+        )
+    )
+
+    warnings: list[str] = []
+    if collision_warning:
+        warnings.append(collision_warning)
+    if source_caveat:
+        warnings.append(source_caveat)
+    if getattr(event, "already_large", False):
+        warnings.append("NOT EARLY — this token is already large.")
+    if warnings:
+        fields.append(CardField("⚠", "\n".join(warnings), P_WARNINGS))
+
+    fields.append(CardField("LINKS", _links(mint, fomo_url), P_LINKS))
+
+    headline = {
+        TRENDING_ALPHA: "🔥 FOMO TRENDING — LOOK NOW",
+        TRENDING_CONTINUATION_ALERT: "🚀 TRENDING CONTINUATION — LOOK NOW",
+        TRENDING_ACCELERATION_ALERT: "🔥 TRENDING ACCELERATION — LOOK NOW",
+        OFF_TRENDING_EXCEPTION: "⚡ OFF-TRENDING EXCEPTION — LOOK NOW",
+    }.get(kind, "🔥 FOMO TRENDING — LOOK NOW")
+
+    display = f"${symbol}" if symbol else (name or "Unknown token")
+    spec = CardSpec(
+        title=f"{headline} • {display}",
+        description=(
+            f"`{mint}`\n"
+            + (
+                "Promoted from HOT WATCH — evidence strengthened.\n"
+                if promoted_from_hot_watch
+                else ""
+            )
+            + "**RESEARCH ONLY. MANUAL DECISION. Nothing was bought and nothing can be.**"
+        ),
+        compact_description=(
+            f"{headline} • {display} `{mint}` — rank "
+            f"{'#' + str(rank) if rank else 'unranked'}, MC "
+            f"{_money(getattr(entry, 'current_market_cap_usd', None))}. Research only."
+        ),
+        fields=tuple(fields),
+        footer=(
+            "Trending is attention, not safety. A verified badge is not rug protection."
+        ),
+        thumbnail_url=image_url,
+        colour=0xE67E22,
+    )
+    return FastAlert(
+        kind=kind,
+        mint=mint,
+        alert_key=f"{kind}:{mint}",
+        spec=spec,
+        ping=True,
+        ping_reason=", ".join(reasons[:3]),
+        token_mint=mint,
+        lane=LANE_URGENT,
+        family=kind,
+    )
+
+
+def build_trending_hot_watch_card(
+    *,
+    mint: str,
+    symbol: str,
+    name: str,
+    fomo_url: str,
+    entry: Any,
+    score: Any,
+    gap: Decimal,
+    now: int = 0,
+) -> FastAlert:
+    """The quiet HOT WATCH card.  Radar lane, no ping (section 44)."""
+
+    display = f"${symbol}" if symbol else (name or "Unknown token")
+    spec = CardSpec(
+        title=f"👀 TRENDING HOT WATCH • {display}",
+        description=(
+            f"`{mint}`\nStrong near miss — reevaluating on a fast cadence for a bounded "
+            "window. This is **not** a ping and **not** a recommendation."
+        ),
+        compact_description=f"HOT WATCH {display} `{mint}` — near miss, rechecking fast.",
+        fields=(
+            CardField(
+                "WHY",
+                f"Trending edge `{getattr(score, 'score', 0)}` — `{gap}` points below the "
+                "alpha threshold. It will ping once only if the evidence strengthens.",
+                P_DECISION,
+            ),
+            CardField(
+                "STATE",
+                f"Rank `{'#' + str(entry.current_rank) if entry.current_rank else 'unranked'}` • "
+                f"MC `{_money(entry.current_market_cap_usd)}`",
+                P_LIQUIDITY,
+            ),
+            CardField("LINKS", _links(mint, fomo_url), P_LINKS),
+        ),
+        footer="Research only. No position was taken.",
+        colour=0x95A5A6,
+    )
+    return FastAlert(
+        kind=TRENDING_HOT_WATCH,
+        mint=mint,
+        alert_key=f"{TRENDING_HOT_WATCH}:{mint}:{now // 300}",
+        spec=spec,
+        ping=False,
+        token_mint=mint,
+        lane=LANE_RADAR,
+        family=TRENDING_HOT_WATCH,
+    )

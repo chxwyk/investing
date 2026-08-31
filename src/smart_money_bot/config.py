@@ -259,6 +259,36 @@ class Settings:
     fomo_live_radar_channel_id: int | None
     fomo_urgent_channel_id: int | None
 
+    # --- Trending-first alpha engine (v2.42) ------------------------------
+    # Every value has a safe code default.  A deployment that sets none of these
+    # runs the Trending lane against the public proxy source, with the legacy
+    # graduated lane still active as the secondary universe.
+    fomo_trending_primary_enabled: bool
+    fomo_graduated_secondary_enabled: bool
+    #: An administrator-supplied, authorised Fomo Trending feed.  Empty means the
+    #: bot has no exact Trending access and must label its data TRENDING_PROXY.
+    fomo_trending_api_url: str | None
+    fomo_trending_api_key: str | None
+    #: What window the authorised feed's displayed percentage covers.  Left blank
+    #: the bot records CHANGE_WINDOW_UNKNOWN rather than guessing.
+    fomo_trending_change_window: str
+    fomo_trending_proxy_enabled: bool
+    fomo_trending_poll_seconds: int
+    fomo_trending_max_tracked: int
+    fomo_trending_alpha_min_score: Decimal
+    fomo_trending_watch_min_score: Decimal
+    fomo_trending_max_alerts_per_hour: int
+    fomo_trending_cooldown_seconds: int
+    fomo_trending_hot_watch_enabled: bool
+    fomo_trending_hot_watch_seconds: int
+    fomo_trending_hot_watch_recheck_seconds: int
+    fomo_trending_hot_watch_max: int
+    fomo_trending_hot_watch_band: Decimal
+    fomo_trending_social_enrich_enabled: bool
+    fomo_trending_shadow_enabled: bool
+    fomo_trending_off_board_exception_enabled: bool
+    fomo_trending_stale_snapshot_seconds: int
+
     news_radar_enabled: bool
     x_news_stream_enabled: bool
     x_news_stream_rule: str
@@ -629,6 +659,39 @@ class Settings:
             fomo_shadow_max_fill_latency_ms=_int("FOMO_SHADOW_MAX_FILL_LATENCY_MS", 30_000),
             fomo_shadow_allow_fallback_fill=_bool("FOMO_SHADOW_ALLOW_FALLBACK_FILL", True),
             fomo_shadow_min_forward_sample=_int("FOMO_SHADOW_MIN_FORWARD_SAMPLE", 30),
+            fomo_trending_primary_enabled=_bool("FOMO_TRENDING_PRIMARY_ENABLED", True),
+            fomo_graduated_secondary_enabled=_bool("FOMO_GRADUATED_SECONDARY_ENABLED", True),
+            fomo_trending_api_url=(os.getenv("FOMO_TRENDING_API_URL", "").strip() or None),
+            fomo_trending_api_key=(os.getenv("FOMO_TRENDING_API_KEY", "").strip() or None),
+            fomo_trending_change_window=os.getenv("FOMO_TRENDING_CHANGE_WINDOW", "").strip(),
+            fomo_trending_proxy_enabled=_bool("FOMO_TRENDING_PROXY_ENABLED", True),
+            # 45s is the fastest cadence the public proxy's documented endpoints
+            # tolerate comfortably alongside the existing radar; an authorised
+            # feed may permit faster, which is why it is configurable rather
+            # than hard-coded.
+            fomo_trending_poll_seconds=_int("FOMO_TRENDING_POLL_SECONDS", 45),
+            fomo_trending_max_tracked=_int("FOMO_TRENDING_MAX_TRACKED", 60),
+            fomo_trending_alpha_min_score=_decimal("FOMO_TRENDING_ALPHA_MIN_SCORE", "62"),
+            fomo_trending_watch_min_score=_decimal("FOMO_TRENDING_WATCH_MIN_SCORE", "40"),
+            fomo_trending_max_alerts_per_hour=_int("FOMO_TRENDING_MAX_ALERTS_PER_HOUR", 10),
+            fomo_trending_cooldown_seconds=_int("FOMO_TRENDING_COOLDOWN_SECONDS", 1800),
+            fomo_trending_hot_watch_enabled=_bool("FOMO_TRENDING_HOT_WATCH_ENABLED", True),
+            fomo_trending_hot_watch_seconds=_int("FOMO_TRENDING_HOT_WATCH_SECONDS", 900),
+            fomo_trending_hot_watch_recheck_seconds=_int(
+                "FOMO_TRENDING_HOT_WATCH_RECHECK_SECONDS", 45
+            ),
+            fomo_trending_hot_watch_max=_int("FOMO_TRENDING_HOT_WATCH_MAX", 12),
+            fomo_trending_hot_watch_band=_decimal("FOMO_TRENDING_HOT_WATCH_BAND", "12"),
+            fomo_trending_social_enrich_enabled=_bool(
+                "FOMO_TRENDING_SOCIAL_ENRICH_ENABLED", True
+            ),
+            fomo_trending_shadow_enabled=_bool("FOMO_TRENDING_SHADOW_ENABLED", True),
+            fomo_trending_off_board_exception_enabled=_bool(
+                "FOMO_TRENDING_OFF_BOARD_EXCEPTION_ENABLED", True
+            ),
+            fomo_trending_stale_snapshot_seconds=_int(
+                "FOMO_TRENDING_STALE_SNAPSHOT_SECONDS", 600
+            ),
             fomo_live_radar_channel_id=_optional_int("FOMO_LIVE_RADAR_CHANNEL_ID"),
             fomo_urgent_channel_id=_optional_int("FOMO_URGENT_CHANNEL_ID"),
             news_radar_enabled=_bool("NEWS_RADAR_ENABLED", True),
@@ -1067,6 +1130,44 @@ class Settings:
             )
         if not 1 <= self.fomo_shadow_min_forward_sample <= 10_000:
             raise ValueError("FOMO_SHADOW_MIN_FORWARD_SAMPLE must be between 1 and 10000")
+        # Trending cadence is bounded on both sides: fast enough to be worth
+        # having a separate lane for, never fast enough to hammer a source.
+        if not 15 <= self.fomo_trending_poll_seconds <= 3_600:
+            raise ValueError("FOMO_TRENDING_POLL_SECONDS must be between 15 and 3600")
+        if not 5 <= self.fomo_trending_max_tracked <= 500:
+            raise ValueError("FOMO_TRENDING_MAX_TRACKED must be between 5 and 500")
+        if not 0 <= self.fomo_trending_alpha_min_score <= 100:
+            raise ValueError("FOMO_TRENDING_ALPHA_MIN_SCORE must be between 0 and 100")
+        if not 0 <= self.fomo_trending_watch_min_score <= 100:
+            raise ValueError("FOMO_TRENDING_WATCH_MIN_SCORE must be between 0 and 100")
+        if self.fomo_trending_watch_min_score > self.fomo_trending_alpha_min_score:
+            raise ValueError(
+                "FOMO_TRENDING_WATCH_MIN_SCORE cannot exceed FOMO_TRENDING_ALPHA_MIN_SCORE"
+            )
+        if not 0 <= self.fomo_trending_max_alerts_per_hour <= 200:
+            raise ValueError("FOMO_TRENDING_MAX_ALERTS_PER_HOUR must be between 0 and 200")
+        if not 0 <= self.fomo_trending_cooldown_seconds <= 86_400:
+            raise ValueError("FOMO_TRENDING_COOLDOWN_SECONDS must be between 0 and 86400")
+        # A hot watch that reevaluates as slowly as the legacy recheck is not a
+        # hot watch; that slowness is the bug it exists to fix.
+        if not 15 <= self.fomo_trending_hot_watch_recheck_seconds <= 600:
+            raise ValueError(
+                "FOMO_TRENDING_HOT_WATCH_RECHECK_SECONDS must be between 15 and 600"
+            )
+        if not 60 <= self.fomo_trending_hot_watch_seconds <= 7_200:
+            raise ValueError("FOMO_TRENDING_HOT_WATCH_SECONDS must be between 60 and 7200")
+        if self.fomo_trending_hot_watch_recheck_seconds >= self.fomo_trending_hot_watch_seconds:
+            raise ValueError(
+                "FOMO_TRENDING_HOT_WATCH_RECHECK_SECONDS must be shorter than the hot-watch window"
+            )
+        if not 1 <= self.fomo_trending_hot_watch_max <= 100:
+            raise ValueError("FOMO_TRENDING_HOT_WATCH_MAX must be between 1 and 100")
+        if not 0 <= self.fomo_trending_hot_watch_band <= 50:
+            raise ValueError("FOMO_TRENDING_HOT_WATCH_BAND must be between 0 and 50")
+        if not 60 <= self.fomo_trending_stale_snapshot_seconds <= 86_400:
+            raise ValueError(
+                "FOMO_TRENDING_STALE_SNAPSHOT_SECONDS must be between 60 and 86400"
+            )
         if self.fomo_notable_min_trade_usd < 0:
             raise ValueError("FOMO_NOTABLE_MIN_TRADE_USD cannot be negative")
         if not 60 <= self.fomo_notable_max_signal_age_seconds <= 86_400:

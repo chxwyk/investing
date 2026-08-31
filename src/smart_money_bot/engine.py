@@ -49,6 +49,9 @@ from .errors import (
 )
 from .executor import ExecutionManager
 from .fast_alerts import (
+    TRENDING_ACCELERATION_ALERT,
+    TRENDING_ALPHA,
+    TRENDING_CONTINUATION_ALERT,
     EnrichmentUpdate,
     FastAlert,
     build_catalyst_alert,
@@ -57,6 +60,8 @@ from .fast_alerts import (
     build_notable_trader_alert,
     build_shadow_entry_alert,
     build_shadow_exit_alert,
+    build_trending_alert,
+    build_trending_hot_watch_card,
     enrichment_from_evidence,
 )
 from .lab.actionability import RankedCandidate as LabRankedCandidate
@@ -95,6 +100,11 @@ from .lab.early import (
 )
 from .lab.early import (
     WHY_NO_DATA as EARLY_WHY_NO_DATA,
+)
+from .lab.exits import (
+    EXIT_LIQUIDITY_DETERIORATION,
+    EXIT_LIQUIDITY_EMERGENCY,
+    EXIT_SAFETY_EMERGENCY,
 )
 from .lab.exits import ExitContext as LabExitContext
 from .lab.fastwatch import evaluate_fast_watch, signals_from_candidate, still_current
@@ -137,6 +147,7 @@ from .lab.shadow import (
     FAMILY_NOTABLE_LATE,
     FAMILY_QUALIFIED_RESEARCH,
     FAMILY_STRICT_PAPER,
+    SHADOW_STRATEGY_VERSION,
     ShadowSignal,
     ShadowTimestamps,
     shadow_config_from_settings,
@@ -238,7 +249,25 @@ from .social import (
     annotate_social_nominations,
 )
 from .strategy import ConsensusStrategy
-from .stream import RealtimeWalletStream, StreamEvent
+from .stream import RealtimeWalletStream, StreamEvent, StreamHealth
+from .trending import (
+    TRENDING_CONTINUATION,
+    TRENDING_EXPERIMENT_VERSION,
+    TRENDING_FAMILY_LABELS,
+    TRENDING_NEW_ENTRY,
+    TRENDING_REENTRY,
+    TRENDING_STRATEGY_VERSION,
+    HotWatchConfig,
+    TrendingEventConfig,
+    TrendingShadowConfig,
+    UniverseTrade,
+    build_risk_panel,
+    family_for_reasons,
+    source_from_settings,
+)
+from .trending_runtime import TrendingCandidate, TrendingRuntime
+from .trending_source import build_trending_client
+from .trending_store import TrendingStore
 from .x_budget import XBudgetManager
 
 logger = logging.getLogger(__name__)
@@ -461,6 +490,47 @@ class SmartMoneyEngine:
             explicit_ws_url=settings.solana_ws_url,
             enabled=settings.realtime_wallet_stream_enabled,
             commitment=settings.realtime_stream_commitment,
+            on_health_warning=self._warn_wallet_stream,
+        )
+        # --- the primary Trending universe (v2.42) -------------------------
+        # Provenance is resolved from configuration alone.  With no authorised
+        # feed configured this is a TRENDING_PROXY and every surface says so.
+        self.trending_source = source_from_settings(
+            api_url=settings.fomo_trending_api_url,
+            api_key=settings.fomo_trending_api_key,
+            proxy_enabled=settings.fomo_trending_proxy_enabled,
+            change_window=settings.fomo_trending_change_window,
+        )
+        self.trending_store = TrendingStore(self.database)
+        self.trending_client = build_trending_client(
+            self.trending_source,
+            api_url=settings.fomo_trending_api_url,
+            api_key=settings.fomo_trending_api_key,
+            referral_code=settings.fomo_referral_code,
+        )
+        self.trending = TrendingRuntime(
+            self.trending_store,
+            self.trending_client,
+            max_tracked=settings.fomo_trending_max_tracked,
+            alpha_threshold=settings.fomo_trending_alpha_min_score,
+            watch_threshold=settings.fomo_trending_watch_min_score,
+            hot_watch_config=HotWatchConfig(
+                ttl_seconds=settings.fomo_trending_hot_watch_seconds,
+                recheck_seconds=settings.fomo_trending_hot_watch_recheck_seconds,
+                max_entries=settings.fomo_trending_hot_watch_max,
+                near_miss_band=settings.fomo_trending_hot_watch_band,
+            ),
+            hot_watch_enabled=settings.fomo_trending_hot_watch_enabled,
+            event_config=TrendingEventConfig(),
+            shadow_config=(
+                TrendingShadowConfig() if settings.fomo_trending_shadow_enabled else None
+            ),
+            max_alerts_per_hour=settings.fomo_trending_max_alerts_per_hour,
+            cooldown_seconds=settings.fomo_trending_cooldown_seconds,
+            stale_snapshot_seconds=settings.fomo_trending_stale_snapshot_seconds,
+            enabled=settings.fomo_trending_primary_enabled,
+            enrich=self._enrich_trending,
+            publish=self._publish_trending,
         )
         self.strategy = ConsensusStrategy(
             self.database,
@@ -473,6 +543,9 @@ class SmartMoneyEngine:
         self.executor = ExecutionManager(settings, self.database, self.market)
         self._task: asyncio.Task[None] | None = None
         self._stream_task: asyncio.Task[None] | None = None
+        self._trending_task: asyncio.Task[None] | None = None
+        self._trending_hot_watch_task: asyncio.Task[None] | None = None
+        self.trending_hot_watch_cards = 0
         self._stream_consumer_task: asyncio.Task[None] | None = None
         self._daily_profit_task: asyncio.Task[None] | None = None
         self._callout_tasks: set[asyncio.Task[None]] = set()
@@ -540,6 +613,32 @@ class SmartMoneyEngine:
             enabled=settings.fomo_shadow_auto_enabled,
         )
         self.shadow_enabled = settings.fomo_shadow_auto_enabled
+        # --- the second, isolated forward experiment (sections 62, 63) -----
+        # Identical shape to legacy — $100 bankroll, $10 entries, 5 positions,
+        # $50 exposure — so the strategy is the only variable.  Isolation is
+        # structural: the store keys bankrolls by ``strategy_version`` and open
+        # positions by ``(mint, family, strategy_version)``, so these two books
+        # cannot share a row even if the same mint appears in both.  The legacy
+        # experiment's config, version and entire forward history are untouched.
+        self._trending_shadow_config = replace(
+            self._shadow_config,
+            strategy_version=TRENDING_STRATEGY_VERSION,
+            bankroll_usd=Decimal("100"),
+            position_usd=Decimal("10"),
+            min_position_usd=Decimal("10"),
+            max_position_usd=Decimal("10"),
+            max_token_exposure_usd=Decimal("10"),
+            max_concurrent_positions=5,
+            max_total_exposure_usd=Decimal("50"),
+            enabled=settings.fomo_trending_shadow_enabled,
+        )
+        self.trending_shadow = ShadowRuntime(
+            self.shadow_store,
+            config=self._trending_shadow_config,
+            enabled=settings.fomo_trending_shadow_enabled,
+            experiment_version=TRENDING_EXPERIMENT_VERSION,
+        )
+        self.trending_shadow_enabled = settings.fomo_trending_shadow_enabled
         # The experiment can run without publishing its own cards, so an
         # operator can quieten the feed without losing the forward sample.
         self.shadow_cards_enabled = settings.fomo_shadow_publish_cards
@@ -672,13 +771,16 @@ class SmartMoneyEngine:
             self._daily_profit_task = asyncio.create_task(
                 self._run_daily_profit_guard(), name="smart-money-daily-risk-guard"
             )
-        if self.stream.enabled:
-            self._stream_task = asyncio.create_task(
-                self.stream.run(), name="smart-money-wallet-stream"
-            )
-            self._stream_consumer_task = asyncio.create_task(
-                self._consume_stream_events(), name="smart-money-stream-consumer"
-            )
+        # The supervisor runs even when the lane cannot connect.  Ending the task
+        # for a disabled or URL-less lane is what produced the production
+        # "DISCONNECTED / 0 subscriptions / 0 reconnects" with no way to tell a
+        # switched-off lane from a broken one (section 52).
+        self._stream_task = asyncio.create_task(
+            self.stream.run(), name="smart-money-wallet-stream"
+        )
+        self._stream_consumer_task = asyncio.create_task(
+            self._consume_stream_events(), name="smart-money-stream-consumer"
+        )
         if self.settings.news_radar_enabled:
             if (
                 self.settings.x_paid_search_enabled
@@ -703,8 +805,26 @@ class SmartMoneyEngine:
                 self._run_x_radar(),
                 name="smart-money-x-radar",
             )
-        if self.settings.fomo_radar_enabled and (
-            self.settings.coin_callouts_enabled or self.settings.fomo_runner_enabled
+        # Trending is the PRIMARY discovery universe (section 39).  It gets its
+        # own lightweight loop rather than sharing the graduated radar's 60s
+        # poll and 1800s recheck, because a new Trending entrant is only
+        # interesting for minutes (sections 74, 77).
+        if self.settings.fomo_trending_primary_enabled:
+            self._trending_task = asyncio.create_task(
+                self._run_trending_radar(),
+                name="smart-money-trending-radar",
+            )
+            if self.settings.fomo_trending_hot_watch_enabled:
+                self._trending_hot_watch_task = asyncio.create_task(
+                    self._run_trending_hot_watch(),
+                    name="smart-money-trending-hot-watch",
+                )
+        # Graduated discovery is retained as the SECONDARY universe.  It is
+        # demoted, never deleted.
+        if (
+            self.settings.fomo_radar_enabled
+            and self.settings.fomo_graduated_secondary_enabled
+            and (self.settings.coin_callouts_enabled or self.settings.fomo_runner_enabled)
         ):
             self._fomo_radar_task = asyncio.create_task(
                 self._run_fomo_radar(),
@@ -728,24 +848,20 @@ class SmartMoneyEngine:
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
             pending.clear()
-        for task in (
+        background = (
             self._news_stream_task,
             self._news_rss_task,
             self._x_radar_task,
             self._fomo_radar_task,
             self._runner_outcome_task,
             self._runner_digest_task,
-        ):
+            self._trending_task,
+            self._trending_hot_watch_task,
+        )
+        for task in background:
             if task:
                 task.cancel()
-        for task in (
-            self._news_stream_task,
-            self._news_rss_task,
-            self._x_radar_task,
-            self._fomo_radar_task,
-            self._runner_outcome_task,
-            self._runner_digest_task,
-        ):
+        for task in background:
             if task:
                 with suppress(asyncio.CancelledError):
                     await task
@@ -755,6 +871,8 @@ class SmartMoneyEngine:
         self._fomo_radar_task = None
         self._runner_outcome_task = None
         self._runner_digest_task = None
+        self._trending_task = None
+        self._trending_hot_watch_task = None
         for task in self._runner_fast_watch_tasks.values():
             task.cancel()
         if self._runner_fast_watch_tasks:
@@ -791,6 +909,7 @@ class SmartMoneyEngine:
         await self.rpc.close()
         await self.market.close()
         await self.dex_screener.close()
+        await self.trending_client.close()
         await self.x_social.close()
         await self.tracker_token_risk.close()
         await self.x_news_stream.close()
@@ -4576,19 +4695,345 @@ class SmartMoneyEngine:
             return ()
         return tuple(await self.database.recent_fast_alerts(limit=limit))
 
+    # ------------------------------------------------------------------
+    # the primary Trending universe (v2.42)
+    # ------------------------------------------------------------------
+    async def _warn_wallet_stream(self, health: StreamHealth) -> None:
+        """Escalate a wallet lane that has been down long enough to matter (§54).
+
+        Losing the smart-money lane silently is the worst outcome: the bot keeps
+        working, the cards keep rendering, and the wallet evidence simply stops
+        arriving with nothing to show for it.
+        """
+
+        detail = (
+            f"Wallet stream {health.state} for {health.down_for_seconds}s — "
+            f"subscriptions {health.subscriptions}, reconnects {health.reconnects}. "
+            f"{health.detail}."
+            + (f" Last error: {health.last_error}" if health.last_error else "")
+            + " Smart-money evidence is degraded until this recovers; the polling "
+            "scan lane is the fallback."
+        )
+        logger.warning(detail)
+        with suppress(Exception):
+            await self.notifier.on_error(
+                "Wallet stream infrastructure", RuntimeError(detail)
+            )
+
+    async def _enrich_trending(self, entry: Any) -> dict[str, Any]:
+        """Targeted, cheap enrichment for one Trending mint (sections 76, 112).
+
+        One cached DEX snapshot per mint, plus whatever the existing lanes have
+        already established.  Nothing here fetches per-candidate forensics: the
+        radar has to stay affordable at a 45-second cadence, and a card that
+        cannot prove something says UNKNOWN rather than paying to guess.
+        """
+
+        payload: dict[str, Any] = {}
+        snapshot = None
+        with suppress(Exception):
+            snapshot = await self.dex_screener.snapshot(entry.mint)
+        if snapshot is not None and snapshot.available:
+            buys = snapshot.buys_5m or snapshot.buys_1h
+            payload["buys"] = buys
+            payload["risk"] = build_risk_panel(
+                entry.mint,
+                liquidity_usd=snapshot.liquidity_usd,
+                # Safety stays UNKNOWN unless a provider actually said otherwise.
+                # UNKNOWN never silently becomes PASS.
+                sell_route_status="UNKNOWN",
+                holders=None,
+                exact_mint_confirmed=True,
+                fomo_verified=entry.verification,
+                safety_status="UNKNOWN",
+                liquidity_collapsed=(
+                    snapshot.liquidity_usd is not None
+                    and snapshot.liquidity_usd < Decimal("1000")
+                ),
+            )
+
+        # Narrative and wallet evidence are read from what the existing lanes
+        # already persisted for this exact mint — never inferred from a name.
+        with suppress(Exception):
+            links = await self.database.narrative_link_rows(mint=entry.mint, limit=5)
+            if links:
+                payload["story_present"] = True
+                payload["story_verified"] = any(
+                    str(link.get("relationship") or "") in {"AUTHENTIC", "CONFIRMED"}
+                    for link in links
+                )
+        return payload
+
+    async def _publish_trending(self, candidate: TrendingCandidate) -> bool:
+        """Render and publish one urgent Trending card.
+
+        The kind is chosen from the *event*, so a continuation card can never
+        describe itself as a new entrant and vice versa.
+        """
+
+        entry = candidate.entry
+        kind = TRENDING_ALPHA
+        if candidate.event.state == TRENDING_CONTINUATION:
+            kind = TRENDING_CONTINUATION_ALERT
+        elif candidate.event.state in {TRENDING_NEW_ENTRY, TRENDING_REENTRY}:
+            kind = TRENDING_ALPHA
+        elif candidate.event.rank_velocity is not None and candidate.event.rank_velocity.climbing:
+            kind = TRENDING_ACCELERATION_ALERT
+
+        theses = None
+        with suppress(Exception):
+            theses = await self.trending_store.about_for(entry.mint)
+
+        alert = build_trending_alert(
+            mint=entry.mint,
+            name=entry.name,
+            symbol=entry.symbol,
+            fomo_url=entry.fomo_url or fomo_coin_url(entry.mint, self.settings.fomo_referral_code),
+            kind=kind,
+            entry=entry,
+            event=candidate.event,
+            score=candidate.score,
+            holders=candidate.holders,
+            risk=candidate.risk,
+            about_summary=str((theses or {}).get("summary") or ""),
+            project_claim=str((theses or {}).get("token_link") or ""),
+            external_verification=str((theses or {}).get("external_state") or ""),
+            source_caveat=self.trending_source.rank_caveat(),
+            market_cap_velocity=candidate.market_cap_velocity,
+            promoted_from_hot_watch=self.trending.is_hot_watched(candidate.mint),
+            now=int(time.time()),
+        )
+        published = await self.notifier.on_fast_alert(alert)
+        if published:
+            self.fast_alerts_published += 1
+            self.last_fast_alert_at = int(time.time())
+            self.last_fast_alert_kind = kind
+            with suppress(Exception):
+                await self._run_trending_shadow(candidate, now=int(time.time()))
+        return bool(published)
+
+    async def _run_trending_shadow(self, candidate: TrendingCandidate, *, now: int) -> bool:
+        """Offer one published Trending alert to the *separate* shadow bankroll.
+
+        Trending Radar shows everything relevant; the Trending shadow only
+        simulates configured strategy signals (section 65).  A candidate whose
+        only named reason is chatter or holder growth is deliberately not
+        tradeable on its own — that is the "social without market" case
+        (section 102) — and :func:`family_for_reasons` returns ``None`` for it.
+
+        Never raises into the alert path: a failure in the experiment must not
+        cost the operator the alert that was already worth sending.
+        """
+
+        if not self.trending_shadow_enabled or self.database.connection is None:
+            return False
+        family = family_for_reasons(candidate.score.reasons)
+        if family is None:
+            return False
+        config = self._trending_shadow_config
+        if candidate.score.score < Decimal("0"):
+            return False
+        entry = candidate.entry
+        try:
+            signal = ShadowSignal(
+                mint=entry.mint,
+                family=family,
+                timestamps=ShadowTimestamps(
+                    signal_at=entry.last_observed_at or now,
+                    first_seen_at=entry.first_seen_at,
+                    decision_at=now,
+                ),
+                name=entry.name or entry.symbol or "Unknown token",
+                symbol=entry.symbol or "?",
+                price_usd=entry.price_usd,
+                market_cap_usd=entry.current_market_cap_usd,
+                liquidity_usd=entry.liquidity_usd,
+                # Safety is whatever the risk panel could actually establish.
+                # UNKNOWN stays UNKNOWN; it never becomes PASS to unblock a fill.
+                safety_status=(
+                    candidate.risk.safety_status if candidate.risk else "UNKNOWN"
+                ),
+                route_available=True,
+                detection_market_cap_usd=entry.first_market_cap_usd,
+                lifecycle_state=candidate.event.state,
+                why=candidate.score.reasons,
+            )
+            decision, position = await self.trending_shadow.consider_signal(signal, now=now)
+        except Exception:
+            logger.exception("Trending shadow evaluation failed for %s", entry.mint)
+            return False
+        if position is None:
+            return False
+        paper = position.position
+        alert = build_shadow_entry_alert(
+            mint=entry.mint,
+            name=signal.name,
+            symbol=signal.symbol,
+            fomo_url=self._fomo_url(entry.mint),
+            family=family,
+            family_label=TRENDING_FAMILY_LABELS.get(family, family),
+            why=candidate.score.reasons,
+            size_usd=decision.size_usd,
+            fill_market_cap_usd=paper.entry_market_cap_usd,
+            fill_price_usd=paper.entry_price_usd,
+            venue=position.venue,
+            fill_source=position.fill_source,
+            graduation_state=position.graduation_state,
+            modeled_cost_usd=paper.entry_costs.total_cost_usd,
+            net_objective_usd=config.net_profit_objective_usd,
+            signal_to_fill_seconds=max(0, now - (signal.timestamps.signal_at or now)),
+            position_id=paper.position_id,
+        )
+        if self.shadow_cards_enabled:
+            await self._publish_fast_alert(alert, now=now)
+        return True
+
+    async def _run_trending_radar(self) -> None:
+        """The primary discovery loop.  Cheap, fast, and independent of the legacy radar."""
+
+        while True:
+            try:
+                result = await self.trending.poll_once()
+                if result.error:
+                    logger.debug("Trending poll: %s", result.error)
+                # A near-miss card is radar-only visibility; it never pings.
+                for mint in result.hot_watched:
+                    candidate = next(
+                        (item for item in result.candidates if item.mint == mint), None
+                    )
+                    if candidate is None:
+                        continue
+                    card = build_trending_hot_watch_card(
+                        mint=candidate.mint,
+                        symbol=candidate.entry.symbol,
+                        name=candidate.entry.name,
+                        fomo_url=(
+                            candidate.entry.fomo_url
+                            or fomo_coin_url(candidate.mint, self.settings.fomo_referral_code)
+                        ),
+                        entry=candidate.entry,
+                        score=candidate.score,
+                        gap=candidate.verdict.near_miss_gap,
+                        now=int(time.time()),
+                    )
+                    with suppress(Exception):
+                        if await self.notifier.on_fast_alert(card):
+                            self.trending_hot_watch_cards += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await self.notifier.on_error("Trending radar", exc)
+            await asyncio.sleep(self.settings.fomo_trending_poll_seconds)
+
+    async def _run_trending_hot_watch(self) -> None:
+        """The fast recheck lane.  A strong near miss is not left for 30 minutes."""
+
+        while True:
+            try:
+                await self.trending.recheck_hot_watches()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await self.notifier.on_error("Trending hot watch", exc)
+            await asyncio.sleep(self.settings.fomo_trending_hot_watch_recheck_seconds)
+
+    # --- operator surfaces --------------------------------------------
+    async def trending_status(self) -> dict[str, Any]:
+        return await self.trending.status()
+
+    def trending_board(self, *, limit: int = 12) -> tuple[Any, ...]:
+        return self.trending.board(limit=limit)
+
+    def trending_entry(self, mint: str) -> Any:
+        return self.trending.entry_for(mint)
+
+    async def trending_hot_watch_report(self) -> dict[str, Any]:
+        return await self.trending.hot_watch_report()
+
+    async def trending_suppressions(self, *, since: int = 0) -> dict[str, int]:
+        return await self.trending_store.suppression_counts(since=since)
+
+    async def trending_universes(self) -> dict[str, Any]:
+        """`/fomo profit view:universes` — $100 TRENDING vs $100 LEGACY (§66).
+
+        Both books are read through the same shadow store using their own
+        ``strategy_version``, which is what makes them independent rather than
+        two views of one account.
+        """
+
+        legacy = await self._universe_trades(SHADOW_STRATEGY_VERSION)
+        trending = await self._universe_trades(TRENDING_STRATEGY_VERSION)
+        comparison = TrendingRuntime.compare(trending, legacy)
+        payload = comparison.to_json()
+        payload["trending_enabled"] = self.settings.fomo_trending_shadow_enabled
+        payload["legacy_strategy_version"] = SHADOW_STRATEGY_VERSION
+        payload["trending_strategy_version"] = TRENDING_STRATEGY_VERSION
+        return payload
+
+    async def _universe_trades(self, strategy_version: str) -> list[UniverseTrade]:
+        """Resolved simulated trades for one isolated bankroll.
+
+        The two universes differ only in ``strategy_version``.  Everything else —
+        the cost model, the exit engine, the arithmetic — is shared, which is the
+        point: a comparison is only fair when the strategy is the sole variable.
+        """
+
+        rows: list[UniverseTrade] = []
+        try:
+            positions = await self.shadow_store.closed_positions(
+                strategy_version=strategy_version
+            )
+        except Exception:
+            return rows
+        for shadow in positions:
+            position = shadow.position
+            reason = position.close_reason or ""
+            mae = position.max_adverse_percent
+            rows.append(
+                UniverseTrade(
+                    mint=position.mint,
+                    family=shadow.family,
+                    opened_at=position.opened_at,
+                    closed_at=position.closed_at or position.opened_at,
+                    net_pnl_usd=Decimal(str(position.realized_net_pnl_usd or 0)),
+                    size_usd=Decimal(str(position.size_usd or 0)),
+                    mfe_percent=position.max_favourable_percent,
+                    mae_percent=mae,
+                    # A "severe failure" is a structural loss, not an ordinary
+                    # losing trade: the position gave back more than half.
+                    severe_failure=bool(mae is not None and mae <= Decimal("-50")),
+                    rugged=reason in {EXIT_SAFETY_EMERGENCY, EXIT_LIQUIDITY_EMERGENCY},
+                    liquidity_collapsed=reason
+                    in {EXIT_LIQUIDITY_EMERGENCY, EXIT_LIQUIDITY_DETERIORATION},
+                    unsellable=reason == EXIT_SAFETY_EMERGENCY,
+                )
+            )
+        return rows
+
     def realtime_status(self) -> dict[str, object]:
-        """What the realtime lane is actually doing right now (section 33)."""
+        """What the realtime lane is actually doing right now (sections 33, 88).
+
+        The wallet-stream fields report a *named state* rather than a bare
+        boolean, because "DISCONNECTED" with zero subscriptions and zero
+        reconnects described three unrelated faults and told an operator how to
+        fix none of them (section 52).
+        """
 
         now = int(time.time())
+        stream_health = self.stream.health(now=now)
         return {
-            "stream_connected": bool(getattr(self.stream, "connected", False)),
+            "stream_connected": stream_health.connected,
+            "stream_state": stream_health.state,
+            "stream_detail": stream_health.detail,
+            "stream_reconnects": stream_health.reconnects,
+            "stream_failed_attempts": stream_health.failed_attempts,
+            "stream_last_message_age": stream_health.last_message_age,
+            "stream_down_for": stream_health.down_for_seconds,
+            "stream_fallback_active": stream_health.fallback_active,
+            "stream_last_error": stream_health.last_error,
             "stream_last_event_at": getattr(self.stream, "last_event_at", None),
-            "stream_last_event_age": (
-                now - int(getattr(self.stream, "last_event_at", 0) or 0)
-                if getattr(self.stream, "last_event_at", None)
-                else None
-            ),
-            "stream_subscriptions": int(getattr(self.stream, "subscription_count", 0) or 0),
+            "stream_last_event_age": stream_health.last_event_age,
+            "stream_subscriptions": stream_health.subscriptions,
             "fast_watch_enabled": (
                 self.settings.fomo_fast_watch_enabled
                 and self.settings.fomo_fast_watch_publish_enabled
@@ -4603,6 +5048,26 @@ class SmartMoneyEngine:
             "alerts_suppressed": self.fast_alerts_suppressed,
             "last_alert_at": self.last_fast_alert_at,
             "last_alert_kind": self.last_fast_alert_kind,
+            # The primary universe's own lane, reported separately from the
+            # legacy graduated one so a healthy secondary can never make a dead
+            # primary look fine.
+            "trending_enabled": self.settings.fomo_trending_primary_enabled,
+            "trending_source": self.trending_source.kind,
+            "trending_source_label": self.trending_source.label,
+            "trending_authorised": self.trending_source.authorised,
+            "trending_health": self.trending.lane_health(now=now),
+            "trending_polls": self.trending.polls,
+            "trending_last_poll_at": self.trending.last_poll_at,
+            "trending_tracked": sum(
+                1 for entry in self.trending.board(limit=1000) if entry.on_board
+            ),
+            "trending_hot_watch": self.trending.hot_watch_status(),
+            "trending_alerts_published": self.trending.alerts_published,
+            "trending_alerts_suppressed": self.trending.alerts_suppressed,
+            "trending_promotions": self.trending.promotions,
+            "trending_hot_watch_cards": self.trending_hot_watch_cards,
+            "graduated_secondary_enabled": self.settings.fomo_graduated_secondary_enabled,
+            "trending_shadow_enabled": self.settings.fomo_trending_shadow_enabled,
             "live_execution": False,
         }
 

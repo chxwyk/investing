@@ -99,6 +99,7 @@ from .models import (
     TrackedTrader,
 )
 from .quality import STAGE_LABELS, why_surfaced
+from .trending import describe_change
 
 logger = logging.getLogger(__name__)
 
@@ -6246,22 +6247,64 @@ def _realtime_embed(
     alerts: tuple[dict, ...],
     shadow: dict[str, object] | None = None,
     early: dict[str, object] | None = None,
+    trending: dict[str, object] | None = None,
 ) -> discord.Embed:
     connected = bool(status.get("stream_connected"))
     age = status.get("stream_last_event_age")
+    state = str(status.get("stream_state") or ("CONNECTED" if connected else "UNKNOWN"))
+    down_for = status.get("stream_down_for")
     embed = discord.Embed(
         title="REALTIME ALPHA LANE",
         description=(
-            f"Wallet stream **{'CONNECTED' if connected else 'DISCONNECTED'}** • "
-            f"subscriptions `{status.get('stream_subscriptions', 0)}`\n"
-            f"Last stream event: "
-            f"{f'`{age}s` ago' if isinstance(age, int) else '`no event yet`'}\n"
-            "**Live execution: DISABLED.** Nothing in this lane can buy, sell, sign, "
+            # A named state, not a bare boolean: "DISCONNECTED / 0 subs / 0
+            # reconnects" used to describe a disabled lane, a lane with no
+            # wallets and a genuinely broken one identically (section 52).
+            f"Wallet stream **{state}** • subscriptions "
+            f"`{status.get('stream_subscriptions', 0)}` • reconnects "
+            f"`{status.get('stream_reconnects', 0)}`\n"
+            f"{status.get('stream_detail', '')}"
+            + (f" • down for `{down_for}s`" if isinstance(down_for, int) and down_for else "")
+            + (
+                f"\nLast error: `{status.get('stream_last_error')}`"
+                if status.get("stream_last_error")
+                else ""
+            )
+            + f"\nLast stream event: "
+            f"{f'`{age}s` ago' if isinstance(age, int) else '`no event yet`'}"
+            + (
+                "\n⚠ **Wallet lane degraded — the polling scan lane is the fallback.**"
+                if status.get("stream_fallback_active")
+                else ""
+            )
+            + "\n**Live execution: DISABLED.** Nothing in this lane can buy, sell, sign, "
             "spend SOL, or launch."
         ),
         colour=0x2ECC71 if connected else 0xE67E22,
         timestamp=discord.utils.utcnow(),
     )
+    if trending is not None:
+        health = trending.get("health") or {}
+        hot = trending.get("hot_watch") or {}
+        source = trending.get("source") or {}
+        embed.add_field(
+            name="FOMO TRENDING (primary universe)",
+            value=(
+                f"Source `{source.get('kind') if isinstance(source, dict) else 'UNKNOWN'}`"
+                f" • lane `{health.get('state') if isinstance(health, dict) else 'UNKNOWN'}`\n"
+                f"Last snapshot `{_relative_age(trending.get('last_poll_at'))}` • tracked "
+                f"`{trending.get('tracked', 0)}` • new entries "
+                f"`{trending.get('new_entries', 0)}` • rank movers "
+                f"`{trending.get('rank_movers', 0)}`\n"
+                f"Hot watch active `{hot.get('active', 0) if isinstance(hot, dict) else 0}` • "
+                f"promoted `{hot.get('promoted', 0) if isinstance(hot, dict) else 0}` • "
+                f"expired `{hot.get('expired', 0) if isinstance(hot, dict) else 0}`\n"
+                f"Promotions `{trending.get('promotions', 0)}` • alerts "
+                f"`{trending.get('alerts_published', 0)}` (suppressed "
+                f"`{trending.get('alerts_suppressed', 0)}`)\n"
+                f"{trending.get('rank_caveat', '')}"
+            )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+            inline=False,
+        )
     embed.add_field(
         name="Lanes",
         value=(
@@ -6271,7 +6314,12 @@ def _realtime_embed(
             f"Catalyst `{'ON' if status.get('catalyst_alerts_enabled') else 'OFF'}` • "
             f"confluence `{'ON' if status.get('confluence_alerts_enabled') else 'OFF'}` • "
             f"social radar `{'ON' if status.get('social_radar_enabled') else 'OFF'}`\n"
-            f"Async enrichment `{'ON' if status.get('enrichment_enabled') else 'OFF'}`"
+            f"Async enrichment `{'ON' if status.get('enrichment_enabled') else 'OFF'}`\n"
+            f"Trending primary `{'ON' if status.get('trending_enabled') else 'OFF'}` • "
+            f"graduated secondary "
+            f"`{'ON' if status.get('graduated_secondary_enabled') else 'OFF'}` • "
+            f"Trending shadow "
+            f"`{'ON' if status.get('trending_shadow_enabled') else 'OFF'}`"
         ),
         inline=False,
     )
@@ -6310,6 +6358,309 @@ def _realtime_embed(
     embed.set_footer(
         text="Speed changes what you SEE, never what the bot is allowed to DO"
     )
+    return _clamp_embed(embed)
+
+
+# --- Trending-first operator surfaces (v2.42) --------------------------------
+def _trending_source_line(status: dict[str, object]) -> str:
+    """One line that can never let a proxy pass itself off as Fomo Trending."""
+
+    source = status.get("source") or {}
+    kind = str(source.get("kind") if isinstance(source, dict) else "") or "NO_SOURCE_CONFIGURED"
+    label = str(status.get("source_label") or kind)
+    health = status.get("health") or {}
+    state = str(health.get("state") if isinstance(health, dict) else "") or "UNKNOWN"
+    return f"**Source:** `{kind}` — {label}\n**Lane:** `{state}` • {status.get('rank_caveat', '')}"
+
+
+def _trending_rank(entry: object) -> str:
+    rank = getattr(entry, "current_rank", None)
+    return f"#{rank}" if rank else "—"
+
+
+def _trending_board_embed(status: dict[str, object], entries: tuple) -> discord.Embed:
+    """`/fomo trending` — the board, with movement rather than just position."""
+
+    embed = discord.Embed(
+        title="FOMO TRENDING — PRIMARY RESEARCH UNIVERSE",
+        description=(
+            _trending_source_line(status)
+            + f"\nTracked `{status.get('tracked', 0)}` • new entries "
+            f"`{status.get('new_entries', 0)}` • rank movers `{status.get('rank_movers', 0)}`\n"
+            "**Trending is attention, not safety. Nothing here was bought.**"
+        ),
+        colour=0xE67E22,
+        timestamp=discord.utils.utcnow(),
+    )
+    if not entries:
+        embed.add_field(
+            name="Board",
+            value=(
+                "No Trending rows yet. If the source says `NO_SOURCE_CONFIGURED`, "
+                "no legitimate Trending feed is connected — that is a configuration "
+                "state, not an empty market."
+            ),
+            inline=False,
+        )
+        return _clamp_embed(embed)
+
+    lines = []
+    for entry in entries:
+        move = entry.market_cap_move_percent()
+        growth = entry.holder_growth()
+        lines.append(
+            f"`{_trending_rank(entry):>4}` **{entry.symbol or entry.name or 'unknown'}** "
+            f"`{_short(entry.mint)}`\n"
+            f"　MC {_money(entry.current_market_cap_usd)} "
+            f"(entered {_money(entry.first_market_cap_usd)}"
+            + (f", {move:+.1f}%" if move is not None else "")
+            + f") • best #{entry.best_rank or '—'} • "
+            f"{entry.seconds_on_board}s on board"
+            + (f" • holders +{growth}" if growth is not None else "")
+        )
+    embed.add_field(
+        name="Board (rank • exact mint • movement)",
+        value="\n".join(lines)[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+        inline=False,
+    )
+    hot = status.get("hot_watch") or {}
+    if isinstance(hot, dict):
+        embed.add_field(
+            name="Hot watch",
+            value=(
+                f"Active `{hot.get('active', 0)}` • promoted `{hot.get('promoted', 0)}` • "
+                f"expired `{hot.get('expired', 0)}`"
+            ),
+            inline=False,
+        )
+    embed.set_footer(
+        text="Mint is identity. A shared name, ticker or story is not a shared token."
+    )
+    return _clamp_embed(embed)
+
+
+def _trending_token_embed(
+    entry: object,
+    status: dict[str, object],
+    about: dict[str, object] | None,
+    theses: list[dict[str, object]],
+) -> discord.Embed:
+    """The per-token detail view, reached by a parameter rather than a new command."""
+
+    move = entry.market_cap_move_percent()
+    embed = discord.Embed(
+        title=f"TRENDING DETAIL — {entry.symbol or entry.name or 'unknown'}",
+        description=(
+            f"`{entry.mint}`\n"
+            + _trending_source_line(status)
+            + "\n**Research only. Manual decision.**"
+        ),
+        colour=0xE67E22,
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(
+        name="Trending",
+        value=(
+            f"Rank `{_trending_rank(entry)}` • best `#{entry.best_rank or '—'}` • entered "
+            f"`#{entry.first_rank or '—'}`\n"
+            f"On board `{entry.seconds_on_board}s` • stints `{entry.entries}` • "
+            f"{'ON BOARD' if entry.on_board else 'LEFT THE BOARD'}"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Market",
+        value=(
+            f"First Trending MC `{_money(entry.first_market_cap_usd)}` → now "
+            f"`{_money(entry.current_market_cap_usd)}`"
+            + (f" ({move:+.1f}%)" if move is not None else "")
+            + f"\nPeak `{_money(entry.peak_market_cap_usd)}` • liquidity "
+            f"`{_money(entry.liquidity_usd)}`\n"
+            "Displayed change `"
+            + describe_change(entry.displayed_change_percent, entry.change_window)
+            + "`"
+        ),
+        inline=False,
+    )
+    growth = entry.holder_growth()
+    concentration = entry.concentration_trend()
+    embed.add_field(
+        name="Holders",
+        value=(
+            f"Count `{entry.holder_count if entry.holder_count is not None else 'unknown'}`"
+            + (f" (+{growth} since entry)" if growth is not None else "")
+            + f"\nTop 10 `{entry.top10_percent if entry.top10_percent is not None else 'unknown'}`"
+            + (f" • trend `{concentration:+.1f}pp`" if concentration is not None else "")
+        ),
+        inline=False,
+    )
+    if about:
+        embed.add_field(
+            name="About (the project's own claim)",
+            value=(
+                f"{about.get('summary') or 'no description'}\n"
+                f"**Token link:** `{about.get('token_link', 'UNVERIFIED')}` • "
+                f"**External:** `{about.get('external_state', 'UNVERIFIED')}`"
+            )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+            inline=False,
+        )
+    if theses:
+        embed.add_field(
+            name="Theses (opinions, graded)",
+            value="\n".join(
+                f"• `{row.get('quality')}` / `{row.get('category')}` by "
+                f"`{row.get('author')}` ({row.get('timing')})"
+                for row in theses[:6]
+            )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+            inline=False,
+        )
+    embed.add_field(
+        name="Verification",
+        value=(
+            f"Fomo verified: `{entry.verification}`\n"
+            "A verification badge is **not** safety, **not** an official project "
+            "token, and **not** rug protection."
+        ),
+        inline=False,
+    )
+    embed.set_footer(text="Every number above belongs to this exact mint and no other.")
+    return _clamp_embed(embed)
+
+
+def _trending_hot_watch_embed(report: dict[str, object]) -> discord.Embed:
+    """`/fomo trending view:hotwatch` — is the fast lane actually promoting? (§90)"""
+
+    embed = discord.Embed(
+        title="TRENDING HOT WATCH",
+        description=(
+            "Strong near misses under rapid reevaluation. A hot watch never pings on "
+            "entry; it pings **once** if the evidence strengthens, and expires "
+            "silently if it does not."
+        ),
+        colour=0x95A5A6,
+        timestamp=discord.utils.utcnow(),
+    )
+    delay = report.get("median_promotion_delay_seconds")
+    embed.add_field(
+        name="Population",
+        value=(
+            f"Active `{report.get('active', 0)}` • promoted `{report.get('promoted', 0)}` • "
+            f"expired `{report.get('expired', 0)}` • dropped `{report.get('dropped', 0)}`"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Promotion timing",
+        value=(
+            f"Heads-up → promotion p50 `{delay if delay is not None else 'no sample'}"
+            + ("s`" if delay is not None else "`")
+            + f"\nExpired without promotion `{report.get('expired_without_promotion', 0)}` • "
+            f"miss rate `{report.get('promotion_miss_rate', '0')}`"
+        ),
+        inline=False,
+    )
+    recent = report.get("recent") or []
+    if isinstance(recent, list) and recent:
+        embed.add_field(
+            name="Recent",
+            value="\n".join(
+                f"• `{_short(str(row.get('mint')))}` `{row.get('state')}` "
+                f"({row.get('origin')}) entry `{row.get('entry_score')}` → best "
+                f"`{row.get('best_score')}` after `{row.get('rechecks')}` rechecks"
+                + (
+                    f" • promotion move `{row.get('promotion_move_percent')}%`"
+                    if row.get("promotion_move_percent")
+                    else ""
+                )
+                for row in recent[:8]
+            )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+            inline=False,
+        )
+    embed.set_footer(
+        text="A promotion that arrives after the move is late, and is measured as late."
+    )
+    return _clamp_embed(embed)
+
+
+def _trending_why_embed(counts: dict[str, int]) -> discord.Embed:
+    """`/fomo trending view:why` — why wasn't I pinged? (section 91)"""
+
+    embed = discord.Embed(
+        title="WHY WASN'T I PINGED? — TRENDING",
+        description=(
+            "Every suppressed Trending candidate records a structured reason. "
+            "Silence is always explainable."
+        ),
+        colour=0x34495E,
+        timestamp=discord.utils.utcnow(),
+    )
+    if not counts:
+        embed.add_field(
+            name="Suppressions",
+            value="No Trending candidate has been suppressed yet.",
+            inline=False,
+        )
+        return _clamp_embed(embed)
+    embed.add_field(
+        name="Reasons",
+        value="\n".join(
+            f"• `{reason}` × {total}" for reason, total in counts.items()
+        )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+        inline=False,
+    )
+    return _clamp_embed(embed)
+
+
+def _universes_embed(payload: dict[str, object]) -> discord.Embed:
+    """`/fomo profit view:universes` — $100 TRENDING vs $100 LEGACY (§66)."""
+
+    trending = payload.get("trending") or {}
+    legacy = payload.get("legacy") or {}
+    embed = discord.Embed(
+        title="TRENDING vs LEGACY — TWO $100 FORWARD EXPERIMENTS",
+        description=(
+            f"**{payload.get('verdict', '')}**\n"
+            "Two completely independent simulated bankrolls: $100 each, $10 per "
+            "position, at most 5 open, at most $50 exposed. Same cost model, same "
+            "exit engine — the strategy is the only variable.\n"
+            "**Both are simulation. Real-money automation is DISABLED.**"
+        ),
+        colour=0x1ABC9C,
+        timestamp=discord.utils.utcnow(),
+    )
+
+    def block(report: dict[str, object]) -> str:
+        provisional = " ⚠ provisional sample" if report.get("provisional") else ""
+        return (
+            f"Bankroll `${report.get('current_bankroll_usd', '100')}` • NET "
+            f"`${report.get('net_usd', '0')}` • ROI `{report.get('roi_percent', '0')}%`\n"
+            f"Trades `{report.get('trades', 0)}` • win rate "
+            f"`{report.get('win_rate', '0')}` • profit factor "
+            f"`{report.get('profit_factor') or 'n/a'}`\n"
+            f"Expectancy `${report.get('expectancy_usd', '0')}` • max drawdown "
+            f"`${report.get('max_drawdown_usd', '0')}`\n"
+            f"Severe failures `{report.get('severe_failures', 0)}` • rug rate "
+            f"`{report.get('rug_rate', '0')}` • liquidity collapse "
+            f"`{report.get('liquidity_collapse_rate', '0')}`\n"
+            f"Hit rates +25 `{report.get('hit_rate_25', '0')}` • +50 "
+            f"`{report.get('hit_rate_50', '0')}` • +100 `{report.get('hit_rate_100', '0')}` • "
+            f"+200 `{report.get('hit_rate_200', '0')}`{provisional}"
+        )
+
+    embed.add_field(name="TRENDING", value=block(trending), inline=False)
+    embed.add_field(name="LEGACY", value=block(legacy), inline=False)
+    embed.add_field(
+        name="Verdict",
+        value=(
+            f"NET leader `{payload.get('net_leader', 'TIE')}` • safety leader "
+            f"`{payload.get('safety_leader', 'TIE')}` • upside leader "
+            f"`{payload.get('upside_leader', 'TIE')}`\n"
+            "Safety and upside are reported separately on purpose — Trending may "
+            "well be safer *and* have less upside, or the reverse."
+        ),
+        inline=False,
+    )
+    embed.set_footer(text="Forward data decides this, not the hypothesis.")
     return _clamp_embed(embed)
 
 
@@ -7221,15 +7572,18 @@ class FomoCommands(
     @app_commands.describe(
         view=(
             "summary: the money answer • signals: families by forward NET • exits: "
-            "which rules cost money • providers: spend • alerts: were we early?"
+            "which rules cost money • providers: spend • alerts: were we early? • "
+            "universes: TRENDING vs LEGACY"
         )
     )
     async def profit(
         self,
         interaction: discord.Interaction,
-        view: Literal["summary", "signals", "exits", "providers", "alerts"] = "summary",
+        view: Literal[
+            "summary", "signals", "exits", "providers", "alerts", "universes"
+        ] = "summary",
     ) -> None:
-        """`/fomo profit` and its three diagnostic views (sections 21-24)."""
+        """`/fomo profit` and its diagnostic views (sections 21-24, 89)."""
 
         if not await self._require_admin(interaction):
             return
@@ -7250,6 +7604,10 @@ class FomoCommands(
             if view == "alerts":
                 payload = await self.bot.engine.alert_performance()
                 await self._resolve_lab(interaction, embed=_profit_alerts_embed(payload))
+                return
+            if view == "universes":
+                payload = await self.bot.engine.trending_universes()
+                await self._resolve_lab(interaction, embed=_universes_embed(payload))
                 return
             payload = await self.bot.engine.profit_summary()
             await self._resolve_lab(interaction, embed=_profit_summary_embed(payload))
@@ -7446,6 +7804,88 @@ class FomoCommands(
         await self._resolve_lab(interaction, embed=_notable_embed(rows, mint=exact_mint))
 
     @app_commands.command(
+        name="trending",
+        description="FOMO TRENDING — the primary research universe. Research only.",
+    )
+    @app_commands.describe(
+        view=(
+            "board: what is trending now • token: one exact mint • "
+            "hotwatch: the fast promotion lane • why: why nothing pinged"
+        ),
+        mint="Exact mint for view:token. A name or ticker is never accepted here.",
+    )
+    async def trending(
+        self,
+        interaction: discord.Interaction,
+        view: Literal["board", "token", "hotwatch", "why"] = "board",
+        mint: str | None = None,
+    ) -> None:
+        """`/fomo trending` and its views (sections 86, 87, 90, 91).
+
+        One child command with a ``view`` parameter rather than four separate
+        ones: Discord allows 25 children per group and this product is already
+        close to that ceiling, so views are the only architecture that leaves
+        room to grow.
+        """
+
+        if not await self._require_admin(interaction):
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        try:
+            status = await self.bot.engine.trending_status()
+            if view == "hotwatch":
+                report = await self.bot.engine.trending_hot_watch_report()
+                await self._resolve_lab(interaction, embed=_trending_hot_watch_embed(report))
+                return
+            if view == "why":
+                counts = await self.bot.engine.trending_suppressions()
+                await self._resolve_lab(interaction, embed=_trending_why_embed(counts))
+                return
+            if view == "token":
+                exact = (mint or "").strip()
+                if not exact:
+                    await self._resolve_lab(
+                        interaction,
+                        content=(
+                            "`view:token` needs the **exact mint**. A name or ticker is "
+                            "not an identity — several unrelated tokens routinely share "
+                            "both."
+                        ),
+                    )
+                    return
+                entry = self.bot.engine.trending_entry(exact)
+                if entry is None:
+                    entry = await self.bot.engine.trending_store.load_entry(exact)
+                if entry is None:
+                    await self._resolve_lab(
+                        interaction,
+                        content=(
+                            f"No Trending record for `{exact}`. "
+                            "Nothing is inferred from the name."
+                        ),
+                    )
+                    return
+                about = await self.bot.engine.trending_store.about_for(exact)
+                theses = await self.bot.engine.trending_store.theses_for(exact, limit=8)
+                await self._resolve_lab(
+                    interaction,
+                    embed=_trending_token_embed(entry, status, about, theses),
+                    view=_token_view(exact, self.bot.settings.fomo_referral_code),
+                )
+                return
+            entries = self.bot.engine.trending_board(limit=12)
+            await self._resolve_lab(interaction, embed=_trending_board_embed(status, entries))
+        except Exception as exc:
+            await self._resolve_lab(
+                interaction,
+                content=(
+                    "The Trending report failed: "
+                    f"`{type(exc).__name__}`. Nothing was bought; this lane is "
+                    "research only and spends $0.00."
+                ),
+            )
+
+    @app_commands.command(
         name="realtime",
         description="Live state of the realtime alpha lane: stream, alerts, suppressions.",
     )
@@ -7457,12 +7897,15 @@ class FomoCommands(
         alerts = await self.bot.engine.fast_alert_feed(limit=8)
         shadow = None
         early = None
+        trending = None
         with suppress(Exception):
             shadow = await self.bot.engine.shadow_status()
         with suppress(Exception):
             early = await self.bot.engine.early_lane_status()
+        with suppress(Exception):
+            trending = await self.bot.engine.trending_status()
         await self._resolve_lab(
-            interaction, embed=_realtime_embed(status, alerts, shadow, early)
+            interaction, embed=_realtime_embed(status, alerts, shadow, early, trending)
         )
 
     @app_commands.command(

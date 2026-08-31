@@ -68,6 +68,19 @@ FAMILY_CATALYST_WATCH = "CATALYST_WATCH"
 FAMILY_CONFLUENCE_WATCH = "CONFLUENCE_WATCH"
 FAMILY_QUALIFIED_RESEARCH = "QUALIFIED_RESEARCH"
 FAMILY_STRICT_PAPER = "STRICT_PAPER_ENTRY"
+# --- Trending families (v2.42, section 64) -----------------------------------
+# The Trending experiment runs on the same engine with its own bankroll, so its
+# families are registered here rather than in a parallel list: one registry means
+# one place where "is this a real family?" is answered, and it keeps every
+# family-weight, attribution and explanation path working unchanged.
+FAMILY_TRENDING_NEW_ENTRY = "TRENDING_NEW_ENTRY"
+FAMILY_TRENDING_ACCELERATION = "TRENDING_ACCELERATION"
+FAMILY_TRENDING_STORY = "TRENDING_STORY"
+FAMILY_TRENDING_THESIS = "TRENDING_THESIS"
+FAMILY_TRENDING_AI_PROJECT = "TRENDING_AI_PROJECT"
+FAMILY_TRENDING_SMART_MONEY = "TRENDING_SMART_MONEY"
+FAMILY_TRENDING_CONTINUATION = "TRENDING_CONTINUATION"
+FAMILY_TRENDING_CONFLUENCE = "TRENDING_CONFLUENCE"
 
 SIGNAL_FAMILIES: tuple[str, ...] = (
     FAMILY_FAST_WATCH,
@@ -79,6 +92,14 @@ SIGNAL_FAMILIES: tuple[str, ...] = (
     FAMILY_CONFLUENCE_WATCH,
     FAMILY_QUALIFIED_RESEARCH,
     FAMILY_STRICT_PAPER,
+    FAMILY_TRENDING_NEW_ENTRY,
+    FAMILY_TRENDING_ACCELERATION,
+    FAMILY_TRENDING_STORY,
+    FAMILY_TRENDING_THESIS,
+    FAMILY_TRENDING_AI_PROJECT,
+    FAMILY_TRENDING_SMART_MONEY,
+    FAMILY_TRENDING_CONTINUATION,
+    FAMILY_TRENDING_CONFLUENCE,
 )
 
 #: Human labels used on cards and in reports.
@@ -92,6 +113,14 @@ FAMILY_LABELS: dict[str, str] = {
     FAMILY_CONFLUENCE_WATCH: "CONFLUENCE WATCH",
     FAMILY_QUALIFIED_RESEARCH: "QUALIFIED RESEARCH",
     FAMILY_STRICT_PAPER: "STRICT PAPER",
+    FAMILY_TRENDING_NEW_ENTRY: "TRENDING NEW ENTRY",
+    FAMILY_TRENDING_ACCELERATION: "TRENDING ACCELERATION",
+    FAMILY_TRENDING_STORY: "TRENDING STORY",
+    FAMILY_TRENDING_THESIS: "TRENDING THESIS",
+    FAMILY_TRENDING_AI_PROJECT: "TRENDING AI / PROJECT",
+    FAMILY_TRENDING_SMART_MONEY: "TRENDING SMART MONEY",
+    FAMILY_TRENDING_CONTINUATION: "TRENDING CONTINUATION",
+    FAMILY_TRENDING_CONFLUENCE: "TRENDING CONFLUENCE",
 }
 
 #: Families whose signal is genuinely urgent enough to interrupt someone
@@ -101,6 +130,12 @@ URGENT_FAMILIES: frozenset[str] = frozenset(
         FAMILY_NOTABLE_EARLY,
         FAMILY_BREAKING_CATALYST,
         FAMILY_CONFLUENCE_WATCH,
+        # Trending is the primary universe (section 59); a new entrant, an
+        # acceleration and a second leg are all time-critical.
+        FAMILY_TRENDING_NEW_ENTRY,
+        FAMILY_TRENDING_ACCELERATION,
+        FAMILY_TRENDING_CONTINUATION,
+        FAMILY_TRENDING_CONFLUENCE,
     }
 )
 
@@ -820,6 +855,28 @@ def why_you_are_seeing_this(signal: ShadowSignal) -> tuple[str, ...]:
         ),
         FAMILY_QUALIFIED_RESEARCH: ("the research funnel qualified this candidate",),
         FAMILY_STRICT_PAPER: ("the strict PAPER engine accepted this entry",),
+        FAMILY_TRENDING_NEW_ENTRY: (
+            "the token just entered the Trending board",
+            "trending is attention, not safety",
+        ),
+        FAMILY_TRENDING_ACCELERATION: (
+            "Trending rank is climbing quickly",
+            "market data is confirming the attention",
+        ),
+        FAMILY_TRENDING_STORY: ("a corroborated story sits behind this exact mint",),
+        FAMILY_TRENDING_THESIS: ("a supported public thesis names this exact mint",),
+        FAMILY_TRENDING_AI_PROJECT: (
+            "the named project publishes this exact mint",
+        ),
+        FAMILY_TRENDING_SMART_MONEY: (
+            "a proven public wallet entered while the token is Trending",
+        ),
+        FAMILY_TRENDING_CONTINUATION: (
+            "not early — a second leg is developing on new evidence",
+        ),
+        FAMILY_TRENDING_CONFLUENCE: (
+            "several independent evidence families agree on this mint",
+        ),
     }
     return defaults.get(signal.family, ("research signal",))
 

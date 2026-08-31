@@ -7,6 +7,7 @@ import dataclasses
 import os
 import tempfile
 import time
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
@@ -229,11 +230,13 @@ async def main() -> None:
     await check_shadow_auto_trader()
     await check_profit_optimization()
     await check_early_alpha()
+    await check_trending_alpha()
 
     print(
         "SELF-CHECK PASSED: detector, scoring, database, discovery rotation, "
         "paper P&L, risk gate, PAPER laboratory, discovery-speed, realtime-alpha, "
-        "SHADOW auto-trader, profit-optimization and early-alpha invariants"
+        "SHADOW auto-trader, profit-optimization, early-alpha and "
+        "Trending-first invariants"
     )
 
 
@@ -1146,6 +1149,264 @@ async def check_early_alpha() -> None:
     assert SHADOW_REAL_MONEY_SPEND == 0
     assert DEFAULT_SHADOW_CONFIG.bankroll_usd == Decimal("100")
     assert DEFAULT_SHADOW_CONFIG.position_usd == Decimal("10")
+
+
+
+async def check_trending_alpha() -> None:
+    """The Trending-first invariants that must hold before a deploy is trusted.
+
+    These are the product's non-negotiables, not a sample of the test suite: a
+    deployment that violates any of them is worse than one that never shipped
+    the feature, because it would present guesses as facts.
+    """
+
+    import tempfile
+    from pathlib import Path as _Path
+
+    from smart_money_bot.lab.shadow import (
+        DEFAULT_SHADOW_CONFIG,
+        SHADOW_STRATEGY_VERSION,
+        SIGNAL_FAMILIES,
+    )
+    from smart_money_bot.stream import (
+        CONFIGURATION_STREAM_STATES,
+        STREAM_CONNECTED,
+        STREAM_DISABLED,
+        STREAM_NO_WALLETS,
+        STREAM_STATES,
+        RealtimeWalletStream,
+    )
+    from smart_money_bot.trending import (
+        CHANGE_WINDOW_UNKNOWN,
+        LEGACY_STRATEGY_VERSION,
+        SOURCE_FOMO_TRENDING,
+        SOURCE_NONE,
+        SOURCE_TRENDING_PROXY,
+        TRENDING_EXIT_POLICIES,
+        TRENDING_FAMILIES,
+        TRENDING_STRATEGY_VERSION,
+        HotWatchConfig,
+        TrendingLedgerEntry,
+        TrendingObservation,
+        TrendingShadowConfig,
+        build_risk_panel,
+        classify_trending_event,
+        decide_alert,
+        normalise_change_window,
+        open_hot_watch,
+        ramp,
+        rank_velocity,
+        recheck_hot_watch,
+        score_trending_edge,
+        source_from_settings,
+    )
+    from smart_money_bot.trending.exits import TrendingExitContext, evaluate_policy
+    from smart_money_bot.trending.hotwatch import ORIGIN_TRENDING_NEAR_MISS
+    from smart_money_bot.trending_store import TrendingStore
+
+    now = 1_700_000_000
+
+    # 1. A proxy can never present itself as Fomo Trending (section 4).
+    proxy = source_from_settings(api_url=None, api_key=None, proxy_enabled=True)
+    assert proxy.kind == SOURCE_TRENDING_PROXY and not proxy.is_exact_fomo
+    assert "not Fomo" in proxy.rank_caveat()
+    assert source_from_settings(
+        api_url=None, api_key=None, proxy_enabled=False
+    ).kind == SOURCE_NONE
+    authorised = source_from_settings(
+        api_url="https://feed.example/t", api_key=None, proxy_enabled=True
+    )
+    assert authorised.kind == SOURCE_FOMO_TRENDING and authorised.is_exact_fomo
+
+    # 2. An undocumented percentage window is never guessed (section 6).
+    assert normalise_change_window("who knows") == CHANGE_WINDOW_UNKNOWN
+    assert normalise_change_window(None) == CHANGE_WINDOW_UNKNOWN
+
+    def observation(**kwargs):
+        payload = {
+            "mint": "MintSelfCheck",
+            "observed_at": now,
+            "rank": 40,
+            "market_cap_usd": Decimal("200000"),
+            "liquidity_usd": Decimal("80000"),
+            "source": proxy,
+        }
+        payload.update(kwargs)
+        return TrendingObservation(**payload)
+
+    # 3. First observations are immutable (sections 5, 93).
+    entry = TrendingLedgerEntry.from_first_observation(observation(rank=44))
+    entry = entry.observe(
+        observation(observed_at=now + 60, rank=22, market_cap_usd=Decimal("260000"))
+    )
+    entry = entry.observe(
+        observation(observed_at=now + 120, rank=8, market_cap_usd=Decimal("330000"))
+    )
+    assert entry.first_rank == 44, "the entry rank must never be rewritten"
+    assert entry.first_market_cap_usd == Decimal("200000")
+    assert entry.first_seen_at == now
+
+    # 4. Mint is identity (section 13).
+    try:
+        entry.observe(observation(mint="OtherMint"))
+    except ValueError:
+        pass
+    else:  # pragma: no cover - a merged mint is a product failure
+        raise AssertionError("a ledger entry must refuse to merge a different mint")
+
+    # 5. Rank velocity, not absolute rank, is the signal (sections 9, 95).
+    velocity = rank_velocity(entry.rank_history, now=now + 120, first_seen_at=entry.first_seen_at)
+    assert velocity.delta == 36 and velocity.climbing
+    flat = TrendingLedgerEntry.from_first_observation(observation(rank=2))
+    for step in range(1, 13):
+        flat = flat.observe(observation(observed_at=now + step * 300, rank=2))
+    flat_velocity = rank_velocity(
+        flat.rank_history, now=now + 3600, first_seen_at=flat.first_seen_at
+    )
+    flat_event = classify_trending_event(flat, flat_velocity, now=now + 3600)
+    flat_score = score_trending_edge(flat, flat_event)
+    flat_verdict = decide_alert(flat_score, flat_event, alpha_threshold=Decimal("62"))
+    assert not flat_verdict.alert, "a high static rank is not alpha"
+
+    # 6. No threshold cliffs (section 43).
+    near = ramp(Decimal("1.94"), floor=Decimal("0"), target=Decimal("2"), weight=Decimal("10"))
+    exact = ramp(Decimal("2.00"), floor=Decimal("0"), target=Decimal("2"), weight=Decimal("10"))
+    assert exact - near < Decimal("0.5"), "1.94 and 2.00 must not be different universes"
+
+    # 7. Hard safety beats every attention signal (sections 71, 100).
+    hot_entry = TrendingLedgerEntry.from_first_observation(observation(rank=40))
+    hot_entry = hot_entry.observe(
+        observation(observed_at=now + 60, rank=3, market_cap_usd=Decimal("400000"))
+    )
+    hot_velocity = rank_velocity(
+        hot_entry.rank_history, now=now + 60, first_seen_at=hot_entry.first_seen_at
+    )
+    hot_event = classify_trending_event(hot_entry, hot_velocity, now=now + 60)
+    blocked = build_risk_panel("MintSelfCheck", sell_failed=True, liquidity_collapsed=True)
+    assert blocked.blocked
+    blocked_score = score_trending_edge(hot_entry, hot_event, risk=blocked)
+    assert blocked_score.score == Decimal("0.0") and not blocked_score.reasons
+    blocked_verdict = decide_alert(
+        blocked_score, hot_event, alpha_threshold=Decimal("62"), risk=blocked
+    )
+    assert not blocked_verdict.alert, "trending must never override a hard failure"
+
+    # 8. A verified badge is a badge (section 37).
+    badged = build_risk_panel("MintSelfCheck", fomo_verified="VERIFIED", safety_status="UNKNOWN")
+    assert not badged.blocked
+    assert any("not a safety guarantee" in concern for concern in badged.concerns)
+
+    # 9. HOT WATCH promotes once, on named evidence, and expires quietly.
+    config = HotWatchConfig(ttl_seconds=300, recheck_seconds=30)
+    watch = open_hot_watch(
+        "MintSelfCheck",
+        origin=ORIGIN_TRENDING_NEAR_MISS,
+        now=now,
+        score=Decimal("52"),
+        market_cap_usd=Decimal("500000"),
+        heads_up_market_cap_usd=Decimal("500000"),
+        config=config,
+    )
+    unnamed = recheck_hot_watch(
+        watch, now=now + 40, score=Decimal("99"), reasons=(), alpha_threshold=Decimal("62")
+    )
+    assert not unnamed.promoted, "a score without a named reason must never ping"
+    promoted = recheck_hot_watch(
+        watch,
+        now=now + 40,
+        score=Decimal("70"),
+        reasons=("TRENDING_ACCELERATION",),
+        market_cap_usd=Decimal("600000"),
+        alpha_threshold=Decimal("62"),
+    )
+    assert promoted.promoted and promoted.should_ping
+    assert promoted.entry.promotion_move_percent() == Decimal("20.0")
+    faded = recheck_hot_watch(
+        watch,
+        now=now + 400,
+        score=Decimal("20"),
+        reasons=("TRENDING_ACCELERATION",),
+        alpha_threshold=Decimal("62"),
+        config=config,
+    )
+    assert faded.expired and not faded.promoted
+
+    # 10. A hot watch recheck is genuinely fast (section 46).
+    assert HotWatchConfig().recheck_seconds <= 120, (
+        "a hot watch that rechecks as slowly as the legacy radar is the bug it fixes"
+    )
+
+    # 11. The two experiments are isolated and identically shaped (sections 62-63).
+    trending_config = TrendingShadowConfig()
+    assert trending_config.strategy_version == TRENDING_STRATEGY_VERSION
+    assert TRENDING_STRATEGY_VERSION != LEGACY_STRATEGY_VERSION == SHADOW_STRATEGY_VERSION
+    assert trending_config.bankroll_usd == DEFAULT_SHADOW_CONFIG.bankroll_usd == Decimal("100")
+    assert trending_config.position_usd == DEFAULT_SHADOW_CONFIG.position_usd == Decimal("10")
+    assert trending_config.max_concurrent_positions == 5
+    assert trending_config.max_total_exposure_usd == Decimal("50")
+    for family in TRENDING_FAMILIES:
+        assert family in SIGNAL_FAMILIES, f"{family} must be a registered shadow family"
+
+    # 12. Every exit policy still obeys a hard failure (section 71).
+    failure = [
+        TrendingExitContext(
+            at=now, seconds_held=60, unrealized_percent=Decimal("50"),
+            peak_percent=Decimal("50"), sell_failed=True,
+        )
+    ]
+    for policy in TRENDING_EXIT_POLICIES:
+        decision = evaluate_policy(policy, failure)
+        assert decision.exit and decision.reason == "SELL_FAILED", policy
+
+    # 13. The wallet lane names its state instead of a bare boolean (section 52).
+    assert len(set(STREAM_STATES)) == len(STREAM_STATES)
+    assert STREAM_DISABLED in CONFIGURATION_STREAM_STATES
+
+    with tempfile.TemporaryDirectory() as directory:
+        database = Database(str(_Path(directory) / "trending.db"), Decimal("1000"))
+        await database.connect()
+        try:
+            # 14. The schema is additive and idempotent (section 110).
+            await database._init_schema()
+            store = TrendingStore(database)
+            fresh = TrendingLedgerEntry.from_first_observation(observation(rank=44))
+            await store.record_observation(fresh, observation(rank=44))
+            # A tampered write must not move the persisted entry numbers.
+            await store.record_observation(
+                replace(fresh, first_rank=1, first_market_cap_usd=Decimal("1"), current_rank=2)
+            )
+            reloaded = await store.load_entry("MintSelfCheck")
+            assert reloaded is not None and reloaded.first_rank == 44, (
+                "the SQL upsert must never rewrite a first observation"
+            )
+            assert reloaded.first_market_cap_usd == Decimal("200000")
+
+            offline = RealtimeWalletStream(
+                database, rpc_url="https://rpc.example/", explicit_ws_url=None, enabled=False
+            )
+            assert offline.health().state == STREAM_DISABLED
+            await offline._run_connection()
+            live = RealtimeWalletStream(
+                database, rpc_url="https://rpc.example/", explicit_ws_url=None, enabled=True
+            )
+            await live._run_connection()
+            assert live.health().state == STREAM_NO_WALLETS, (
+                "no wallets is its own state, not a bare DISCONNECTED"
+            )
+            live._set_state(STREAM_CONNECTED)
+            assert live.health().healthy and not live.health().fallback_active
+        finally:
+            await database.close()
+
+    # 15. Nothing in the Trending package can move real funds (section 109).
+    import pathlib as _pathlib
+
+    import smart_money_bot.trending as _trending
+
+    for path in _pathlib.Path(_trending.__file__).parent.glob("*.py"):
+        source = path.read_text()
+        for forbidden in ("Keypair", "send_transaction", "sign_transaction", "aiohttp"):
+            assert forbidden not in source, f"{path.name} must stay provider- and signer-free"
 
 
 if __name__ == "__main__":

@@ -27,6 +27,7 @@ from types import SimpleNamespace
 import pytest
 
 from smart_money_bot import fast_alerts as fa
+from smart_money_bot import stream
 from smart_money_bot.database import Database
 from smart_money_bot.discord_render import MESSAGE_EMBED_LIMIT, build_embed, render_message
 from smart_money_bot.lab.catalyst import (
@@ -73,6 +74,10 @@ from smart_money_bot.lab.notable import (
 )
 from smart_money_bot.lab.shadow import DEFAULT_SHADOW_CONFIG
 from smart_money_bot.lab.smartmoney import WalletReputation
+from smart_money_bot.trending import source_from_settings
+from smart_money_bot.trending_runtime import TrendingRuntime
+from smart_money_bot.trending_source import build_trending_client
+from smart_money_bot.trending_store import TrendingStore
 
 D = Decimal
 MINT = "So11111111111111111111111111111111111111112"
@@ -630,11 +635,13 @@ def test_no_fast_alert_class_can_ever_be_entry_eligible() -> None:
 
 
 def test_only_earned_classes_may_interrupt_the_user() -> None:
-    """v2.41 adds EARLY_RUNNER, because being early is the entire objective.
+    """v2.42 adds the Trending classes, because Trending is now the primary lane.
 
     Everything still excluded is excluded for a reason: a late observation, an
     ordinary catalyst watch, a quiet heads-up and a simulated fill are all
     published where the operator can read them, and none of them earns a ping.
+    TRENDING_HOT_WATCH is the newest member of that quiet set — a hot watch is a
+    promise to look again in seconds, not an interruption (section 44).
     """
 
     assert set(fa.PINGABLE) == {
@@ -642,11 +649,16 @@ def test_only_earned_classes_may_interrupt_the_user() -> None:
         fa.BREAKING_CATALYST,
         fa.CONFLUENCE_WATCH,
         fa.EARLY_RUNNER,
+        fa.TRENDING_ALPHA,
+        fa.TRENDING_ACCELERATION_ALERT,
+        fa.TRENDING_CONTINUATION_ALERT,
+        fa.OFF_TRENDING_EXCEPTION,
     }
     assert fa.NOTABLE_TRADER_LATE not in fa.PINGABLE
     assert fa.CATALYST_WATCH not in fa.PINGABLE
     assert fa.EARLY_HEADS_UP not in fa.PINGABLE
     assert fa.SHADOW_ENTRY not in fa.PINGABLE
+    assert fa.TRENDING_HOT_WATCH not in fa.PINGABLE
 
 
 def test_every_fast_alert_fits_inside_one_discord_message() -> None:
@@ -1228,14 +1240,43 @@ async def test_the_engine_names_the_lane_state_without_claiming_live_execution(
     database,
 ) -> None:
     engine = _notable_engine(database, _RecordingNotifier())
-    engine.stream = SimpleNamespace(connected=True, last_event_at=None, subscription_count=4)
     engine.settings.fomo_catalyst_alerts_enabled = True
     engine.settings.fomo_confluence_alerts_enabled = True
     engine.settings.fomo_social_radar_enabled = False
+    engine.settings.fomo_trending_primary_enabled = True
+    engine.settings.fomo_graduated_secondary_enabled = True
+    engine.settings.fomo_trending_shadow_enabled = True
+    # A real stream and a real Trending runtime: the status surface reads named
+    # state off both, and a stub that only carries the old booleans would let
+    # this assertion pass while production reported nothing useful.
+    engine.stream = stream.RealtimeWalletStream(
+        database,
+        rpc_url="https://rpc.example/",
+        explicit_ws_url=None,
+        enabled=True,
+    )
+    engine.trending_source = source_from_settings(
+        api_url=None, api_key=None, proxy_enabled=True
+    )
+    engine.trending_hot_watch_cards = 0
+    engine.trending = TrendingRuntime(
+        TrendingStore(database), build_trending_client(
+            engine.trending_source, api_url=None, api_key=None
+        )
+    )
+    engine.stream._set_state(stream.STREAM_CONNECTED)
+    engine.stream.subscription_count = 4
     status = engine.realtime_status()
     assert status["live_execution"] is False
     assert status["stream_connected"] is True
     assert status["fast_watch_enabled"] is True
+    # v2.42: the lane reports a named state, not just a boolean.  "DISCONNECTED,
+    # 0 subscriptions, 0 reconnects" described three unrelated faults and told
+    # the operator how to fix none of them.
+    assert status["stream_state"] == stream.STREAM_CONNECTED
+    assert status["stream_detail"]
+    assert status["stream_fallback_active"] is False
+    assert status["trending_source"] in {"TRENDING_PROXY", "FOMO_TRENDING", "NO_SOURCE_CONFIGURED"}
 
 
 async def test_a_stale_cached_market_cap_never_manufactures_a_move(database) -> None:

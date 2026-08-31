@@ -1053,6 +1053,205 @@ class Database:
                 ON narrative_links(mint);
             CREATE INDEX IF NOT EXISTS idx_narrative_links_rank
                 ON narrative_links(narrative_id, confidence DESC);
+
+            -- Trending-first alpha engine (v2.42).  Every statement here is
+            -- additive and IF NOT EXISTS: no existing table is altered, no
+            -- forward history is rewritten, and a restart re-runs the whole
+            -- block harmlessly.  The two shadow experiments share these tables
+            -- only in the sense that they share the file -- they are partitioned
+            -- by strategy_version, which is a different bankroll.
+
+            -- The primary Trending ledger (section 5).  One row per exact mint.
+            -- The first_* columns are written once by INSERT OR IGNORE and then
+            -- never updated, which is what makes "was the alert early?"
+            -- answerable rather than reconstructable.
+            CREATE TABLE IF NOT EXISTS trending_tokens (
+                mint TEXT PRIMARY KEY,
+                name TEXT NOT NULL DEFAULT '',
+                symbol TEXT NOT NULL DEFAULT '',
+                fomo_token_id TEXT NOT NULL DEFAULT '',
+                fomo_url TEXT NOT NULL DEFAULT '',
+                source_kind TEXT NOT NULL DEFAULT 'TRENDING_PROXY',
+                first_seen_at INTEGER NOT NULL,
+                first_rank INTEGER,
+                first_market_cap_usd REAL,
+                first_holder_count INTEGER,
+                first_top10_percent REAL,
+                current_rank INTEGER,
+                best_rank INTEGER,
+                current_market_cap_usd REAL,
+                peak_market_cap_usd REAL,
+                change_window TEXT NOT NULL DEFAULT 'CHANGE_WINDOW_UNKNOWN',
+                verification TEXT NOT NULL DEFAULT 'UNKNOWN',
+                entries INTEGER NOT NULL DEFAULT 1,
+                seconds_on_board INTEGER NOT NULL DEFAULT 0,
+                on_board INTEGER NOT NULL DEFAULT 1,
+                exited_at INTEGER,
+                last_observed_at INTEGER NOT NULL,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_trending_tokens_rank
+                ON trending_tokens(on_board DESC, current_rank ASC);
+            CREATE INDEX IF NOT EXISTS idx_trending_tokens_recent
+                ON trending_tokens(last_observed_at DESC);
+
+            -- Raw board snapshots, so rank velocity survives a restart.
+            CREATE TABLE IF NOT EXISTS trending_snapshots (
+                mint TEXT NOT NULL,
+                observed_at INTEGER NOT NULL,
+                rank INTEGER,
+                market_cap_usd REAL,
+                price_usd REAL,
+                liquidity_usd REAL,
+                holder_count INTEGER,
+                top10_percent REAL,
+                displayed_change_percent REAL,
+                change_window TEXT NOT NULL DEFAULT 'CHANGE_WINDOW_UNKNOWN',
+                source_kind TEXT NOT NULL DEFAULT 'TRENDING_PROXY',
+                PRIMARY KEY (mint, observed_at)
+            );
+            CREATE INDEX IF NOT EXISTS idx_trending_snapshots_time
+                ON trending_snapshots(observed_at DESC);
+
+            -- Classified Trending state changes (section 7).
+            CREATE TABLE IF NOT EXISTS trending_events (
+                mint TEXT NOT NULL,
+                state TEXT NOT NULL,
+                occurred_at INTEGER NOT NULL,
+                rank INTEGER,
+                rank_delta INTEGER NOT NULL DEFAULT 0,
+                market_cap_usd REAL,
+                move_percent REAL,
+                score REAL,
+                reasons_json TEXT NOT NULL DEFAULT '[]',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                PRIMARY KEY (mint, state, occurred_at)
+            );
+            CREATE INDEX IF NOT EXISTS idx_trending_events_recent
+                ON trending_events(occurred_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_trending_events_state
+                ON trending_events(state, occurred_at DESC);
+
+            -- HOT WATCH (sections 41-50).  One row per mint per entry window;
+            -- the promotion market caps are write-once for the same reason the
+            -- ledger's first_* columns are.
+            CREATE TABLE IF NOT EXISTS trending_hot_watch (
+                mint TEXT NOT NULL,
+                entered_at INTEGER NOT NULL,
+                origin TEXT NOT NULL DEFAULT 'TRENDING_NEAR_MISS',
+                state TEXT NOT NULL DEFAULT 'ACTIVE',
+                expires_at INTEGER NOT NULL,
+                entry_score REAL NOT NULL DEFAULT 0,
+                best_score REAL NOT NULL DEFAULT 0,
+                last_score REAL NOT NULL DEFAULT 0,
+                rechecks INTEGER NOT NULL DEFAULT 0,
+                last_recheck_at INTEGER NOT NULL DEFAULT 0,
+                promoted_at INTEGER,
+                resolved_at INTEGER,
+                hot_watch_market_cap_usd REAL,
+                promotion_market_cap_usd REAL,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (mint, entered_at)
+            );
+            CREATE INDEX IF NOT EXISTS idx_trending_hot_watch_state
+                ON trending_hot_watch(state, expires_at);
+            CREATE INDEX IF NOT EXISTS idx_trending_hot_watch_recent
+                ON trending_hot_watch(entered_at DESC);
+
+            -- Ingested public theses, keyed to the EXACT mint (sections 19-26).
+            CREATE TABLE IF NOT EXISTS trending_theses (
+                thesis_id TEXT PRIMARY KEY,
+                mint TEXT NOT NULL,
+                author TEXT NOT NULL,
+                posted_at INTEGER NOT NULL,
+                source TEXT NOT NULL DEFAULT '',
+                category TEXT NOT NULL DEFAULT 'OTHER',
+                quality TEXT NOT NULL DEFAULT 'NOISE',
+                timing TEXT NOT NULL DEFAULT 'TIMELY',
+                specificity INTEGER NOT NULL DEFAULT 0,
+                cluster_id TEXT NOT NULL DEFAULT '',
+                cluster_leader INTEGER NOT NULL DEFAULT 1,
+                market_cap_at_thesis_usd REAL,
+                penalties_json TEXT NOT NULL DEFAULT '[]',
+                text TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_trending_theses_mint
+                ON trending_theses(mint, posted_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_trending_theses_author
+                ON trending_theses(author, posted_at DESC);
+
+            -- Forward-measured thesis-author reputation (section 25).  This is
+            -- an outcome record, not a popularity score.
+            CREATE TABLE IF NOT EXISTS trending_thesis_authors (
+                author TEXT PRIMARY KEY,
+                sample INTEGER NOT NULL DEFAULT 0,
+                avg_forward_move_percent REAL,
+                avg_mfe_percent REAL,
+                avg_mae_percent REAL,
+                severe_failures INTEGER NOT NULL DEFAULT 0,
+                rug_exposures INTEGER NOT NULL DEFAULT 0,
+                late_theses INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL
+            );
+
+            -- The token's own About section and how far it could be checked
+            -- (sections 16-18).  Claims and corroboration are separate columns
+            -- on purpose: they must never be rendered as one thing.
+            CREATE TABLE IF NOT EXISTS trending_about (
+                mint TEXT PRIMARY KEY,
+                summary TEXT NOT NULL DEFAULT '',
+                claims_json TEXT NOT NULL DEFAULT '[]',
+                website TEXT NOT NULL DEFAULT '',
+                has_official_claim INTEGER NOT NULL DEFAULT 0,
+                external_state TEXT NOT NULL DEFAULT 'NOT_APPLICABLE',
+                token_link TEXT NOT NULL DEFAULT 'NO_CLAIM',
+                mentions_exact_mint INTEGER NOT NULL DEFAULT 0,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                updated_at INTEGER NOT NULL
+            );
+
+            -- Trending latency stamps (sections 78-79).  Write-once per stage.
+            CREATE TABLE IF NOT EXISTS trending_latency (
+                mint TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                occurred_at INTEGER NOT NULL,
+                market_cap_usd REAL,
+                PRIMARY KEY (mint, stage)
+            );
+            CREATE INDEX IF NOT EXISTS idx_trending_latency_recent
+                ON trending_latency(occurred_at DESC);
+
+            -- Why a Trending candidate did not ping (section 91).
+            CREATE TABLE IF NOT EXISTS trending_suppression (
+                mint TEXT NOT NULL,
+                reason_code TEXT NOT NULL,
+                occurred_at INTEGER NOT NULL,
+                score REAL,
+                market_cap_usd REAL,
+                detail TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (mint, reason_code, occurred_at)
+            );
+            CREATE INDEX IF NOT EXISTS idx_trending_suppression_recent
+                ON trending_suppression(occurred_at DESC);
+
+            -- Missed Trending opportunities, graded after the fact (s80-82).
+            CREATE TABLE IF NOT EXISTS trending_missed (
+                mint TEXT NOT NULL,
+                miss_class TEXT NOT NULL,
+                observed_at INTEGER NOT NULL,
+                market_cap_at_observation_usd REAL,
+                peak_market_cap_usd REAL,
+                move_percent REAL,
+                suppression_reason TEXT NOT NULL DEFAULT '',
+                detail TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (mint, miss_class)
+            );
+            CREATE INDEX IF NOT EXISTS idx_trending_missed_recent
+                ON trending_missed(observed_at DESC);
             """
         )
         await self._migrate_pump_launch_status_constraint()

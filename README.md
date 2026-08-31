@@ -7,6 +7,57 @@ transactions, and mirrors every newly detected hot-wallet swap in PAPER mode. PA
 as either a forced source-price observation ledger or an executable Jupiter quote-shadow
 trial; the two answer different questions and are labeled separately.
 
+Version 2.42.0 makes **FOMO Trending the primary research universe**. The product question is no
+longer "which token just graduated?" but *what is trending right now, why, who is talking about
+it, are those theses real or bullshit, who is buying, and is there still a tradeable
+continuation?* Graduated discovery is **demoted to a secondary lane, not deleted**.
+
+**What this release can honestly see.** There is no documented public Fomo Trending API available
+to this deployment and no authorised Fomo feed is configured by default, so the bot does **not**
+pretend to have one. Provenance is a persisted, first-class value with exactly three states:
+`FOMO_TRENDING` (only when an administrator supplies `FOMO_TRENDING_API_URL`), `TRENDING_PROXY`
+(a public DEX Screener approximation of attention), and `NO_SOURCE_CONFIGURED`. Out of the box
+this runs as `TRENDING_PROXY`, and every card, ledger row and status surface says so. No code path
+promotes the proxy to `FOMO_TRENDING` — not on a heuristic, not on a hostname, not on a response
+shape. Nothing scrapes a protected endpoint, reuses a session, replays a cookie or works around a
+rate limit.
+
+**Trending is not safety.** The release deliberately encodes none of `TRENDING = SAFE`,
+`VERIFIED = CANNOT RUG`, or `THESIS = FACT`. Attention, story, thesis, public chatter, smart money
+and market structure are all *evidence*; a confirmed sell failure or a collapsed pool beats every
+one of them.
+
+Three concrete defects drove the work:
+
+* **The threshold cliff.** A candidate with ~1,532 buys, ~789 sells, a 1.94 buy/sell ratio and
+  heavy volume scored ~50 against a 55 gate with a 2.00 organic requirement. It produced a silent
+  heads-up and then ran. 1.94 and 2.00 are not different universes, so every component of the new
+  **Trending edge score** is a continuous ramp between a floor and a target rather than a boolean,
+  and strength in one dimension can compensate for a marginal miss in another. Everything stays
+  bounded and auditable — each contribution is returned with its own line.
+* **The 30-minute wait.** Even with better scoring, a candidate that missed by a hair was not
+  reconsidered for a full recheck window. **HOT WATCH** fixes that: a strong near miss is
+  reevaluated every 45 seconds for a bounded window from cached evidence, does **not** ping on
+  entry, promotes with exactly **one** ping when the evidence genuinely strengthens, and expires
+  silently when it does not. Promotion lateness is measured honestly — a heads-up at $500K and a
+  promotion at $1M is recorded as a 100% late promotion, not dressed up as early.
+* **The wallet lane was dead and said nothing useful.** `/fomo realtime` reported
+  `DISCONNECTED / subscriptions: 0 / reconnects: 0`. Zero reconnects means nothing ever *failed* —
+  the lane was never started or never subscribing. Three unrelated faults produced that identical
+  output. The stream now reports a **named state** (`DISABLED_BY_CONFIG`, `NO_WS_URL`,
+  `NO_WALLETS_SUBSCRIBED`, `CONNECTING`, `CONNECTED`, `RECONNECTING`, `STALE_NO_TRAFFIC`), runs its
+  supervisor even when it cannot connect, detects an open-but-silent socket and rebuilds its
+  subscriptions, counts every reconnect attempt, and escalates to the operator when the lane stays
+  down — losing smart-money intelligence silently is not acceptable.
+
+And the release adds the measurement that decides whether any of this was a good idea: a second,
+**completely isolated** `$100 / $10 / 5 positions / $50 exposure` forward experiment. The legacy
+shadow experiment is untouched — same version string, same bankroll, same history — and the two
+books are partitioned by `strategy_version` at the storage layer, so the same mint can be open in
+both at once without either seeing the other. `/fomo profit view:universes` reports which one
+actually makes more money and which one actually gets rugged less, and refuses to name a winner
+until both have a real sample.
+
 Version 2.41.0 is the **FOMO alpha engine**: ultra-early discovery and story-first alpha. It
 exists to fix one measured product failure — the bot recorded Grok Pocket at a **~$31.18K** market
 cap and the operator did not get useful visibility until **~$61.49K**, a **+97%** move that had
@@ -1062,6 +1113,161 @@ The bot needs these Discord application permissions:
 
 No privileged Discord gateway intents are required.
 
+## Trending-first alpha engine (v2.42)
+
+### What the bot can legitimately see
+
+| | |
+| --- | --- |
+| Authorised Fomo Trending feed | **not available by default** — no documented public API is reachable from this deployment |
+| Default source | `TRENDING_PROXY` — DEX Screener `token-boosts/top`, `token-boosts/latest`, `token-profiles/latest` for the ordering, and the documented batch endpoint `tokens/v1/solana/{addresses}` (30 mints per request) for market data |
+| Authorised path | set `FOMO_TRENDING_API_URL` (optionally `FOMO_TRENDING_API_KEY`) and the adapter labels its rows `FOMO_TRENDING` |
+| Nothing configured | `NO_SOURCE_CONFIGURED` — the lane says so instead of showing an empty board |
+
+The proxy is an approximation of *attention*, not Fomo's ranking. Its rank is a position in our
+own ordering, and that caveat travels with every card:
+
+> Rank is a PROXY ordering from public attention data, not Fomo's Trending rank.
+
+**No unauthorised access of any kind.** No cookies, no reused sessions, no replayed credentials,
+no undocumented or authenticated endpoints, no reverse-engineered private APIs, no rate-limit
+circumvention, and no invented feed.
+
+### Percentage windows are never guessed
+
+If a source displays `+325%` and does not document what window it covers, the bot persists
+`CHANGE_WINDOW_UNKNOWN` and prints `+325.0% (window unknown)`. It does not silently call it 24h.
+
+### The Trending ledger
+
+One row per **exact mint**. `first_seen_at`, `first_rank`, `first_market_cap_usd`,
+`first_holder_count` and `first_top10_percent` are written once by an `INSERT OR IGNORE` and never
+appear in an `UPDATE SET` clause, so no code path — including a buggy one — can move them. The
+read path re-derives those fields from those protected columns rather than from the JSON payload,
+so a corrupted write cannot round-trip its corruption back out. That immutability is what makes
+"was the alert early?" answerable rather than reconstructable.
+
+Re-entry is decided by the board diff (`on_board`), never by the gap between two observations: a
+slow poll, a restart or a busy loop all produce large gaps while the token never left the board.
+Time on the board is credited only from observations actually made, capped per gap, so a three-hour
+outage is never credited as three hours of observation.
+
+### Trending event states
+
+`TRENDING_NEW_ENTRY` · `TRENDING_RANK_RISING` · `TRENDING_ACCELERATING` · `TRENDING_HEALTHY` ·
+`TRENDING_CONTINUATION` · `TRENDING_REENTRY` · `TRENDING_COOLING` · `TRENDING_FADING` ·
+`TRENDING_EXITED` · `TRENDING_EDGE_CONSUMED`
+
+Every one is derived from **movement** — rank velocity, market-cap acceleration, holder growth,
+time on the board — never from absolute rank. `#44 → #31 → #18 → #9` in minutes is a signal;
+`#2` flat for six hours is a position. `TRENDING_CONTINUATION` requires genuinely **new** evidence
+(a fresh supported thesis, a new catalyst, renewed accumulation, holder acceleration); "it pumped,
+therefore buy" cannot reach it, and a continuation card states plainly that it is **not early**.
+
+### The Trending edge score
+
+The legacy opportunity score was built for a different question and is kept only as supporting
+context. The primary lens is a bounded 0–100 **Trending edge score** with a printable derivation:
+rank velocity, new-entry status, market acceleration, holder growth, liquidity, thesis quality,
+story, public social, and smart money, minus concentration and edge-consumed penalties.
+
+Every component is a continuous ramp, which is the fix for the threshold cliff. A hard safety
+failure zeroes the score outright and clears every reason — attention never outvotes a confirmed
+sell failure.
+
+**A score is never a reason.** An urgent alert must carry a named serious category:
+`TRENDING_ACCELERATION`, `TRENDING_NEW_ENTRY`, `STORY`, `THESIS`, `AI_PROJECT`, `SMART_MONEY`,
+`PUBLIC_SOCIAL`, `HOLDER_EXPANSION`, `CONFLUENCE`, `EXCEPTIONAL_MARKET_STRUCTURE` or
+`TRENDING_CONTINUATION`. A candidate that clears the threshold with no named reason is suppressed,
+as is one whose only reason is chatter without market confirmation.
+
+### HOT WATCH
+
+| | |
+| --- | --- |
+| Entry | a strong near miss within 12 points of the alpha threshold, or a new entrant with strong evidence |
+| Recheck cadence | **45 s** (versus the legacy 1800 s recheck) |
+| Window | 900 s, then it expires |
+| Population cap | 12 concurrent, so cost stays bounded |
+| On entry | a quiet radar card. **No ping.** |
+| On promotion | exactly **one** escalation ping, and only with a named reason |
+| On fade | silent expiry |
+
+Promotion timing is persisted and reported: first-seen MC, Trending-entry MC, heads-up MC, hot
+watch time, promotion MC and urgent-ping MC. `/fomo trending view:hotwatch` shows the heads-up →
+promotion p50, the promotion miss rate, and how many expired without a ping.
+
+### Claims, theses and stories are kept apart from facts
+
+* **About** is summarised, never dumped, and rendered as *the project's own claim*.
+* A named project is only `SUPPORTED` when an official source publishes **this exact mint**. A real
+  project with a real website that has never heard of the token is `UNVERIFIED` — that is the most
+  common trap in the category.
+* Theses are graded on **specificity, timing, exact-mint provenance, independence and the author's
+  forward record** — never on how confident they sound or how many likes they have. Generic moon
+  posts, copy-paste, developer self-promotion, circular sourcing, claims lifted from another mint,
+  unsupported "insider" assertions and post-move hindsight are all penalised by name.
+* Near-identical theses are clustered: three copies of one post are **one** information source;
+  three analysts reaching the same conclusion separately are three.
+* Public commentary is called **PUBLIC EARLY CHATTER**, never "insider info". Nothing reads private
+  messages, leaks or non-public sources.
+* Engagement counts are recorded only when a source actually supplies them. A missing count is
+  `None`, never a confident-looking `0`.
+
+### Holders
+
+Genuine participant growth is distinguished from repeat transactions: a thousand transactions from
+ten wallets is not five hundred new independent holders. Concentration is tracked as a **trend**,
+because "top 10 hold 40%" means nothing without knowing whether it was 25% or 60% ten minutes ago.
+
+### Mint is identity
+
+A name, a ticker, a story, an About blurb and an image are all attributes several unrelated tokens
+routinely share. Evidence never crosses mints — a same-name token's thesis, story or wallet event
+is not this token's evidence — and a ledger entry raises rather than merging a different mint.
+Every Fomo link is derived from the mint itself and verified to resolve to it, so a card can never
+show one token and link to another. Collisions are surfaced, not hidden.
+
+### The two forward experiments
+
+|  | LEGACY | TRENDING |
+| --- | --- | --- |
+| Strategy version | `shadow-v1` | `trending-shadow-v1` |
+| Bankroll | $100 | $100 |
+| Per position | $10 | $10 |
+| Max open | 5 | 5 |
+| Max exposure | $50 | $50 |
+
+Identical shape so the **strategy is the only variable**. Isolation is structural: the store keys
+bankrolls by `strategy_version` and open positions by `(mint, family, strategy_version)`, so the
+same mint can be open in both books simultaneously and neither can see, spend or block the other.
+The legacy experiment's config, version and entire forward history are untouched.
+
+Trending Radar shows everything relevant; the Trending experiment only simulates configured
+strategy signals. Chatter or holder growth alone is deliberately not tradeable.
+
+`/fomo profit view:universes` reports current bankroll, NET, ROI, trades, win rate, profit factor,
+expectancy, drawdown, MFE, MAE, severe failures and rug / liquidity-collapse rates for both — and
+reports **safety** and **upside** separately, because "Trending rugs less" and "Trending runs
+further" are different questions that can come out in opposite directions. It refuses to name a
+winner until both books have at least 10 resolved trades.
+
+### Trending-aware exits are challengers, not replacements
+
+The hypothesis that Trending tokens deserve more patience is **tested**, not assumed. Twelve
+counterfactual policies — current champion, Trending persistence, rank trailing, thesis/story/
+holder continuation, adaptive trail, principal-recovery runner, and fixed 5m/15m/30m/1h holds —
+replay the observation stream the engine already records, so they cost zero extra provider
+requests. Every one of them, including the most patient, exits immediately on a confirmed sell
+failure, liquidity collapse or hard malicious evidence. A `SOFT_PAUSE` on a token still on the
+board with growing holders and healthy liquidity is not a reversal.
+
+### Real money
+
+Unchanged and non-negotiable: no signer, no private key, no swap, no SOL spending, no live
+execution. The entire `smart_money_bot.trending` package holds no network client, no database
+handle and no wallet — asserted by the test suite and by the deploy self-check.
+
 ## Ultra-early discovery and story-first alpha (v2.41)
 
 ### The Grok Pocket postmortem
@@ -1350,6 +1556,64 @@ transaction, an order execution call or a swap. The test suite and the self-chec
 module's AST and assert it.
 
 ## Railway deployment
+
+### v2.42.0 Railway changes
+
+Every new setting has a safe code default, so **no Railway variable has to be added**. Nothing here
+enables live trading or real-money execution, no shadow forward history is reset, and the legacy
+$100 / $10 / 5 / $50 experiment keeps its own bankroll and its whole record.
+
+**ADD:** none required.  **CHANGE:** none required.
+
+**OPTIONAL:**
+
+```text
+FOMO_TRENDING_PRIMARY_ENABLED=true          # Trending as the primary discovery universe
+FOMO_GRADUATED_SECONDARY_ENABLED=true       # keep graduated discovery as the secondary lane
+FOMO_TRENDING_PROXY_ENABLED=true            # allow the public TRENDING_PROXY approximation
+FOMO_TRENDING_POLL_SECONDS=45               # source-safe cadence for the Trending loop
+FOMO_TRENDING_MAX_TRACKED=60                # board rows tracked per poll
+FOMO_TRENDING_ALPHA_MIN_SCORE=62            # the bar an urgent Trending alert must clear
+FOMO_TRENDING_WATCH_MIN_SCORE=40            # the quiet "strengthening" tier
+FOMO_TRENDING_MAX_ALERTS_PER_HOUR=10        # hourly ceiling on Trending interruptions
+FOMO_TRENDING_COOLDOWN_SECONDS=1800         # per-mint cooldown between Trending pings
+FOMO_TRENDING_HOT_WATCH_ENABLED=true        # the fast near-miss reevaluation lane
+FOMO_TRENDING_HOT_WATCH_SECONDS=900         # how long a hot watch may live
+FOMO_TRENDING_HOT_WATCH_RECHECK_SECONDS=45  # how often it is reconsidered
+FOMO_TRENDING_HOT_WATCH_MAX=12              # concurrent hot watches, so cost stays bounded
+FOMO_TRENDING_HOT_WATCH_BAND=12             # points below the alpha bar that count as a near miss
+FOMO_TRENDING_SOCIAL_ENRICH_ENABLED=true    # attach public social evidence to Trending candidates
+FOMO_TRENDING_SHADOW_ENABLED=true           # the second, isolated $100 forward experiment
+FOMO_TRENDING_STALE_SNAPSHOT_SECONDS=600    # after this the lane reports STALE, not ACTIVE
+```
+
+**Only if an administrator has an authorised Fomo Trending feed:**
+
+```text
+FOMO_TRENDING_API_URL=https://<authorised-feed>   # ONLY this promotes provenance to FOMO_TRENDING
+FOMO_TRENDING_API_KEY=<key>                       # optional, sent as x-api-key
+FOMO_TRENDING_CHANGE_WINDOW=24H                   # only if the feed documents its window
+```
+
+Leave `FOMO_TRENDING_API_URL` unset and the bot runs on `TRENDING_PROXY` and says so everywhere.
+Leave `FOMO_TRENDING_CHANGE_WINDOW` unset and displayed percentages are recorded as
+`CHANGE_WINDOW_UNKNOWN` rather than guessed.
+
+**Worth knowing without changing anything:**
+
+* **Provider cost is roughly flat.** The Trending loop costs 3 small list requests plus
+  `ceil(tracked / 30)` batch requests per poll — about 5 requests every 45 seconds — and enrichment
+  reuses the DEX snapshot cache the radar already fills. Hot-watch rechecks read *cached* state and
+  add no board fetches. `FOMO_TRENDING_POLL_SECONDS` is bounded to 15–3600 s; do not set it below
+  what the source tolerates.
+* **The hot-watch cadence must stay well under its window.** Configuration validation rejects a
+  recheck interval that is not shorter than `FOMO_TRENDING_HOT_WATCH_SECONDS`, because a hot watch
+  that reevaluates as slowly as the legacy radar is precisely the bug it exists to fix.
+* **Turning the Trending lane off does not restore v2.41 behaviour by itself.** Set
+  `FOMO_TRENDING_PRIMARY_ENABLED=false` to stop the Trending loop; the graduated lane keeps running
+  because `FOMO_GRADUATED_SECONDARY_ENABLED` defaults to true.
+* **`FOMO_TRENDING_SHADOW_ENABLED=false` pauses the new experiment only.** The legacy shadow book is
+  a different `strategy_version` and is unaffected either way.
 
 ### v2.41.0 Railway changes
 
@@ -1808,6 +2072,25 @@ Mutation commands require Discord Administrator or a role listed in
 
 Every one of these is read-only research. They show `WAIT`, `REJECT`, `COOLDOWN` and
 `REENTRY_WATCH` candidates on purpose; seeing a candidate never makes it entry eligible.
+
+### Trending-first alpha (v2.42, admin only)
+
+| Command | What it answers |
+| --- | --- |
+| `/fomo trending` | **What is trending right now, and is any of it still tradeable?** The board by rank, each token's exact mint, its market cap when it entered Trending versus now, best rank, time on the board, holder growth, and the active hot-watch count. Always states which source produced the rank. |
+| `/fomo trending view:token mint:<exact mint>` | One token in full: rank and best rank, entry rank, stints, first Trending MC → now, peak, liquidity, the displayed change *with its window* (or `window unknown`), holder count and concentration trend, the About section as a **claim** beside its external verification as a **fact**, graded theses with author and timing, and the Fomo verification badge labelled as a badge. A name or ticker is refused — only the exact mint is accepted. |
+| `/fomo trending view:hotwatch` | Is the fast lane actually promoting in time? Active, promoted, expired and dropped counts, the heads-up → promotion p50, the promotion miss rate, and recent entries with their entry score, best score, recheck count and how much the market cap moved between heads-up and promotion. |
+| `/fomo trending view:why` | **Why wasn't I pinged?** Every structured Trending suppression reason with its count — `HOT_WATCH`, `EDGE_CONSUMED`, `SOCIAL_ONLY`, `NOT_STRONG_ENOUGH`, `HARD_SAFETY_FAILURE`, `NO_NAMED_SERIOUS_REASON`, `RATE_LIMIT`, `COOLDOWN` and the rest. |
+| `/fomo profit view:universes` | **$100 LEGACY versus $100 TRENDING — which one actually made more money, and which one actually got rugged less?** Both bankrolls side by side with NET, ROI, win rate, profit factor, expectancy, drawdown, severe failures, rug and liquidity-collapse rates, and +25/+50/+100/+200 hit rates. Safety and upside leaders are reported separately, and no winner is named until both books have a real sample. |
+
+`/fomo trending` is **one** child command with a `view` parameter rather than four separate ones:
+Discord allows 25 subcommands per group and `/fomo` was already at 23, so views are the only shape
+that leaves room to grow. The group now sits at **24 of 25**.
+
+`/fomo realtime` carries the Trending block: the source kind and lane state, last snapshot age,
+tracked rows, new entries, rank movers, active hot watches, promotions, alerts published and
+suppressed — plus the wallet lane's **named** state, its reconnect count, how long it has been down,
+and whether the polling fallback is carrying the load.
 
 ### Ultra-early alpha (v2.41, admin only)
 
