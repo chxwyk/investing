@@ -1120,12 +1120,38 @@ class DexNarrativeMatcher:
                     pair_url=str(pair.get("url") or ""),
                 )
             )
+        if not matches:
+            return None
+
+        # A text search over a name or ticker returns a *set* of unrelated
+        # tokens.  Returning "the best" of them asserts an identity the search
+        # never established, and the old ranking preferred the *youngest* pair —
+        # which is precisely how a brand-new same-symbol clone beat the real
+        # token and reached an operator as a runner.
+        #
+        # So a narrative search now refuses to pick a winner whenever more than
+        # one live token answers to the term.  The collision is reported instead,
+        # and the caller decides what to do with a lead it cannot verify.
+        identities = {
+            _normalize_term(item.symbol) or _normalize_term(item.name)
+            for item in matches
+        }
+        distinct_mints = {item.mint for item in matches}
+        if len(distinct_mints) > 1 and len(identities) <= 1:
+            logger.info(
+                "Narrative %r matches %d tokens sharing one identity; refusing to "
+                "choose between them",
+                query,
+                len(distinct_mints),
+            )
+            return None
+
+        # A single unambiguous match is still only a *lead*: it was resolved from
+        # text, not from an address, so it carries UNVERIFIED provenance and the
+        # caller must gate on that.
         return max(
             matches,
-            key=lambda item: (
-                -(item.pair_age_minutes or 0),
-                item.liquidity_usd or Decimal("0"),
-            ),
+            key=lambda item: item.liquidity_usd or Decimal("0"),
             default=None,
         )
 

@@ -1168,6 +1168,50 @@ The bot needs these Discord application permissions:
 
 No privileged Discord gateway intents are required.
 
+## Token identity is chain + exact mint (v2.43.1 hotfix)
+
+A card once reached the operator for `7TqH1d4Vf9QG578vB99Q7ewFQPoxSYqBDxSAzBpBpump` — a
+minutes-old token that shared a ticker with the one they were actually watching. It was
+titled `ORGANIC RUNNER — LOOK NOW`, admitted `SAFETY: UNKNOWN` two fields further down, and
+offered a one-click buy. Four independent defects had to line up for that, and each one is
+now closed by an invariant the deploy self-check enforces.
+
+**A token is its chain plus its exact mint. Name and ticker are display metadata.** They are
+never used to resolve, substitute, merge, deduplicate, enrich or choose between tokens.
+
+| Defect | What it did | What happens now |
+| --- | --- | --- |
+| Symbol resolution | A narrative search broke ties by picking the *youngest* matching pair, which is always the freshest clone | Two or more live tokens answering to one term resolve to **nothing**. A single unambiguous match is still only a lead, carrying `SYMBOL_SEARCH` provenance that no promotion gate accepts |
+| Organic classification | `EV_ORGANIC` came from raw flow — 542 buys against 144 sells | Flow bars are necessary but no longer sufficient: the category also needs confirmed *independent* buyers. Unknown independence is recorded as `None`, which is not zero, and the token stays visible under the neutral `EARLY RUNNER` name |
+| Card language | An unvalidated card led with `LOOK NOW` | The early lane publishes as `🔬 RESEARCH CANDIDATE — VALIDATION PENDING (<tier>)`. The tier is kept in parentheses because it is real information; it just no longer sets the headline |
+| Buy CTA | The buy button rendered unconditionally | `_token_view(..., trade_eligible=...)` defaults to `False`. Research links — Fomo, Pump.fun, DEX, Solscan — always render, and so does *Sell*, because an operator already holding a token needs an exit |
+
+### Provenance travels with every candidate
+
+`smart_money_bot.token_identity` is a pure module — it imports no HTTP client and no signer,
+so it structurally cannot resolve a token by asking someone. Every candidate carries
+`source`, `source_chain`, `source_mint`, `resolved_chain`, `resolved_mint`,
+`resolution_method`, `symbol_collision` and `identity_verified`. When a source supplied an
+address, `source_mint` **must** equal `resolved_mint`; `assert_exact_propagation()` checks
+that at each hand-off (enrichment, scoring, persistence, render) and raises rather than
+letting a swapped mint surface as a wrong card.
+
+Exact enrichment that fails returns `UNRESOLVED_EXACT_MINT`. It never falls back to a symbol
+search. **Failure is preferable to substitution.**
+
+### A symbol collision never picks a winner
+
+`detect_symbol_collision()` groups every known mint sharing a normalised ticker and reports
+it — on the card, as `⚠ SYMBOL COLLISION`, naming the exact mint the card is about. It has no
+`best`, `winner` or `preferred` accessor, because there is no basis on which to choose one.
+`Database.known_symbols()` is deliberately keyed by mint rather than symbol: a symbol-keyed
+index is how a substituting lookup gets written by accident.
+
+The deploy self-check (`tests/run_selfcheck.py`) refuses to pass if the age-based tie-break
+returns, if enrichment stops filtering on the exact address, if an unvalidated card regains
+actionable language, if the buy control loses its gate, or if a raw buy count is enough to be
+called organic again.
+
 ## Terminal-style trenches intelligence (v2.43)
 
 ### What was reviewed, and what was actually accessible

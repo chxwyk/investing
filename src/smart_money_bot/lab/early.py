@@ -153,6 +153,9 @@ WHY_TOO_OLD = "TOKEN_NOT_FRESH"
 WHY_MC_OUT_OF_RANGE = "MARKET_CAP_OUTSIDE_EARLY_RANGE"
 WHY_INSIDER_ONLY = "LARGE_BUY_WAS_CREATOR_LINKED"
 WHY_NO_DATA = "NO_CHEAP_MARKET_DATA"
+#: Flow looked strong but the buyers behind it could not be shown to be
+#: independent, so the candidate is not called organic (hotfix).
+WHY_INDEPENDENCE_UNCONFIRMED = "BUYER_INDEPENDENCE_UNCONFIRMED"
 WHY_DUPLICATE = "DUPLICATE_SUPPRESSED"
 WHY_RATE_LIMITED = "RATE_LIMITED"
 WHY_COOLDOWN = "TIER_COOLDOWN_ACTIVE"
@@ -205,6 +208,8 @@ class EarlyConfig:
 
     # ---- organic runner (section 17) --------------------------------------
     organic_min_buyers: int = 20
+    #: Distinct independent buyers required before flow may be called organic.
+    organic_min_independent_buyers: int = 8
     organic_min_buy_sell_ratio: Decimal = Decimal("2")
     organic_min_volume_to_liquidity: Decimal = Decimal("0.5")
 
@@ -279,6 +284,10 @@ class EarlySignals:
     largest_buy_usd: Decimal | None = None
     largest_buy_is_creator_linked: bool = False
     independent_buyers_after_largest_buy: int = 0
+    #: Distinct independent buyers in the 5-minute window, when the participant
+    #: intelligence could establish it.  ``None`` means unknown — which is not
+    #: the same as zero, and is never treated as proof of anything.
+    independent_buyers_5m: int | None = None
 
     #: Corroboration from the other lanes, when it happens to be in hand.
     notable_wallet_count: int = 0
@@ -598,15 +607,36 @@ def evaluate_early_signal(
     bounded = max(ZERO, min(HUNDRED, score)).quantize(CENT)
 
     # --- serious evidence categories (section 15) --------------------------
-    organic_strong = bool(
+    # A raw buy count is *activity*, not organic demand.  542 buys against 144
+    # sells clears every flow bar there is and says nothing about how many
+    # people are behind it — four wallets trading in a loop produce the same
+    # numbers as four hundred participants.  So the flow bars are necessary but
+    # no longer sufficient: EV_ORGANIC additionally requires evidence that the
+    # buyers were *independent*.
+    flow_strong = bool(
         signals.buys_5m >= config.organic_min_buyers
         and ratio is not None
         and ratio >= config.organic_min_buy_sell_ratio
         and depth is not None
         and depth >= config.organic_min_volume_to_liquidity
     )
+    independent_buyers = max(
+        signals.independent_buyers_5m or 0,
+        signals.independent_buyers_after_largest_buy,
+    )
+    independence_confirmed = independent_buyers >= config.organic_min_independent_buyers
+    organic_strong = flow_strong and independence_confirmed
     if organic_strong:
         categories.append(EV_ORGANIC)
+    elif flow_strong:
+        # Strong flow with unproven independence is exactly the case that
+        # produced a clone alert: it stays visible, it just may not be called
+        # organic yet.
+        reasons.append(
+            f"strong flow ({signals.buys_5m} buys) but independence unconfirmed — "
+            "not classified organic"
+        )
+        why.append(WHY_INDEPENDENCE_UNCONFIRMED)
     if impulse.is_demand:
         categories.append(EV_STRUCTURE)
     if signals.story_state in {"ACCELERATING", "STRONG", "VIRAL"} and (
@@ -634,7 +664,13 @@ def evaluate_early_signal(
     elif bounded >= config.runner_min_score and categories:
         # A runner whose whole case is market structure is an ORGANIC RUNNER,
         # and section 17 wants it named that way — no story is not a defect.
-        tier = TIER_ORGANIC_RUNNER if market_only else TIER_EARLY_RUNNER
+        # But the word "organic" is a claim about *who* is buying, so it is only
+        # earned once independence is confirmed; strong flow on its own still
+        # runs, it just runs under the neutral name.
+        if market_only:
+            tier = TIER_ORGANIC_RUNNER if EV_ORGANIC in categories else TIER_EARLY_RUNNER
+        else:
+            tier = TIER_EARLY_RUNNER
     elif bounded >= config.heads_up_min_score:
         tier = TIER_EARLY_HEADS_UP
         if bounded >= config.runner_min_score:

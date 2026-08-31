@@ -104,6 +104,7 @@ def signals(**overrides) -> EarlySignals:
         "buys_5m": 26,
         "sells_5m": 6,
         "route_available": True,
+        "independent_buyers_5m": 19,
     }
     payload.update(overrides)
     return EarlySignals(**payload)

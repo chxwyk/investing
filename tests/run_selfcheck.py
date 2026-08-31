@@ -232,12 +232,243 @@ async def main() -> None:
     await check_early_alpha()
     await check_trending_alpha()
     await check_trenches_intelligence()
+    await check_token_identity()
 
     print(
         "SELF-CHECK PASSED: detector, scoring, database, discovery rotation, "
         "paper P&L, risk gate, PAPER laboratory, discovery-speed, realtime-alpha, "
-        "SHADOW auto-trader, profit-optimization, early-alpha, Trending-first and "
-        "trenches-intelligence invariants"
+        "SHADOW auto-trader, profit-optimization, early-alpha, Trending-first, "
+        "trenches-intelligence and token-identity invariants"
+    )
+
+
+async def check_token_identity() -> None:
+    """A token is its chain plus its exact mint.  Everything else is display.
+
+    This deploy gate exists because the bot once alerted on a brand-new
+    same-ticker clone, called it an organic runner, admitted in the same card
+    that safety was UNKNOWN, and offered a buy button.  Four separate defects,
+    four separate invariants.
+    """
+
+    import ast
+    import inspect
+    import pathlib
+    import textwrap
+
+    import smart_money_bot.bot as bot_module
+    import smart_money_bot.engine as engine_module
+    from smart_money_bot.fast_alerts import build_early_alert
+    from smart_money_bot.lab.early import EarlySignals, evaluate_early_signal
+    from smart_money_bot.token_identity import (
+        SOURCE_RESOLVED_MISMATCH,
+        UNRESOLVED_EXACT_MINT,
+        ResolutionProvenance,
+        TokenIdentityError,
+        assert_exact_propagation,
+        detect_symbol_collision,
+        exact,
+        unresolved,
+    )
+
+    watched = "GPR7Ax4kQ2mVn8hLdT6yWc3JbRfE9uZsXqM1oP5tH4dK"
+    clone = "7TqH1d4Vf9QG578vB99Q7ewFQPoxSYqBDxSAzBpBpump"
+
+    # 1. No symbol-based token resolution anywhere on the identity path.
+    #    A text search may produce a *lead*; it may never decide which token a
+    #    card is about, so the tie-break that used to pick the youngest pair is
+    #    gone and the ambiguous case returns nothing.
+    from smart_money_bot.news import DexNarrativeMatcher
+
+    search_source = inspect.getsource(DexNarrativeMatcher.search)
+    selectors = [
+        ast.unparse(node)
+        for node in ast.walk(ast.parse(textwrap.dedent(search_source)))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "max"
+        for keyword in node.keywords
+        if keyword.arg == "key"
+        for node in (keyword.value,)
+    ]
+    assert selectors, "the resolver must still have an explicit selection rule"
+    for selector in selectors:
+        assert "age" not in selector, (
+            "resolving a symbol to the youngest pair is how the clone got chosen"
+        )
+    assert "distinct_mints" in search_source and "return None" in search_source, (
+        "an ambiguous symbol must resolve to nothing, never to a guess"
+    )
+
+    matcher = DexNarrativeMatcher(min_liquidity_usd=Decimal("1000"), max_age_minutes=600)
+    created = int(time.time() * 1000) - 120_000
+
+    def _pair(mint: str, liquidity: str, age_ms: int) -> dict:
+        return {
+            "chainId": "solana",
+            "baseToken": {"address": mint, "symbol": "GPRO", "name": "GPRO"},
+            "liquidity": {"usd": liquidity},
+            "pairCreatedAt": age_ms,
+            "txns": {"m5": {"buys": 40, "sells": 5}},
+            "volume": {"m5": "9000"},
+        }
+
+    async def _pairs(query: str) -> list[dict]:
+        return [
+            _pair(watched, "90000", created - 3_000_000),
+            _pair(clone, "6000", created),
+        ]
+
+    matcher._search_pairs = _pairs  # type: ignore[method-assign]
+    assert await matcher.search("GPRO") is None, (
+        "two live tokens sharing a ticker must resolve to neither"
+    )
+
+    # 1b. Enrichment is keyed on the exact address: a pair belonging to another
+    #     token can never be read into this token's snapshot.
+    from smart_money_bot.callouts import parse_dex_snapshot
+
+    payload = {
+        "pairs": [
+            {
+                "chainId": "solana",
+                "baseToken": {"address": clone, "symbol": "GPRO"},
+                "liquidity": {"usd": "250000"},
+                "marketCap": "900000",
+                "pairCreatedAt": created,
+            }
+        ]
+    }
+    assert not parse_dex_snapshot(payload, mint=watched).available, (
+        "a same-symbol pair for another mint must never enrich this one"
+    )
+
+    # 2. Exact-mint propagation is asserted at the hand-offs, and a mismatch is
+    #    a hard failure rather than a silently different card.
+    assert_exact_propagation(watched, watched, stage="selfcheck")
+    try:
+        assert_exact_propagation(watched, clone, stage="selfcheck")
+    except TokenIdentityError:
+        pass
+    else:  # pragma: no cover - the gate is the point
+        raise AssertionError("a swapped mint must raise, not warn")
+
+    swapped = ResolutionProvenance(
+        source="fomo_trending",
+        source_mint=watched,
+        resolved_mint=clone,
+        resolution_method="EXACT_MINT",
+    )
+    assert swapped.substituted and not swapped.identity_verified
+    assert swapped.failure_reason() == SOURCE_RESOLVED_MISMATCH
+    assert exact(watched, source="fomo_trending").identity_verified
+    assert unresolved(watched, source="fomo_trending").failure_reason() == UNRESOLVED_EXACT_MINT
+
+    # 3. A shared ticker groups tokens; it never merges or ranks them.
+    collision = detect_symbol_collision(
+        "GPRO", {watched: "GPRO", clone: "gpro"}, subject_mint=watched
+    )
+    assert collision.detected and collision.count == 2
+    assert watched in collision.warning_line(watched)
+
+    identity_source = pathlib.Path(
+        inspect.getsourcefile(exact) or ""
+    ).read_text()
+    identity_tree = ast.parse(identity_source)
+    imported = {
+        node.module.split(".")[0]
+        for node in ast.walk(identity_tree)
+        if isinstance(node, ast.ImportFrom) and node.module
+    } | {
+        alias.name.split(".")[0]
+        for node in ast.walk(identity_tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+    assert not (imported & {"aiohttp", "httpx", "requests", "solana", "solders"}), (
+        "identity resolution must not be able to call a provider"
+    )
+
+    # 4. A card that does not know cannot sound like it does, and the buy
+    #    control is gated on eligibility the early lane can never grant.
+    signals = EarlySignals(
+        mint=watched,
+        now=1_700_000_000,
+        first_seen_at=1_700_000_000 - 8,
+        pair_age_seconds=82,
+        market_cap_usd=Decimal("33100"),
+        first_seen_market_cap_usd=Decimal("31180"),
+        liquidity_usd=Decimal("6900"),
+        volume_5m_usd=Decimal("5200"),
+        price_change_5m_percent=Decimal("14"),
+        buys_5m=26,
+        sells_5m=6,
+        independent_buyers_5m=19,
+        route_available=True,
+    )
+    verdict = evaluate_early_signal(signals)
+    alert = build_early_alert(
+        mint=watched,
+        name="Grok Pocket",
+        symbol="GPRO",
+        fomo_url=f"https://fomo.family/coin?address={watched}",
+        verdict=verdict,
+        age_seconds=82,
+        first_seen_seconds_ago=8,
+        first_seen_market_cap_usd=Decimal("31180"),
+        alert_market_cap_usd=Decimal("33100"),
+        current_market_cap_usd=Decimal("33100"),
+        liquidity_usd=Decimal("6900"),
+        buys=26,
+        sells=6,
+        safety_status="UNKNOWN",
+    )
+    for phrase in ("LOOK NOW", "BUY NOW", "APE", "SEND IT"):
+        assert phrase not in alert.spec.title, (
+            "an unvalidated card may not lead with actionable language"
+        )
+    state = {field.name: field.value for field in alert.spec.fields}["STATE"]
+    assert "Entry eligible: **NO**" in state and "Trade CTA: **DISABLED**" in state
+    assert alert.trade_eligible is False
+    assert watched in alert.spec.description, "the exact mint must be on the card"
+
+    view_source = inspect.getsource(bot_module._token_view)
+    assert "if trade_eligible:" in view_source, "the buy control must be gated"
+    buttons = {item.label for item in bot_module._token_view(watched).children}
+    assert "Buy on Jupiter" not in buttons
+    assert {"Open in Fomo", "Chart", "Solscan"} <= buttons, "research links always render"
+    eligible = {
+        item.label for item in bot_module._token_view(watched, trade_eligible=True).children
+    }
+    assert "Buy on Jupiter" in eligible
+    assert "trade_eligible=alert.trade_eligible" in inspect.getsource(
+        bot_module.SmartMoneyBot.on_fast_alert
+    ), "the renderer must read the gate the lane set"
+
+    # 5. "Organic" is a claim about who is buying, not how many trades printed.
+    loud = evaluate_early_signal(
+        EarlySignals(
+            **{
+                **{
+                    field: getattr(signals, field)
+                    for field in EarlySignals.__dataclass_fields__
+                },
+                "buys_5m": 542,
+                "sells_5m": 144,
+                "volume_5m_usd": Decimal("180000"),
+                "independent_buyers_5m": None,
+            }
+        )
+    )
+    assert "ORGANIC_MARKET_EVIDENCE" not in loud.evidence_categories, (
+        "542 buys against 144 sells is activity, not proven organic demand"
+    )
+    assert loud.tier != "ORGANIC_RUNNER"
+    assert loud.visible, "restraint must not make the token invisible"
+
+    lane_source = inspect.getsource(engine_module.SmartMoneyEngine._independent_buyers_5m)
+    assert "return None" in lane_source, (
+        "unknown independence must be distinguishable from zero independence"
     )
 
 
@@ -968,6 +1199,7 @@ async def check_early_alpha() -> None:
             "buys_5m": 26,
             "sells_5m": 6,
             "route_available": True,
+            "independent_buyers_5m": 19,
         }
         payload.update(overrides)
         return EarlySignals(**payload)

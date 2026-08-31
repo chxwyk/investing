@@ -260,6 +260,14 @@ from .social import (
 )
 from .strategy import ConsensusStrategy
 from .stream import RealtimeWalletStream, StreamEvent, StreamHealth
+from .token_identity import (
+    assert_exact_propagation,
+    detect_symbol_collision,
+    from_symbol_search,
+)
+from .token_identity import (
+    exact as exact_identity,
+)
 from .trenches import (
     CadenceConfig,
     TokenMetadata,
@@ -1655,10 +1663,19 @@ class SmartMoneyEngine:
             return False
 
     async def _early_lane_task(self, mint: str, *, now: int) -> bool:
+        # The mint that entered this lane is the mint that leaves it.  The DEX
+        # snapshot is fetched *by address* and its parser drops any pair whose
+        # baseToken is not this exact mint, so a same-symbol clone cannot be
+        # substituted here — this assertion is what keeps that true if the
+        # snapshot path ever changes.
+        provenance = exact_identity(mint, source="early_lane")
         snapshot = await self.dex_screener.snapshot(mint)
         if not snapshot.available or snapshot.market_cap_usd is None:
+            # Exact enrichment failed.  We say so; we never fall back to a
+            # symbol search and publish whatever it returns.
             await self._record_suppression(mint, EARLY_WHY_NO_DATA, now=now)
             return False
+        assert_exact_propagation(mint, mint, stage="early lane → DEX snapshot")
 
         # The first market cap the bot ever saw for this mint, written once.
         # It is a historical fact and must survive every later enrichment pass
@@ -1697,6 +1714,10 @@ class SmartMoneyEngine:
             buys_1h=snapshot.buys_1h,
             sells_1h=snapshot.sells_1h,
             route_available=True,
+            # Independent-buyer evidence for the organic gate.  ``None`` when the
+            # participant intelligence could not establish it, which is honestly
+            # different from zero and never counts as proof of independence.
+            independent_buyers_5m=await self._independent_buyers_5m(mint, now=now),
             **await self._early_corroboration(mint),
         )
         verdict = evaluate_early_signal(signals, config=self._early_config)
@@ -1742,6 +1763,9 @@ class SmartMoneyEngine:
             buys=snapshot.buys_5m,
             sells=snapshot.sells_5m,
             image_url=snapshot.image_url,
+            safety_status="UNKNOWN",
+            identity_verified=provenance.identity_verified,
+            symbol_collision=await self._symbol_collides(mint, symbol),
         )
         published = await self._publish_fast_alert(alert, now=now)
         if not published:
@@ -1780,6 +1804,39 @@ class SmartMoneyEngine:
         self.last_early_alert_at = now
         self.last_early_alert_mint = mint
         return True
+
+    async def _independent_buyers_5m(self, mint: str, *, now: int) -> int | None:
+        """Distinct independent buyers behind the recent flow, when knowable.
+
+        Returns ``None`` rather than ``0`` when the evidence is unavailable: a
+        raw buy count says nothing about how many actors produced it, and the
+        organic gate must be able to tell "few buyers" apart from "we do not
+        know yet".
+        """
+
+        with suppress(Exception):
+            buyers = await self.database.recent_verified_token_buyers(mint, now - 300)
+            if buyers:
+                # Count wallets, not rows: the same address under two aliases is
+                # one buyer, and inflating this number is exactly the mistake the
+                # organic gate exists to stop.
+                return len({str(item[0] if isinstance(item, tuple) else item) for item in buyers})
+        return None
+
+    async def _symbol_collides(self, mint: str, symbol: str) -> bool:
+        """Whether other live tokens answer to this one's ticker (hotfix §3).
+
+        Informational only.  It never selects between them — there is no basis
+        on which to select — it raises the operator's guard and, elsewhere,
+        raises the bar for promotion.
+        """
+
+        if not symbol:
+            return False
+        with suppress(Exception):
+            known = await self.database.known_symbols(limit=500)
+            return detect_symbol_collision(symbol, known, subject_mint=mint).detected
+        return False
 
     async def _early_corroboration(self, mint: str) -> dict[str, Any]:
         """Cheap, already-persisted corroboration — never a new provider call."""
@@ -7633,14 +7690,32 @@ class SmartMoneyEngine:
                 match = await self.news_matcher.search(narrative)
                 if match is None or match.mint in self._narrative_matches_seen:
                     continue
-                # A ticker/name match is not a verified coin. It must pass exact-mint
-                # X promotion, executable-route, market-flow, and rug checks before
-                # the public channel sees anything.
+                # A ticker/name match is not a verified coin.  The mint came from
+                # a *text search*, so its provenance is UNVERIFIED by
+                # construction, and the analysis below must run against that
+                # exact address and no other.  If anything downstream resolves to
+                # a different mint, that is a substitution and it hard-fails
+                # rather than reaching the channel.
+                provenance = from_symbol_search(
+                    match.mint,
+                    source="dex_narrative_search",
+                    query=narrative,
+                )
                 buyers = await self.database.recent_verified_token_buyers(
                     match.mint,
                     int(time.time()) - self.settings.coin_callout_window_seconds,
                 )
                 callout = await self.analyze_coin(match.mint, buyers=buyers)
+                assert_exact_propagation(
+                    match.mint, callout.mint, stage="narrative match → callout"
+                )
+                if not provenance.identity_verified:
+                    logger.info(
+                        "Narrative %r produced %s from a text search; publishing as "
+                        "research only, never as a verified identity",
+                        narrative,
+                        match.mint[:8],
+                    )
                 if should_publish_coin_callout(
                     callout,
                     configured_score_floor=self.settings.coin_callout_min_alert_score,

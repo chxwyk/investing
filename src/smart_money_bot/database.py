@@ -5435,6 +5435,36 @@ class Database:
     # operator-visibility timeline (sections 2, 3, 12, 52)
     # ------------------------------------------------------------------
 
+    async def known_symbols(self, *, limit: int = 500) -> dict[str, str]:
+        """Every mint we have a symbol for, as ``mint -> symbol``.
+
+        Used **only** for symbol-collision detection.  It is deliberately keyed
+        by mint rather than by symbol: a symbol is not a key, and building a
+        symbol-keyed index is how a lookup that substitutes one token for another
+        gets written by accident.
+        """
+
+        known: dict[str, str] = {}
+        for table, mint_column, symbol_column in (
+            ("pump_tokens", "mint", "symbol"),
+            ("runner_candidates", "mint", "symbol"),
+        ):
+            try:
+                cursor = await self.db.execute(
+                    f"SELECT {mint_column} AS mint, {symbol_column} AS symbol "
+                    f"FROM {table} WHERE {symbol_column} IS NOT NULL "
+                    f"AND {symbol_column} != '' LIMIT ?",
+                    (limit,),
+                )
+            except Exception:
+                continue
+            for row in await cursor.fetchall():
+                mint = str(row["mint"] or "")
+                symbol = str(row["symbol"] or "")
+                if mint and symbol:
+                    known.setdefault(mint, symbol)
+        return known
+
     async def record_alert_stage(
         self,
         *,

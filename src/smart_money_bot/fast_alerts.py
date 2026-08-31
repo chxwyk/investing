@@ -190,6 +190,15 @@ class FastAlert:
     lane: str = LANE_RADAR
     #: The shadow signal family, when this card came from one.
     family: str = ""
+    #: Whether this candidate has earned an actionable buy control.  Default
+    #: False: a card must *prove* eligibility to get a buy CTA, because
+    #: attaching one to a candidate whose safety is UNKNOWN or whose identity is
+    #: unverified presents a guess as an opportunity.
+    trade_eligible: bool = False
+    #: Whether the exact mint on this card was verified rather than inferred.
+    identity_verified: bool = True
+    #: Set when other live tokens share this one's symbol.
+    symbol_collision: bool = False
 
     def __post_init__(self) -> None:
         if self.kind not in ALERT_CLASSES:
@@ -230,6 +239,36 @@ def _percent_plain(value: Decimal | None) -> str:
     """A share, not a change: no leading sign."""
 
     return "unknown" if value is None else f"{value:.1f}%"
+
+
+#: Actionable phrases a card may only use once validation has actually passed.
+_ACTIONABLE_PHRASES: tuple[str, ...] = ("LOOK NOW", "BUY NOW", "APE", "SEND IT")
+
+
+def _validation_pending_title(tier_label: str, *, late: bool = False) -> str:
+    """Strip actionable language from a card whose validation is not finished.
+
+    The tier is preserved in parentheses because it is genuine information —
+    "this reached the organic-runner bar" is worth knowing.  What it may not do
+    is *lead* with an instruction the evidence does not support.
+    """
+
+    cleaned = tier_label
+    for phrase in _ACTIONABLE_PHRASES:
+        cleaned = cleaned.replace(f" — {phrase}", "").replace(f" - {phrase}", "")
+        cleaned = cleaned.replace(phrase, "")
+    cleaned = cleaned.strip(" —-•").strip()
+    if late:
+        return (
+            f"🕒 RESEARCH CANDIDATE — LATE ({cleaned})"
+            if cleaned
+            else "🕒 RESEARCH CANDIDATE — LATE"
+        )
+    return (
+        f"🔬 RESEARCH CANDIDATE — VALIDATION PENDING ({cleaned})"
+        if cleaned
+        else "🔬 RESEARCH CANDIDATE — VALIDATION PENDING"
+    )
 
 
 def _links(mint: str, fomo_url: str) -> str:
@@ -627,6 +666,9 @@ def build_early_alert(
     story_summary: str = "",
     notable_summary: str = "",
     image_url: str = "",
+    safety_status: str = "UNKNOWN",
+    identity_verified: bool = True,
+    symbol_collision: bool = False,
 ) -> FastAlert:
     """The EARLY HEADS-UP / EARLY RUNNER card (sections 45, 46).
 
@@ -732,16 +774,55 @@ def build_early_alert(
             )
         )
 
+    # The early lane is cheap by design: it publishes before safety, identity and
+    # deep validation have finished.  That is fine — being early is the point —
+    # but the card must then say what it does not know, in the same breath as
+    # what it does.  A card that prints "SAFETY: UNKNOWN" under the title
+    # "ORGANIC RUNNER — LOOK NOW" is telling the operator two contradictory
+    # things and letting the louder one win.
     fields.append(
         CardField(
-            "SAFETY",
-            "**UNKNOWN** — deep analysis still running. Research only.",
+            "STATE",
+            (
+                f"Identity: **{'VERIFIED' if identity_verified else 'UNVERIFIED'}**"
+                f" • Symbol collision: **{'YES' if symbol_collision else 'NO'}**\n"
+                f"Safety: **{safety_status}** — deep analysis still running\n"
+                "Entry eligible: **NO** • Trade CTA: **DISABLED**"
+            ),
             P_SAFETY,
         )
     )
+    if symbol_collision:
+        fields.append(
+            CardField(
+                "⚠ SYMBOL COLLISION",
+                (
+                    f"Other live tokens use `${symbol}`. This card is for the exact "
+                    f"mint `{mint}` and no other. A shared ticker is not a shared "
+                    "token."
+                ),
+                P_WARNINGS,
+            )
+        )
+    if not identity_verified:
+        fields.append(
+            CardField(
+                "⚠ IDENTITY UNVERIFIED",
+                (
+                    "This mint was not confirmed against the discovery source. "
+                    "Treat it as a lead to check, not as the token you were "
+                    "looking at."
+                ),
+                P_WARNINGS,
+            )
+        )
     fields.append(CardField("LINKS", _links(mint, fomo_url), P_LIQUIDITY))
 
-    title = str(getattr(verdict, "label", "👀 EARLY HEADS-UP"))
+    # Nothing from this lane is actionable, so nothing from it may use
+    # actionable language.  The tier still travels on the card — the operator
+    # wants to know *why* it surfaced — it just no longer sets the headline.
+    tier_label = str(getattr(verdict, "label", "👀 EARLY HEADS-UP"))
+    title = _validation_pending_title(tier_label, late=late)
     spec = CardSpec(
         title=title,
         description=(
@@ -769,6 +850,11 @@ def build_early_alert(
         # A late card never pings, whatever tier the evidence reached.
         ping=kind == EARLY_RUNNER and not late,
         ping_reason=", ".join(categories[:2]),
+        # This lane publishes before validation finishes, so it can never hand
+        # out a buy control.
+        trade_eligible=False,
+        identity_verified=identity_verified,
+        symbol_collision=symbol_collision,
         fingerprint=f"{tier}:{int(getattr(verdict, 'score', ZERO))}",
         token_mint=mint,
         lane=LANE_URGENT if (kind == EARLY_RUNNER and not late) else LANE_RADAR,

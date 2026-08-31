@@ -165,7 +165,26 @@ def _fomo_coin_url(mint: str, referral_code: str | None = None) -> str:
     return fomo_coin_url(mint, referral_code)
 
 
-def _token_view(mint: str, fomo_referral_code: str | None = None) -> discord.ui.View:
+def _token_view(
+    mint: str,
+    fomo_referral_code: str | None = None,
+    *,
+    trade_eligible: bool = False,
+) -> discord.ui.View:
+    """Link buttons for one exact mint.
+
+    ``trade_eligible`` gates the **buy** control only.  Inspection links — Fomo,
+    Pump.fun, DEX, Solscan — always remain, because looking at a token is how an
+    operator decides anything and withholding them helps nobody.
+
+    A buy button is different in kind: it is a call to action, and attaching one
+    to a candidate whose safety is UNKNOWN, whose validation is still running, or
+    whose identity could not be verified presents a guess as an opportunity.
+    That is what put a same-symbol clone in front of the operator with a
+    one-click buy, so the default here is ``False`` — a caller has to prove
+    eligibility to get the control.
+    """
+
     view = discord.ui.View(timeout=None)
     view.add_item(
         discord.ui.Button(
@@ -183,14 +202,15 @@ def _token_view(mint: str, fomo_referral_code: str | None = None) -> discord.ui.
             row=0,
         )
     )
-    view.add_item(
-        discord.ui.Button(
-            label="Buy on Jupiter",
-            style=discord.ButtonStyle.link,
-            url=f"https://jup.ag/swap/SOL-{mint}",
-            row=0,
+    if trade_eligible:
+        view.add_item(
+            discord.ui.Button(
+                label="Buy on Jupiter",
+                style=discord.ButtonStyle.link,
+                url=f"https://jup.ag/swap/SOL-{mint}",
+                row=0,
+            )
         )
-    )
     view.add_item(
         discord.ui.Button(
             label="Sell on Jupiter",
@@ -3174,7 +3194,14 @@ class SmartMoneyBot(commands.Bot):
             [alert.spec],
             content=f"<@{alert_user_id}>" if should_ping else None,
             view=(
-                _token_view(alert.token_mint, self.settings.fomo_referral_code)
+                _token_view(
+                    alert.token_mint,
+                    self.settings.fomo_referral_code,
+                    # The buy control is gated on the alert's own declaration.
+                    # Research links stay either way; only the call to action
+                    # requires eligibility.
+                    trade_eligible=alert.trade_eligible,
+                )
                 if alert.token_mint
                 else None
             ),
