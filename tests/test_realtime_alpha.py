@@ -629,12 +629,24 @@ def test_no_fast_alert_class_can_ever_be_entry_eligible() -> None:
     assert all(item.entry_eligible is False for item in alerts)
 
 
-def test_only_the_three_urgent_classes_may_interrupt_the_user() -> None:
-    assert frozenset(
-        {fa.NOTABLE_TRADER_EARLY, fa.BREAKING_CATALYST, fa.CONFLUENCE_WATCH}
-    ) == fa.PINGABLE
+def test_only_earned_classes_may_interrupt_the_user() -> None:
+    """v2.41 adds EARLY_RUNNER, because being early is the entire objective.
+
+    Everything still excluded is excluded for a reason: a late observation, an
+    ordinary catalyst watch, a quiet heads-up and a simulated fill are all
+    published where the operator can read them, and none of them earns a ping.
+    """
+
+    assert set(fa.PINGABLE) == {
+        fa.NOTABLE_TRADER_EARLY,
+        fa.BREAKING_CATALYST,
+        fa.CONFLUENCE_WATCH,
+        fa.EARLY_RUNNER,
+    }
     assert fa.NOTABLE_TRADER_LATE not in fa.PINGABLE
     assert fa.CATALYST_WATCH not in fa.PINGABLE
+    assert fa.EARLY_HEADS_UP not in fa.PINGABLE
+    assert fa.SHADOW_ENTRY not in fa.PINGABLE
 
 
 def test_every_fast_alert_fits_inside_one_discord_message() -> None:

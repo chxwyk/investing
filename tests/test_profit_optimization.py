@@ -467,8 +467,11 @@ def test_an_outage_is_not_rescued_when_the_market_is_also_breaking() -> None:
     )
 
     for assessment in (no_route, drained, selling):
+        # The outage rescue is for a healthy market with an absent provider.
+        # None of these markets is healthy, so each keeps its defensive plan.
         assert assessment.plan.reason_code != SHADOW_SAFETY_MONITOR
         assert assessment.plan.acts is True
+        assert assessment.plan.reason_code != "SHADOW_SOFT_PAUSE_HOLD"
 
 
 def test_the_rescue_never_applies_to_a_confirmed_fail_flag() -> None:

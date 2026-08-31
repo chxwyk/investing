@@ -34,6 +34,10 @@ def _d(value: Any) -> Decimal:
     return Decimal(str(value or 0))
 
 
+def _float_or_none(value: Decimal | None) -> float | None:
+    return None if value is None else float(value)
+
+
 class Database:
     def __init__(self, path: str, paper_starting_usd: Decimal) -> None:
         self.path = path
@@ -979,6 +983,76 @@ class Database:
                 ON shadow_signal_log(decided_at DESC);
             CREATE INDEX IF NOT EXISTS idx_shadow_signal_log_family
                 ON shadow_signal_log(family, decided_at DESC);
+
+            -- Ultra-early discovery (v2.41).  All additive.
+
+            -- The operator-visibility timeline (sections 2, 3, 52).  One row per
+            -- (mint, stage), written with INSERT OR IGNORE, so every stage is
+            -- write-once: the market cap an alert was actually sent at can never
+            -- be rewritten during enrichment.  That immutability is the whole
+            -- point -- it is what stops a late alert looking early in hindsight.
+            CREATE TABLE IF NOT EXISTS alert_timeline (
+                mint TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                occurred_at INTEGER NOT NULL,
+                market_cap_usd REAL,
+                price_usd REAL,
+                liquidity_usd REAL,
+                tier TEXT NOT NULL DEFAULT '',
+                edge_state TEXT NOT NULL DEFAULT '',
+                evidence_json TEXT NOT NULL DEFAULT '{}',
+                PRIMARY KEY (mint, stage)
+            );
+            CREATE INDEX IF NOT EXISTS idx_alert_timeline_recent
+                ON alert_timeline(occurred_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_alert_timeline_stage
+                ON alert_timeline(stage, occurred_at DESC);
+
+            -- Why the operator was not pinged (section 12).  Append-only, keyed
+            -- so a repeated pass does not spam the same explanation.
+            CREATE TABLE IF NOT EXISTS alert_suppression (
+                mint TEXT NOT NULL,
+                reason_code TEXT NOT NULL,
+                occurred_at INTEGER NOT NULL,
+                market_cap_usd REAL,
+                tier TEXT NOT NULL DEFAULT '',
+                detail TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (mint, reason_code)
+            );
+            CREATE INDEX IF NOT EXISTS idx_alert_suppression_recent
+                ON alert_suppression(occurred_at DESC);
+
+            -- Durable real-world narratives, independent of any token (s21).
+            CREATE TABLE IF NOT EXISTS narratives (
+                narrative_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                virality TEXT NOT NULL DEFAULT 'NONE',
+                first_seen_at INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_narratives_recent
+                ON narratives(last_seen_at DESC);
+
+            -- Graded, directional narrative -> exact-mint claims (sections 22-26).
+            -- Keyed by (narrative_id, mint): a story and a mint are different
+            -- things, and the link between them belongs to neither alone.
+            CREATE TABLE IF NOT EXISTS narrative_links (
+                narrative_id TEXT NOT NULL,
+                mint TEXT NOT NULL,
+                relationship TEXT NOT NULL DEFAULT 'UNRELATED',
+                direction TEXT NOT NULL DEFAULT 'TOKEN_TO_STORY',
+                confidence REAL NOT NULL DEFAULT 0,
+                seconds_after_story INTEGER,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (narrative_id, mint)
+            );
+            CREATE INDEX IF NOT EXISTS idx_narrative_links_mint
+                ON narrative_links(mint);
+            CREATE INDEX IF NOT EXISTS idx_narrative_links_rank
+                ON narrative_links(narrative_id, confidence DESC);
             """
         )
         await self._migrate_pump_launch_status_constraint()
@@ -4950,6 +5024,289 @@ class Database:
                 ORDER BY calls DESC
                 """,
                 (usage_day,),
+            )
+        return [dict(row) for row in await cursor.fetchall()]
+
+    # ------------------------------------------------------------------
+    # operator-visibility timeline (sections 2, 3, 12, 52)
+    # ------------------------------------------------------------------
+
+    async def record_alert_stage(
+        self,
+        *,
+        mint: str,
+        stage: str,
+        occurred_at: int,
+        market_cap_usd: Decimal | None = None,
+        price_usd: Decimal | None = None,
+        liquidity_usd: Decimal | None = None,
+        tier: str = "",
+        edge_state: str = "",
+        evidence: dict[str, Any] | None = None,
+    ) -> bool:
+        """Write one stage of the visibility timeline, once and only once.
+
+        ``INSERT OR IGNORE`` is the immutability (section 52): the market cap an
+        alert was sent at is a historical fact, and enrichment arriving later
+        must never be able to overwrite it.  Returns whether this call was the
+        one that recorded the stage.
+        """
+
+        async with self._write_lock:
+            cursor = await self.db.execute(
+                """
+                INSERT OR IGNORE INTO alert_timeline (
+                    mint, stage, occurred_at, market_cap_usd, price_usd,
+                    liquidity_usd, tier, edge_state, evidence_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    mint,
+                    stage,
+                    occurred_at,
+                    _float_or_none(market_cap_usd),
+                    _float_or_none(price_usd),
+                    _float_or_none(liquidity_usd),
+                    tier,
+                    edge_state,
+                    json.dumps(evidence or {}, separators=(",", ":"), sort_keys=True),
+                ),
+            )
+            await self.db.commit()
+        return bool(cursor.rowcount)
+
+    async def alert_timeline(self, mint: str) -> list[dict[str, Any]]:
+        cursor = await self.db.execute(
+            """
+            SELECT stage, occurred_at, market_cap_usd, price_usd, liquidity_usd,
+                   tier, edge_state, evidence_json
+            FROM alert_timeline WHERE mint = ? ORDER BY occurred_at ASC
+            """,
+            (mint,),
+        )
+        return [dict(row) for row in await cursor.fetchall()]
+
+    async def alert_stage_rows(
+        self,
+        *,
+        stage: str | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        if stage is None:
+            cursor = await self.db.execute(
+                """
+                SELECT mint, stage, occurred_at, market_cap_usd, price_usd,
+                       liquidity_usd, tier, edge_state
+                FROM alert_timeline ORDER BY occurred_at DESC LIMIT ?
+                """,
+                (limit,),
+            )
+        else:
+            cursor = await self.db.execute(
+                """
+                SELECT mint, stage, occurred_at, market_cap_usd, price_usd,
+                       liquidity_usd, tier, edge_state
+                FROM alert_timeline WHERE stage = ?
+                ORDER BY occurred_at DESC LIMIT ?
+                """,
+                (stage, limit),
+            )
+        return [dict(row) for row in await cursor.fetchall()]
+
+    async def record_alert_suppression(
+        self,
+        *,
+        mint: str,
+        reason_code: str,
+        occurred_at: int,
+        market_cap_usd: Decimal | None = None,
+        tier: str = "",
+        detail: str = "",
+    ) -> bool:
+        """Persist why the operator did not get pinged (section 12)."""
+
+        async with self._write_lock:
+            cursor = await self.db.execute(
+                """
+                INSERT OR IGNORE INTO alert_suppression (
+                    mint, reason_code, occurred_at, market_cap_usd, tier, detail
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    mint,
+                    reason_code,
+                    occurred_at,
+                    _float_or_none(market_cap_usd),
+                    tier,
+                    detail[:400],
+                ),
+            )
+            await self.db.commit()
+        return bool(cursor.rowcount)
+
+    async def alert_suppression_rows(
+        self,
+        *,
+        mint: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        if mint is None:
+            cursor = await self.db.execute(
+                """
+                SELECT mint, reason_code, occurred_at, market_cap_usd, tier, detail
+                FROM alert_suppression ORDER BY occurred_at DESC LIMIT ?
+                """,
+                (limit,),
+            )
+        else:
+            cursor = await self.db.execute(
+                """
+                SELECT mint, reason_code, occurred_at, market_cap_usd, tier, detail
+                FROM alert_suppression WHERE mint = ?
+                ORDER BY occurred_at DESC LIMIT ?
+                """,
+                (mint, limit),
+            )
+        return [dict(row) for row in await cursor.fetchall()]
+
+    async def suppression_counts(self, *, since: int = 0) -> dict[str, int]:
+        cursor = await self.db.execute(
+            """
+            SELECT reason_code, COUNT(*) AS total FROM alert_suppression
+            WHERE occurred_at >= ? GROUP BY reason_code ORDER BY total DESC
+            """,
+            (since,),
+        )
+        return {str(row["reason_code"]): int(row["total"]) for row in await cursor.fetchall()}
+
+    # ------------------------------------------------------------------
+    # narratives and exact-mint links (sections 21-26)
+    # ------------------------------------------------------------------
+
+    async def save_narrative(
+        self,
+        *,
+        narrative_id: str,
+        title: str,
+        virality: str,
+        first_seen_at: int,
+        last_seen_at: int,
+        payload: dict[str, Any] | None = None,
+        now: int | None = None,
+    ) -> None:
+        moment = now if now is not None else int(time.time())
+        async with self._write_lock:
+            await self.db.execute(
+                """
+                INSERT INTO narratives (
+                    narrative_id, title, virality, first_seen_at, last_seen_at,
+                    payload_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(narrative_id) DO UPDATE SET
+                    title = excluded.title,
+                    virality = excluded.virality,
+                    last_seen_at = excluded.last_seen_at,
+                    payload_json = excluded.payload_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    narrative_id,
+                    title,
+                    virality,
+                    first_seen_at,
+                    last_seen_at,
+                    json.dumps(payload or {}, separators=(",", ":"), sort_keys=True),
+                    moment,
+                ),
+            )
+            await self.db.commit()
+
+    async def narrative_rows(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        cursor = await self.db.execute(
+            """
+            SELECT narrative_id, title, virality, first_seen_at, last_seen_at, payload_json
+            FROM narratives ORDER BY last_seen_at DESC LIMIT ?
+            """,
+            (limit,),
+        )
+        return [dict(row) for row in await cursor.fetchall()]
+
+    async def save_narrative_link(
+        self,
+        *,
+        narrative_id: str,
+        mint: str,
+        relationship: str,
+        direction: str,
+        confidence: Decimal,
+        seconds_after_story: int | None = None,
+        payload: dict[str, Any] | None = None,
+        now: int | None = None,
+    ) -> None:
+        moment = now if now is not None else int(time.time())
+        async with self._write_lock:
+            await self.db.execute(
+                """
+                INSERT INTO narrative_links (
+                    narrative_id, mint, relationship, direction, confidence,
+                    seconds_after_story, payload_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(narrative_id, mint) DO UPDATE SET
+                    relationship = excluded.relationship,
+                    direction = excluded.direction,
+                    confidence = excluded.confidence,
+                    seconds_after_story = excluded.seconds_after_story,
+                    payload_json = excluded.payload_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    narrative_id,
+                    mint,
+                    relationship,
+                    direction,
+                    float(confidence),
+                    seconds_after_story,
+                    json.dumps(payload or {}, separators=(",", ":"), sort_keys=True),
+                    moment,
+                ),
+            )
+            await self.db.commit()
+
+    async def narrative_link_rows(
+        self,
+        *,
+        narrative_id: str | None = None,
+        mint: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        if narrative_id is not None:
+            cursor = await self.db.execute(
+                """
+                SELECT narrative_id, mint, relationship, direction, confidence,
+                       seconds_after_story, payload_json
+                FROM narrative_links WHERE narrative_id = ?
+                ORDER BY confidence DESC LIMIT ?
+                """,
+                (narrative_id, limit),
+            )
+        elif mint is not None:
+            cursor = await self.db.execute(
+                """
+                SELECT narrative_id, mint, relationship, direction, confidence,
+                       seconds_after_story, payload_json
+                FROM narrative_links WHERE mint = ?
+                ORDER BY confidence DESC LIMIT ?
+                """,
+                (mint, limit),
+            )
+        else:
+            cursor = await self.db.execute(
+                """
+                SELECT narrative_id, mint, relationship, direction, confidence,
+                       seconds_after_story, payload_json
+                FROM narrative_links ORDER BY confidence DESC LIMIT ?
+                """,
+                (limit,),
             )
         return [dict(row) for row in await cursor.fetchall()]
 

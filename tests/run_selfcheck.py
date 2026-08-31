@@ -228,11 +228,12 @@ async def main() -> None:
     await check_paper_laboratory()
     await check_shadow_auto_trader()
     await check_profit_optimization()
+    await check_early_alpha()
 
     print(
         "SELF-CHECK PASSED: detector, scoring, database, discovery rotation, "
         "paper P&L, risk gate, PAPER laboratory, discovery-speed, realtime-alpha, "
-        "SHADOW auto-trader and profit-optimization invariants"
+        "SHADOW auto-trader, profit-optimization and early-alpha invariants"
     )
 
 
@@ -893,6 +894,258 @@ async def check_profit_optimization() -> None:
     assert DEFAULT_SHADOW_CONFIG.max_total_exposure_usd == Decimal("50")
     assert DEFAULT_LAB_CONFIG.normal_position_usd == Decimal("5")
     assert DEFAULT_LAB_CONFIG.min_independent_buyers == 12
+
+
+async def check_early_alpha() -> None:
+    """The invariants behind "the bot knew at $31K and I found out at $61K".
+
+    Being early is the whole point of the release, so the first three checks are
+    about *ordering*: the cheap lane must run before deep enrichment, its verdict
+    must be reachable without any provider, and the market cap it recorded must
+    not be rewritten once the price has moved.  The rest is restraint — a score
+    alone must not ping, a creator self-buy must not read as demand, and a token
+    that merely copied a campaign link must not inherit the real story.
+    """
+
+    import ast
+    import inspect
+
+    from smart_money_bot import engine as engine_module
+    from smart_money_bot.fast_alerts import PINGABLE, URGENT_CLASSES
+    from smart_money_bot.lab.early import (
+        BUY_INSIDER,
+        EDGE_CONSUMED,
+        PINGABLE_TIERS,
+        TIER_EARLY_HEADS_UP,
+        TIER_NONE,
+        TIER_ORGANIC_RUNNER,
+        WHY_INSIDER_ONLY,
+        WHY_MOVE_CONSUMED,
+        WHY_NOT_SERIOUS,
+        EarlyConfig,
+        EarlySignals,
+        detect_large_buy,
+        evaluate_early_signal,
+    )
+    from smart_money_bot.lab.exits import ExitContext, open_position
+    from smart_money_bot.lab.narrative import (
+        DIR_STORY_TO_TOKEN,
+        DIR_TOKEN_TO_STORY,
+        INHERITS_STORY,
+        REL_NAME_ONLY,
+        REL_PLAUSIBLE,
+        NarrativeEntity,
+        StorySource,
+        TokenIdentityClaim,
+        assess_narrative_link,
+        mark_official,
+    )
+    from smart_money_bot.lab.shadow import DEFAULT_SHADOW_CONFIG
+    from smart_money_bot.lab.shadow_exits import (
+        SHADOW_SOFT_PAUSE_HOLD,
+        RunnerEvidence,
+        plan_shadow_exit,
+    )
+
+    now = 1_800_000_000
+    mint = "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr"
+
+    def signals(**overrides) -> EarlySignals:
+        payload = {
+            "mint": mint,
+            "now": now,
+            "first_seen_at": now - 8,
+            "pair_age_seconds": 82,
+            "market_cap_usd": Decimal("33100"),
+            "first_seen_market_cap_usd": Decimal("31180"),
+            "liquidity_usd": Decimal("6900"),
+            "volume_5m_usd": Decimal("5200"),
+            "price_change_5m_percent": Decimal("14"),
+            "buys_5m": 26,
+            "sells_5m": 6,
+            "route_available": True,
+        }
+        payload.update(overrides)
+        return EarlySignals(**payload)
+
+    # 1. The cheap lane runs before the deep gather.  This ordering *is* the fix.
+    radar = inspect.getsource(engine_module.SmartMoneyEngine._run_fomo_radar)
+    assert radar.index("_run_early_lane") < radar.index("evaluate(mint) for mint in selected"), (
+        "first operator visibility must not wait on deep enrichment"
+    )
+
+    # 2. The verdict must be reachable from a DEX snapshot alone: no provider
+    #    call, no wallet forensics, no social lookup anywhere in the module.
+    from smart_money_bot.lab import early as early_module
+
+    early_tree = ast.parse(inspect.getsource(early_module))
+    imported = {
+        node.module.split(".")[0]
+        for node in ast.walk(early_tree)
+        if isinstance(node, ast.ImportFrom) and node.module
+    } | {
+        alias.name.split(".")[0]
+        for node in ast.walk(early_tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+    assert not (imported & {"aiohttp", "httpx", "requests", "solana", "solders"}), (
+        "the early lane must not be able to call a provider"
+    )
+
+    # 3. A grade the operator can act on, right at first sight.
+    verdict = evaluate_early_signal(signals())
+    assert verdict.tier == TIER_ORGANIC_RUNNER and verdict.may_ping
+    assert verdict.entry_eligible is False, "the cheap lane must never authorise an entry"
+
+    # 4. A late alert says so instead of dressing itself up as early.
+    late = evaluate_early_signal(
+        signals(first_seen_market_cap_usd=Decimal("31180"), market_cap_usd=Decimal("61490"))
+    )
+    assert late.edge_state == EDGE_CONSUMED and late.late
+    assert WHY_MOVE_CONSUMED in late.why_not_pinged
+    assert "EDGE CONSUMED" in late.label
+
+    # 5. A score alone is never a reason to interrupt anyone.
+    scored = evaluate_early_signal(
+        signals(buys_5m=13, sells_5m=9, volume_5m_usd=Decimal("1400")),
+        config=EarlyConfig(runner_min_score=Decimal("1")),
+    )
+    assert scored.tier == TIER_EARLY_HEADS_UP and not scored.may_ping
+    assert WHY_NOT_SERIOUS in scored.why_not_pinged
+
+    # 6. A creator self-buy is not demand.
+    insider = detect_large_buy(
+        signals(largest_buy_usd=Decimal("900"), largest_buy_is_creator_linked=True)
+    )
+    assert insider.quality == BUY_INSIDER and not insider.is_demand
+    blocked = evaluate_early_signal(
+        signals(largest_buy_usd=Decimal("900"), largest_buy_is_creator_linked=True, buys_5m=6)
+    )
+    assert blocked.tier == TIER_NONE and WHY_INSIDER_ONLY in blocked.why_not_pinged
+
+    # 7. Only tiers that earned it may ping, and anything that may interrupt a
+    #    person lands in the urgent lane.  A heads-up is radar only, always.
+    assert set(PINGABLE_TIERS) == {"EARLY_RUNNER", "ORGANIC_RUNNER"}
+    assert set(PINGABLE) <= set(URGENT_CLASSES), "a pingable class must ride the urgent lane"
+    assert "EARLY_RUNNER" in PINGABLE
+    assert "EARLY_HEADS_UP" not in PINGABLE and "EARLY_HEADS_UP" not in URGENT_CLASSES
+
+    # 8. MINT IS IDENTITY: the same name is never the same token, and a token
+    #    that only claims a link can never inherit the story's credibility.
+    def story(links_mint: str = "") -> NarrativeEntity:
+        return NarrativeEntity(
+            narrative_id="grok-pocket",
+            title="Grok Pocket",
+            keywords=("grok pocket",),
+            first_seen_at=now - 900,
+            last_seen_at=now,
+            sources=(
+                StorySource(
+                    name="campaign",
+                    url="https://grokpocket.example",
+                    observed_at=now - 900,
+                    is_primary=True,
+                    links_exact_mint=links_mint,
+                ),
+            ),
+        )
+
+    # A token that merely copied the campaign URL claims the link by itself, and
+    # metadata can be copied, so it must never inherit the story's credibility.
+    copycat = assess_narrative_link(
+        story(),
+        TokenIdentityClaim(
+            mint=mint,
+            name="Grok Pocket",
+            website_url="https://grokpocket.example",
+            created_at=now - 60,
+        ),
+        now=now,
+    )
+    assert copycat.direction == DIR_TOKEN_TO_STORY
+    assert copycat.relationship not in INHERITS_STORY, (
+        "metadata can be copied, so a token's own claim can never inherit a story"
+    )
+    assert copycat.relationship == REL_PLAUSIBLE and copycat.confidence <= Decimal("70")
+    assert copycat.inherits_story is False
+
+    other = "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R"
+    name_only = assess_narrative_link(
+        story(links_mint=mint),
+        TokenIdentityClaim(mint=other, name="Grok Pocket", created_at=now - 60),
+        now=now,
+    )
+    assert name_only.relationship == REL_NAME_ONLY, "same name is not the same token"
+    assert name_only.mint == other and name_only.mint != mint
+
+    try:
+        mark_official(copycat, authority="operator")
+    except ValueError:
+        pass
+    else:  # pragma: no cover - defensive
+        raise AssertionError("token-to-story evidence must never establish OFFICIAL")
+
+    # Only the story side, naming the exact mint, can establish OFFICIAL.
+    from_story = assess_narrative_link(
+        story(links_mint=mint),
+        TokenIdentityClaim(mint=mint, name="Grok Pocket", created_at=now - 60),
+        now=now,
+    )
+    assert from_story.direction == DIR_STORY_TO_TOKEN
+    official = mark_official(from_story, authority="verified campaign page")
+    assert official.relationship == "OFFICIAL" and official.mint == mint
+
+    try:
+        mark_official(from_story, authority="   ")
+    except ValueError:
+        pass
+    else:  # pragma: no cover - defensive
+        raise AssertionError("OFFICIAL requires a named authority")
+
+    # 9. A pause is not a reversal: one weak print must not dump a healthy runner.
+    position = open_position(
+        position_id="p",
+        mint=mint,
+        now=1_000,
+        decision_price_usd=Decimal("0.001"),
+        size_usd=Decimal("10"),
+        market_cap_usd=Decimal("60000"),
+        config=DEFAULT_SHADOW_CONFIG.exit_config(),
+    )
+    # Momentum prints weak while buyers still lead and liquidity is growing.
+    cooling = ExitContext(
+        now=1_600,
+        price_usd=Decimal("0.00105"),
+        market_cap_usd=Decimal("90000"),
+        liquidity_usd=Decimal("42000"),
+        entry_liquidity_usd=Decimal("40000"),
+        momentum_score=Decimal("10"),
+        organic_score=Decimal("70"),
+        buys=140,
+        sells=40,
+        volume_usd=Decimal("18000"),
+        entry_volume_usd=Decimal("12000"),
+        safety_status="PASS",
+        route_available=True,
+    )
+    paused = plan_shadow_exit(position, cooling, RunnerEvidence())
+    assert paused.plan.fraction == Decimal("0"), (
+        "a single weak momentum print must not sell a healthy runner"
+    )
+    assert paused.plan.reason_code == SHADOW_SOFT_PAUSE_HOLD and not paused.plan.final
+
+    decaying = plan_shadow_exit(
+        position, cooling, RunnerEvidence(consecutive_weak_observations=3)
+    )
+    assert decaying.plan.fraction > Decimal("0"), "confirmed decay must still de-risk"
+
+    # 10. Nothing here spends a cent, and the experiment is untouched.
+    from smart_money_bot.lab.shadow import SHADOW_REAL_MONEY_SPEND
+
+    assert SHADOW_REAL_MONEY_SPEND == 0
+    assert DEFAULT_SHADOW_CONFIG.bankroll_usd == Decimal("100")
+    assert DEFAULT_SHADOW_CONFIG.position_usd == Decimal("10")
 
 
 if __name__ == "__main__":

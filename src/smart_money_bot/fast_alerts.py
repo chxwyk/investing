@@ -49,6 +49,8 @@ NOTABLE_DISTRIBUTION = "NOTABLE_DISTRIBUTION"
 BREAKING_CATALYST = "BREAKING_CATALYST"
 CATALYST_WATCH = "CATALYST_WATCH"
 CONFLUENCE_WATCH = "CONFLUENCE_WATCH"
+EARLY_HEADS_UP = "EARLY_HEADS_UP"
+EARLY_RUNNER = "EARLY_RUNNER"
 SHADOW_ENTRY = "SHADOW_AUTO_ENTRY"
 SHADOW_EXIT = "SHADOW_AUTO_EXIT"
 
@@ -60,6 +62,8 @@ ALERT_CLASSES: tuple[str, ...] = (
     BREAKING_CATALYST,
     CATALYST_WATCH,
     CONFLUENCE_WATCH,
+    EARLY_HEADS_UP,
+    EARLY_RUNNER,
     SHADOW_ENTRY,
     SHADOW_EXIT,
 )
@@ -67,8 +71,12 @@ ALERT_CLASSES: tuple[str, ...] = (
 #: Classes that may interrupt the user.  A late observation never does — it is
 #: published, clearly marked, and left for the user to read on their own time.
 #: A simulated shadow fill never does either: it is a record, not news.
+#: EARLY_RUNNER earns a ping because it is the whole point of the release: a
+#: token the bot saw at $31K has to reach the operator while it is still near
+#: $31K.  EARLY_HEADS_UP deliberately does not — it is the quiet "watch this"
+#: tier, and it publishes to the radar instead.
 PINGABLE: frozenset[str] = frozenset(
-    {NOTABLE_TRADER_EARLY, BREAKING_CATALYST, CONFLUENCE_WATCH}
+    {NOTABLE_TRADER_EARLY, BREAKING_CATALYST, CONFLUENCE_WATCH, EARLY_RUNNER}
 )
 
 # --- the two visibility layers (sections 27-29) ------------------------------
@@ -84,7 +92,13 @@ LANES: tuple[str, ...] = (LANE_RADAR, LANE_URGENT)
 
 #: Classes that belong in the urgent lane when they fire at all.
 URGENT_CLASSES: frozenset[str] = frozenset(
-    {NOTABLE_TRADER_EARLY, BREAKING_CATALYST, CONFLUENCE_WATCH, CATALYST_WATCH}
+    {
+        NOTABLE_TRADER_EARLY,
+        BREAKING_CATALYST,
+        CONFLUENCE_WATCH,
+        CATALYST_WATCH,
+        EARLY_RUNNER,
+    }
 )
 
 RESEARCH_ONLY_FOOTER = "⚠ RESEARCH ONLY — NOT ENTRY ELIGIBLE • deep validation still running"
@@ -529,6 +543,183 @@ def build_catalyst_alert(
         lane=LANE_URGENT if urgent else LANE_RADAR,
         family=kind,
     )
+
+
+def build_early_alert(
+    *,
+    mint: str,
+    name: str,
+    symbol: str,
+    fomo_url: str,
+    verdict: Any,
+    age_seconds: int | None,
+    first_seen_seconds_ago: int | None,
+    first_seen_market_cap_usd: Decimal | None,
+    alert_market_cap_usd: Decimal | None,
+    current_market_cap_usd: Decimal | None,
+    liquidity_usd: Decimal | None,
+    buys: int | None,
+    sells: int | None,
+    story_summary: str = "",
+    notable_summary: str = "",
+    image_url: str = "",
+) -> FastAlert:
+    """The EARLY HEADS-UP / EARLY RUNNER card (sections 45, 46).
+
+    Short on purpose.  The operator has to understand it in one glance, and the
+    exact mint has to be trivially copyable, so identity and the money numbers
+    come first and everything else is one line each.
+
+    A card that arrives after the move says so in its own title.  Printing
+    "first seen $31.2K" beside a doubled price without calling it late is the
+    exact failure this release exists to fix (sections 10, 47).
+    """
+
+    tier = str(getattr(verdict, "tier", "EARLY_HEADS_UP"))
+    late = bool(getattr(verdict, "late", False))
+    kind = EARLY_RUNNER if tier in {"EARLY_RUNNER", "ORGANIC_RUNNER"} else EARLY_HEADS_UP
+    move_before = _percent_or(_move_percent(first_seen_market_cap_usd, alert_market_cap_usd))
+    move_after = _percent_or(_move_percent(alert_market_cap_usd, current_market_cap_usd))
+
+    fields = [
+        CardField(
+            "MARKET CAP",
+            (
+                f"First seen `{_money(first_seen_market_cap_usd)}`"
+                + (
+                    f" ({first_seen_seconds_ago}s ago)"
+                    if first_seen_seconds_ago is not None
+                    else ""
+                )
+                + f"\n**At this alert `{_money(alert_market_cap_usd)}`**\n"
+                f"Current `{_money(current_market_cap_usd)}`\n"
+                f"Move before alert `{move_before}` • since alert `{move_after}`"
+            ),
+            P_DECISION,
+        ),
+        CardField(
+            "MARKET",
+            (
+                f"Age `{age_seconds if age_seconds is not None else '?'}s` • liquidity "
+                f"`{_money(liquidity_usd)}`\n"
+                f"Flow `{buys if buys is not None else '?'}` buys / "
+                f"`{sells if sells is not None else '?'}` sells • signal "
+                f"`{getattr(verdict, 'score', ZERO):.0f}/100`"
+                + (f"\n{notable_summary}" if notable_summary else "")
+                + (f"\nStory: {story_summary}" if story_summary else "\nStory: NONE FOUND")
+            ),
+            P_DEMAND,
+        ),
+    ]
+
+    impulse = getattr(verdict, "impulse", None)
+    if impulse is not None and getattr(impulse, "detected", False):
+        fields.append(
+            CardField(
+                "LARGE BUY",
+                (
+                    f"Quality `{impulse.quality}`"
+                    + (
+                        f" • {impulse.liquidity_share_percent}% of liquidity"
+                        if impulse.liquidity_share_percent is not None
+                        else ""
+                    )
+                    + (
+                        f" • {impulse.follow_on_buyers} independent buyers followed"
+                        if impulse.follow_on_buyers
+                        else ""
+                    )
+                ),
+                P_EDGE,
+            )
+        )
+
+    categories = tuple(getattr(verdict, "evidence_categories", ()) or ())
+    reasons = tuple(getattr(verdict, "reasons", ()) or ())
+    fields.append(
+        CardField(
+            "WHY PINGED" if kind == EARLY_RUNNER and not late else "WHY YOU'RE SEEING THIS",
+            (
+                "\n".join(f"• {item}" for item in reasons[:5])
+                or "• early acceleration on cheap evidence"
+            )
+            + (
+                "\nEvidence: " + ", ".join(item.replace("_", " ").lower() for item in categories)
+                if categories
+                else ""
+            ),
+            P_WHY_SURFACED,
+        )
+    )
+
+    if late:
+        why_not = tuple(getattr(verdict, "why_not_pinged", ()) or ())
+        fields.append(
+            CardField(
+                "⚠ WHY THIS IS NOT AN EARLY ALERT",
+                (
+                    f"The move was already `{move_before}` by the time this fired.\n"
+                    + (
+                        "\n".join(f"• {item.replace('_', ' ').lower()}" for item in why_not[:4])
+                        or "• the gate was reached after the move"
+                    )
+                ),
+                P_WARNINGS,
+            )
+        )
+
+    fields.append(
+        CardField(
+            "SAFETY",
+            "**UNKNOWN** — deep analysis still running. Research only.",
+            P_SAFETY,
+        )
+    )
+    fields.append(CardField("LINKS", _links(mint, fomo_url), P_LIQUIDITY))
+
+    title = str(getattr(verdict, "label", "👀 EARLY HEADS-UP"))
+    spec = CardSpec(
+        title=title,
+        description=(
+            f"**{name}** `${symbol}`\n"
+            f"Mint: `{mint}`\n"
+            f"MC now `{_money(alert_market_cap_usd)}` • first seen "
+            f"`{_money(first_seen_market_cap_usd)}` ({move_before})\n"
+            f"{_links(mint, fomo_url)}"
+        ),
+        compact_description=(
+            f"{title}\n**{name}** `${symbol}`\n`{mint}`\n"
+            f"Alert MC `{_money(alert_market_cap_usd)}` • first seen "
+            f"`{_money(first_seen_market_cap_usd)}` ({move_before})"
+        ),
+        fields=tuple(fields),
+        footer=RESEARCH_ONLY_FOOTER,
+        thumbnail_url=image_url,
+        colour=0x95A5A6 if late else (0xE74C3C if kind == EARLY_RUNNER else 0xF39C12),
+    )
+    return FastAlert(
+        kind=kind,
+        mint=mint,
+        alert_key=f"{kind}:{mint}",
+        spec=spec,
+        # A late card never pings, whatever tier the evidence reached.
+        ping=kind == EARLY_RUNNER and not late,
+        ping_reason=", ".join(categories[:2]),
+        fingerprint=f"{tier}:{int(getattr(verdict, 'score', ZERO))}",
+        token_mint=mint,
+        lane=LANE_URGENT if (kind == EARLY_RUNNER and not late) else LANE_RADAR,
+        family=tier,
+    )
+
+
+def _move_percent(base: Decimal | None, current: Decimal | None) -> Decimal | None:
+    if base is None or current is None or base <= 0:
+        return None
+    return ((current - base) / base * Decimal("100")).quantize(Decimal("0.01"))
+
+
+def _percent_or(value: Decimal | None) -> str:
+    return "unknown" if value is None else f"{value:+.2f}%"
 
 
 def build_shadow_entry_alert(

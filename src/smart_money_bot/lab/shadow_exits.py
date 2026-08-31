@@ -58,6 +58,7 @@ SHADOW_PRINCIPAL_RECOVERY = "SHADOW_PRINCIPAL_RECOVERY"
 HOLD_SHADOW_RUNNER = "SHADOW_HEALTHY_RUNNER_HOLD"
 SHADOW_STALE_OBSERVATION = "SHADOW_STALE_OBSERVATION"
 SHADOW_SAFETY_MONITOR = "SHADOW_SAFETY_UNKNOWN_MONITORING"
+SHADOW_SOFT_PAUSE_HOLD = "SHADOW_SOFT_PAUSE_HOLD"
 
 #: Reasons the overlay must never touch: they are emergencies or protection of
 #: a profit that has already started giving back.
@@ -71,6 +72,44 @@ PROTECTED_REASONS: frozenset[str] = frozenset(
         "TIME_STOP",
     }
 )
+
+# --- momentum change classes (sections 55, 56) -------------------------------
+#: Momentum slowed, but demand, flow, liquidity and route are all still fine and
+#: price is near its recent high.  A pause, not a death.
+MOMENTUM_SOFT_PAUSE = "SOFT_PAUSE"
+#: Several independent things are weakening together.
+MOMENTUM_CONFIRMED_DECAY = "CONFIRMED_DECAY"
+#: Sellers in control, drawdown, liquidity leaving, distribution.
+MOMENTUM_HARD_REVERSAL = "HARD_REVERSAL"
+#: Nothing is wrong.
+MOMENTUM_HEALTHY = "HEALTHY"
+
+MOMENTUM_STATES: tuple[str, ...] = (
+    MOMENTUM_HEALTHY,
+    MOMENTUM_SOFT_PAUSE,
+    MOMENTUM_CONFIRMED_DECAY,
+    MOMENTUM_HARD_REVERSAL,
+)
+
+#: Non-emergency de-risk reasons the momentum classifier is allowed to soften.
+#: Safety, liquidity emergencies, the hard stop, trailing and break-even are
+#: deliberately absent: section 56 permits patience with momentum, never with
+#: an emergency.
+SOFTENABLE_REASONS: frozenset[str] = frozenset(
+    {
+        "MOMENTUM_DECAY",
+        "BUY_FLOW_REVERSAL",
+        "VOLUME_EXHAUSTION",
+    }
+)
+
+#: How many consecutive weak observations before a slowdown counts as decay.
+MIN_WEAK_OBSERVATIONS_FOR_DECAY = 2
+#: How many independent negative signals make a single observation conclusive.
+MIN_INDEPENDENT_NEGATIVES_FOR_DECAY = 2
+#: Drawdown from the post-entry high that is material on its own.
+MATERIAL_PEAK_DRAWDOWN_PERCENT = Decimal("22")
+
 
 # --- runner health bands (section 9) -----------------------------------------
 HEALTH_ACCELERATING = "ACCELERATING"
@@ -108,6 +147,13 @@ class RunnerEvidence:
     safety_provider_degraded: bool = False
     #: A provider actively confirmed the token is unsafe.  Only this exits.
     safety_confirmed_fail: bool = False
+    #: How many consecutive observations have looked weak.  One weak tick is a
+    #: wobble; three in a row is a trend (section 56).
+    consecutive_weak_observations: int = 0
+    #: A strong or accelerating story with healthy flow is evidence that a
+    #: momentum cooldown is cooling rather than dying (section 57).  It never
+    #: overrides a confirmed hard failure.
+    story_state: str = ""
 
 
 #: No extra runner evidence beyond what the exit context already carries.
@@ -334,6 +380,128 @@ def assess_runner_health(
 
 
 @dataclass(frozen=True, slots=True)
+class MomentumVerdict:
+    """Is this a pause, a decay or a reversal? (sections 55, 56)"""
+
+    state: str = MOMENTUM_HEALTHY
+    negatives: tuple[str, ...] = field(default_factory=tuple)
+    positives: tuple[str, ...] = field(default_factory=tuple)
+    consecutive_weak: int = 0
+    peak_drawdown_percent: Decimal | None = None
+
+    @property
+    def soft(self) -> bool:
+        return self.state == MOMENTUM_SOFT_PAUSE
+
+    @property
+    def conclusive(self) -> bool:
+        return self.state in {MOMENTUM_CONFIRMED_DECAY, MOMENTUM_HARD_REVERSAL}
+
+
+def classify_momentum(
+    position: PaperPosition,
+    context: ExitContext,
+    evidence: RunnerEvidence = NO_RUNNER_EVIDENCE,
+    *,
+    config: ShadowConfig = DEFAULT_SHADOW_CONFIG,
+) -> MomentumVerdict:
+    """Separate a momentum pause from a real reversal.
+
+    The shared engine de-risks 50% the first time momentum prints weak.  On a
+    volatile fresh token that fires constantly, and it is the single most
+    expensive class of exit: it sells a live runner into a wobble.
+
+    Section 56's rule is applied here — a non-emergency reduction wants
+    *repeated* weakness, or *several independent* negatives, or a material
+    drawdown from the post-entry high — while leaving every emergency untouched.
+    """
+
+    negatives: list[str] = []
+    positives: list[str] = []
+    # Some observations are not wobbles.  Heavy realized selling or smart-money
+    # distribution is a fact about the market, not a noisy score, so either is
+    # conclusive on its own and does not have to wait for a second opinion.
+    strong_negatives: list[str] = []
+
+    ratio = context.buy_sell_ratio
+    liquidity_change = context.liquidity_change_percent
+    drawdown = position.drawdown_from_peak_percent(context.price_usd)
+
+    if ratio is not None and ratio <= Decimal("0.5"):
+        strong_negatives.append(f"heavy selling: {context.buys} buys to {context.sells} sells")
+    elif ratio is not None and ratio < Decimal("0.8"):
+        negatives.append("sellers now outnumber buyers")
+    elif ratio is not None and ratio >= Decimal("1.2"):
+        positives.append("buyers still lead")
+
+    if liquidity_change is not None and liquidity_change <= Decimal("-20"):
+        negatives.append(f"liquidity down {liquidity_change}%")
+    elif liquidity_change is not None and liquidity_change >= ZERO:
+        positives.append("liquidity holding")
+
+    if context.smart_money_distributing or evidence.smart_money_distributing:
+        strong_negatives.append("smart wallets distributing")
+    elif context.smart_money_accumulating or evidence.smart_money_accumulating:
+        positives.append("smart wallets still accumulating")
+
+    if evidence.independent_buyer_growth is not None:
+        if evidence.independent_buyer_growth < 0:
+            negatives.append("independent buyers leaving")
+        elif evidence.independent_buyer_growth > 0:
+            positives.append("independent buyers still arriving")
+
+    if evidence.volume_ratio is not None and evidence.volume_ratio <= Decimal("0.3"):
+        negatives.append("volume collapsed")
+
+    if drawdown is not None and drawdown >= MATERIAL_PEAK_DRAWDOWN_PERCENT:
+        negatives.append(f"down {drawdown}% from the post-entry high")
+
+    if not context.route_available:
+        negatives.append("no sell route")
+    if context.safety_status == "FAIL":
+        negatives.append("safety failed")
+
+    if evidence.story_state in {"ACCELERATING", "STRONG", "VIRAL"}:
+        # Section 57: a live story is evidence that a cooldown is cooling, not
+        # dying.  It is a positive, never a veto over a confirmed failure.
+        positives.append(f"story still {evidence.story_state.lower()}")
+
+    weak = evidence.consecutive_weak_observations
+
+    material_drawdown = (
+        drawdown is not None and drawdown >= MATERIAL_PEAK_DRAWDOWN_PERCENT
+    )
+    broken = context.safety_status == "FAIL" or not context.route_available
+    total = len(negatives) + len(strong_negatives)
+    if (
+        broken
+        or len(strong_negatives) >= 2
+        or total >= 3
+        or (total >= 2 and material_drawdown)
+    ):
+        state = MOMENTUM_HARD_REVERSAL
+    elif (
+        strong_negatives
+        or total >= MIN_INDEPENDENT_NEGATIVES_FOR_DECAY
+        or weak >= MIN_WEAK_OBSERVATIONS_FOR_DECAY
+        or material_drawdown
+    ):
+        state = MOMENTUM_CONFIRMED_DECAY
+    elif negatives:
+        state = MOMENTUM_SOFT_PAUSE
+    else:
+        state = MOMENTUM_HEALTHY
+
+    return MomentumVerdict(
+        state=state,
+        negatives=tuple((*strong_negatives, *negatives)),
+        positives=tuple(positives),
+        consecutive_weak=weak,
+        peak_drawdown_percent=drawdown,
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class ShadowExitAssessment:
     """The plan plus the reasoning behind it, for the card and `/fomo shadow`."""
 
@@ -342,6 +510,7 @@ class ShadowExitAssessment:
     health: RunnerHealth = field(default_factory=RunnerHealth)
     net: ShadowNetPnl = field(default_factory=ShadowNetPnl)
     objective_met: bool = False
+    momentum: MomentumVerdict = field(default_factory=MomentumVerdict)
     why: tuple[str, ...] = field(default_factory=tuple)
 
     @property
@@ -371,6 +540,7 @@ def plan_shadow_exit(
     exit_config = lab_config if lab_config is not None else config.exit_config()
     base = plan_exit(position, context, config=exit_config)
     health = assess_runner_health(position, context, evidence, config=config)
+    momentum = classify_momentum(position, context, evidence, config=config)
     net = net_pnl_now(
         position,
         context.price_usd,
@@ -390,6 +560,7 @@ def plan_shadow_exit(
             health=health,
             net=net,
             objective_met=objective_met,
+            momentum=momentum,
             why=why,
         )
 
@@ -412,6 +583,37 @@ def plan_shadow_exit(
     price = context.price_usd
     if price is None or price <= 0:
         return result(base, ("no usable current price",))
+
+    # 1b. A momentum *pause* is not a momentum *reversal* (sections 55, 56).
+    #     The shared engine reduces on the first weak print; on a fresh, volatile
+    #     token that repeatedly sells live runners into wobbles.  A reduction now
+    #     needs repeated weakness, several independent negatives, or a material
+    #     drawdown from the post-entry high.  Every emergency above is untouched,
+    #     and trailing and break-even protection stay armed, so a real giveback
+    #     still exits without waiting for momentum to agree.
+    if base.acts and base.reason_code in SOFTENABLE_REASONS and not momentum.conclusive:
+        return result(
+            ExitPlan(
+                fraction=ZERO,
+                reason_code=SHADOW_SOFT_PAUSE_HOLD,
+                final=False,
+                notes=(
+                    f"{base.reason_code.lower().replace('_', ' ')} on a single "
+                    "observation, with demand still intact",
+                    *momentum.positives[:2],
+                ),
+
+            ),
+            (
+                "momentum paused rather than reversed — holding",
+                *momentum.positives[:2],
+                *(
+                    (f"one negative so far: {momentum.negatives[0]}",)
+                    if momentum.negatives
+                    else ()
+                ),
+            ),
+        )
 
     if not objective_met:
         # Below the objective the staged engine decides alone, so a broken setup
@@ -672,6 +874,7 @@ def shadow_exit_priority(reason_code: str) -> int:
         SHADOW_RUNNER_PARTIAL: 9,
         SHADOW_STALE_OBSERVATION: 9,
         SHADOW_SAFETY_MONITOR: 12,
+        SHADOW_SOFT_PAUSE_HOLD: 12,
         "TIME_STOP": 10,
         EXIT_MOON_BAG: 11,
         HOLD_SHADOW_RUNNER: 12,

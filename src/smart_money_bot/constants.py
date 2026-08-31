@@ -2,7 +2,7 @@
 
 from urllib.parse import urlencode
 
-BOT_VERSION = "2.40.0"
+BOT_VERSION = "2.41.0"
 PAPER_DEMO_MINT = "PAPER-DEMO-ONLY"
 PAPER_DEMO_ENTRY_PRICE_USD = "1"
 

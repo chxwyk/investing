@@ -52,6 +52,7 @@ from .fast_alerts import (
     EnrichmentUpdate,
     FastAlert,
     build_catalyst_alert,
+    build_early_alert,
     build_fast_watch_alert,
     build_notable_trader_alert,
     build_shadow_entry_alert,
@@ -71,6 +72,30 @@ from .lab.catalyst import (
     classify_catalyst_alert,
 )
 from .lab.config import lab_config_from_settings
+from .lab.early import (
+    HUMAN_WHY as HUMAN_EARLY_WHY,
+)
+from .lab.early import (
+    PINGABLE_TIERS as EARLY_PINGABLE_TIERS,
+)
+from .lab.early import (
+    STAGE_BOT_FIRST_SEEN,
+    STAGE_CHEAP_SIGNAL,
+    STAGE_EARLY_RUNNER,
+    STAGE_OPERATOR_HEADS_UP,
+    STAGE_URGENT_PING,
+    AlertTiming,
+    EarlySignals,
+    early_config_from_settings,
+    evaluate_early_signal,
+    summarize_alert_performance,
+)
+from .lab.early import (
+    WHY_DUPLICATE as EARLY_WHY_DUPLICATE,
+)
+from .lab.early import (
+    WHY_NO_DATA as EARLY_WHY_NO_DATA,
+)
 from .lab.exits import ExitContext as LabExitContext
 from .lab.fastwatch import evaluate_fast_watch, signals_from_candidate, still_current
 from .lab.forward import EdgeInputs as ForwardEdgeInputs
@@ -553,6 +578,15 @@ class SmartMoneyEngine:
         self.runner_analysis_timeouts = 0
         self.runner_analysis_errors = 0
         self.forward_pings_withheld = 0
+        # --- ultra-early operator lane (v2.41) ---------------------------
+        # Cheap, synchronous-ish, and deliberately ahead of deep enrichment.
+        self._early_config = early_config_from_settings(settings)
+        self._early_published: dict[str, int] = {}
+        self._early_runner_times: deque[int] = deque()
+        self.early_heads_up_published = 0
+        self.early_runners_published = 0
+        self.last_early_alert_at: int | None = None
+        self.last_early_alert_mint: str = ""
 
     def _x_usage_day(self) -> str:
         return datetime.now(ZoneInfo(self.settings.x_daily_search_timezone)).date().isoformat()
@@ -1401,6 +1435,210 @@ class SmartMoneyEngine:
                 await self.notifier.on_error("Proactive X radar", exc)
             await asyncio.sleep(self.settings.x_radar_poll_seconds)
 
+    # ------------------------------------------------------------------
+    # Ultra-early operator visibility (v2.41): sections 1-14, 45-52
+    # ------------------------------------------------------------------
+
+    async def _run_early_lane(self, mint: str, *, now: int) -> bool:
+        """Give the operator a chance to look while the edge still exists.
+
+        One cheap DEX snapshot, one pure evaluation, one card.  No wallet
+        forensics, no Solana Tracker, no social lookup, no safety provider —
+        safety is published honestly as UNKNOWN.  Nothing in here may block, and
+        nothing in here may raise into the radar loop.
+        """
+
+        try:
+            return await self._early_lane_task(mint, now=now)
+        except Exception:
+            logger.exception("Early lane failed for %s", mint[:8])
+            return False
+
+    async def _early_lane_task(self, mint: str, *, now: int) -> bool:
+        snapshot = await self.dex_screener.snapshot(mint)
+        if not snapshot.available or snapshot.market_cap_usd is None:
+            await self._record_suppression(mint, EARLY_WHY_NO_DATA, now=now)
+            return False
+
+        # The first market cap the bot ever saw for this mint, written once.
+        # It is a historical fact and must survive every later enrichment pass
+        # (sections 3, 52) — that immutability is what makes "was this early?"
+        # answerable at all.
+        await self.database.record_alert_stage(
+            mint=mint,
+            stage=STAGE_BOT_FIRST_SEEN,
+            occurred_at=now,
+            market_cap_usd=snapshot.market_cap_usd,
+            liquidity_usd=snapshot.liquidity_usd,
+        )
+        timeline = {
+            str(row["stage"]): row for row in await self.database.alert_timeline(mint)
+        }
+        first_seen_row = timeline.get(STAGE_BOT_FIRST_SEEN, {})
+        first_seen_at = int(first_seen_row.get("occurred_at") or now)
+        first_seen_mc = _engine_decimal(first_seen_row.get("market_cap_usd"))
+
+        signals = EarlySignals(
+            mint=mint,
+            now=now,
+            first_seen_at=first_seen_at,
+            pair_age_seconds=(
+                snapshot.pair_age_minutes * 60
+                if snapshot.pair_age_minutes is not None
+                else None
+            ),
+            market_cap_usd=snapshot.market_cap_usd,
+            first_seen_market_cap_usd=first_seen_mc,
+            liquidity_usd=snapshot.liquidity_usd,
+            volume_5m_usd=snapshot.volume_5m_usd,
+            price_change_5m_percent=snapshot.price_change_5m_percent,
+            buys_5m=snapshot.buys_5m,
+            sells_5m=snapshot.sells_5m,
+            buys_1h=snapshot.buys_1h,
+            sells_1h=snapshot.sells_1h,
+            route_available=True,
+            **await self._early_corroboration(mint),
+        )
+        verdict = evaluate_early_signal(signals, config=self._early_config)
+
+        await self.database.record_alert_stage(
+            mint=mint,
+            stage=STAGE_CHEAP_SIGNAL,
+            occurred_at=now,
+            market_cap_usd=snapshot.market_cap_usd,
+            liquidity_usd=snapshot.liquidity_usd,
+            tier=verdict.tier,
+            edge_state=verdict.edge_state,
+            evidence={
+                "score": str(verdict.score),
+                "categories": list(verdict.evidence_categories),
+                "reasons": list(verdict.reasons[:6]),
+                "why_not_pinged": list(verdict.why_not_pinged),
+            },
+        )
+        for reason in verdict.why_not_pinged:
+            await self._record_suppression(
+                mint, reason, now=now, market_cap=snapshot.market_cap_usd, tier=verdict.tier
+            )
+        if not verdict.visible:
+            return False
+
+        if not self._early_lane_allows(mint, verdict, now=now):
+            return False
+
+        name, symbol = await self._cached_token_names(mint)
+        alert = build_early_alert(
+            mint=mint,
+            name=name if name != "Unknown token" else (symbol or mint[:8]),
+            symbol=symbol,
+            fomo_url=self._fomo_url(mint),
+            verdict=verdict,
+            age_seconds=signals.pair_age_seconds,
+            first_seen_seconds_ago=signals.seconds_since_first_seen,
+            first_seen_market_cap_usd=first_seen_mc,
+            alert_market_cap_usd=snapshot.market_cap_usd,
+            current_market_cap_usd=snapshot.market_cap_usd,
+            liquidity_usd=snapshot.liquidity_usd,
+            buys=snapshot.buys_5m,
+            sells=snapshot.sells_5m,
+            image_url=snapshot.image_url,
+        )
+        published = await self._publish_fast_alert(alert, now=now)
+        if not published:
+            await self._record_suppression(mint, EARLY_WHY_DUPLICATE, now=now)
+            return False
+
+        stage = (
+            STAGE_EARLY_RUNNER
+            if verdict.tier in EARLY_PINGABLE_TIERS
+            else STAGE_OPERATOR_HEADS_UP
+        )
+        await self.database.record_alert_stage(
+            mint=mint,
+            stage=stage,
+            occurred_at=now,
+            market_cap_usd=snapshot.market_cap_usd,
+            liquidity_usd=snapshot.liquidity_usd,
+            tier=verdict.tier,
+            edge_state=verdict.edge_state,
+            evidence={"categories": list(verdict.evidence_categories)},
+        )
+        if alert.may_ping:
+            await self.database.record_alert_stage(
+                mint=mint,
+                stage=STAGE_URGENT_PING,
+                occurred_at=now,
+                market_cap_usd=snapshot.market_cap_usd,
+                tier=verdict.tier,
+            )
+        self._early_published[mint] = now
+        if verdict.tier in EARLY_PINGABLE_TIERS:
+            self._early_runner_times.append(now)
+            self.early_runners_published += 1
+        else:
+            self.early_heads_up_published += 1
+        self.last_early_alert_at = now
+        self.last_early_alert_mint = mint
+        return True
+
+    async def _early_corroboration(self, mint: str) -> dict[str, Any]:
+        """Cheap, already-persisted corroboration — never a new provider call."""
+
+        payload: dict[str, Any] = {
+            "notable_wallet_count": 0,
+            "proven_early_wallet_count": 0,
+            "story_state": "",
+            "story_relationship": "",
+        }
+        with suppress(Exception):
+            links = await self.database.narrative_link_rows(mint=mint, limit=1)
+            if links:
+                payload["story_relationship"] = str(links[0].get("relationship") or "")
+                narratives = await self.database.narrative_rows(limit=50)
+                by_id = {str(row["narrative_id"]): row for row in narratives}
+                story = by_id.get(str(links[0].get("narrative_id") or ""))
+                if story:
+                    payload["story_state"] = str(story.get("virality") or "")
+        return payload
+
+    def _early_lane_allows(self, mint: str, verdict: Any, *, now: int) -> bool:
+        """Cooldown and hourly ceiling, so being early does not become spam."""
+
+        last = self._early_published.get(mint)
+        if last is not None and now - last < self.settings.fomo_early_cooldown_seconds:
+            return False
+        if verdict.tier in EARLY_PINGABLE_TIERS:
+            while (
+                self._early_runner_times
+                and now - self._early_runner_times[0] >= 3_600
+            ):
+                self._early_runner_times.popleft()
+            if len(self._early_runner_times) >= self.settings.fomo_early_max_runners_per_hour:
+                self.fast_alerts_suppressed += 1
+                return False
+        return True
+
+    async def _record_suppression(
+        self,
+        mint: str,
+        reason_code: str,
+        *,
+        now: int,
+        market_cap: Decimal | None = None,
+        tier: str = "",
+    ) -> None:
+        """Section 12: "why wasn't I pinged?" must be answerable afterwards."""
+
+        with suppress(Exception):
+            await self.database.record_alert_suppression(
+                mint=mint,
+                reason_code=reason_code,
+                occurred_at=now,
+                market_cap_usd=market_cap,
+                tier=tier,
+                detail=HUMAN_EARLY_WHY.get(reason_code, ""),
+            )
+
     async def _record_discovery(self, mint: str, *, now: int) -> None:
         """Write the cheap-discovery timestamp; never let it break a scan."""
 
@@ -1451,6 +1689,19 @@ class SmartMoneyEngine:
                     await self._record_discovery(mint, now=now)
                     if self.settings.coin_callouts_enabled:
                         self._queue_coin_callout(mint)
+
+                # The cheap operator lane runs HERE — before the deep gather
+                # below, not after it.  This is the whole fix: every
+                # operator-visible alert used to sit behind ``analyze_runner``,
+                # which is budgeted at 30 seconds *per mint* and gathered across
+                # the batch, so the slowest token delayed all of them.  A token
+                # first seen at $31K could not reach a human until the deep pass
+                # finished, by which point it was $61K.  One DEX snapshot per
+                # mint is enough to say "this is moving, look now".
+                if self.settings.fomo_early_lane_enabled:
+                    await asyncio.gather(
+                        *(self._run_early_lane(mint, now=now) for mint in selected)
+                    )
                 if self.settings.fomo_runner_enabled:
                     async def evaluate(
                         mint: str,
@@ -2984,6 +3235,35 @@ class SmartMoneyEngine:
         status["cards_enabled"] = self.shadow_cards_enabled
         return status
 
+    async def early_lane_status(self) -> dict[str, Any]:
+        """The early-lane half of the `/fomo realtime` truth panel (section 74)."""
+
+        await self.initialize()
+        report = await self.alert_performance()
+        performance = report["performance"]
+        return {
+            "enabled": self.settings.fomo_early_lane_enabled,
+            "heads_up_published": self.early_heads_up_published,
+            "runners_published": self.early_runners_published,
+            "last_early_alert_at": self.last_early_alert_at,
+            "last_early_alert_mint": self.last_early_alert_mint,
+            "median_first_seen_to_alert_seconds": (
+                performance.median_first_seen_to_alert_seconds
+            ),
+            "median_move_before_alert_percent": (
+                performance.median_move_before_alert_percent
+            ),
+            "early_rate_percent": performance.early_rate_percent,
+            "late_alerts": performance.late_alerts,
+            "analysis_timeouts": self.runner_analysis_timeouts,
+            "analysis_errors": self.runner_analysis_errors,
+            "suppressions": report["suppressions"],
+            "social": self.social_status(),
+            "stream_connected": bool(getattr(self.stream, "connected", False)),
+            "stream_subscriptions": int(getattr(self.stream, "subscription_count", 0) or 0),
+            "stream_reconnects": int(getattr(self.stream, "reconnects", 0) or 0),
+        }
+
     async def shadow_refusals(self, *, since: int = 0) -> dict[str, int]:
         await self.initialize()
         return await self.shadow.refusals(since=since)
@@ -2997,6 +3277,161 @@ class SmartMoneyEngine:
 
         await self.initialize()
         return await self.shadow.counterfactuals(position_id)
+
+    # --- early-alert visibility reports (sections 74-77) ----------------
+
+    async def early_runners(self, *, limit: int = 8) -> list[dict[str, Any]]:
+        """`/fomo runners` — what is running right now and how early we were."""
+
+        await self.initialize()
+        rows: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for stage in (STAGE_EARLY_RUNNER, STAGE_OPERATOR_HEADS_UP):
+            for row in await self.database.alert_stage_rows(stage=stage, limit=limit * 3):
+                mint = str(row["mint"])
+                if mint in seen:
+                    continue
+                seen.add(mint)
+                rows.append(await self._early_runner_row(mint, row))
+                if len(rows) >= limit:
+                    return rows
+        return rows
+
+    async def _early_runner_row(self, mint: str, alert_row: dict[str, Any]) -> dict[str, Any]:
+        timeline = {
+            str(item["stage"]): item for item in await self.database.alert_timeline(mint)
+        }
+        first_seen = timeline.get(STAGE_BOT_FIRST_SEEN, {})
+        name, symbol = await self._cached_token_names(mint)
+        context = await self._cached_token_context(mint)
+        timing = AlertTiming(
+            mint=mint,
+            first_seen_at=_int_or_none_engine(first_seen.get("occurred_at")),
+            alert_at=_int_or_none_engine(alert_row.get("occurred_at")),
+            first_seen_market_cap_usd=_engine_decimal(first_seen.get("market_cap_usd")),
+            alert_market_cap_usd=_engine_decimal(alert_row.get("market_cap_usd")),
+            current_market_cap_usd=_engine_decimal(context.get("market_cap_usd")),
+            tier=str(alert_row.get("tier") or ""),
+        )
+        return {
+            "mint": mint,
+            "name": name,
+            "symbol": symbol,
+            "tier": timing.tier,
+            "edge_state": str(alert_row.get("edge_state") or ""),
+            "timing": timing,
+            "liquidity_usd": _engine_decimal(context.get("liquidity_usd")),
+            "route_available": bool(context.get("route_available", True)),
+        }
+
+    async def runner_timeline(self, mint: str) -> dict[str, Any]:
+        """`/fomo runner <mint>` — the full story of one exact mint (section 76)."""
+
+        await self.initialize()
+        name, symbol = await self._cached_token_names(mint)
+        return {
+            "mint": mint,
+            "name": name,
+            "symbol": symbol,
+            "stages": await self.database.alert_timeline(mint),
+            "suppressions": await self.database.alert_suppression_rows(mint=mint),
+            "narratives": await self.database.narrative_link_rows(mint=mint),
+            "shadow": await self.shadow_store.open_positions_for_mint(
+                mint, strategy_version=self._shadow_config.strategy_version
+            ),
+        }
+
+    async def narrative_collisions(self, *, limit: int = 6) -> list[dict[str, Any]]:
+        """`/fomo collisions` — same story, different mints (sections 25, 77)."""
+
+        await self.initialize()
+        payload: list[dict[str, Any]] = []
+        for story in await self.database.narrative_rows(limit=limit * 2):
+            narrative_id = str(story["narrative_id"])
+            links = await self.database.narrative_link_rows(narrative_id=narrative_id)
+            if len(links) < 2:
+                continue
+            payload.append({"narrative": story, "links": links})
+            if len(payload) >= limit:
+                break
+        return payload
+
+    async def alert_performance(self) -> dict[str, Any]:
+        """How often the operator saw the coin before it moved (section 14)."""
+
+        await self.initialize()
+        timings: list[AlertTiming] = []
+        for stage in (STAGE_EARLY_RUNNER, STAGE_OPERATOR_HEADS_UP):
+            for row in await self.database.alert_stage_rows(stage=stage, limit=200):
+                mint = str(row["mint"])
+                timeline = {
+                    str(item["stage"]): item
+                    for item in await self.database.alert_timeline(mint)
+                }
+                first_seen = timeline.get(STAGE_BOT_FIRST_SEEN, {})
+                context = await self._cached_token_context(mint)
+                timings.append(
+                    AlertTiming(
+                        mint=mint,
+                        first_seen_at=_int_or_none_engine(first_seen.get("occurred_at")),
+                        alert_at=_int_or_none_engine(row.get("occurred_at")),
+                        first_seen_market_cap_usd=_engine_decimal(
+                            first_seen.get("market_cap_usd")
+                        ),
+                        alert_market_cap_usd=_engine_decimal(row.get("market_cap_usd")),
+                        current_market_cap_usd=_engine_decimal(
+                            context.get("market_cap_usd")
+                        ),
+                        tier=str(row.get("tier") or ""),
+                    )
+                )
+        return {
+            "performance": summarize_alert_performance(timings, config=self._early_config),
+            "suppressions": await self.database.suppression_counts(),
+            "heads_up_published": self.early_heads_up_published,
+            "runners_published": self.early_runners_published,
+            "last_early_alert_at": self.last_early_alert_at,
+            "last_early_alert_mint": self.last_early_alert_mint,
+        }
+
+    def social_status(self) -> dict[str, Any]:
+        """The honest state of the X/social lane (section 31).
+
+        Production diagnostics showed X sitting at zero activity next to a
+        generic HEALTHY.  A provider that has never produced a usable signal is
+        not healthy — it is off, unconfigured, or unauthenticated, and each of
+        those is a different thing for an operator to do something about.
+        """
+
+        client = self.x_social
+        configured = bool(getattr(client, "bearer_token", None) or getattr(client, "api_key", None))
+        enabled = bool(getattr(client, "search_enabled", False))
+        error = getattr(client, "last_radar_error", None) or ""
+        searches = int(getattr(client, "searches", 0) or 0)
+
+        if not self.settings.x_radar_enabled and not enabled:
+            state = "DISABLED_BY_CONFIG"
+        elif not configured:
+            state = "AUTH_MISSING"
+        elif not enabled:
+            state = "DISABLED_BY_CONFIG"
+        elif not self.settings.x_radar_query.strip():
+            state = "NO_SOURCE_CONFIGURED"
+        elif "rate" in error.casefold() or "429" in error:
+            state = "RATE_LIMITED"
+        elif error:
+            state = "PROVIDER_DEGRADED"
+        elif searches == 0:
+            state = "ACTIVE_NO_EVENTS"
+        else:
+            state = "ACTIVE"
+        return {
+            "state": state,
+            "searches": searches,
+            "configured": configured,
+            "enabled": enabled,
+            "last_error": error,
+        }
 
     # --- profit-first dashboard (sections 21-24) ------------------------
 
@@ -7529,6 +7964,15 @@ def _first_int(*values: object) -> int | None:
         except (TypeError, ValueError):
             continue
     return None
+
+
+def _int_or_none_engine(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return None
 
 
 def _engine_decimal(value: Any) -> Decimal | None:

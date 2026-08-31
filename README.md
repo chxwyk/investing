@@ -7,7 +7,28 @@ transactions, and mirrors every newly detected hot-wallet swap in PAPER mode. PA
 as either a forced source-price observation ledger or an executable Jupiter quote-shadow
 trial; the two answer different questions and are labeled separately.
 
-Version 2.40.0 is a **profit-first forward optimization**. It builds nothing new for its own
+Version 2.41.0 is the **FOMO alpha engine**: ultra-early discovery and story-first alpha. It
+exists to fix one measured product failure — the bot recorded Grok Pocket at a **~$31.18K** market
+cap and the operator did not get useful visibility until **~$61.49K**, a **+97%** move that had
+already happened by the time the card arrived. "First seen $31.18K" was printed as historical
+trivia beside a doubled price.
+
+The cause was architectural, not a threshold. Every operator-visible alert sat behind
+`analyze_runner` — deep enrichment with a 30-second budget, gathered across a whole batch, so the
+slowest mint delayed all of them, and a mint that missed the bar on its first pass was not looked
+at again for the full 30-minute recheck window. So the cheap operator lane now runs **before** the
+deep gather, from one DEX snapshot the pipeline already fetches: an ORGANIC RUNNER verdict is
+produced in **~5 ms** where enrichment takes up to 20 seconds. The first-seen market cap is written
+**once** and can never be rewritten, and an alert that arrives after the move is labelled
+**EDGE CONSUMED** instead of being dressed up as early.
+
+Being early is worthless if the channel fills with noise, so the restraint is built in the same
+release: a tier that pings needs a *named serious evidence category*, a large buy must be
+corroborated by independent follow-on demand before it counts as demand, a **creator self-buy is
+never demand**, and — because **MINT IS IDENTITY** — a token that merely copied a campaign URL can
+never inherit the real story's credibility.
+
+Version 2.40.0 was a **profit-first forward optimization**. It builds nothing new for its own
 sake; every change traces either to a failure observed in the production logs or to a number the
 account was leaking. Three things came straight out of a live log window:
 
@@ -1041,6 +1062,111 @@ The bot needs these Discord application permissions:
 
 No privileged Discord gateway intents are required.
 
+## Ultra-early discovery and story-first alpha (v2.41)
+
+### The Grok Pocket postmortem
+
+| | value |
+| --- | --- |
+| Market cap when the bot first saw it | ~$31.18K |
+| Market cap when the operator got useful visibility | ~$61.49K |
+| Move already spent before the human could act | ~+97% |
+| Cause | first visibility was gated behind deep enrichment, not behind a threshold |
+
+Deep enrichment ran with a 30-second per-mint budget inside one `asyncio.gather` over the whole
+batch, on a 60-second poll with a 1,800-second recheck. Nothing about the evidence was wrong; the
+operator simply got it after the trade was over.
+
+### The cheap lane runs first, by construction
+
+`lab/early.py` decides operator visibility from **one DEX snapshot and two timestamps**. It
+imports no HTTP client, no RPC client, no wallet forensics and no social lookup — a test walks its
+syntax tree to prove it — so it cannot be slowed down by a provider even in principle. Safety is
+reported honestly as `UNKNOWN`; it is never implied to be `PASS`, and the cheap lane can never make
+anything entry eligible.
+
+In the radar loop the early lane is awaited **before** the enrichment gather, and a test asserts
+that ordering by source position, because the ordering *is* the fix.
+
+### Three visibility tiers
+
+| Tier | Means | Lane |
+| --- | --- | --- |
+| `EARLY_HEADS_UP` | "This is beginning to move. Watch." | radar only, never pings by default |
+| `EARLY_RUNNER` | Serious early evidence from more than one family — look now. | urgent, may ping |
+| `ORGANIC_RUNNER` | An early runner whose whole case is market structure. No story is not a defect. | urgent, may ping |
+
+A tier that pings must name a **serious evidence category**: organic market evidence, exceptional
+market structure, a story, a proven early wallet, a catalyst, or multi-source confluence. A high
+score on its own is recorded as `NO_SERIOUS_EVIDENCE_CATEGORY` and demoted to a heads-up.
+Confluence means *independent* families agreeing — organic flow and a structural impulse are both
+market evidence and count once between them, so a single market observation cannot manufacture its
+own corroboration.
+
+### Large buys are measured relatively, and whose money it is matters
+
+There is no dollar threshold. A buy is an impulse when it is worth **5%+ of liquidity**, or **8x**
+the recent average trade, or moves the market cap **8%+** in the window. It only counts as
+*demand* once **8+ independent buyers** follow it. A large buy whose only follower is the creator
+is graded `LARGE_BUY_CREATOR_LINKED`, **subtracts** from the score, and blocks the surface with
+`LARGE_BUY_WAS_CREATOR_LINKED` — pretending a self-buy is demand is the easiest possible way to
+fill a channel with traps.
+
+### A late alert says so
+
+| Move since first seen | State |
+| --- | --- |
+| < 35% | `EDGE_AVAILABLE` |
+| 35–80% | `EDGE_NARROWING` |
+| 80–150% | `EDGE_CONSUMED` |
+| > 150% | `MOVE_ALREADY_EXTENDED` |
+
+An `EDGE_CONSUMED` card is titled **"⚠ RUNNER — EDGE CONSUMED"**, publishes to the radar lane,
+**never pings**, and reports the move that happened *before* the alert. The Grok Pocket case now
+renders as "+97.21% move before alert" rather than "first seen $31.18K".
+
+### The timeline is write-once
+
+Ten stages are persisted with a timestamp **and the market cap at that moment**:
+`SOURCE_CREATED`, `BOT_FIRST_SEEN`, `CHEAP_SIGNAL_TRIGGER`, `OPERATOR_HEADS_UP_SENT`,
+`EARLY_RUNNER_TRIGGER`, `URGENT_PING_SENT`, `DEEP_ENRICHMENT_COMPLETE`, `QUALIFIED_RESEARCH`,
+`SHADOW_DECISION`, `SHADOW_FILL`. The primary key is `(mint, stage)` and writes are
+`INSERT OR IGNORE`, so a re-observation at $61K cannot rewrite what the bot knew at $31K. Every
+suppression is persisted too, with a structured reason code, so **"why wasn't I pinged for this"**
+is a query rather than a guess.
+
+### MINT IS IDENTITY
+
+Narratives are first-class entities that exist independently of any token, and every token-to-story
+link is **graded and directional**:
+
+* `UNRELATED` → `NAME_ONLY` → `WEAK` → `PLAUSIBLE` → `STRONG` → `DIRECTLY_LINKED` → `OFFICIAL`
+* only `STRONG` and above may display the story as the token's own,
+* and a link the **token** claims about itself is capped at `PLAUSIBLE` with a
+  `METADATA_ONLY_EVIDENCE` warning, because metadata can be copied.
+
+`OFFICIAL` requires the story side naming the exact mint **and** a named authority; asking for
+`OFFICIAL` from token-side evidence raises rather than returning a softer answer. Same name is
+never the same token: lookalikes are grouped into a collision group with a ranked resolution and
+the reasons for it, and a token that predates the story is flagged, not condemned.
+
+### A pause is not a reversal
+
+The shared exit engine used to cut 50% the first time momentum printed weak, which on fresh
+volatile tokens sold live runners into noise. Momentum is now classified as `HEALTHY`,
+`SOFT_PAUSE`, `CONFIRMED_DECAY` or `HARD_REVERSAL`. A softenable exit (`MOMENTUM_DECAY`,
+`BUY_FLOW_REVERSAL`, `VOLUME_EXHAUSTION`) with an inconclusive verdict returns
+`SHADOW_SOFT_PAUSE_HOLD` and sells nothing. Confirmation needs **two** weak observations and
+**two** independent negatives — but facts about the market, not noisy scores, still act on one
+observation: heavy selling (a 2:1 sell imbalance) and smart-money distribution are conclusive
+alone, and a confirmed hard safety failure is untouched and still exits immediately and in full.
+
+### Honest status instead of a green tick
+
+`/fomo realtime` reports the X/social lane as `DISABLED_BY_CONFIG` when it is switched off rather
+than as a generic healthy, and reports the wallet stream's reconnects and last-message age. The bot
+never invents engagement counts: engagement is recorded only where a source genuinely exposes it.
+
 ## Profit-first forward optimization (v2.40)
 
 The objective of this release is one number: **forward NET expectancy**. Not more alerts, not more
@@ -1224,6 +1350,30 @@ transaction, an order execution call or a swap. The test suite and the self-chec
 module's AST and assert it.
 
 ## Railway deployment
+
+### v2.41.0 Railway changes
+
+Every new setting has a safe code default, so **no Railway variable has to be added**. Nothing here
+enables live trading or real-money execution, and no shadow forward history is reset.
+
+**ADD:** none required.  **CHANGE:** none required.
+
+**OPTIONAL:**
+
+```text
+FOMO_EARLY_LANE_ENABLED=true          # the cheap operator lane ahead of deep enrichment
+FOMO_EARLY_HEADS_UP_PING=false        # keep heads-ups on the radar lane (recommended)
+FOMO_EARLY_MIN_LIQUIDITY_USD=4000     # floor a $10 simulated trade actually needs
+FOMO_EARLY_MAX_AGE_SECONDS=3600       # how fresh "early" means
+FOMO_EARLY_RUNNER_MIN_SCORE=55        # the bar an EARLY_RUNNER must clear
+FOMO_EARLY_MAX_RUNNERS_PER_HOUR=12    # hourly ceiling on the pinging tier
+FOMO_EARLY_COOLDOWN_SECONDS=1800      # per-mint cooldown between early cards
+```
+
+**Worth knowing without changing anything:** turning `FOMO_EARLY_HEADS_UP_PING` on will
+substantially increase interruptions — a heads-up is deliberately the tier that has *not* earned
+one. The early lane adds **no** provider calls: it reads the DEX snapshot the radar already
+fetches.
 
 ### v2.40.0 Railway changes
 
@@ -1659,6 +1809,19 @@ Mutation commands require Discord Administrator or a role listed in
 Every one of these is read-only research. They show `WAIT`, `REJECT`, `COOLDOWN` and
 `REENTRY_WATCH` candidates on purpose; seeing a candidate never makes it entry eligible.
 
+### Ultra-early alpha (v2.41, admin only)
+
+| Command | What it answers |
+| --- | --- |
+| `/fomo runners` | **What is moving right now that I should look at?** Every live early surface with its tier, edge state, score, first-seen market cap, current market cap, the move already spent, and the evidence categories behind it. |
+| `/fomo runner <mint>` | The write-once timeline for one exact mint: what the bot knew at each stage, the market cap at that moment, when a human first saw it, and — if nobody was pinged — the structured reason why. |
+| `/fomo collisions` | Tokens sharing a name or a story: the collision group, each candidate's exact mint, the graded directional link, and which one the resolver ranks first with its reasons. |
+| `/fomo profit view:alerts` | Alert performance as timing, not volume: how early alerts actually were, median move before and after the alert, the late-alert rate, and an audit of runners the bot saw but never surfaced. |
+
+`/fomo realtime` carries the early block: whether the lane is on, heads-ups and runners published,
+how long ago the last early alert fired, and the honest status of the X/social and wallet-stream
+lanes.
+
 ### Profit dashboard (v2.40, admin only)
 
 | Command | What it answers |
@@ -1861,6 +2024,19 @@ family is demoted and a losing *and rugging* family is retired, that weights sta
 auditable, that historical opportunity cannot outrank current edge, that the ping gate can only
 withhold, and that exit regret never reaches a live decision.
 
+The v2.41 suite adds the alpha engine: that the operator is alerted before a deliberately slow
+20-second enrichment pass finishes, that the cheap lane runs before the deep gather in the radar
+loop, that the alert fires at the first-seen market cap and that cap can never be rewritten, that a
+late alert is labelled `EDGE_CONSUMED` and never pings, that a high score with no serious evidence
+category is demoted to a heads-up, that a creator self-buy is not demand, that a large buy needs
+independent follow-on buyers, that same name is never the same token, that a token that only claims
+a story cannot inherit it and can never be marked `OFFICIAL`, that a lone weak momentum print no
+longer dumps a healthy runner while heavy selling and distribution still de-risk on one
+observation, that a missing snapshot records a structured reason instead of failing silently, that
+an early-lane failure never breaks the radar, and that no module in the early lane can call a
+provider.
+
 `python tests/run_selfcheck.py` re-asserts the non-negotiables — including the $10 entry size, the
 $100/5/$50 caps, the STRICT PAPER separation, `SHADOW_REAL_MONEY_SPEND = 0`, the provider backoff,
-the outage-is-not-a-failure rule and the small-sample protection — without pytest.
+the outage-is-not-a-failure rule, the small-sample protection, the cheap-lane ordering, the
+"a score alone never pings" rule, MINT IS IDENTITY and the soft-pause hold — without pytest.

@@ -234,6 +234,13 @@ class Settings:
     # Safe code defaults cover every value below, so a deployment does not need
     # to define any of these Railway variables to run the shadow experiment.
     fomo_runner_analysis_budget_seconds: int
+    fomo_early_lane_enabled: bool
+    fomo_early_heads_up_ping: bool
+    fomo_early_min_liquidity_usd: Decimal
+    fomo_early_max_age_seconds: int
+    fomo_early_runner_min_score: Decimal
+    fomo_early_max_runners_per_hour: int
+    fomo_early_cooldown_seconds: int
     fomo_forward_ping_gate_enabled: bool
     fomo_shadow_auto_enabled: bool
     fomo_shadow_publish_cards: bool
@@ -597,6 +604,13 @@ class Settings:
                 "FOMO_RUNNER_ANALYSIS_BUDGET_SECONDS", 30
             ),
             fomo_forward_ping_gate_enabled=_bool("FOMO_FORWARD_PING_GATE_ENABLED", True),
+            fomo_early_lane_enabled=_bool("FOMO_EARLY_LANE_ENABLED", True),
+            fomo_early_heads_up_ping=_bool("FOMO_EARLY_HEADS_UP_PING", False),
+            fomo_early_min_liquidity_usd=_decimal("FOMO_EARLY_MIN_LIQUIDITY_USD", "4000"),
+            fomo_early_max_age_seconds=_int("FOMO_EARLY_MAX_AGE_SECONDS", 3600),
+            fomo_early_runner_min_score=_decimal("FOMO_EARLY_RUNNER_MIN_SCORE", "55"),
+            fomo_early_max_runners_per_hour=_int("FOMO_EARLY_MAX_RUNNERS_PER_HOUR", 12),
+            fomo_early_cooldown_seconds=_int("FOMO_EARLY_COOLDOWN_SECONDS", 1800),
             fomo_shadow_auto_enabled=_bool("FOMO_SHADOW_AUTO_ENABLED", True),
             fomo_shadow_publish_cards=_bool("FOMO_SHADOW_PUBLISH_CARDS", True),
             fomo_shadow_bankroll_usd=_decimal("FOMO_SHADOW_BANKROLL_USD", "100"),
@@ -1008,6 +1022,20 @@ class Settings:
             raise ValueError(
                 "FOMO_RUNNER_ANALYSIS_BUDGET_SECONDS must be between 5 and 300"
             )
+        if self.fomo_early_min_liquidity_usd < 0:
+            raise ValueError("FOMO_EARLY_MIN_LIQUIDITY_USD cannot be negative")
+        if not 60 <= self.fomo_early_max_age_seconds <= 86_400:
+            raise ValueError(
+                "FOMO_EARLY_MAX_AGE_SECONDS must be between 60 and 86400"
+            )
+        if not 0 <= self.fomo_early_runner_min_score <= 100:
+            raise ValueError("FOMO_EARLY_RUNNER_MIN_SCORE must be between 0 and 100")
+        if not 0 <= self.fomo_early_max_runners_per_hour <= 500:
+            raise ValueError(
+                "FOMO_EARLY_MAX_RUNNERS_PER_HOUR must be between 0 and 500"
+            )
+        if not 0 <= self.fomo_early_cooldown_seconds <= 86_400:
+            raise ValueError("FOMO_EARLY_COOLDOWN_SECONDS must be between 0 and 86400")
         if self.fomo_shadow_position_usd <= 0:
             raise ValueError("FOMO_SHADOW_POSITION_USD must be positive")
         if self.fomo_shadow_max_position_usd != self.fomo_shadow_position_usd:

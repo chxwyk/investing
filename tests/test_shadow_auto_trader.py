@@ -992,13 +992,51 @@ def test_trailing_protection_fires_after_a_large_giveback() -> None:
     assert assessment.plan.acts is True
 
 
-def test_momentum_decay_flow_reversal_and_distribution_de_risk_below_the_objective() -> None:
+def test_a_lone_weak_momentum_print_no_longer_dumps_a_healthy_runner() -> None:
+    """v2.41: a single weak tick is a wobble, not a reversal (sections 55, 56).
+
+    The shared engine reduces 50% the first time momentum prints weak.  On a
+    fresh, volatile token that repeatedly sold live runners into noise, which is
+    the most expensive class of exit the experiment can make.
+    """
+
+    from smart_money_bot.lab.shadow_exits import (
+        MOMENTUM_CONFIRMED_DECAY,
+        SHADOW_SOFT_PAUSE_HOLD,
+    )
+
+    position = position_for()
+    # Momentum prints weak while buyers still lead and liquidity is growing.
+    healthy = plan_shadow_exit(
+        position, exit_context("0.00105", momentum_score=D("10")), RunnerEvidence()
+    )
+
+    assert healthy.plan.reason_code == SHADOW_SOFT_PAUSE_HOLD
+    assert healthy.plan.acts is False
+
+    # The same weak print, three observations running, is a trend.
+    repeated = plan_shadow_exit(
+        position,
+        exit_context("0.00105", momentum_score=D("10")),
+        RunnerEvidence(consecutive_weak_observations=3),
+    )
+
+    assert repeated.momentum.state == MOMENTUM_CONFIRMED_DECAY
+    assert repeated.plan.acts is True
+    assert repeated.plan.fraction < D("1")
+
+
+def test_heavy_selling_and_distribution_still_de_risk_on_one_observation() -> None:
+    """Some observations are facts about the market, not noisy scores."""
+
+    from smart_money_bot.lab.shadow_exits import (
+        MOMENTUM_CONFIRMED_DECAY,
+        MOMENTUM_HARD_REVERSAL,
+    )
+
     position = position_for()
     below = "0.00105"
 
-    decay = plan_shadow_exit(
-        position, exit_context(below, momentum_score=D("10")), RunnerEvidence()
-    )
     reversal = plan_shadow_exit(
         position,
         exit_context(below, momentum_score=D("60"), buys=10, sells=100),
@@ -1012,8 +1050,12 @@ def test_momentum_decay_flow_reversal_and_distribution_de_risk_below_the_objecti
         RunnerEvidence(),
     )
 
-    for assessment in (decay, reversal, distribution):
+    for assessment in (reversal, distribution):
         assert assessment.objective_met is False
+        assert assessment.momentum.state in {
+            MOMENTUM_CONFIRMED_DECAY,
+            MOMENTUM_HARD_REVERSAL,
+        }
         assert assessment.plan.acts is True
         assert assessment.plan.fraction < D("1")
 

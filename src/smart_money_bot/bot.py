@@ -5410,6 +5410,199 @@ def _shadow_policies_embed(
     return _clamp_embed(embed)
 
 
+def _early_runners_embed(rows: list[dict[str, object]]) -> discord.Embed:
+    """`/fomo runners` — how early we actually were, per token (section 75)."""
+
+    embed = discord.Embed(
+        title="🚨 EARLY RUNNERS",
+        description=(
+            f"`{len(rows)}` token(s) the operator lane surfaced recently, each with "
+            "the market cap it was first seen at and the market cap the alert "
+            "actually went out at."
+            if rows
+            else "No early alerts recorded yet."
+        ),
+        colour=0xE74C3C,
+        timestamp=discord.utils.utcnow(),
+    )
+    for row in rows[:8]:
+        timing = row["timing"]
+        late = not timing.was_early
+        marker = "⚠ LATE" if late else "✅ EARLY"
+        embed.add_field(
+            name=f"{marker} ${row.get('symbol') or '?'} — {row.get('tier') or 'HEADS UP'}",
+            value=(
+                f"`{row.get('mint')}`\n"
+                f"First seen `{_shadow_money(timing.first_seen_market_cap_usd)}` → alert "
+                f"`{_shadow_money(timing.alert_market_cap_usd)}` → now "
+                f"`{_shadow_money(timing.current_market_cap_usd)}`\n"
+                f"Move before alert `{_pending(timing.move_before_alert_percent, '%')}` • "
+                f"since alert `{_pending(timing.move_after_alert_percent, '%')}`\n"
+                f"First seen → alert "
+                f"`{_pending(timing.first_seen_to_alert_seconds, 's')}` • edge "
+                f"`{row.get('edge_state') or 'unknown'}`\n"
+                f"Liquidity `{_shadow_money(row.get('liquidity_usd'))}` • route "
+                f"`{'OK' if row.get('route_available') else 'NONE'}`"
+            )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+            inline=False,
+        )
+    embed.set_footer(text="Research only • safety is UNKNOWN until deep analysis completes")
+    return _clamp_embed(embed)
+
+
+def _runner_timeline_embed(payload: dict[str, object]) -> discord.Embed:
+    """`/fomo runner <mint>` — what the bot knew and when (sections 2, 76)."""
+
+    stages = payload.get("stages") or []
+    embed = discord.Embed(
+        title=f"🕒 RUNNER TIMELINE — ${payload.get('symbol') or '?'}",
+        description=(
+            f"**{payload.get('name')}**\n`{payload.get('mint')}`\n"
+            "Every stage keeps the market cap it happened at. None of them can be "
+            "rewritten later."
+        ),
+        colour=0x3498DB,
+        timestamp=discord.utils.utcnow(),
+    )
+    if stages:
+        embed.add_field(
+            name="Stages",
+            value="\n".join(
+                f"`{row.get('stage')}` {_relative_age(row.get('occurred_at'))} • MC "
+                f"{_shadow_money(row.get('market_cap_usd'))}"
+                + (f" • {row.get('tier')}" if row.get("tier") else "")
+                for row in stages
+            )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+            inline=False,
+        )
+    else:
+        embed.add_field(
+            name="Stages",
+            value="Nothing recorded for this mint yet.",
+            inline=False,
+        )
+    suppressions = payload.get("suppressions") or []
+    if suppressions:
+        embed.add_field(
+            name="Why you were not pinged",
+            value="\n".join(
+                f"• `{row.get('reason_code')}` at MC "
+                f"{_shadow_money(row.get('market_cap_usd'))}"
+                for row in suppressions[:6]
+            )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+            inline=False,
+        )
+    narratives = payload.get("narratives") or []
+    if narratives:
+        embed.add_field(
+            name="Story links",
+            value="\n".join(
+                f"• `{row.get('relationship')}` via `{row.get('direction')}` "
+                f"(confidence {row.get('confidence')})"
+                for row in narratives[:4]
+            )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+            inline=False,
+        )
+    positions = payload.get("shadow") or []
+    if positions:
+        embed.add_field(
+            name="Shadow",
+            value="\n".join(
+                f"• `{item.family}` opened {_relative_age(item.position.opened_at)} • "
+                f"${item.position.size_usd} simulated"
+                for item in positions[:3]
+            )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+            inline=False,
+        )
+    embed.set_footer(text="Mint is identity • research only • REAL MONEY $0.00")
+    return _clamp_embed(embed)
+
+
+def _collisions_embed(groups: list[dict[str, object]]) -> discord.Embed:
+    """`/fomo collisions` — same story, different mints (sections 25, 77)."""
+
+    embed = discord.Embed(
+        title="🧬 NARRATIVE COLLISIONS",
+        description=(
+            "Tokens claiming the same story. **Same name is not the same token** — "
+            "identity is the exact mint, and evidence never transfers between them."
+            if groups
+            else "No narrative currently has more than one candidate mint."
+        ),
+        colour=0x9B59B6,
+        timestamp=discord.utils.utcnow(),
+    )
+    for group in groups[:5]:
+        narrative = group["narrative"]
+        links = group["links"]
+        embed.add_field(
+            name=f"{narrative.get('title')} — {narrative.get('virality')}",
+            value="\n".join(
+                f"`{str(row.get('mint'))[:16]}…` **{row.get('relationship')}** "
+                f"via `{row.get('direction')}` (confidence {row.get('confidence')})"
+                for row in links[:6]
+            )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+            inline=False,
+        )
+    embed.set_footer(
+        text="Only a story source naming an exact mint can reach DIRECTLY_LINKED or OFFICIAL"
+    )
+    return _clamp_embed(embed)
+
+
+def _profit_alerts_embed(payload: dict[str, object]) -> discord.Embed:
+    """`/fomo profit view:alerts` — was the operator shown it in time? (§14, §66)"""
+
+    performance = payload["performance"]
+    embed = discord.Embed(
+        title="⏱️ ALERT TIMING — WAS THE OPERATOR EARLY?",
+        description=(
+            f"Alerts `{performance.alerts}` • genuinely early `{performance.early_alerts}` "
+            f"• late `{performance.late_alerts}`\n"
+            f"Early rate `{_pending(performance.early_rate_percent, '%')}`\n"
+            f"Median first seen → alert "
+            f"`{_pending(performance.median_first_seen_to_alert_seconds, 's')}` • median "
+            f"move before alert "
+            f"`{_pending(performance.median_move_before_alert_percent, '%')}`"
+        ),
+        colour=0x1ABC9C,
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(
+        name="Alerted before the move",
+        value=(
+            f"+10% `{_pending(performance.alerted_before_10_percent, '%')}` • "
+            f"+25% `{_pending(performance.alerted_before_25_percent, '%')}`\n"
+            f"+50% `{_pending(performance.alerted_before_50_percent, '%')}` • "
+            f"+100% `{_pending(performance.alerted_before_100_percent, '%')}`\n"
+            f"Median first-seen MC "
+            f"`{_shadow_money(performance.median_first_seen_market_cap_usd)}` • median "
+            f"alert MC `{_shadow_money(performance.median_alert_market_cap_usd)}`"
+        )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+        inline=False,
+    )
+    suppressions = payload.get("suppressions") or {}
+    embed.add_field(
+        name="Why alerts were withheld",
+        value=(
+            "\n".join(f"• `{code}` × {count}" for code, count in list(suppressions.items())[:8])
+            or "Nothing has been suppressed yet."
+        )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+        inline=False,
+    )
+    embed.add_field(
+        name="Lane",
+        value=(
+            f"Heads-up published `{payload.get('heads_up_published', 0)}` • runners "
+            f"`{payload.get('runners_published', 0)}`\n"
+            f"Last early alert {_relative_age(payload.get('last_early_alert_at'))}"
+        )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+        inline=False,
+    )
+    embed.set_footer(text="Post-alert moves are evaluation only — they never change an alert")
+    return _clamp_embed(embed)
+
+
 def _profit_summary_embed(payload: dict[str, object]) -> discord.Embed:
     """`/fomo profit` — the money answer, nothing buried (section 21)."""
 
@@ -6022,10 +6215,37 @@ def _shadow_status_lines(status: dict[str, object]) -> str:
     )
 
 
+def _early_lane_lines(early: dict[str, object]) -> str:
+    """The early-visibility block of the truth panel (section 74)."""
+
+    social = early.get("social") or {}
+    return (
+        f"EARLY LANE **{'ON' if early.get('enabled') else 'OFF'}**\n"
+        f"Heads-up `{early.get('heads_up_published', 0)}` • early runners "
+        f"`{early.get('runners_published', 0)}` • late "
+        f"`{early.get('late_alerts', 0)}`\n"
+        f"Early rate `{_pending(early.get('early_rate_percent'), '%')}` • median "
+        f"first-seen → alert "
+        f"`{_pending(early.get('median_first_seen_to_alert_seconds'), 's')}`\n"
+        f"Median move before alert "
+        f"`{_pending(early.get('median_move_before_alert_percent'), '%')}`\n"
+        f"Last early alert {_relative_age(early.get('last_early_alert_at'))}\n"
+        f"Deep-analysis timeouts `{early.get('analysis_timeouts', 0)}` • errors "
+        f"`{early.get('analysis_errors', 0)}`\n"
+        f"Wallet stream "
+        f"`{'CONNECTED' if early.get('stream_connected') else 'DISCONNECTED'}` • "
+        f"subscriptions `{early.get('stream_subscriptions', 0)}` • reconnects "
+        f"`{early.get('stream_reconnects', 0)}`\n"
+        f"X / social `{social.get('state', 'UNKNOWN')}`"
+        + (f" ({social.get('searches', 0)} searches)" if social.get("searches") else "")
+    )
+
+
 def _realtime_embed(
     status: dict[str, object],
     alerts: tuple[dict, ...],
     shadow: dict[str, object] | None = None,
+    early: dict[str, object] | None = None,
 ) -> discord.Embed:
     connected = bool(status.get("stream_connected"))
     age = status.get("stream_last_event_age")
@@ -6065,6 +6285,12 @@ def _realtime_embed(
         ),
         inline=False,
     )
+    if early is not None:
+        embed.add_field(
+            name="Early operator visibility",
+            value=_early_lane_lines(early)[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+            inline=False,
+        )
     if shadow is not None:
         embed.add_field(
             name="Shadow auto-trader",
@@ -6922,19 +7148,86 @@ class FomoCommands(
         await self._resolve_lab(interaction, embed=_lab_performance_embed(payload))
 
     @app_commands.command(
+        name="runners",
+        description="Early runners: how early the alert was, per token.",
+    )
+    async def runners(self, interaction: discord.Interaction) -> None:
+        """`/fomo runners` — section 75."""
+
+        if not await self._require_admin(interaction):
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        try:
+            rows = await self.bot.engine.early_runners()
+            await self._resolve_lab(interaction, embed=_early_runners_embed(rows))
+        except Exception as exc:
+            await self._resolve_lab(
+                interaction,
+                content=f"The early-runner view failed: `{type(exc).__name__}`.",
+            )
+
+    @app_commands.command(
+        name="runner",
+        description="Full timeline for one exact Solana mint: what the bot knew, and when.",
+    )
+    @app_commands.describe(mint="Exact Solana token mint; ticker searches are not accepted")
+    async def runner(self, interaction: discord.Interaction, mint: str) -> None:
+        """`/fomo runner <mint>` — sections 2, 76.  Identity is the exact mint."""
+
+        if not await self._require_admin(interaction):
+            return
+        try:
+            exact_mint = str(Pubkey.from_string(mint.strip()))
+        except ValueError:
+            await interaction.response.send_message(
+                "Enter an exact valid Solana mint. Same name is not the same token, "
+                "so ticker searches are not accepted.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        try:
+            payload = await self.bot.engine.runner_timeline(exact_mint)
+            await self._resolve_lab(interaction, embed=_runner_timeline_embed(payload))
+        except Exception as exc:
+            await self._resolve_lab(
+                interaction,
+                content=f"The runner timeline failed: `{type(exc).__name__}`.",
+            )
+
+    @app_commands.command(
+        name="collisions",
+        description="Tokens claiming the same story, ranked by what each actually proved.",
+    )
+    async def collisions(self, interaction: discord.Interaction) -> None:
+        """`/fomo collisions` — sections 25, 77."""
+
+        if not await self._require_admin(interaction):
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        try:
+            groups = await self.bot.engine.narrative_collisions()
+            await self._resolve_lab(interaction, embed=_collisions_embed(groups))
+        except Exception as exc:
+            await self._resolve_lab(
+                interaction,
+                content=f"The collision view failed: `{type(exc).__name__}`.",
+            )
+
+    @app_commands.command(
         name="profit",
         description="Is the simulated account making money? Profit first, diagnostics after.",
     )
     @app_commands.describe(
         view=(
-            "summary: the money answer • signals: families by forward NET • "
-            "exits: which rules cost money • providers: where spend goes"
+            "summary: the money answer • signals: families by forward NET • exits: "
+            "which rules cost money • providers: spend • alerts: were we early?"
         )
     )
     async def profit(
         self,
         interaction: discord.Interaction,
-        view: Literal["summary", "signals", "exits", "providers"] = "summary",
+        view: Literal["summary", "signals", "exits", "providers", "alerts"] = "summary",
     ) -> None:
         """`/fomo profit` and its three diagnostic views (sections 21-24)."""
 
@@ -6953,6 +7246,10 @@ class FomoCommands(
             if view == "providers":
                 rows = await self.bot.engine.profit_providers()
                 await self._resolve_lab(interaction, embed=_profit_providers_embed(rows))
+                return
+            if view == "alerts":
+                payload = await self.bot.engine.alert_performance()
+                await self._resolve_lab(interaction, embed=_profit_alerts_embed(payload))
                 return
             payload = await self.bot.engine.profit_summary()
             await self._resolve_lab(interaction, embed=_profit_summary_embed(payload))
@@ -7159,10 +7456,13 @@ class FomoCommands(
         status = self.bot.engine.realtime_status()
         alerts = await self.bot.engine.fast_alert_feed(limit=8)
         shadow = None
+        early = None
         with suppress(Exception):
             shadow = await self.bot.engine.shadow_status()
+        with suppress(Exception):
+            early = await self.bot.engine.early_lane_status()
         await self._resolve_lab(
-            interaction, embed=_realtime_embed(status, alerts, shadow)
+            interaction, embed=_realtime_embed(status, alerts, shadow, early)
         )
 
     @app_commands.command(
