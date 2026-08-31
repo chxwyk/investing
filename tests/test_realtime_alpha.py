@@ -74,6 +74,10 @@ from smart_money_bot.lab.notable import (
 )
 from smart_money_bot.lab.shadow import DEFAULT_SHADOW_CONFIG
 from smart_money_bot.lab.smartmoney import WalletReputation
+from smart_money_bot.pump_chain import PumpChainReader
+from smart_money_bot.pump_stream import PumpCreationStream
+from smart_money_bot.trenches_runtime import TrenchesRuntime
+from smart_money_bot.trenches_store import TrenchesStore
 from smart_money_bot.trending import source_from_settings
 from smart_money_bot.trending_runtime import TrendingRuntime
 from smart_money_bot.trending_source import build_trending_client
@@ -653,12 +657,17 @@ def test_only_earned_classes_may_interrupt_the_user() -> None:
         fa.TRENDING_ACCELERATION_ALERT,
         fa.TRENDING_CONTINUATION_ALERT,
         fa.OFF_TRENDING_EXCEPTION,
+        fa.TRENCH_RUNNER_ALERT,
+        fa.ALMOST_BONDED_ALERT,
+        fa.PUBLIC_TRENDING_ALERT,
     }
     assert fa.NOTABLE_TRADER_LATE not in fa.PINGABLE
     assert fa.CATALYST_WATCH not in fa.PINGABLE
     assert fa.EARLY_HEADS_UP not in fa.PINGABLE
     assert fa.SHADOW_ENTRY not in fa.PINGABLE
     assert fa.TRENDING_HOT_WATCH not in fa.PINGABLE
+    # v2.43: a trench heads-up is radar visibility, not an interruption.
+    assert fa.TRENCH_HEADS_UP_ALERT not in fa.PINGABLE
 
 
 def test_every_fast_alert_fits_inside_one_discord_message() -> None:
@@ -1259,6 +1268,14 @@ async def test_the_engine_names_the_lane_state_without_claiming_live_execution(
         api_url=None, api_key=None, proxy_enabled=True
     )
     engine.trending_hot_watch_cards = 0
+    engine.settings.fomo_trenches_enabled = True
+    engine.settings.fomo_public_trending_enabled = True
+    engine.pump_chain = PumpChainReader(engine.rpc if hasattr(engine, "rpc") else None)
+    engine.trenches_store = TrenchesStore(database)
+    engine.pump_creation_stream = PumpCreationStream(
+        rpc_url="https://rpc.example/", explicit_ws_url=None, enabled=True
+    )
+    engine.trenches = TrenchesRuntime(engine.trenches_store, engine.pump_chain)
     engine.trending = TrendingRuntime(
         TrendingStore(database), build_trending_client(
             engine.trending_source, api_url=None, api_key=None
@@ -1277,6 +1294,11 @@ async def test_the_engine_names_the_lane_state_without_claiming_live_execution(
     assert status["stream_detail"]
     assert status["stream_fallback_active"] is False
     assert status["trending_source"] in {"TRENDING_PROXY", "FOMO_TRENDING", "NO_SOURCE_CONFIGURED"}
+    # v2.43: the Pump trenches lane and its realtime creation stream report
+    # separately, so a healthy poll can never make a dead stream look fine.
+    assert status["trenches_enabled"] is True
+    assert status["creation_stream"]["state"] in stream.STREAM_STATES
+    assert status["public_model_enabled"] is True
 
 
 async def test_a_stale_cached_market_cap_never_manufactures_a_move(database) -> None:

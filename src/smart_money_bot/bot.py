@@ -99,6 +99,7 @@ from .models import (
     TrackedTrader,
 )
 from .quality import STAGE_LABELS, why_surfaced
+from .trenches.publicmodel import MODEL_CAVEAT as PUBLIC_MODEL_CAVEAT
 from .trending import describe_change
 
 logger = logging.getLogger(__name__)
@@ -6282,6 +6283,37 @@ def _realtime_embed(
         colour=0x2ECC71 if connected else 0xE67E22,
         timestamp=discord.utils.utcnow(),
     )
+    creation = status.get("creation_stream") or {}
+    if status.get("trenches_enabled"):
+        embed.add_field(
+            name="PUMP.FUN TRENCHES (primary universe)",
+            value=(
+                f"Creation stream `{creation.get('state', 'UNKNOWN')}` • subscribed "
+                f"`{creation.get('subscribed', False)}` • creations "
+                f"`{creation.get('creations_seen', 0)}` • reconnects "
+                f"`{creation.get('reconnects', 0)}`\n"
+                f"{creation.get('detail', '')}\n"
+                f"Tracked `{status.get('trenches_tracked', 0)}` • scans "
+                f"`{status.get('trenches_scans', 0)}` • alerts "
+                f"`{status.get('trenches_alerts_published', 0)}` (suppressed "
+                f"`{status.get('trenches_alerts_suppressed', 0)}`)\n"
+                f"Public model `{'ON' if status.get('public_model_enabled') else 'OFF'}` — "
+                "our own ranking, not Terminal's and not Fomo's"
+            )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+            inline=False,
+        )
+        usage = status.get("chain_usage") or {}
+        if usage:
+            embed.add_field(
+                name="On-chain reads",
+                value=(
+                    f"Curve `{usage.get('curve_reads', 0)}` • holders "
+                    f"`{usage.get('holder_reads', 0)}` • wallets "
+                    f"`{usage.get('wallet_reads', 0)}` • cache hits "
+                    f"`{usage.get('cache_hits', 0)}` • errors `{usage.get('errors', 0)}`"
+                ),
+                inline=False,
+            )
     if trending is not None:
         health = trending.get("health") or {}
         hot = trending.get("hot_watch") or {}
@@ -6661,6 +6693,277 @@ def _universes_embed(payload: dict[str, object]) -> discord.Embed:
         inline=False,
     )
     embed.set_footer(text="Forward data decides this, not the hypothesis.")
+    return _clamp_embed(embed)
+
+
+# --- Trenches surfaces (v2.43) -----------------------------------------------
+def _money_short(value: object) -> str:
+    if value is None:
+        return "unknown"
+    try:
+        amount = Decimal(str(value))
+    except Exception:
+        return "unknown"
+    for threshold, suffix in (
+        (Decimal("1e9"), "B"),
+        (Decimal("1e6"), "M"),
+        (Decimal("1e3"), "K"),
+    ):
+        if abs(amount) >= threshold:
+            return f"${amount / threshold:.2f}{suffix}"
+    return f"${amount:.2f}"
+
+
+def _percent_or_unknown(value: object, suffix: str = "%") -> str:
+    if value is None:
+        return "unknown"
+    try:
+        return f"{Decimal(str(value)):.1f}{suffix}"
+    except Exception:
+        return "unknown"
+
+
+def _trench_row(row: dict) -> str:
+    """One line per token: stage, bonding, the move since we first saw it."""
+
+    mint = str(row.get("mint") or "")
+    symbol = str(row.get("symbol") or "") or str(row.get("name") or "") or "unknown"
+    first = row.get("first_market_cap_usd")
+    current = row.get("market_cap_usd")
+    move = ""
+    try:
+        if first and current and Decimal(str(first)) > 0:
+            change = (Decimal(str(current)) - Decimal(str(first))) / Decimal(str(first)) * 100
+            move = f" ({change:+.0f}%)"
+    except Exception:
+        move = ""
+    return (
+        f"`{_percent_or_unknown(row.get('bonding_percent')):>7}` **{symbol}** "
+        f"`{_short(mint)}`\n"
+        f"　{row.get('stage', 'UNKNOWN')} • MC {_money_short(current)}"
+        f"{move} • first seen {_money_short(first)}"
+        + (f" • holders {row['holders']}" if row.get("holders") is not None else "")
+        + (
+            f" • top10 {_percent_or_unknown(row.get('top10_percent'))}"
+            if row.get("top10_percent") is not None
+            else ""
+        )
+    )
+
+
+def _trenches_embed(sections: dict, status: dict, focus: str = "all") -> discord.Embed:
+    """`/fomo trending view:trenches` and its per-section views (section 78)."""
+
+    stream = status.get("creation_stream") or {}
+    latency = status.get("discovery_latency") or {}
+    stream_line = (
+        f"Creation stream `{stream.get('state', 'UNKNOWN')}` • seen "
+        f"`{stream.get('creations_seen', 0)}` • reconnects "
+        f"`{stream.get('reconnects', 0)}`"
+    )
+    latency_line = ""
+    if isinstance(latency, dict) and latency:
+        parts = [
+            f"{source}: p50 `{data.get('p50')}s` (n={data.get('samples')})"
+            for source, data in list(latency.items())[:3]
+        ]
+        latency_line = "\nTime to first observation — " + " • ".join(parts)
+
+    embed = discord.Embed(
+        title="PUMP.FUN TRENCHES",
+        description=(
+            f"{stream_line}{latency_line}\n"
+            f"Tracked `{status.get('tracked', 0)}` • cadence "
+            f"`{status.get('cadence_tiers', {})}`\n"
+            "Everything here is public on-chain state. **Early is not safe.**"
+        ),
+        colour=0x9B59B6,
+        timestamp=discord.utils.utcnow(),
+    )
+
+    titles = {
+        "new": "NEW",
+        "almost_bonded": "ALMOST BONDED",
+        "recently_bonded": "RECENTLY BONDED",
+        "hot": "HOT (fastest recheck tier)",
+    }
+    wanted = list(titles) if focus == "all" else [focus]
+    for key in wanted:
+        rows = sections.get(key) or []
+        if not rows and focus == "all":
+            continue
+        embed.add_field(
+            name=titles.get(key, key.upper()),
+            value=(
+                "\n".join(_trench_row(row) for row in rows[:6])
+                or "nothing in this section yet"
+            )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+            inline=False,
+        )
+    if not embed.fields:
+        embed.add_field(
+            name="Board",
+            value=(
+                "No Pump.fun candidates tracked yet. If the creation stream is not "
+                "`CONNECTED`, that is a configuration state — not an empty market."
+            ),
+            inline=False,
+        )
+    embed.set_footer(
+        text="Bonding progress is a feature, not a buy signal. Mint is identity."
+    )
+    return _clamp_embed(embed)
+
+
+def _public_trending_embed(board: list, status: dict) -> discord.Embed:
+    """`/fomo trending view:public` — OUR ranking, labelled as ours (§32, §48)."""
+
+    embed = discord.Embed(
+        title="PUBLIC TRENDING MODEL",
+        description=(
+            f"_{PUBLIC_MODEL_CAVEAT}_\n"
+            "Ranked from multi-timeframe momentum, independent participants, holder "
+            "expansion and liquidity depth — **not** from paid DEX placement.\n"
+            f"Ranked `{status.get('public_ranked', 0)}` tokens."
+        ),
+        colour=0xE67E22,
+        timestamp=discord.utils.utcnow(),
+    )
+    if not board:
+        embed.add_field(
+            name="Board",
+            value="Nothing has cleared the model's floor yet.",
+            inline=False,
+        )
+        return _clamp_embed(embed)
+    embed.add_field(
+        name="Rank • mint • model score",
+        value="\n".join(
+            f"`#{row.get('rank'):>3}` `{_short(str(row.get('mint')))}` "
+            f"score `{row.get('score'):.1f}` • {row.get('shape', '')} / "
+            f"{row.get('momentum_curve', '')}"
+            for row in board[:12]
+        )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+        inline=False,
+    )
+    embed.set_footer(text="Our model over public data. Nobody else's rank.")
+    return _clamp_embed(embed)
+
+
+def _trench_token_embed(payload: dict) -> discord.Embed:
+    """One Pump token in full: lifecycle, dev, bundles, holders, sources."""
+
+    mint = str(payload.get("mint") or "")
+    intel = payload.get("intel") or {}
+    dev = payload.get("dev_profile") or {}
+    embed = discord.Embed(
+        title=f"TRENCH DETAIL — {payload.get('symbol') or payload.get('name') or 'unknown'}",
+        description=(
+            f"`{mint}`\n"
+            f"Stage `{payload.get('stage', 'UNKNOWN')}` • bonding "
+            f"`{_percent_or_unknown(payload.get('bonding_percent'))}`\n"
+            "**Research only. Manual decision.**"
+        ),
+        colour=0x9B59B6,
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(
+        name="Market",
+        value=(
+            f"First seen MC `{_money_short(payload.get('first_market_cap_usd'))}` → now "
+            f"`{_money_short(payload.get('market_cap_usd'))}`\n"
+            f"Liquidity `{_money_short(payload.get('liquidity_usd'))}` • holders "
+            f"`{payload.get('holders') if payload.get('holders') is not None else 'unknown'}`"
+        ),
+        inline=False,
+    )
+    history = payload.get("holder_history") or []
+    if history:
+        path = " → ".join(
+            _percent_or_unknown(item.get("top10_percent")) for item in history[-4:]
+        )
+        embed.add_field(name="Top-10 concentration trend", value=path, inline=False)
+    if intel:
+        embed.add_field(
+            name="Intelligence",
+            value=(
+                f"Dev `{intel.get('dev_posture', 'UNKNOWN')}` • holding "
+                f"`{_percent_or_unknown(intel.get('dev_current_percent'))}`\n"
+                f"Bundles `{intel.get('bundle_risk', 'UNKNOWN')}` "
+                f"({intel.get('bundle_count', 0)}) • distributing "
+                f"`{bool(intel.get('bundle_distributing'))}`\n"
+                f"Independent buyers `{intel.get('independent_buyers', 'unknown')}` of "
+                f"`{intel.get('unique_buyers', 'unknown')}` • clustered "
+                f"`{_percent_or_unknown(intel.get('clustered_percent'))}`\n"
+                f"Metadata reuse `{intel.get('metadata_reuse', 'NONE')}`"
+            ),
+            inline=False,
+        )
+    if dev:
+        embed.add_field(
+            name="Creator record (neutral)",
+            value=(
+                f"`{dev.get('history_label', 'DEV_HISTORY_UNKNOWN')}` • "
+                f"{dev.get('tokens_created', 0)} prior token(s), "
+                f"{dev.get('graduated', 0)} graduated, {dev.get('collapsed', 0)} collapsed\n"
+                "Poor token outcomes are not an accusation about a person."
+            ),
+            inline=False,
+        )
+    nominations = payload.get("nominations") or []
+    if nominations:
+        embed.add_field(
+            name="Discovered by",
+            value=", ".join(f"`{row.get('lane')}`" for row in nominations[:8]),
+            inline=False,
+        )
+    embed.set_footer(text="Every number belongs to this exact mint and no other.")
+    return _clamp_embed(embed)
+
+
+def _trench_latency_embed(latency: dict, status: dict) -> discord.Embed:
+    """`view:latency` — launch → observation, the v2.43 question (section 73)."""
+
+    embed = discord.Embed(
+        title="TIME TO FIRST OBSERVATION",
+        description=(
+            "v2.41 fixed *observation → alert*. v2.42 improved Trending. This is the "
+            "remaining gap: **launch → the bot seeing it at all.**"
+        ),
+        colour=0x3498DB,
+        timestamp=discord.utils.utcnow(),
+    )
+    if not latency:
+        embed.add_field(
+            name="Samples",
+            value=(
+                "No creation-time samples yet. Latency is only measurable for tokens "
+                "whose creation the bot actually witnessed."
+            ),
+            inline=False,
+        )
+    else:
+        embed.add_field(
+            name="By discovery source",
+            value="\n".join(
+                f"`{source}` — p50 `{data.get('p50')}s` • p90 `{data.get('p90')}s` • "
+                f"best `{data.get('best')}s` • n={data.get('samples')}"
+                for source, data in latency.items()
+            )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+            inline=False,
+        )
+    stream = status.get("creation_stream") or {}
+    embed.add_field(
+        name="Realtime lane",
+        value=(
+            f"State `{stream.get('state', 'UNKNOWN')}` • subscribed "
+            f"`{stream.get('subscribed', False)}` • creations `"
+            f"{stream.get('creations_seen', 0)}` • reconnects "
+            f"`{stream.get('reconnects', 0)}`\n{stream.get('detail', '')}"
+        ),
+        inline=False,
+    )
+    embed.set_footer(text="A poll is the safety net; the stream is the speed.")
     return _clamp_embed(embed)
 
 
@@ -7809,29 +8112,104 @@ class FomoCommands(
     )
     @app_commands.describe(
         view=(
-            "board: what is trending now • token: one exact mint • "
-            "hotwatch: the fast promotion lane • why: why nothing pinged"
+            "board/token/hotwatch/why: Fomo Trending • trenches/new/almostbonded/"
+            "recentlybonded/hot: Pump.fun • public: our own model • latency: "
+            "launch→observation"
         ),
-        mint="Exact mint for view:token. A name or ticker is never accepted here.",
+        mint=(
+            "Exact mint for view:token or view:trenchtoken. A name or ticker is "
+            "never accepted here."
+        ),
     )
     async def trending(
         self,
         interaction: discord.Interaction,
-        view: Literal["board", "token", "hotwatch", "why"] = "board",
+        view: Literal[
+            "board",
+            "token",
+            "hotwatch",
+            "why",
+            "trenches",
+            "new",
+            "almostbonded",
+            "recentlybonded",
+            "hot",
+            "public",
+            "trenchtoken",
+            "latency",
+        ] = "board",
         mint: str | None = None,
     ) -> None:
-        """`/fomo trending` and its views (sections 86, 87, 90, 91).
+        """`/fomo trending` and its views (sections 78-80, 86, 87, 90, 91).
 
-        One child command with a ``view`` parameter rather than four separate
-        ones: Discord allows 25 children per group and this product is already
-        close to that ceiling, so views are the only architecture that leaves
-        room to grow.
+        One child command with a ``view`` parameter rather than a dozen separate
+        ones: Discord allows 25 children per group and this product is at 24, so
+        views are the only architecture that leaves room to grow.  v2.43 adds the
+        Pump.fun trenches sections and our own public model here rather than
+        claiming the last slot.
         """
 
         if not await self._require_admin(interaction):
             return
         await interaction.response.defer(thinking=True, ephemeral=True)
         try:
+            # --- Pump.fun trenches views (section 78) ----------------------
+            if view in {"trenches", "new", "almostbonded", "recentlybonded", "hot"}:
+                trench_status = await self.bot.engine.trenches_status()
+                sections = await self.bot.engine.trenches_sections()
+                focus = {
+                    "trenches": "all",
+                    "new": "new",
+                    "almostbonded": "almost_bonded",
+                    "recentlybonded": "recently_bonded",
+                    "hot": "hot",
+                }[view]
+                await self._resolve_lab(
+                    interaction, embed=_trenches_embed(sections, trench_status, focus)
+                )
+                return
+            if view == "public":
+                trench_status = await self.bot.engine.trenches_status()
+                board = await self.bot.engine.trenches_public_board(limit=12)
+                await self._resolve_lab(
+                    interaction, embed=_public_trending_embed(board, trench_status)
+                )
+                return
+            if view == "latency":
+                trench_status = await self.bot.engine.trenches_status()
+                latency = await self.bot.engine.trenches_latency()
+                await self._resolve_lab(
+                    interaction, embed=_trench_latency_embed(latency, trench_status)
+                )
+                return
+            if view == "trenchtoken":
+                exact = (mint or "").strip()
+                if not exact:
+                    await self._resolve_lab(
+                        interaction,
+                        content=(
+                            "`view:trenchtoken` needs the **exact mint**. A name or "
+                            "ticker is not an identity."
+                        ),
+                    )
+                    return
+                payload = await self.bot.engine.trenches_token(exact)
+                if payload is None:
+                    await self._resolve_lab(
+                        interaction,
+                        content=(
+                            f"No Pump.fun record for `{exact}`. "
+                            "Nothing is inferred from the name."
+                        ),
+                    )
+                    return
+                await self._resolve_lab(
+                    interaction,
+                    embed=_trench_token_embed(payload),
+                    view=_token_view(exact, self.bot.settings.fomo_referral_code),
+                )
+                return
+
             status = await self.bot.engine.trending_status()
             if view == "hotwatch":
                 report = await self.bot.engine.trending_hot_watch_report()

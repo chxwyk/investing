@@ -231,12 +231,13 @@ async def main() -> None:
     await check_profit_optimization()
     await check_early_alpha()
     await check_trending_alpha()
+    await check_trenches_intelligence()
 
     print(
         "SELF-CHECK PASSED: detector, scoring, database, discovery rotation, "
         "paper P&L, risk gate, PAPER laboratory, discovery-speed, realtime-alpha, "
-        "SHADOW auto-trader, profit-optimization, early-alpha and "
-        "Trending-first invariants"
+        "SHADOW auto-trader, profit-optimization, early-alpha, Trending-first and "
+        "trenches-intelligence invariants"
     )
 
 
@@ -1407,6 +1408,373 @@ async def check_trending_alpha() -> None:
         source = path.read_text()
         for forbidden in ("Keypair", "send_transaction", "sign_transaction", "aiohttp"):
             assert forbidden not in source, f"{path.name} must stay provider- and signer-free"
+
+
+
+async def check_trenches_intelligence() -> None:
+    """The v2.43 non-negotiables, checked before a deploy is trusted.
+
+    These are the product's structural guarantees, not a sample of the suite: a
+    deployment violating any of them would present guesses, purchased attention
+    or somebody else's ranking as findings.
+    """
+
+    import struct
+    import tempfile
+    from pathlib import Path as _Path
+
+    from smart_money_bot.pump_chain import bonding_curve_address, decode_bonding_curve
+    from smart_money_bot.pump_stream import extract_created_mint
+    from smart_money_bot.trenches import (
+        BUNDLE_RISK_HIGH,
+        CADENCE_HOT,
+        CADENCE_NORMAL,
+        CONCENTRATION_WORSENING,
+        DEV_HISTORY_HIGH_FAILURE,
+        FAIL,
+        FORBIDDEN_RANKING_CLAIMS,
+        MODEL_NAME,
+        PASS,
+        PUBLIC_TRENDING_MODEL,
+        RISK_DIMENSIONS,
+        SHAPE_SUSTAINED_TREND,
+        STAGE_ALMOST_BONDED,
+        STAGE_UNKNOWN,
+        TIMEFRAMES,
+        UNKNOWN,
+        BuyerRecord,
+        HolderAccount,
+        MarketObservation,
+        Nomination,
+        PriorToken,
+        SlotTrade,
+        SourceRef,
+        assert_honest_ranking_name,
+        assess_bundles,
+        assess_concentration_trend,
+        assess_depth,
+        assess_dev_history,
+        assess_participants,
+        build_consensus,
+        build_holder_snapshot,
+        build_risk_profile,
+        build_timeframe_profile,
+        cadence_tier,
+        classify_lifecycle,
+        decide_trench_tier,
+        score_public_trend,
+        window_metrics,
+    )
+    from smart_money_bot.trenches.provenance import (
+        DEXSCREENER_PUBLIC,
+        J7_AUTHORIZED,
+        PUMP_ONCHAIN,
+        SOLANA_RPC,
+    )
+    from smart_money_bot.trenches_runtime import TrenchesRuntime
+    from smart_money_bot.trenches_store import TrenchesStore
+
+    now = 1_700_000_000
+    mint = "9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump"
+
+    def curve(remaining: int, *, complete: bool = False) -> bytes:
+        return (
+            b"\x00" * 8
+            + struct.pack(
+                "<QQQQQ",
+                1_073_000_000_000_000,
+                30_000_000_000,
+                remaining,
+                5_000_000_000,
+                1_000_000_000_000_000,
+            )
+            + (b"\x01" if complete else b"\x00")
+        )
+
+    # 1. Bonding progress is computed from the chain, and an unreadable curve is
+    #    UNKNOWN rather than 0% (sections 7, 8).
+    blind = decode_bonding_curve(mint, None)
+    assert blind.available is False and blind.progress_percent() is None, (
+        "an unreadable bonding curve must be UNKNOWN, never 0%"
+    )
+    half = decode_bonding_curve(mint, curve(396_550_000_000_000))
+    assert half.progress_percent() == Decimal("50.00")
+    assert classify_lifecycle(blind, now=now).stage == STAGE_UNKNOWN
+    assert (
+        classify_lifecycle(
+            decode_bonding_curve(mint, curve(39_655_000_000_000)), now=now, created_at=now - 60
+        ).stage
+        == STAGE_ALMOST_BONDED
+    ), "graduation proximity comes from reserves, never from age"
+    assert bonding_curve_address(mint) == bonding_curve_address(mint)
+
+    # 2. The realtime creation detector only fires on an actual create.
+    pumpy = "9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump"
+    assert extract_created_mint(
+        ["Program log: Instruction: Create", f"Program log: mint: {pumpy}"]
+    ) == pumpy
+    assert extract_created_mint(
+        ["Program log: Instruction: Buy", f"Program log: {pumpy}"]
+    ) == "", "an ordinary trade must never be recorded as a launch"
+
+    # 3. Five independent windows, no leakage (section 85).
+    observations = [
+        MarketObservation(at=now - 3000, market_cap_usd=Decimal("10000")),
+        MarketObservation(at=now - 700, market_cap_usd=Decimal("15000")),
+        MarketObservation(at=now - 200, market_cap_usd=Decimal("20000")),
+        MarketObservation(at=now - 30, market_cap_usd=Decimal("30000")),
+    ]
+    profile = build_timeframe_profile(mint, observations, now=now)
+    assert set(profile.windows) == set(TIMEFRAMES)
+    one_minute = window_metrics(observations, timeframe="1m", now=now)
+    assert not one_minute.usable, "a window with one sample must report nothing"
+    assert one_minute.market_cap_change_percent is None
+    hour = window_metrics(observations, timeframe="1h", now=now)
+    assert hour.market_cap_change_percent == Decimal("200.00")
+
+    # 4. Raw transactions are not demand; coordinated wallets collapse (s13, 15).
+    bots = [
+        BuyerRecord(wallet=f"B{index % 4}", at=now, amount_usd=Decimal("50"))
+        for index in range(1000)
+    ]
+    wash = assess_participants(mint, bots, buys=1000, sells=20)
+    assert wash.unique_buyers == 4 and not wash.organic, (
+        "1000 buys from 4 wallets must never read as organic demand"
+    )
+    sybils = [
+        BuyerRecord(
+            wallet=f"S{index}",
+            at=now,
+            amount_usd=Decimal("25"),
+            first_activity_at=now - 600,
+            funded_by="ONE_SOURCE",
+            funded_at=now - 700,
+        )
+        for index in range(20)
+    ]
+    clustered = assess_participants(mint, sybils, buys=20, sells=0)
+    assert clustered.independent_buyers == 1, (
+        "twenty wallets funded by one source are one actor"
+    )
+    assert clustered.independent_fresh_buyers == 0
+
+    # 5. Holder concentration excludes infrastructure and is a trend (s20, 21).
+    def snapshot(at: int, top10: str):
+        whales = Decimal(top10) / 10
+        tail = (Decimal("100") - Decimal(top10)) / 40
+        return build_holder_snapshot(
+            mint,
+            [HolderAccount(address=f"W{i}", amount=whales) for i in range(10)]
+            + [HolderAccount(address=f"T{i}", amount=tail) for i in range(40)],
+            total_supply=Decimal("100"),
+            at=at,
+        )
+
+    worsening = assess_concentration_trend(mint, [snapshot(now - 600, "18"), snapshot(now, "35")])
+    assert worsening.state == CONCENTRATION_WORSENING
+
+    with_curve = build_holder_snapshot(
+        mint,
+        [HolderAccount(address="CURVE", amount=Decimal("700"), infrastructure=True)]
+        + [HolderAccount(address=f"H{i}", amount=Decimal("10")) for i in range(30)],
+        total_supply=Decimal("1000"),
+        at=now,
+    )
+    assert with_curve.infrastructure_percent == Decimal("70.00"), (
+        "the bonding curve is infrastructure, never a holder"
+    )
+
+    # 6. Launch bundling is lifecycle-aware, and distribution escalates (s23, 92).
+    launch = [
+        SlotTrade(wallet=f"B{i}", slot=100, at=now + 5, token_amount=Decimal("60000000000000"))
+        for i in range(5)
+    ]
+    assert (
+        assess_bundles(
+            mint, launch, created_at=now, total_supply=Decimal("1000000000000000")
+        ).risk
+        == BUNDLE_RISK_HIGH
+    )
+    mature = [
+        SlotTrade(wallet=f"C{i}", slot=900, at=now + 7200, token_amount=Decimal("1000"))
+        for i in range(5)
+    ]
+    assert (
+        assess_bundles(
+            mint,
+            mature,
+            created_at=now,
+            total_supply=Decimal("1000000000000000"),
+            pre_graduation=False,
+        ).risk
+        == "NONE"
+    ), "ordinary same-slot co-trading is not launch bundling"
+
+    # 7. A poor creator record stays a neutral label (section 19).
+    history = assess_dev_history(
+        "D", [PriorToken(mint=f"M{i}", collapsed=True) for i in range(4)]
+    )
+    assert history.label == DEV_HISTORY_HIGH_FAILURE
+    assert "scam" not in history.operator_line().casefold()
+
+    # 8. Risk is per-dimension, UNKNOWN never becomes PASS, hard fails win (59-61).
+    blind_risk = build_risk_profile(mint)
+    assert len(blind_risk.dimensions) == len(RISK_DIMENSIONS)
+    assert PASS not in {item.verdict for item in blind_risk.dimensions}, (
+        "an unknown dimension must never be reported as a pass"
+    )
+    assert blind_risk.blocked is False, "not knowing is not a hard failure"
+    assert all(
+        build_risk_profile(mint, liquidity_usd=Decimal("999999"), **kwargs).blocked
+        for kwargs in (
+            {"sell_failed": True},
+            {"liquidity_collapsed": True},
+            {"malicious_evidence": True},
+            {"route_available": False},
+        )
+    ), "a hard failure outranks every positive signal"
+    assert build_risk_profile(mint, dev_selling=True).dimension("DEV").verdict == FAIL
+    assert UNKNOWN in {item.verdict for item in blind_risk.dimensions}
+
+    # 9. Paid DEX placement cannot carry our public model (sections 26, 31, 95).
+    flat = build_timeframe_profile(
+        mint,
+        [
+            MarketObservation(at=now - 900, market_cap_usd=Decimal("10000")),
+            MarketObservation(at=now - 10, market_cap_usd=Decimal("10000")),
+        ],
+        now=now,
+    )
+    boosted = score_public_trend(mint, timeframes=flat, dex_paid=True, dex_boosts=99)
+    assert boosted.score <= Decimal("5"), (
+        "purchased attention must never lift a token that is not moving"
+    )
+    moving = build_timeframe_profile(
+        mint,
+        [
+            MarketObservation(at=now - 880, market_cap_usd=Decimal("10000")),
+            MarketObservation(at=now - 300, market_cap_usd=Decimal("22000")),
+            MarketObservation(at=now - 20, market_cap_usd=Decimal("45000")),
+        ],
+        now=now,
+    )
+    assert moving.shape == SHAPE_SUSTAINED_TREND
+    organic = score_public_trend(mint, timeframes=moving, independent_buyers=90)
+    assert organic.score > boosted.score * 5
+
+    # 10. Our ranking is ours, and can never claim to be anyone else's (s97, 98).
+    assert MODEL_NAME == PUBLIC_TRENDING_MODEL
+    for claim in FORBIDDEN_RANKING_CLAIMS:
+        try:
+            assert_honest_ranking_name(claim)
+        except ValueError:
+            continue
+        raise AssertionError(f"{claim} must be refused as a ranking name")
+    caveat = organic.to_json()["caveat"]
+    assert "not Terminal" in caveat and "not Fomo" in caveat
+
+    # 11. Duplicate feeds are one evidence family (section 34).
+    duplicates = build_consensus(
+        [
+            Nomination(mint=mint, lane="A", source=SourceRef(kind=SOLANA_RPC)),
+            Nomination(mint=mint, lane="B", source=SourceRef(kind=DEXSCREENER_PUBLIC)),
+            Nomination(mint=mint, lane="C", source=SourceRef(kind=PUMP_ONCHAIN)),
+        ]
+    )[mint]
+    assert duplicates.lane_count == 3 and duplicates.independent_count == 1, (
+        "three market feeds of the same chain are one observation"
+    )
+    genuine = build_consensus(
+        [
+            Nomination(mint=mint, lane="A", source=SourceRef(kind=PUMP_ONCHAIN)),
+            Nomination(mint=mint, lane="B", source=SourceRef(kind=J7_AUTHORIZED)),
+        ]
+    )[mint]
+    assert genuine.independent_count == 2
+
+    # 12. A score is never a reason, and the risk gates are hard (sections 36, 37).
+    assert (
+        decide_trench_tier(mint, score=Decimal("95"), reasons=()).suppression
+        == "NO_NAMED_SERIOUS_REASON"
+    )
+    assert not decide_trench_tier(
+        mint,
+        score=Decimal("95"),
+        reasons=("INDEPENDENT_DEMAND",),
+        clustered_demand=True,
+    ).ping, "coordinated demand must never ping"
+    assert not decide_trench_tier(
+        mint, score=Decimal("95"), reasons=("MARKET_ACCELERATION",), dev_selling=True
+    ).ping
+
+    # 13. Cadence tiers are bounded and time-critical candidates get the fast one.
+    assert cadence_tier(score=Decimal("58"), alpha_threshold=Decimal("62")) == CADENCE_HOT
+    assert (
+        cadence_tier(score=Decimal("10"), alpha_threshold=Decimal("62"), almost_bonded=True)
+        == CADENCE_HOT
+    )
+    assert cadence_tier(score=Decimal("5"), alpha_threshold=Decimal("62")) == CADENCE_NORMAL
+
+    # 14. Depth: the same market cap on different liquidity is not the same token.
+    assert assess_depth(market_cap_usd=Decimal("50000"), liquidity_usd=Decimal("1000")).thin
+    assert not assess_depth(
+        market_cap_usd=Decimal("50000"), liquidity_usd=Decimal("15000")
+    ).thin
+
+    with tempfile.TemporaryDirectory() as directory:
+        database = Database(str(_Path(directory) / "trenches.db"), Decimal("1000"))
+        await database.connect()
+        try:
+            # 15. Schema additive and idempotent (section 101).
+            await database._init_schema()
+            store = TrenchesStore(database)
+            runtime = TrenchesRuntime(store, _SelfCheckChain())
+
+            # 16. First observation is stamped immediately and never rewritten.
+            await runtime.observe_creation(
+                mint, at=now, created_at=now - 3, source="PUMP_CREATION_STREAM"
+            )
+            row = await store.token(mint)
+            assert row["first_observed_at"] == now
+            latency = await store.discovery_latencies()
+            assert latency[0]["latency_seconds"] == 3, (
+                "launch-to-observation latency must be measurable"
+            )
+            await store.record_token(
+                mint, now=now + 900, stage="PUMPSWAP", market_cap_usd=Decimal("90000")
+            )
+            assert (await store.token(mint))["first_observed_at"] == now, (
+                "the first-observation stamp must survive every later write"
+            )
+
+            # 17. Graduation is recorded once and preserves earlier history.
+            await store.mark_graduated(mint, at=now + 600, market_cap_usd=Decimal("69000"))
+            await store.mark_graduated(mint, at=now + 9000, market_cap_usd=Decimal("1"))
+            graduated = await store.token(mint)
+            assert graduated["graduated_at"] == now + 600
+            assert graduated["graduation_market_cap_usd"] == 69000.0
+        finally:
+            await database.close()
+
+    # 18. Nothing in the trenches package can move real funds (section 100).
+    import pathlib as _pathlib
+
+    import smart_money_bot.trenches as _trenches
+
+    for path in _pathlib.Path(_trenches.__file__).parent.glob("*.py"):
+        source = path.read_text()
+        for forbidden in ("Keypair", "send_transaction", "sign_transaction", "aiohttp"):
+            assert forbidden not in source, f"{path.name} must stay provider- and signer-free"
+
+
+class _SelfCheckChain:
+    """A no-network chain reader for the deploy check."""
+
+    def usage_snapshot(self) -> dict[str, int]:
+        return {"curve_reads": 0}
+
+    async def bonding_curves(self, mints: list[str]) -> dict[str, object]:
+        return {}
 
 
 if __name__ == "__main__":

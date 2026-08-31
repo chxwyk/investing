@@ -81,6 +81,16 @@ FAMILY_TRENDING_AI_PROJECT = "TRENDING_AI_PROJECT"
 FAMILY_TRENDING_SMART_MONEY = "TRENDING_SMART_MONEY"
 FAMILY_TRENDING_CONTINUATION = "TRENDING_CONTINUATION"
 FAMILY_TRENDING_CONFLUENCE = "TRENDING_CONFLUENCE"
+# --- Pump trench families (v2.43, section 63) --------------------------------
+# These ride the Trending bankroll and are separated by *attribution* rather
+# than by a third account.  A third $100 book would take three times as long to
+# reach a meaningful sample, and the question "did the pre-graduation lane pay?"
+# is answerable from family attribution within one book.  Set
+# FOMO_TRENCH_SHADOW_SEPARATE_BANKROLL=true if clean statistical separation is
+# wanted later; the families are already distinct either way.
+FAMILY_TRENCH_RUNNER = "PUMP_TRENCH_RUNNER"
+FAMILY_TRENCH_ALMOST_BONDED = "PUMP_ALMOST_BONDED"
+FAMILY_PUBLIC_TRENDING = "PUBLIC_TRENDING_MODEL"
 
 SIGNAL_FAMILIES: tuple[str, ...] = (
     FAMILY_FAST_WATCH,
@@ -100,6 +110,9 @@ SIGNAL_FAMILIES: tuple[str, ...] = (
     FAMILY_TRENDING_SMART_MONEY,
     FAMILY_TRENDING_CONTINUATION,
     FAMILY_TRENDING_CONFLUENCE,
+    FAMILY_TRENCH_RUNNER,
+    FAMILY_TRENCH_ALMOST_BONDED,
+    FAMILY_PUBLIC_TRENDING,
 )
 
 #: Human labels used on cards and in reports.
@@ -121,6 +134,9 @@ FAMILY_LABELS: dict[str, str] = {
     FAMILY_TRENDING_SMART_MONEY: "TRENDING SMART MONEY",
     FAMILY_TRENDING_CONTINUATION: "TRENDING CONTINUATION",
     FAMILY_TRENDING_CONFLUENCE: "TRENDING CONFLUENCE",
+    FAMILY_TRENCH_RUNNER: "PUMP TRENCH RUNNER",
+    FAMILY_TRENCH_ALMOST_BONDED: "PUMP ALMOST BONDED",
+    FAMILY_PUBLIC_TRENDING: "PUBLIC TRENDING MODEL",
 }
 
 #: Families whose signal is genuinely urgent enough to interrupt someone
@@ -136,6 +152,10 @@ URGENT_FAMILIES: frozenset[str] = frozenset(
         FAMILY_TRENDING_ACCELERATION,
         FAMILY_TRENDING_CONTINUATION,
         FAMILY_TRENDING_CONFLUENCE,
+        # Pre-graduation candidates are time-critical by nature.
+        FAMILY_TRENCH_RUNNER,
+        FAMILY_TRENCH_ALMOST_BONDED,
+        FAMILY_PUBLIC_TRENDING,
     }
 )
 
@@ -876,6 +896,18 @@ def why_you_are_seeing_this(signal: ShadowSignal) -> tuple[str, ...]:
         ),
         FAMILY_TRENDING_CONFLUENCE: (
             "several independent evidence families agree on this mint",
+        ),
+        FAMILY_TRENCH_RUNNER: (
+            "independent early demand on a Pump.fun bonding curve",
+            "early is not safe",
+        ),
+        FAMILY_TRENCH_ALMOST_BONDED: (
+            "approaching graduation with healthy participation",
+            "the trading route is about to change",
+        ),
+        FAMILY_PUBLIC_TRENDING: (
+            "our own public model ranks this highly",
+            "this is not Terminal's rank and not Fomo's",
         ),
     }
     return defaults.get(signal.family, ("research signal",))

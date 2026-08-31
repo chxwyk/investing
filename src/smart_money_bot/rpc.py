@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 from typing import Any
 
@@ -150,6 +151,58 @@ class SolanaRPC:
             [mint, {"commitment": "confirmed"}],
         )
         return dict((result or {}).get("value") or {})
+
+    async def get_account_data(self, address: str) -> bytes | None:
+        """Raw account bytes, for program state that has no jsonParsed form.
+
+        The Pump.fun bonding curve is a plain Anchor account, so reading its real
+        reserves means decoding base64 rather than asking the RPC to parse it.
+        Returns ``None`` when the account does not exist — which is itself
+        information: a graduated token's curve account is closed.
+        """
+
+        result = await self.call(
+            "getAccountInfo",
+            [address, {"encoding": "base64", "commitment": "confirmed"}],
+        )
+        value = (result or {}).get("value")
+        if not isinstance(value, dict):
+            return None
+        data = value.get("data")
+        if isinstance(data, list) and data and isinstance(data[0], str):
+            try:
+                return base64.b64decode(data[0])
+            except (ValueError, TypeError):
+                return None
+        return None
+
+    async def get_multiple_account_data(
+        self,
+        addresses: list[str],
+    ) -> dict[str, bytes | None]:
+        """Batch raw account reads.  One request per 100 accounts, not one each."""
+
+        results: dict[str, bytes | None] = {}
+        for start in range(0, len(addresses), 100):
+            batch = addresses[start : start + 100]
+            result = await self.call(
+                "getMultipleAccounts",
+                [batch, {"encoding": "base64", "commitment": "confirmed"}],
+            )
+            values = (result or {}).get("value") or []
+            for address, value in zip(batch, values, strict=False):
+                if not isinstance(value, dict):
+                    results[address] = None
+                    continue
+                data = value.get("data")
+                if isinstance(data, list) and data and isinstance(data[0], str):
+                    try:
+                        results[address] = base64.b64decode(data[0])
+                    except (ValueError, TypeError):
+                        results[address] = None
+                else:
+                    results[address] = None
+        return results
 
     async def get_multiple_parsed_accounts(
         self,

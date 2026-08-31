@@ -289,6 +289,36 @@ class Settings:
     fomo_trending_off_board_exception_enabled: bool
     fomo_trending_stale_snapshot_seconds: int
 
+    # --- Terminal-style trenches intelligence (v2.43) ----------------------
+    # Every value has a safe code default.  The whole engine runs on public
+    # Solana RPC and Pump.fun program state, so no paid provider is required.
+    fomo_trenches_enabled: bool
+    fomo_trenches_poll_seconds: int
+    fomo_trenches_max_tracked: int
+    fomo_trenches_runner_min_score: Decimal
+    fomo_trenches_heads_up_min_score: Decimal
+    fomo_trenches_max_alerts_per_hour: int
+    fomo_trenches_cooldown_seconds: int
+    #: Realtime Pump.fun token-creation detection from public program logs.
+    fomo_pump_creation_stream_enabled: bool
+    #: Per-candidate on-chain enrichment budget, so a busy board cannot become a
+    #: thousand RPC calls.
+    fomo_trenches_max_enrichment_per_scan: int
+    fomo_trenches_wallet_lookups_per_token: int
+    fomo_trenches_holder_reads_per_scan: int
+    #: Our own public Trending model (never labelled as anyone else's rank).
+    fomo_public_trending_enabled: bool
+    fomo_public_trending_min_score: Decimal
+    #: Cadence tiers for rapid rechecks.
+    fomo_trenches_hot_recheck_seconds: int
+    fomo_trenches_warm_recheck_seconds: int
+    fomo_trenches_normal_recheck_seconds: int
+    fomo_trenches_max_hot: int
+    fomo_trenches_max_warm: int
+    #: Attribution-only Trench cohort inside the Trending shadow book, or its own
+    #: bankroll when clean separation is explicitly wanted.
+    fomo_trench_shadow_separate_bankroll: bool
+
     news_radar_enabled: bool
     x_news_stream_enabled: bool
     x_news_stream_rule: str
@@ -691,6 +721,43 @@ class Settings:
             ),
             fomo_trending_stale_snapshot_seconds=_int(
                 "FOMO_TRENDING_STALE_SNAPSHOT_SECONDS", 600
+            ),
+            fomo_trenches_enabled=_bool("FOMO_TRENCHES_ENABLED", True),
+            # 30s is comfortable against a public RPC once curve reads are
+            # batched 100 per request; the creation stream is what actually
+            # provides speed, so this poll is the safety net rather than the
+            # discovery path.
+            fomo_trenches_poll_seconds=_int("FOMO_TRENCHES_POLL_SECONDS", 30),
+            fomo_trenches_max_tracked=_int("FOMO_TRENCHES_MAX_TRACKED", 80),
+            fomo_trenches_runner_min_score=_decimal("FOMO_TRENCHES_RUNNER_MIN_SCORE", "62"),
+            fomo_trenches_heads_up_min_score=_decimal(
+                "FOMO_TRENCHES_HEADS_UP_MIN_SCORE", "38"
+            ),
+            fomo_trenches_max_alerts_per_hour=_int("FOMO_TRENCHES_MAX_ALERTS_PER_HOUR", 8),
+            fomo_trenches_cooldown_seconds=_int("FOMO_TRENCHES_COOLDOWN_SECONDS", 1800),
+            fomo_pump_creation_stream_enabled=_bool(
+                "FOMO_PUMP_CREATION_STREAM_ENABLED", True
+            ),
+            fomo_trenches_max_enrichment_per_scan=_int(
+                "FOMO_TRENCHES_MAX_ENRICHMENT_PER_SCAN", 12
+            ),
+            fomo_trenches_wallet_lookups_per_token=_int(
+                "FOMO_TRENCHES_WALLET_LOOKUPS_PER_TOKEN", 25
+            ),
+            fomo_trenches_holder_reads_per_scan=_int(
+                "FOMO_TRENCHES_HOLDER_READS_PER_SCAN", 10
+            ),
+            fomo_public_trending_enabled=_bool("FOMO_PUBLIC_TRENDING_ENABLED", True),
+            fomo_public_trending_min_score=_decimal("FOMO_PUBLIC_TRENDING_MIN_SCORE", "10"),
+            fomo_trenches_hot_recheck_seconds=_int("FOMO_TRENCHES_HOT_RECHECK_SECONDS", 15),
+            fomo_trenches_warm_recheck_seconds=_int("FOMO_TRENCHES_WARM_RECHECK_SECONDS", 45),
+            fomo_trenches_normal_recheck_seconds=_int(
+                "FOMO_TRENCHES_NORMAL_RECHECK_SECONDS", 120
+            ),
+            fomo_trenches_max_hot=_int("FOMO_TRENCHES_MAX_HOT", 6),
+            fomo_trenches_max_warm=_int("FOMO_TRENCHES_MAX_WARM", 16),
+            fomo_trench_shadow_separate_bankroll=_bool(
+                "FOMO_TRENCH_SHADOW_SEPARATE_BANKROLL", False
             ),
             fomo_live_radar_channel_id=_optional_int("FOMO_LIVE_RADAR_CHANNEL_ID"),
             fomo_urgent_channel_id=_optional_int("FOMO_URGENT_CHANNEL_ID"),
@@ -1167,6 +1234,56 @@ class Settings:
         if not 60 <= self.fomo_trending_stale_snapshot_seconds <= 86_400:
             raise ValueError(
                 "FOMO_TRENDING_STALE_SNAPSHOT_SECONDS must be between 60 and 86400"
+            )
+        # The Trenches loop reads public RPC, so its floor is set by politeness
+        # to the node rather than by a vendor's plan.
+        if not 10 <= self.fomo_trenches_poll_seconds <= 3_600:
+            raise ValueError("FOMO_TRENCHES_POLL_SECONDS must be between 10 and 3600")
+        if not 5 <= self.fomo_trenches_max_tracked <= 500:
+            raise ValueError("FOMO_TRENCHES_MAX_TRACKED must be between 5 and 500")
+        if not 0 <= self.fomo_trenches_runner_min_score <= 100:
+            raise ValueError("FOMO_TRENCHES_RUNNER_MIN_SCORE must be between 0 and 100")
+        if not 0 <= self.fomo_trenches_heads_up_min_score <= 100:
+            raise ValueError("FOMO_TRENCHES_HEADS_UP_MIN_SCORE must be between 0 and 100")
+        if self.fomo_trenches_heads_up_min_score > self.fomo_trenches_runner_min_score:
+            raise ValueError(
+                "FOMO_TRENCHES_HEADS_UP_MIN_SCORE cannot exceed FOMO_TRENCHES_RUNNER_MIN_SCORE"
+            )
+        if not 0 <= self.fomo_trenches_max_alerts_per_hour <= 200:
+            raise ValueError("FOMO_TRENCHES_MAX_ALERTS_PER_HOUR must be between 0 and 200")
+        if not 0 <= self.fomo_trenches_cooldown_seconds <= 86_400:
+            raise ValueError("FOMO_TRENCHES_COOLDOWN_SECONDS must be between 0 and 86400")
+        # Enrichment budgets are what keep a busy board affordable (section 71).
+        if not 1 <= self.fomo_trenches_max_enrichment_per_scan <= 100:
+            raise ValueError(
+                "FOMO_TRENCHES_MAX_ENRICHMENT_PER_SCAN must be between 1 and 100"
+            )
+        if not 0 <= self.fomo_trenches_wallet_lookups_per_token <= 200:
+            raise ValueError(
+                "FOMO_TRENCHES_WALLET_LOOKUPS_PER_TOKEN must be between 0 and 200"
+            )
+        if not 0 <= self.fomo_trenches_holder_reads_per_scan <= 100:
+            raise ValueError(
+                "FOMO_TRENCHES_HOLDER_READS_PER_SCAN must be between 0 and 100"
+            )
+        if not 0 <= self.fomo_public_trending_min_score <= 100:
+            raise ValueError("FOMO_PUBLIC_TRENDING_MIN_SCORE must be between 0 and 100")
+        # The cadence tiers must actually be tiers.
+        if not 5 <= self.fomo_trenches_hot_recheck_seconds <= 600:
+            raise ValueError("FOMO_TRENCHES_HOT_RECHECK_SECONDS must be between 5 and 600")
+        if not (
+            self.fomo_trenches_hot_recheck_seconds
+            <= self.fomo_trenches_warm_recheck_seconds
+            <= self.fomo_trenches_normal_recheck_seconds
+        ):
+            raise ValueError(
+                "Trenches recheck cadences must satisfy hot <= warm <= normal"
+            )
+        if not 1 <= self.fomo_trenches_max_hot <= 50:
+            raise ValueError("FOMO_TRENCHES_MAX_HOT must be between 1 and 50")
+        if self.fomo_trenches_max_warm < self.fomo_trenches_max_hot:
+            raise ValueError(
+                "FOMO_TRENCHES_MAX_WARM cannot be smaller than FOMO_TRENCHES_MAX_HOT"
             )
         if self.fomo_notable_min_trade_usd < 0:
             raise ValueError("FOMO_NOTABLE_MIN_TRADE_USD cannot be negative")

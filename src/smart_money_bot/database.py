@@ -1252,6 +1252,211 @@ class Database:
             );
             CREATE INDEX IF NOT EXISTS idx_trending_missed_recent
                 ON trending_missed(observed_at DESC);
+
+            -- Terminal-style trenches intelligence (v2.43).  Additive and
+            -- IF NOT EXISTS throughout: no existing table is altered, no forward
+            -- history is touched, and a restart re-runs the block harmlessly.
+
+            -- One row per Pump.fun mint the engine has ever observed.  The
+            -- first_* columns are write-once by INSERT OR IGNORE and never
+            -- appear in an UPDATE SET clause, exactly as the Trending ledger
+            -- does, so "when did we first see it and at what price" survives
+            -- every later enrichment pass.
+            CREATE TABLE IF NOT EXISTS pump_tokens (
+                mint TEXT PRIMARY KEY,
+                name TEXT NOT NULL DEFAULT '',
+                symbol TEXT NOT NULL DEFAULT '',
+                creator TEXT NOT NULL DEFAULT '',
+                created_at INTEGER,
+                first_observed_at INTEGER NOT NULL,
+                first_observed_source TEXT NOT NULL DEFAULT '',
+                first_market_cap_usd REAL,
+                first_bonding_percent REAL,
+                stage TEXT NOT NULL DEFAULT 'UNKNOWN',
+                bonding_percent REAL,
+                market_cap_usd REAL,
+                liquidity_usd REAL,
+                holders INTEGER,
+                top10_percent REAL,
+                graduated_at INTEGER,
+                graduation_market_cap_usd REAL,
+                special_mode TEXT NOT NULL DEFAULT '',
+                last_observed_at INTEGER NOT NULL,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_pump_tokens_stage
+                ON pump_tokens(stage, bonding_percent DESC);
+            CREATE INDEX IF NOT EXISTS idx_pump_tokens_recent
+                ON pump_tokens(first_observed_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_pump_tokens_creator
+                ON pump_tokens(creator);
+
+            -- The multi-timeframe observation stream.  Every window in
+            -- sections 9-11 is computed from these rows, so they are the single
+            -- source the 1m/5m/15m/30m/1h numbers all derive from.
+            CREATE TABLE IF NOT EXISTS pump_observations (
+                mint TEXT NOT NULL,
+                observed_at INTEGER NOT NULL,
+                price_usd REAL,
+                market_cap_usd REAL,
+                liquidity_usd REAL,
+                bonding_percent REAL,
+                buys INTEGER NOT NULL DEFAULT 0,
+                sells INTEGER NOT NULL DEFAULT 0,
+                volume_usd REAL NOT NULL DEFAULT 0,
+                unique_buyers INTEGER,
+                unique_sellers INTEGER,
+                independent_buyers INTEGER,
+                holders INTEGER,
+                PRIMARY KEY (mint, observed_at)
+            );
+            CREATE INDEX IF NOT EXISTS idx_pump_observations_time
+                ON pump_observations(mint, observed_at DESC);
+
+            -- Holder concentration over time (section 21).  A single snapshot
+            -- cannot say whether ownership is broadening or concentrating.
+            CREATE TABLE IF NOT EXISTS pump_holder_snapshots (
+                mint TEXT NOT NULL,
+                observed_at INTEGER NOT NULL,
+                top10_percent REAL,
+                top20_percent REAL,
+                largest_holder_percent REAL,
+                infrastructure_percent REAL,
+                holder_count INTEGER,
+                PRIMARY KEY (mint, observed_at)
+            );
+            CREATE INDEX IF NOT EXISTS idx_pump_holder_snapshots_time
+                ON pump_holder_snapshots(mint, observed_at DESC);
+
+            -- Creator intelligence, kept per creator rather than per token so a
+            -- dev's observable record accumulates across their launches.
+            CREATE TABLE IF NOT EXISTS pump_dev_profiles (
+                wallet TEXT PRIMARY KEY,
+                tokens_created INTEGER NOT NULL DEFAULT 0,
+                graduated INTEGER NOT NULL DEFAULT 0,
+                collapsed INTEGER NOT NULL DEFAULT 0,
+                retained_liquidity INTEGER NOT NULL DEFAULT 0,
+                history_label TEXT NOT NULL DEFAULT 'DEV_HISTORY_UNKNOWN',
+                funding_source_type TEXT NOT NULL DEFAULT 'UNKNOWN',
+                funding_source_wallet TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                updated_at INTEGER NOT NULL
+            );
+
+            -- Per-token dev holding, bundle exposure and participant quality.
+            CREATE TABLE IF NOT EXISTS pump_intel (
+                mint TEXT PRIMARY KEY,
+                dev_wallet TEXT NOT NULL DEFAULT '',
+                dev_initial_percent REAL,
+                dev_current_percent REAL,
+                dev_posture TEXT NOT NULL DEFAULT 'UNKNOWN',
+                bundle_risk TEXT NOT NULL DEFAULT 'UNKNOWN',
+                bundle_count INTEGER NOT NULL DEFAULT 0,
+                bundle_supply_percent REAL,
+                bundle_distributing INTEGER NOT NULL DEFAULT 0,
+                independent_buyers INTEGER,
+                unique_buyers INTEGER,
+                clustered_percent REAL,
+                fresh_wallet_percent REAL,
+                related_percent REAL,
+                metadata_reuse TEXT NOT NULL DEFAULT 'NONE',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                updated_at INTEGER NOT NULL
+            );
+
+            -- Metadata fingerprints, so reuse across mints is detectable
+            -- (section 27) without retaining third-party text.
+            CREATE TABLE IF NOT EXISTS pump_metadata_prints (
+                mint TEXT NOT NULL,
+                field TEXT NOT NULL,
+                digest TEXT NOT NULL,
+                created_at INTEGER,
+                PRIMARY KEY (mint, field)
+            );
+            CREATE INDEX IF NOT EXISTS idx_pump_metadata_prints_digest
+                ON pump_metadata_prints(field, digest);
+
+            -- Our own public Trending ranking over time.
+            CREATE TABLE IF NOT EXISTS public_trend_ranks (
+                mint TEXT NOT NULL,
+                observed_at INTEGER NOT NULL,
+                rank INTEGER NOT NULL,
+                score REAL NOT NULL,
+                shape TEXT NOT NULL DEFAULT '',
+                momentum_curve TEXT NOT NULL DEFAULT '',
+                model TEXT NOT NULL DEFAULT 'PUBLIC_TRENDING_MODEL',
+                PRIMARY KEY (mint, observed_at)
+            );
+            CREATE INDEX IF NOT EXISTS idx_public_trend_ranks_time
+                ON public_trend_ranks(observed_at DESC, rank ASC);
+
+            -- Which lanes nominated a mint, for the consensus count (s33-34).
+            CREATE TABLE IF NOT EXISTS discovery_nominations (
+                mint TEXT NOT NULL,
+                lane TEXT NOT NULL,
+                source_kind TEXT NOT NULL DEFAULT '',
+                first_at INTEGER NOT NULL,
+                last_at INTEGER NOT NULL,
+                detail TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (mint, lane)
+            );
+            CREATE INDEX IF NOT EXISTS idx_discovery_nominations_recent
+                ON discovery_nominations(last_at DESC);
+
+            -- Trench alerts and why they were or were not sent (s35, 82).
+            CREATE TABLE IF NOT EXISTS trench_alerts (
+                mint TEXT NOT NULL,
+                tier TEXT NOT NULL,
+                occurred_at INTEGER NOT NULL,
+                score REAL,
+                stage TEXT NOT NULL DEFAULT '',
+                bonding_percent REAL,
+                market_cap_usd REAL,
+                reasons_json TEXT NOT NULL DEFAULT '[]',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                PRIMARY KEY (mint, tier, occurred_at)
+            );
+            CREATE INDEX IF NOT EXISTS idx_trench_alerts_recent
+                ON trench_alerts(occurred_at DESC);
+
+            CREATE TABLE IF NOT EXISTS trench_suppression (
+                mint TEXT NOT NULL,
+                reason_code TEXT NOT NULL,
+                occurred_at INTEGER NOT NULL,
+                score REAL,
+                stage TEXT NOT NULL DEFAULT '',
+                detail TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (mint, reason_code, occurred_at)
+            );
+            CREATE INDEX IF NOT EXISTS idx_trench_suppression_recent
+                ON trench_suppression(occurred_at DESC);
+
+            -- Time-to-first-observation, the v2.43 latency question (s73, 79).
+            CREATE TABLE IF NOT EXISTS pump_discovery_latency (
+                mint TEXT PRIMARY KEY,
+                created_at INTEGER,
+                observed_at INTEGER NOT NULL,
+                source TEXT NOT NULL DEFAULT '',
+                latency_seconds INTEGER,
+                market_cap_at_observation_usd REAL
+            );
+            CREATE INDEX IF NOT EXISTS idx_pump_discovery_latency_recent
+                ON pump_discovery_latency(observed_at DESC);
+
+            -- Administrator-supplied benchmark observations (section 83).
+            -- Manually captured only; nothing in this codebase fetches them.
+            CREATE TABLE IF NOT EXISTS benchmark_snapshots (
+                snapshot_id TEXT PRIMARY KEY,
+                board_name TEXT NOT NULL DEFAULT '',
+                captured_at INTEGER NOT NULL,
+                captured_by TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL DEFAULT 'ADMIN_MANUAL_OBSERVATION',
+                entries_json TEXT NOT NULL DEFAULT '[]',
+                comparison_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_benchmark_snapshots_recent
+                ON benchmark_snapshots(captured_at DESC);
             """
         )
         await self._migrate_pump_launch_status_constraint()

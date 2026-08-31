@@ -7,6 +7,61 @@ transactions, and mirrors every newly detected hot-wallet swap in PAPER mode. PA
 as either a forced source-price observation ledger or an executable Jupiter quote-shadow
 trial; the two answer different questions and are labeled separately.
 
+Version 2.43.0 gives the bot **its own terminal-grade intelligence, built from public
+on-chain data**. v2.42 made Trending the primary universe but ran it on `TRENDING_PROXY` —
+DEX Screener's boost and profile ordering, which is *paid placement*. A token ranked there
+because someone bought a slot, not because anyone was trading it. That is now one small
+capped feature among many, and the ranking is computed from activity.
+
+**Three universes, two of them primary.** `TRENDING` (attention and momentum) and
+`PUMPFUN TRENCHES` (new, bonding and near-graduation candidates) are the primary lanes;
+legacy graduated research is retained as secondary. The old failure mode — *wait until a
+token graduates, then analyse it* — is gone: the engine now tracks a coin from creation
+through the curve, graduation, PumpSwap and continuation.
+
+**Everything runs on public Solana RPC and Pump.fun program state.** Bonding progress is
+decoded from the curve account's real reserves, not guessed from age. Holder concentration
+comes from `getTokenLargestAccounts` with the bonding curve and pool excluded, because
+counting the liquidity pool as a whale makes every token look either dangerously
+concentrated or artificially safe depending on stage. Wallet age comes from signature
+history; bundles from slot grouping. If DEX Screener is degraded, Fomo is unavailable and
+Solana Tracker has no credits, this keeps working.
+
+**Source honesty, extended to everything.** Terminal (formerly Padre) publishes
+documentation describing the *kinds* of signal active traders care about — multi-timeframe
+momentum, bonding progress, dev holding, bundles, fresh wallets, holder concentration. That
+is a legitimate design reference, and it is all this release used. Their ranking is
+proprietary and their feed is not something this deployment can legitimately read, so what
+we compute is labelled `PUBLIC_TRENDING_MODEL` and never Terminal's or Fomo's.
+`assert_honest_ranking_name` makes a dishonest label a crash rather than a card. Nothing
+reads a logged-in session, reuses cookies or auth tokens, calls a private endpoint, or
+reverse-engineers a proprietary algorithm.
+
+Four things drove the work:
+
+* **One 5-minute number cannot describe a trend.** Five windows — 1m, 5m, 15m, 30m, 1h — are
+  now computed **independently**, with no leakage; a window with too few samples reports
+  nothing rather than borrowing its neighbour's reading. The shape *across* them is the
+  signal, and it is read from **velocity**, not level: a spike in the last minute is inside
+  the fifteen-minute window too, so only per-minute rates separate "just started moving"
+  from "has been moving for an hour and is stalling".
+* **Raw counts are not demand.** 1,000 buys from 4 bots must not score like 300 buys from 250
+  independent participants. Wallets that share a funder, were funded in one burst, or land in
+  the same slot collapse to **one actor**, so twenty sybils funded from one source contribute
+  exactly as much independent demand as one wallet. Fresh wallets are tracked because their
+  absence is informative — never because they are bullish.
+* **Launch → observation was still unmeasured.** v2.41 fixed observation→alert; v2.42 improved
+  Trending. Neither fixed the bot seeing a coin late in the first place. A public
+  `logsSubscribe` on the Pump.fun program now detects creation in the same second it lands,
+  turning first-observation from *up to a poll interval* into **sub-second**, with the poll
+  demoted to a safety net. Latency is recorded per source, so a slow stream and a slow poll
+  are separable problems.
+* **A single risk number hides which thing is wrong.** Ten dimensions are graded separately —
+  liquidity, dev, concentration, bundle, related wallets, fresh-wallet cluster, route,
+  sellability, story and thesis provenance. `UNKNOWN` never becomes `PASS`; a provider outage
+  is not a finding about a token; and a confirmed sell failure, collapsed pool, lost route or
+  hard malicious evidence outranks every positive signal in the system.
+
 Version 2.42.0 makes **FOMO Trending the primary research universe**. The product question is no
 longer "which token just graduated?" but *what is trending right now, why, who is talking about
 it, are those theses real or bullshit, who is buying, and is there still a tradeable
@@ -1113,6 +1168,153 @@ The bot needs these Discord application permissions:
 
 No privileged Discord gateway intents are required.
 
+## Terminal-style trenches intelligence (v2.43)
+
+### What was reviewed, and what was actually accessible
+
+| | |
+| --- | --- |
+| Terminal/Padre documentation | reviewed as a **design reference** for which signal classes matter |
+| `docs.padre.gg` direct fetch | **blocked by this environment's network egress proxy** — the documented signal classes were obtained from public secondary sources describing those docs |
+| `pump.fun/docs` direct fetch | **blocked by the same proxy**; bonding-curve constants and the account layout came from a public open-source SDK's documentation |
+| Terminal data used at runtime | **none.** No feed, no session, no endpoint |
+| Terminal ranking reproduced | **none.** Our ranking is our own model over public data |
+
+**No unauthorised access of any kind.** No logged-in session is read, no cookies or auth
+tokens are reused, no private or undocumented endpoint is called, no proprietary ranking is
+reverse-engineered, and no Terminal or Pump.fun API is invented. A `TERMINAL_AUTHORIZED`
+value exists only when an administrator supplies one by hand.
+
+### Every intelligence source is attributed
+
+`PUMP_ONCHAIN` · `PUMPSWAP_ONCHAIN` · `SOLANA_RPC` · `DEXSCREENER_PUBLIC` ·
+`AUTHORIZED_SOCIAL` · `J7_AUTHORIZED` · `FOMO_AUTHORIZED` · `TERMINAL_AUTHORIZED` ·
+`PUBLIC_WEB` · `DERIVED_PUBLIC_MODEL`
+
+The first three are on-chain facts rather than a vendor's opinion, which is why the engine is
+built on them. Consensus is counted over **evidence families**, not feeds: three market
+vendors relaying the same chain are one observation with three invoices.
+
+### Pump.fun lifecycle, from the program's own accounts
+
+`NEW` → `EARLY_CURVE` → `MID_CURVE` → `ALMOST_BONDED` → `GRADUATING` → `RECENTLY_BONDED` →
+`PUMPSWAP` → `MATURE`, plus an honest `UNKNOWN`.
+
+Bonding progress is `(sold / available)` read from the curve account's `real_token_reserves`,
+and graduation from its `complete` flag. **Age never infers graduation** — a six-hour-old
+token can sit at 4% and a four-minute-old one can be at 96%. An unreadable curve reports
+`UNKNOWN`, never 0%. Crossing 25/50/75/90/95% is an *event* that recomputes the candidate
+immediately rather than at the next tick.
+
+### Multi-timeframe momentum
+
+Five windows computed independently from one observation stream, each using only samples
+inside its own span. Under two samples, a window reports `None` — a fabricated 1-minute
+reading is worse than an absent one.
+
+The shape across them is the signal:
+
+| shape | meaning |
+| --- | --- |
+| `VERY_EARLY_ACCELERATION` | the short window is running several times faster than the long one — the move *just started* |
+| `SUSTAINED_TREND` | short, medium and long all strong together |
+| `BUILDING` | shorter windows improving together |
+| `COOLING` | the short window has turned while longer ones hold |
+| `FADING` | short and medium falling after a strong longer window |
+
+And a second-derivative question a level cannot answer: is acceleration itself `INCREASING`,
+`STEADY`, `COOLING` or `REVERSING`? "Price is currently green" is not that.
+
+`$50K MC on $1K liquidity` and `$50K MC on $15K liquidity` are scored as the different things
+they are, via liquidity/MC, volume/liquidity and estimated impact.
+
+### Participants, not transactions
+
+| | |
+| --- | --- |
+| Wallet age | `VERY_NEW` / `RECENTLY_FUNDED` / `ESTABLISHED` / `UNKNOWN`, from first observable signature |
+| Clustering | shared funder, funding burst in one window, or same-slot buys |
+| Effect | every wallet in a cluster collapses to **one** independent actor |
+
+A fresh wallet is **not inherently bullish** — it can be a new trader, a bot, an insider or a
+sybil, and only coordination tells them apart. Large buys are sized against the pool they
+landed in, and count as demand only once independent buyers follow.
+
+### Dev, holders and bundles
+
+* **Dev funding** — source type, amount and timing where publicly observable. Funded three
+  minutes before launch is *context*, explicitly not proof of anything.
+* **Dev holding** — `STABLE` / `REDUCED` / `SELLING` / `DISTRIBUTED`.
+* **Dev history** — neutral labels only. A creator whose prior tokens collapsed gets
+  `DEV_HISTORY_HIGH_FAILURE_RATE`; this codebase never calls a person a scammer and never
+  asserts identity beyond an observed funding edge.
+* **Holders** — top 10 / top 20 / largest, with infrastructure excluded and measured against
+  circulating rather than total supply. Reported as a **trend**: `43% → 37% → 31%` and
+  `18% → 35%` mean opposite things.
+* **Bundles** — same-slot, same-direction groups, and only inside the launch window. On a busy
+  mature pool, same-slot co-trading is block production, not coordination. A bundle that is
+  *distributing* escalates to `HIGH` on behaviour regardless of its size.
+* **Bot transactions** — trading-app routing share, recorded as attention context. Bot
+  activity is **not** smart money.
+* **Metadata reuse** — image, website, description and socials fingerprinted (hashes only, no
+  third-party text retained) so copying across mints is detectable. Copying is evidence, not
+  proof of malice.
+
+### Two scores, for two different questions
+
+**`PUMP_TRENCH_SCORE`** asks *is the early participation in this token real?* — so its heaviest
+weights are independent demand, holder distribution, dev behaviour, bundle exposure and
+fresh-wallet quality. A token up 300% on the curve can score badly, because 300% bought by
+nine wallets from one funder is one person's spending.
+
+**`PUBLIC_TRENDING_MODEL`** asks *which Solana tokens are experiencing the strongest meaningful
+attention right now?* — from multi-timeframe momentum, independent participants, holder
+expansion and liquidity depth. Paid DEX placement is worth at most 3 of ~100 points and is
+structurally incapable of lifting a token nothing is happening to.
+
+Both use continuous ramps rather than boolean gates, both are bounded and fully printable, and
+a hard safety failure zeroes either one and clears every reason.
+
+### Alert tiers and cadence
+
+`TRENCH_HEADS_UP` · `TRENCH_RUNNER` · `TRENDING_WATCH` · `TRENDING_ALPHA` ·
+`CONTINUATION_WATCH` · `HIGH_CONFLUENCE` — the two "watch" tiers publish to radar and never
+interrupt anyone.
+
+Rechecks run in bounded tiers (`HOT` 15s / `WARM` 45s / `NORMAL` 120s) rather than one
+interval for everything, capped in *population* as well as speed so cost stays flat, and
+reading cached state so a faster cadence costs CPU rather than provider calls. Meaningful
+events — a large independent buy, a buyer burst, a notable wallet, a story match, a new
+thesis, holder acceleration, a rank jump, a bonding milestone, graduation — recompute a
+candidate immediately instead of waiting for the timer.
+
+**Hard gates that no score can override:** coordinated demand, liquidity too thin to exit,
+heavy launch bundling, or a creator distributing. A high score built on those inputs is a
+measurement of the wrong thing.
+
+### Time to first observation
+
+A public `logsSubscribe` on the Pump.fun program detects creation in the same second it
+lands. First observation is persisted **before any enrichment**, because that stamp is what
+every latency metric is measured against. Latency is recorded per source, so the stream and
+the poll are separately attributable — visible in `/fomo trending view:latency`.
+
+### The shadow decision
+
+The trenches lane rides the **existing Trending book** and is separated by *family attribution*
+rather than a third bankroll. A third `$100` account would take three times as long to reach a
+meaningful sample, and "did the pre-graduation lane pay?" is answerable from
+`PUMP_TRENCH_RUNNER`, `PUMP_ALMOST_BONDED` and `PUBLIC_TRENDING_MODEL` attribution inside one
+book. `FOMO_TRENCH_SHADOW_SEPARATE_BANKROLL=true` splits it later; the families are already
+distinct either way. **Both existing experiments are untouched** — same version strings, same
+bankrolls, same forward history.
+
+### Real money
+
+Unchanged and non-negotiable: no signer, no private key, no swap, no transaction submission,
+no SOL spending. The entire `smart_money_bot.trenches` package holds no network client, no
+database handle and no wallet — asserted by the test suite and by the deploy self-check.
+
 ## Trending-first alpha engine (v2.42)
 
 ### What the bot can legitimately see
@@ -1556,6 +1758,60 @@ transaction, an order execution call or a swap. The test suite and the self-chec
 module's AST and assert it.
 
 ## Railway deployment
+
+### v2.43.0 Railway changes
+
+Every new setting has a safe code default, so **no Railway variable has to be added**. Nothing
+here enables live trading or real-money execution, no forward history is reset, and both
+existing shadow experiments keep their own bankrolls and records. The whole engine runs on
+public Solana RPC and Pump.fun program state — **no paid provider is required**.
+
+**ADD:** none required.  **CHANGE:** none required.
+
+**OPTIONAL:**
+
+```text
+FOMO_TRENCHES_ENABLED=true                    # the Pump.fun trenches universe
+FOMO_PUMP_CREATION_STREAM_ENABLED=true        # realtime creation detection (public program logs)
+FOMO_TRENCHES_POLL_SECONDS=30                 # the safety net behind the stream
+FOMO_TRENCHES_MAX_TRACKED=80                  # candidates evaluated per pass
+FOMO_TRENCHES_RUNNER_MIN_SCORE=62             # the bar a trench ping must clear
+FOMO_TRENCHES_HEADS_UP_MIN_SCORE=38           # the quiet radar tier
+FOMO_TRENCHES_MAX_ALERTS_PER_HOUR=8           # hourly ceiling on trench interruptions
+FOMO_TRENCHES_COOLDOWN_SECONDS=1800           # per-mint cooldown between trench pings
+FOMO_TRENCHES_HOT_RECHECK_SECONDS=15          # cadence tiers: hot / warm / normal
+FOMO_TRENCHES_WARM_RECHECK_SECONDS=45
+FOMO_TRENCHES_NORMAL_RECHECK_SECONDS=120
+FOMO_TRENCHES_MAX_HOT=6                       # population caps, so cost stays flat
+FOMO_TRENCHES_MAX_WARM=16
+FOMO_TRENCHES_MAX_ENRICHMENT_PER_SCAN=12      # who gets the expensive reads each pass
+FOMO_TRENCHES_WALLET_LOOKUPS_PER_TOKEN=25     # fresh-wallet history budget per token
+FOMO_TRENCHES_HOLDER_READS_PER_SCAN=10
+FOMO_PUBLIC_TRENDING_ENABLED=true             # our own ranking over public data
+FOMO_PUBLIC_TRENDING_MIN_SCORE=10             # floor below which nothing is ranked
+FOMO_TRENCH_SHADOW_SEPARATE_BANKROLL=false    # true splits trenches into its own $100 book
+```
+
+**Worth knowing without changing anything:**
+
+* **Provider cost is on-chain, not vendor.** A pass costs one batched `getMultipleAccounts`
+  per 100 curve reads, plus holder and wallet reads capped by
+  `FOMO_TRENCHES_HOLDER_READS_PER_SCAN` and `FOMO_TRENCHES_WALLET_LOOKUPS_PER_TOKEN`. Curve
+  state is cached for 10s, holders for 45s and wallet history for 30 minutes — a wallet's
+  first activity is immutable once observed, so re-reading it is pure waste. `SOLANA_TRACKER_API_KEY`
+  remains entirely optional and is not used by this lane.
+* **The stream is the speed; the poll is the safety net.** With
+  `FOMO_PUMP_CREATION_STREAM_ENABLED=false` the lane still works, but first observation
+  degrades from sub-second to up to `FOMO_TRENCHES_POLL_SECONDS`. Check which is carrying the
+  load in `/fomo trending view:latency`.
+* **Cadence tiers must stay ordered.** Configuration validation rejects
+  `hot > warm > normal`, and rejects a `MAX_WARM` smaller than `MAX_HOT`.
+* **Turning the trenches lane off does not restore v2.42 behaviour by itself.**
+  `FOMO_TRENCHES_ENABLED=false` stops the Pump lane; Trending and the graduated lane keep
+  running on their own flags.
+* **A separate trench bankroll is opt-in and one-way in practice.** Splitting mid-experiment
+  starts a fresh $100 book with no history, so the comparison restarts. Attribution inside the
+  Trending book is the default for exactly that reason.
 
 ### v2.42.0 Railway changes
 
@@ -2072,6 +2328,30 @@ Mutation commands require Discord Administrator or a role listed in
 
 Every one of these is read-only research. They show `WAIT`, `REJECT`, `COOLDOWN` and
 `REENTRY_WATCH` candidates on purpose; seeing a candidate never makes it entry eligible.
+
+### Terminal-style trenches (v2.43, admin only)
+
+`/fomo` sits at **24 of Discord's 25** child commands, so v2.43 adds its surfaces as *views*
+on the existing `/fomo trending` rather than claiming the last slot.
+
+| View | What it answers |
+| --- | --- |
+| `/fomo trending view:trenches` | **What is happening on Pump.fun right now?** All four sections at once — NEW, ALMOST BONDED, RECENTLY BONDED and HOT — with bonding progress, stage, market cap versus first-seen, holders and top-10 for each. |
+| `/fomo trending view:new` | Freshly created coins, newest first. |
+| `/fomo trending view:almostbonded` | Approaching graduation — where the trading route is about to change. |
+| `/fomo trending view:recentlybonded` | Just migrated to PumpSwap, kept for continuation. |
+| `/fomo trending view:hot` | Whatever the engine is rechecking fastest right now, which is the answer to "what are you actually watching?" |
+| `/fomo trending view:public` | **Our own public ranking**, with its caveat attached: not Terminal's proprietary rank and not Fomo's. Shows rank, model score, multi-timeframe shape and whether acceleration is itself increasing. |
+| `/fomo trending view:trenchtoken mint:<exact mint>` | One Pump token in full: lifecycle and bonding, first-seen versus current market cap, the top-10 concentration *path*, dev posture and holding, bundle risk and whether those wallets are distributing, buyer independence and clustering, metadata reuse, the creator's neutral record, and which lanes discovered it. A name or ticker is refused. |
+| `/fomo trending view:latency` | **Launch → observation**, per discovery source, with p50/p90/best. The remaining gap after v2.41 fixed observation→alert. |
+
+`/fomo realtime` gains the trenches block: creation-stream state, whether it is actually
+subscribed, creations seen, reconnects, tracked candidates, alerts published and suppressed,
+and the on-chain read counters with cache hits — so an expensive lane cannot hide.
+
+`/fomo latency` is unchanged and still measures the *lab* pipeline (observation → alert); the
+new `view:latency` measures discovery (launch → observation). They are different stages with
+different fixes.
 
 ### Trending-first alpha (v2.42, admin only)
 

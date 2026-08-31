@@ -33,6 +33,7 @@ from .discord_render import (
     P_IDENTITY,
     P_LINKS,
     P_LIQUIDITY,
+    P_MOMENTUM,
     P_SAFETY,
     P_SMART_MONEY,
     P_SOCIAL,
@@ -41,6 +42,7 @@ from .discord_render import (
     CardField,
     CardSpec,
 )
+from .trenches.publicmodel import MODEL_CAVEAT as PUBLIC_MODEL_CAVEAT
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +70,14 @@ TRENDING_ACCELERATION_ALERT = "TRENDING_ACCELERATION"
 TRENDING_CONTINUATION_ALERT = "TRENDING_CONTINUATION"
 TRENDING_HOT_WATCH = "TRENDING_HOT_WATCH"
 OFF_TRENDING_EXCEPTION = "OFF_TRENDING_EXCEPTION"
+# --- Trenches classes (v2.43) ------------------------------------------------
+# Pre-graduation candidates get their own classes: a curve token and a Trending
+# token are different objects with different evidence, and squeezing one into
+# the other's card is how a bonding percentage ends up rendered as a rank.
+TRENCH_RUNNER_ALERT = "PUMP_TRENCH_RUNNER"
+TRENCH_HEADS_UP_ALERT = "PUMP_TRENCH_HEADS_UP"
+ALMOST_BONDED_ALERT = "ALMOST_BONDED_MOMENTUM"
+PUBLIC_TRENDING_ALERT = "PUBLIC_TRENDING"
 
 ALERT_CLASSES: tuple[str, ...] = (
     FAST_WATCH,
@@ -86,6 +96,10 @@ ALERT_CLASSES: tuple[str, ...] = (
     TRENDING_CONTINUATION_ALERT,
     TRENDING_HOT_WATCH,
     OFF_TRENDING_EXCEPTION,
+    TRENCH_RUNNER_ALERT,
+    TRENCH_HEADS_UP_ALERT,
+    ALMOST_BONDED_ALERT,
+    PUBLIC_TRENDING_ALERT,
 )
 
 #: Classes that may interrupt the user.  A late observation never does — it is
@@ -105,6 +119,11 @@ PINGABLE: frozenset[str] = frozenset(
         TRENDING_ACCELERATION_ALERT,
         TRENDING_CONTINUATION_ALERT,
         OFF_TRENDING_EXCEPTION,
+        # v2.43: the pre-graduation lane is primary too, so its serious classes
+        # earn an interruption.  The heads-up tier deliberately does not.
+        TRENCH_RUNNER_ALERT,
+        ALMOST_BONDED_ALERT,
+        PUBLIC_TRENDING_ALERT,
     }
 )
 
@@ -134,6 +153,9 @@ URGENT_CLASSES: frozenset[str] = frozenset(
         TRENDING_ACCELERATION_ALERT,
         TRENDING_CONTINUATION_ALERT,
         OFF_TRENDING_EXCEPTION,
+        TRENCH_RUNNER_ALERT,
+        ALMOST_BONDED_ALERT,
+        PUBLIC_TRENDING_ALERT,
     }
 )
 
@@ -1321,3 +1343,387 @@ def build_trending_hot_watch_card(
         lane=LANE_RADAR,
         family=TRENDING_HOT_WATCH,
     )
+
+
+# --- Trenches cards (v2.43, sections 47, 48) ---------------------------------
+def _terminal_url(mint: str) -> str:
+    """A plain navigation link, built from the exact mint (section 49).
+
+    Navigation only: no authentication is attempted, nothing is read back, and
+    the link is derived from the mint rather than from a name.
+    """
+
+    return f"https://trade.padre.gg/trade/solana/{mint}"
+
+
+def _trench_links(mint: str, fomo_url: str) -> str:
+    """Every link is derived from the exact mint — never from a name (§50-52)."""
+
+    return (
+        f"[FOMO]({fomo_url}) • [PUMP.FUN](https://pump.fun/coin/{mint}) • "
+        f"[TERMINAL]({_terminal_url(mint)}) • "
+        f"[JUPITER](https://jup.ag/swap/SOL-{mint}) • "
+        f"[DEX](https://dexscreener.com/solana/{mint}) • "
+        f"[SOLSCAN](https://solscan.io/token/{mint})"
+    )
+
+
+def _timeframe_line(timeframes: Any) -> str:
+    if timeframes is None:
+        return "no timeframe data yet"
+    headline = timeframes.headline()
+    return (
+        f"{headline}\nShape `{timeframes.shape}` • momentum `{timeframes.momentum_curve}`"
+    )
+
+
+def build_trench_runner_alert(
+    *,
+    mint: str,
+    name: str,
+    symbol: str,
+    fomo_url: str,
+    kind: str,
+    candidate: Any,
+    story: str = "",
+    chatter: str = "",
+    notable_wallets: int = 0,
+    reuse_warning: str = "",
+    image_url: str = "",
+    now: int = 0,
+) -> FastAlert:
+    """The PUMP TRENCH RUNNER card (section 47).
+
+    Everything on it is public or on-chain, and every uncertain field says
+    UNKNOWN rather than guessing.  It is allowed to say LOOK NOW; it is never
+    allowed to say buy, safe or guaranteed.
+    """
+
+    lifecycle = candidate.lifecycle
+    participants = candidate.participants
+    dev = candidate.dev
+    bundles = candidate.bundles
+    risk = candidate.risk
+
+    fields = [
+        CardField(
+            "STAGE",
+            (
+                f"`{lifecycle.label}`"
+                + (
+                    f" • bonding `{lifecycle.progress_percent}%`"
+                    if lifecycle.progress_percent is not None
+                    else " • bonding `unknown`"
+                )
+                + (
+                    f" • age `{_duration(lifecycle.age_seconds)}`"
+                    if lifecycle.age_seconds is not None
+                    else ""
+                )
+                + (
+                    f"\n⚠ `{lifecycle.special_mode}` mode — not an ordinary token"
+                    if lifecycle.special_mode
+                    else ""
+                )
+            ),
+            P_DECISION,
+        ),
+        CardField(
+            "MARKET",
+            (
+                f"First seen MC `{_money(candidate.first_market_cap_usd)}` → now "
+                f"`{_money(candidate.market_cap_usd)}`\n"
+                f"Liquidity `{_money(candidate.liquidity_usd)}`\n"
+                f"{_timeframe_line(candidate.timeframes)}"
+            ),
+            P_LIQUIDITY,
+        ),
+    ]
+
+    if participants is not None:
+        ratio = participants.independence_ratio
+        fields.append(
+            CardField(
+                "PARTICIPATION",
+                (
+                    f"Buys/sells `{participants.buys}` / `{participants.sells}`\n"
+                    f"Unique buyers `{participants.unique_buyers}` → **independent "
+                    f"`{participants.independent_buyers}`**"
+                    + (f" (ratio `{ratio}`)" if ratio is not None else "")
+                    + (
+                        f"\nFresh wallets `{participants.fresh_wallet_buyers}`, "
+                        f"independent `{participants.independent_fresh_buyers}`"
+                        if participants.fresh_wallet_buyers
+                        else ""
+                    )
+                    + (
+                        f"\nClustered demand `{participants.clustered_percent}%`"
+                        if participants.clustered_percent is not None
+                        else ""
+                    )
+                ),
+                P_DEMAND,
+            )
+        )
+
+    holder_bits = []
+    if candidate.holders is not None:
+        holder_bits.append(f"Holders `{candidate.holders}`")
+    if candidate.top10_percent is not None:
+        holder_bits.append(f"Top 10 `{candidate.top10_percent}%`")
+    if holder_bits:
+        fields.append(CardField("HOLDERS", " • ".join(holder_bits), P_DEMAND))
+
+    if dev is not None and dev.wallet:
+        fields.append(
+            CardField(
+                "DEV",
+                (
+                    (
+                        f"Holding `{dev.holding.current_percent}%` "
+                        f"(`{dev.holding.posture}`)\n"
+                        if dev.holding.current_percent is not None
+                        else f"Holding `unknown` (`{dev.holding.posture}`)\n"
+                    )
+                    + dev.funding.operator_line()
+                    + "\n"
+                    + dev.history.operator_line()
+                ),
+                P_SMART_MONEY,
+            )
+        )
+
+    if bundles is not None:
+        fields.append(CardField("BUNDLES", bundles.operator_line(), P_WARNINGS))
+
+    if story:
+        fields.append(CardField("STORY", story, P_SOCIAL))
+    if chatter:
+        fields.append(CardField("PUBLIC CHATTER", chatter, P_SOCIAL))
+    if notable_wallets:
+        fields.append(
+            CardField("NOTABLE WALLETS", f"`{notable_wallets}` proven wallet(s)", P_SMART_MONEY)
+        )
+
+    if risk is not None:
+        fields.append(
+            CardField("RISK", "\n".join(risk.operator_lines()), P_SAFETY)
+        )
+
+    if candidate.consensus is not None and candidate.consensus.lane_count:
+        fields.append(
+            CardField("SOURCES", candidate.consensus.operator_line(), P_DIAGNOSTICS)
+        )
+
+    fields.append(
+        CardField(
+            "WHY PINGED",
+            "\n".join(
+                f"• {reason.replace('_', ' ').title()}" for reason in candidate.score.reasons
+            )
+            or "• no named reason — this card should not have been sent",
+            P_WHY_SURFACED,
+        )
+    )
+    fields.append(
+        CardField(
+            "SCORE",
+            f"Pump trench score `{candidate.score.score}` • cadence "
+            f"`{candidate.cadence}`",
+            P_DIAGNOSTICS,
+        )
+    )
+
+    warnings = []
+    if reuse_warning:
+        warnings.append(reuse_warning)
+    if warnings:
+        fields.append(CardField("⚠", "\n".join(warnings), P_WARNINGS))
+
+    fields.append(CardField("LINKS", _trench_links(mint, fomo_url), P_LINKS))
+
+    headline = {
+        TRENCH_RUNNER_ALERT: "🚨 PUMP TRENCH RUNNER — LOOK NOW",
+        ALMOST_BONDED_ALERT: "⚡ ALMOST BONDED — MOMENTUM",
+        PUBLIC_TRENDING_ALERT: "🔥 PUBLIC TRENDING — LOOK NOW",
+        TRENCH_HEADS_UP_ALERT: "👀 TRENCH HEADS-UP",
+    }.get(kind, "🚨 PUMP TRENCH RUNNER — LOOK NOW")
+
+    display = f"${symbol}" if symbol else (name or "Unknown token")
+    spec = CardSpec(
+        title=f"{headline} • {display}",
+        description=(
+            f"`{mint}`\n"
+            "**RESEARCH ONLY. MANUAL DECISION.** Nothing was bought and nothing can be."
+        ),
+        compact_description=(
+            f"{headline} • {display} `{mint}` — {lifecycle.label}, MC "
+            f"{_money(candidate.market_cap_usd)}. Research only."
+        ),
+        fields=tuple(fields),
+        footer=(
+            "Early is not safe. Fresh wallets are not demand until they are "
+            "independent, and a bonding curve is not a thesis."
+        ),
+        thumbnail_url=image_url,
+        colour=0x9B59B6,
+    )
+    return FastAlert(
+        kind=kind,
+        mint=mint,
+        alert_key=f"{kind}:{mint}",
+        spec=spec,
+        ping=kind in {TRENCH_RUNNER_ALERT, ALMOST_BONDED_ALERT, PUBLIC_TRENDING_ALERT},
+        ping_reason=", ".join(candidate.score.reasons[:3]),
+        token_mint=mint,
+        lane=(
+            LANE_URGENT
+            if kind in {TRENCH_RUNNER_ALERT, ALMOST_BONDED_ALERT, PUBLIC_TRENDING_ALERT}
+            else LANE_RADAR
+        ),
+        family=kind,
+    )
+
+
+def build_public_trending_alert(
+    *,
+    mint: str,
+    name: str,
+    symbol: str,
+    fomo_url: str,
+    candidate: Any,
+    rank: int | None = None,
+    previous_rank: int | None = None,
+    story: str = "",
+    thesis: str = "",
+    mentions: str = "",
+    notable_wallets: int = 0,
+    image_url: str = "",
+    now: int = 0,
+) -> FastAlert:
+    """The PUBLIC TRENDING card (section 48).
+
+    The rank on this card is **ours**.  The caveat is not decoration: it is the
+    difference between reporting a model and claiming somebody else's ranking.
+    """
+
+    trend = candidate.public_trend
+    rank_line = "unranked"
+    if rank is not None:
+        rank_line = f"#{rank}"
+        if previous_rank is not None and previous_rank != rank:
+            rank_line += f" (was #{previous_rank}, {previous_rank - rank:+d})"
+
+    fields = [
+        CardField(
+            "PUBLIC TREND RANK",
+            f"**{rank_line}**\n_{PUBLIC_MODEL_CAVEAT}_",
+            P_DECISION,
+        ),
+        CardField("MOMENTUM", _timeframe_line(candidate.timeframes), P_MOMENTUM),
+        CardField(
+            "MARKET",
+            (
+                f"MC `{_money(candidate.market_cap_usd)}` • liquidity "
+                f"`{_money(candidate.liquidity_usd)}`\n"
+                f"Stage `{candidate.lifecycle.label}`"
+                + (
+                    f" • bonding `{candidate.lifecycle.progress_percent}%`"
+                    if candidate.lifecycle.progress_percent is not None
+                    else ""
+                )
+            ),
+            P_LIQUIDITY,
+        ),
+    ]
+
+    if candidate.holders is not None or candidate.top10_percent is not None:
+        parts = []
+        if candidate.holders is not None:
+            parts.append(f"Holders `{candidate.holders}`")
+        if candidate.top10_percent is not None:
+            parts.append(f"Top 10 `{candidate.top10_percent}%`")
+        fields.append(CardField("HOLDERS", " • ".join(parts), P_DEMAND))
+
+    if candidate.participants is not None:
+        fields.append(
+            CardField(
+                "FLOW",
+                f"Independent buyers `{candidate.participants.independent_buyers}` "
+                f"of `{candidate.participants.unique_buyers}` wallets",
+                P_DEMAND,
+            )
+        )
+
+    if story:
+        fields.append(CardField("STORY", story, P_SOCIAL))
+    if thesis:
+        fields.append(CardField("THESIS", thesis, P_SOCIAL))
+    if mentions:
+        fields.append(CardField("J7 / PUBLIC", mentions, P_SOCIAL))
+    if notable_wallets:
+        fields.append(
+            CardField("SMART WALLETS", f"`{notable_wallets}`", P_SMART_MONEY)
+        )
+    if candidate.risk is not None:
+        fields.append(CardField("RISK", "\n".join(candidate.risk.operator_lines()), P_SAFETY))
+
+    fields.append(
+        CardField(
+            "WHY PINGED",
+            "\n".join(
+                f"• {reason.replace('_', ' ').title()}" for reason in candidate.score.reasons
+            )
+            or "• no named reason — this card should not have been sent",
+            P_WHY_SURFACED,
+        )
+    )
+    if trend is not None:
+        fields.append(
+            CardField(
+                "MODEL",
+                f"`{trend.model}` score `{trend.score}` • "
+                f"{trend.independent_sources} independent source(s)",
+                P_DIAGNOSTICS,
+            )
+        )
+    fields.append(CardField("LINKS", _trench_links(mint, fomo_url), P_LINKS))
+
+    display = f"${symbol}" if symbol else (name or "Unknown token")
+    spec = CardSpec(
+        title=f"🔥 PUBLIC TRENDING — LOOK NOW • {display}",
+        description=(
+            f"`{mint}`\n"
+            "**RESEARCH ONLY. MANUAL DECISION.** Nothing was bought and nothing can be."
+        ),
+        compact_description=(
+            f"PUBLIC TRENDING {rank_line} • {display} `{mint}` — research only."
+        ),
+        fields=tuple(fields),
+        footer=PUBLIC_MODEL_CAVEAT,
+        thumbnail_url=image_url,
+        colour=0xE67E22,
+    )
+    return FastAlert(
+        kind=PUBLIC_TRENDING_ALERT,
+        mint=mint,
+        alert_key=f"{PUBLIC_TRENDING_ALERT}:{mint}",
+        spec=spec,
+        ping=True,
+        ping_reason=", ".join(candidate.score.reasons[:3]),
+        token_mint=mint,
+        lane=LANE_URGENT,
+        family=PUBLIC_TRENDING_ALERT,
+    )
+
+
+def _duration(seconds: int | None) -> str:
+    if seconds is None:
+        return "unknown"
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, remainder = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {remainder:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m"

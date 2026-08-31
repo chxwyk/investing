@@ -49,6 +49,9 @@ from .errors import (
 )
 from .executor import ExecutionManager
 from .fast_alerts import (
+    ALMOST_BONDED_ALERT,
+    PUBLIC_TRENDING_ALERT,
+    TRENCH_RUNNER_ALERT,
     TRENDING_ACCELERATION_ALERT,
     TRENDING_ALPHA,
     TRENDING_CONTINUATION_ALERT,
@@ -58,8 +61,10 @@ from .fast_alerts import (
     build_early_alert,
     build_fast_watch_alert,
     build_notable_trader_alert,
+    build_public_trending_alert,
     build_shadow_entry_alert,
     build_shadow_exit_alert,
+    build_trench_runner_alert,
     build_trending_alert,
     build_trending_hot_watch_card,
     enrichment_from_evidence,
@@ -145,8 +150,11 @@ from .lab.shadow import (
     FAMILY_LABELS,
     FAMILY_NOTABLE_EARLY,
     FAMILY_NOTABLE_LATE,
+    FAMILY_PUBLIC_TRENDING,
     FAMILY_QUALIFIED_RESEARCH,
     FAMILY_STRICT_PAPER,
+    FAMILY_TRENCH_ALMOST_BONDED,
+    FAMILY_TRENCH_RUNNER,
     SHADOW_STRATEGY_VERSION,
     ShadowSignal,
     ShadowTimestamps,
@@ -208,6 +216,8 @@ from .news import (
     XFilteredNewsStream,
     is_coin_actionable_news,
 )
+from .pump_chain import PumpChainReader
+from .pump_stream import PumpCreation, PumpCreationStream
 from .quality import (
     STAGE_ENTRY,
     STAGE_HEATING,
@@ -250,6 +260,18 @@ from .social import (
 )
 from .strategy import ConsensusStrategy
 from .stream import RealtimeWalletStream, StreamEvent, StreamHealth
+from .trenches import (
+    CadenceConfig,
+    TokenMetadata,
+    detect_reuse,
+)
+from .trenches.lifecycle import STAGE_ALMOST_BONDED, STAGE_GRADUATING
+from .trenches_runtime import (
+    SOURCE_CREATION_STREAM,
+    TrenchCandidate,
+    TrenchesRuntime,
+)
+from .trenches_store import TrenchesStore
 from .trending import (
     TRENDING_CONTINUATION,
     TRENDING_EXPERIMENT_VERSION,
@@ -508,6 +530,42 @@ class SmartMoneyEngine:
             api_key=settings.fomo_trending_api_key,
             referral_code=settings.fomo_referral_code,
         )
+        # --- Terminal-style trenches intelligence (v2.43) ------------------
+        # Built on public Solana RPC and Pump.fun program state, so it keeps
+        # working when every third-party vendor is degraded (section 4).
+        self.pump_chain = PumpChainReader(self.rpc)
+        self.trenches_store = TrenchesStore(self.database)
+        self.pump_creation_stream = PumpCreationStream(
+            rpc_url=settings.solana_rpc_url,
+            explicit_ws_url=settings.solana_ws_url,
+            enabled=settings.fomo_pump_creation_stream_enabled,
+            commitment=settings.realtime_stream_commitment,
+            on_creation=self._handle_pump_creation,
+        )
+        self.trenches = TrenchesRuntime(
+            self.trenches_store,
+            self.pump_chain,
+            enabled=settings.fomo_trenches_enabled,
+            max_tracked=settings.fomo_trenches_max_tracked,
+            runner_threshold=settings.fomo_trenches_runner_min_score,
+            heads_up_threshold=settings.fomo_trenches_heads_up_min_score,
+            max_alerts_per_hour=settings.fomo_trenches_max_alerts_per_hour,
+            cooldown_seconds=settings.fomo_trenches_cooldown_seconds,
+            cadence_config=CadenceConfig(
+                hot_seconds=settings.fomo_trenches_hot_recheck_seconds,
+                warm_seconds=settings.fomo_trenches_warm_recheck_seconds,
+                normal_seconds=settings.fomo_trenches_normal_recheck_seconds,
+                max_hot=settings.fomo_trenches_max_hot,
+                max_warm=settings.fomo_trenches_max_warm,
+            ),
+            max_enrichment_per_scan=settings.fomo_trenches_max_enrichment_per_scan,
+            wallet_lookups_per_token=settings.fomo_trenches_wallet_lookups_per_token,
+            holder_reads_per_scan=settings.fomo_trenches_holder_reads_per_scan,
+            public_model_enabled=settings.fomo_public_trending_enabled,
+            public_model_min_score=settings.fomo_public_trending_min_score,
+            enrich=self._enrich_trench,
+            publish=self._publish_trench,
+        )
         self.trending = TrendingRuntime(
             self.trending_store,
             self.trending_client,
@@ -545,6 +603,9 @@ class SmartMoneyEngine:
         self._stream_task: asyncio.Task[None] | None = None
         self._trending_task: asyncio.Task[None] | None = None
         self._trending_hot_watch_task: asyncio.Task[None] | None = None
+        self._trenches_task: asyncio.Task[None] | None = None
+        self._pump_creation_task: asyncio.Task[None] | None = None
+        self._pump_creation_consumer_task: asyncio.Task[None] | None = None
         self.trending_hot_watch_cards = 0
         self._stream_consumer_task: asyncio.Task[None] | None = None
         self._daily_profit_task: asyncio.Task[None] | None = None
@@ -805,6 +866,19 @@ class SmartMoneyEngine:
                 self._run_x_radar(),
                 name="smart-money-x-radar",
             )
+        # Pump.fun trenches: realtime creation detection plus a polling safety
+        # net.  The stream is what makes first-observation sub-second; the poll
+        # exists so a dropped socket degrades latency rather than coverage.
+        if self.settings.fomo_trenches_enabled:
+            self._trenches_task = asyncio.create_task(
+                self._run_trenches(), name="smart-money-pump-trenches"
+            )
+            self._pump_creation_task = asyncio.create_task(
+                self.pump_creation_stream.run(), name="smart-money-pump-creations"
+            )
+            self._pump_creation_consumer_task = asyncio.create_task(
+                self._consume_pump_creations(), name="smart-money-pump-creation-intake"
+            )
         # Trending is the PRIMARY discovery universe (section 39).  It gets its
         # own lightweight loop rather than sharing the graduated radar's 60s
         # poll and 1800s recheck, because a new Trending entrant is only
@@ -857,6 +931,9 @@ class SmartMoneyEngine:
             self._runner_digest_task,
             self._trending_task,
             self._trending_hot_watch_task,
+            self._trenches_task,
+            self._pump_creation_task,
+            self._pump_creation_consumer_task,
         )
         for task in background:
             if task:
@@ -873,6 +950,9 @@ class SmartMoneyEngine:
         self._runner_digest_task = None
         self._trending_task = None
         self._trending_hot_watch_task = None
+        self._trenches_task = None
+        self._pump_creation_task = None
+        self._pump_creation_consumer_task = None
         for task in self._runner_fast_watch_tasks.values():
             task.cancel()
         if self._runner_fast_watch_tasks:
@@ -910,6 +990,7 @@ class SmartMoneyEngine:
         await self.market.close()
         await self.dex_screener.close()
         await self.trending_client.close()
+        await self.pump_creation_stream.close()
         await self.x_social.close()
         await self.tracker_token_risk.close()
         await self.x_news_stream.close()
@@ -4888,6 +4969,341 @@ class SmartMoneyEngine:
             await self._publish_fast_alert(alert, now=now)
         return True
 
+    # ------------------------------------------------------------------
+    # Terminal-style trenches intelligence (v2.43)
+    # ------------------------------------------------------------------
+    async def _handle_pump_creation(self, creation: PumpCreation) -> None:
+        """Persist a brand-new Pump.fun mint the instant the program log lands.
+
+        Nothing here waits on enrichment.  The whole point of the realtime lane
+        is that first-observation happens in the same second as the launch, and
+        anything that blocks it corrupts the latency it exists to fix (§73, §74).
+        """
+
+        with suppress(Exception):
+            await self.trenches.observe_creation(
+                creation.mint,
+                at=creation.observed_at,
+                created_at=creation.observed_at,
+                source=SOURCE_CREATION_STREAM,
+            )
+
+    async def _enrich_trench(self, mint: str) -> dict[str, Any]:
+        """Budgeted public enrichment for one Trenches candidate (section 71).
+
+        Market data comes from the cached DEX snapshot the rest of the pipeline
+        already fetches; holders and buyer history come from public RPC through
+        the shared reader, which caches and batches.  Everything unavailable
+        stays absent, so the risk model reports UNKNOWN rather than guessing.
+        """
+
+        payload: dict[str, Any] = {}
+
+        snapshot = None
+        with suppress(Exception):
+            snapshot = await self.dex_screener.snapshot(mint)
+        if snapshot is not None and snapshot.available:
+            payload.update(
+                {
+                    "market_cap_usd": snapshot.market_cap_usd,
+                    "liquidity_usd": snapshot.liquidity_usd,
+                    "volume_usd": snapshot.volume_5m_usd or snapshot.volume_1h_usd,
+                    "buys": snapshot.buys_5m or snapshot.buys_1h,
+                    "sells": snapshot.sells_5m or snapshot.sells_1h,
+                    "dex_paid": bool(snapshot.has_website and snapshot.has_x_profile),
+                    "dex_boosts": snapshot.active_boosts,
+                }
+            )
+            # Metadata reuse across mints (section 27): fingerprints only, never
+            # a copy of the third-party text.
+            with suppress(Exception):
+                metadata = TokenMetadata(
+                    mint=mint,
+                    image_url=snapshot.image_url,
+                    website=snapshot.website_url,
+                    twitter=(f"https://x.com/{snapshot.x_handle}" if snapshot.x_handle else ""),
+                    telegram=snapshot.telegram_url,
+                    discord=snapshot.discord_url,
+                )
+                prints = metadata.fingerprints()
+                if prints:
+                    others = await self.trenches_store.mints_sharing_prints(
+                        prints, exclude_mint=mint
+                    )
+                    await self.trenches_store.save_metadata_prints(mint, prints)
+                    reuse = detect_reuse(metadata, others)
+                    payload["metadata_reuse"] = reuse
+
+        with suppress(Exception):
+            holders = await self.pump_chain.holder_snapshot(mint)
+            if holders.top10_percent is not None:
+                payload["holder_snapshot"] = holders
+
+        # Narrative and thesis evidence for this exact mint, read from what the
+        # existing lanes already persisted — never inferred from a name.
+        with suppress(Exception):
+            links = await self.database.narrative_link_rows(mint=mint, limit=5)
+            if links:
+                payload["story_verified"] = any(
+                    str(link.get("relationship") or "") in {"AUTHENTIC", "CONFIRMED"}
+                    for link in links
+                )
+        return payload
+
+    async def _publish_trench(self, candidate: TrenchCandidate) -> bool:
+        """Render and publish one Trenches card."""
+
+        kind = TRENCH_RUNNER_ALERT
+        if candidate.lifecycle.stage in {STAGE_ALMOST_BONDED, STAGE_GRADUATING}:
+            kind = ALMOST_BONDED_ALERT
+        elif not candidate.lifecycle.pre_graduation and candidate.public_trend is not None:
+            kind = PUBLIC_TRENDING_ALERT
+
+        fomo_url = self._fomo_url(candidate.mint)
+        if kind == PUBLIC_TRENDING_ALERT:
+            board = {row["mint"]: row["rank"] for row in await self.trenches.public_board(limit=50)}
+            alert = build_public_trending_alert(
+                mint=candidate.mint,
+                name=candidate.name,
+                symbol=candidate.symbol,
+                fomo_url=fomo_url,
+                candidate=candidate,
+                rank=board.get(candidate.mint),
+                notable_wallets=0,
+                now=int(time.time()),
+            )
+        else:
+            alert = build_trench_runner_alert(
+                mint=candidate.mint,
+                name=candidate.name,
+                symbol=candidate.symbol,
+                fomo_url=fomo_url,
+                kind=kind,
+                candidate=candidate,
+                now=int(time.time()),
+            )
+
+        published = await self.notifier.on_fast_alert(alert)
+        if published:
+            self.fast_alerts_published += 1
+            self.last_fast_alert_at = int(time.time())
+            self.last_fast_alert_kind = kind
+            with suppress(Exception):
+                await self._run_trench_shadow(candidate, kind=kind, now=int(time.time()))
+        return bool(published)
+
+    async def _run_trench_shadow(
+        self,
+        candidate: TrenchCandidate,
+        *,
+        kind: str,
+        now: int,
+    ) -> bool:
+        """Offer a published trench alert to the Trending shadow book (section 63).
+
+        Attribution, not a third bankroll: the family distinguishes a
+        pre-graduation entry from a Trending one inside the same $100 experiment,
+        so the question "did the trenches lane pay?" is answerable without
+        tripling the time to a meaningful sample.  Set
+        ``FOMO_TRENCH_SHADOW_SEPARATE_BANKROLL`` to split it later.
+        """
+
+        if not self.trending_shadow_enabled or self.database.connection is None:
+            return False
+        family = {
+            TRENCH_RUNNER_ALERT: FAMILY_TRENCH_RUNNER,
+            ALMOST_BONDED_ALERT: FAMILY_TRENCH_ALMOST_BONDED,
+            PUBLIC_TRENDING_ALERT: FAMILY_PUBLIC_TRENDING,
+        }.get(kind)
+        if family is None:
+            return False
+        try:
+            signal = ShadowSignal(
+                mint=candidate.mint,
+                family=family,
+                timestamps=ShadowTimestamps(signal_at=now, decision_at=now),
+                name=candidate.name or candidate.symbol or "Unknown token",
+                symbol=candidate.symbol or "?",
+                market_cap_usd=candidate.market_cap_usd,
+                liquidity_usd=candidate.liquidity_usd,
+                # Safety is whatever the risk model could actually establish.
+                # UNKNOWN stays UNKNOWN; it never becomes PASS to unblock a fill.
+                safety_status=(
+                    "FAIL"
+                    if candidate.risk is not None and candidate.risk.blocked
+                    else "UNKNOWN"
+                ),
+                route_available=True,
+                detection_market_cap_usd=candidate.first_market_cap_usd,
+                lifecycle_state=candidate.lifecycle.stage,
+                independent_buyers=(
+                    candidate.participants.independent_buyers
+                    if candidate.participants
+                    else None
+                ),
+                why=candidate.score.reasons,
+            )
+            decision, position = await self.trending_shadow.consider_signal(signal, now=now)
+        except Exception:
+            logger.exception("Trench shadow evaluation failed for %s", candidate.mint)
+            return False
+        if position is None:
+            return False
+        paper = position.position
+        alert = build_shadow_entry_alert(
+            mint=candidate.mint,
+            name=signal.name,
+            symbol=signal.symbol,
+            fomo_url=self._fomo_url(candidate.mint),
+            family=family,
+            family_label=FAMILY_LABELS.get(family, family),
+            why=candidate.score.reasons,
+            size_usd=decision.size_usd,
+            fill_market_cap_usd=paper.entry_market_cap_usd,
+            fill_price_usd=paper.entry_price_usd,
+            venue=position.venue,
+            fill_source=position.fill_source,
+            graduation_state=position.graduation_state,
+            modeled_cost_usd=paper.entry_costs.total_cost_usd,
+            net_objective_usd=self._trending_shadow_config.net_profit_objective_usd,
+            signal_to_fill_seconds=0,
+            position_id=paper.position_id,
+        )
+        if self.shadow_cards_enabled:
+            await self._publish_fast_alert(alert, now=now)
+        return True
+
+    async def _run_trenches(self) -> None:
+        """The Pump.fun trenches loop: the safety net behind the realtime stream."""
+
+        while True:
+            try:
+                result = await self.trenches.scan_once()
+                if result.error:
+                    logger.debug("Trenches scan: %s", result.error)
+                for mint in result.graduated:
+                    # Graduation is context, and it is recorded once — the moment
+                    # never moves on a later pass (sections 39, 46).
+                    with suppress(Exception):
+                        candidate = next(
+                            (item for item in result.candidates if item.mint == mint), None
+                        )
+                        await self.trenches_store.mark_graduated(
+                            mint,
+                            at=int(time.time()),
+                            market_cap_usd=(
+                                candidate.market_cap_usd if candidate is not None else None
+                            ),
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await self.notifier.on_error("Pump trenches", exc)
+            await asyncio.sleep(self.settings.fomo_trenches_poll_seconds)
+
+    async def _consume_pump_creations(self) -> None:
+        """Drain the creation queue, so a slow consumer never stalls the socket."""
+
+        while True:
+            creation = await self.pump_creation_stream.events.get()
+            try:
+                await self._handle_pump_creation(creation)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await self.notifier.on_error("Pump creation intake", exc)
+            finally:
+                self.pump_creation_stream.events.task_done()
+
+    # --- operator surfaces --------------------------------------------
+    async def trenches_status(self) -> dict[str, Any]:
+        status = await self.trenches.status()
+        status["creation_stream"] = self.pump_creation_stream.status()
+        return status
+
+    async def trenches_sections(self, *, limit: int = 8) -> dict[str, Any]:
+        return await self.trenches.sections(limit=limit)
+
+    async def trenches_public_board(self, *, limit: int = 12) -> list[dict[str, Any]]:
+        return await self.trenches.public_board(limit=limit)
+
+    async def trenches_token(self, mint: str) -> dict[str, Any] | None:
+        row = await self.trenches_store.token(mint)
+        if row is None:
+            return None
+        payload = dict(row)
+        payload["intel"] = await self.trenches_store.intel(mint)
+        payload["nominations"] = await self.trenches_store.nominations_for(mint)
+        payload["holder_history"] = [
+            item.to_json() for item in await self.trenches_store.holder_snapshots(mint)
+        ]
+        creator = str(row.get("creator") or "")
+        payload["dev_profile"] = await self.trenches_store.dev_profile(creator)
+        return payload
+
+    async def trenches_suppressions(self, *, since: int = 0) -> dict[str, int]:
+        return await self.trenches_store.suppression_counts(since=since)
+
+    async def trenches_latency(self) -> dict[str, Any]:
+        """Time-to-first-observation, per discovery source (section 73)."""
+
+        return await self.trenches_store.discovery_latency_by_source()
+
+    async def record_benchmark_snapshot(
+        self,
+        *,
+        board_name: str,
+        captured_at: int,
+        captured_by: str,
+        entries: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Store an administrator's manual observation and compare it (section 83).
+
+        Manual only.  Nothing in this codebase fetches a third-party board, and
+        the comparison exists to calibrate our own model honestly — not to
+        reproduce anyone's proprietary ranking.
+        """
+
+        from .trenches import BenchmarkEntry, BenchmarkSnapshot, compare_to_benchmark
+
+        rows = tuple(
+            BenchmarkEntry(
+                mint=str(item["mint"]),
+                rank=int(item["rank"]),
+                observed_at=captured_at,
+            )
+            for item in entries
+            if item.get("mint") and item.get("rank") is not None
+        )
+        snapshot = BenchmarkSnapshot(
+            captured_at=captured_at,
+            entries=rows,
+            board_name=board_name,
+            captured_by=captured_by,
+        )
+        ours = {
+            str(row["mint"]): int(row["rank"])
+            for row in await self.trenches.public_board(limit=100)
+        }
+        first_seen: dict[str, int] = {}
+        for mint in ours:
+            token = await self.trenches_store.token(mint)
+            if token is not None:
+                first_seen[mint] = int(token["first_observed_at"])
+        comparison = compare_to_benchmark(snapshot, ours, first_seen=first_seen)
+        await self.trenches_store.save_benchmark(
+            f"{board_name}:{captured_at}",
+            board_name=board_name,
+            captured_at=captured_at,
+            captured_by=captured_by,
+            source=snapshot.source,
+            entries=[
+                {"mint": item.mint, "rank": item.rank} for item in snapshot.entries
+            ],
+            comparison=comparison.to_json(),
+        )
+        return comparison.to_json()
+
     async def _run_trending_radar(self) -> None:
         """The primary discovery loop.  Cheap, fast, and independent of the legacy radar."""
 
@@ -5068,6 +5484,17 @@ class SmartMoneyEngine:
             "trending_hot_watch_cards": self.trending_hot_watch_cards,
             "graduated_secondary_enabled": self.settings.fomo_graduated_secondary_enabled,
             "trending_shadow_enabled": self.settings.fomo_trending_shadow_enabled,
+            # The Pump trenches lane and the realtime creation stream, reported
+            # separately so a healthy poll cannot make a dead stream look fine.
+            "trenches_enabled": self.settings.fomo_trenches_enabled,
+            "trenches_tracked": len(self.trenches._tracked),
+            "trenches_scans": self.trenches.scans,
+            "trenches_creations_seen": self.trenches.creations_seen,
+            "trenches_alerts_published": self.trenches.alerts_published,
+            "trenches_alerts_suppressed": self.trenches.alerts_suppressed,
+            "creation_stream": self.pump_creation_stream.status(now=now),
+            "public_model_enabled": self.settings.fomo_public_trending_enabled,
+            "chain_usage": self.pump_chain.usage_snapshot(),
             "live_execution": False,
         }
 
