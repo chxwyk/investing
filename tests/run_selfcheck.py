@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import os
 import tempfile
@@ -234,12 +235,14 @@ async def main() -> None:
     await check_trenches_intelligence()
     await check_token_identity()
     await check_promotion_intelligence()
+    await check_gmgn_integration()
 
     print(
         "SELF-CHECK PASSED: detector, scoring, database, discovery rotation, "
         "paper P&L, risk gate, PAPER laboratory, discovery-speed, realtime-alpha, "
         "SHADOW auto-trader, profit-optimization, early-alpha, Trending-first, "
-        "trenches-intelligence, token-identity and promotion-intelligence invariants"
+        "trenches-intelligence, token-identity, promotion-intelligence and "
+        "GMGN-integration invariants"
     )
 
 
@@ -726,6 +729,229 @@ async def check_promotion_intelligence() -> None:
     from smart_money_bot.lab.shadow import SIGNAL_FAMILIES
 
     assert len(SIGNAL_FAMILIES) >= 8, "no shadow signal family may be removed"
+
+
+async def check_gmgn_integration() -> None:
+    """GMGN is a research provider, and this build cannot trade through it.
+
+    The two things worth failing a deploy over: a credential that could escape,
+    and a code path that could spend money.  Everything else about a provider
+    integration is recoverable; those two are not.
+    """
+
+    import inspect
+    import json as _json
+    import pathlib
+
+    import smart_money_bot
+    import smart_money_bot.gmgn as gmgn
+    from smart_money_bot.execution import (
+        GATE_NAMES,
+        MODE_LIVE_AUTO,
+        ExecutionIntent,
+        LiveTradingGates,
+        ShadowExecutionProvider,
+        gates_from_settings,
+    )
+    from smart_money_bot.gmgn import lifecycle as gmgn_stages
+
+    secret = "gmgn-selfcheck-key-0123456789abcdef"
+    mint = "GPR7Ax4kQ2mVn8hLdT6yWc3JbRfE9uZsXqM1oP5tH4dK"
+    other = "7TqH1d4Vf9QG578vB99Q7ewFQPoxSYqBDxSAzBpBpump"
+
+    class _Response:
+        def __init__(self, payload, status=200, headers=None):
+            self._payload, self.status = payload, status
+            self.headers = headers or {}
+
+        async def text(self):
+            return _json.dumps(self._payload)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _Session:
+        closed = False
+
+        def __init__(self, handler):
+            self._handler, self.requests = handler, []
+
+        def request(self, method, url, **kwargs):
+            self.requests.append((method, url, kwargs))
+            return self._handler(method, url, kwargs)
+
+    # 1. No signed-auth mode, no signing key, no order route.  This is what
+    #    makes "cannot trade" structural rather than configured.
+    client_source = inspect.getsource(gmgn.GmgnClient)
+    for forbidden in ("X-Signature", "GMGN_PRIVATE_KEY", "detectAlgorithm"):
+        assert forbidden not in client_source, (
+            "the GMGN client must not gain a request signer — that is the half "
+            "of the API that places orders"
+        )
+    assert gmgn.ORDER_PATHS.isdisjoint(gmgn.READ_PATHS)
+    for path in gmgn.ORDER_PATHS:
+        assert path not in client_source
+
+    root = pathlib.Path(smart_money_bot.__file__).parent
+    for path in root.rglob("*.py"):
+        text = path.read_text()
+        for needle in ('getenv("GMGN_PRIVATE_KEY"', "gmgn_private_key"):
+            assert needle not in text, f"{path.name} reads a GMGN signing key"
+    for path in (root / "gmgn").glob("*.py"):
+        text = path.read_text()
+        for forbidden in ("Keypair", "send_transaction", "sign_transaction", "solders"):
+            assert forbidden not in text, f"gmgn/{path.name} must stay signer-free"
+
+    # 2. A non-read path is refused before a request is ever built.
+    client = gmgn.GmgnClient(
+        api_key=secret,
+        session=_Session(lambda m, u, k: _Response({"code": 0, "data": []})),
+    )
+    try:
+        await client._request("POST", "/v1/trade/swap", kind="rank", body={})
+    except gmgn.GmgnError as exc:
+        assert "research reads only" in str(exc)
+    else:  # pragma: no cover - the gate is the point
+        raise AssertionError("the client must refuse a non-read path")
+    assert client._session.requests == [], "a refused path must not reach the network"
+
+    # 3. The credential is a header, never a query param, and never in output.
+    await client.trending(interval="1m")
+    _, url, kwargs = client._session.requests[0]
+    assert kwargs["headers"]["X-APIKEY"] == secret
+    assert secret not in url
+    assert all(secret not in str(value) for _, value in kwargs["params"])
+    assert secret not in _json.dumps(client.usage_snapshot())
+
+    leaky = gmgn.GmgnClient(
+        api_key=secret,
+        session=_Session(
+            lambda m, u, k: _Response({"code": 500, "error": f"echo {secret}"}, 500)
+        ),
+    )
+    try:
+        await leaky.trending(interval="1m")
+    except gmgn.GmgnError as exc:
+        assert secret not in str(exc), "a provider echoing the key must not leak it"
+    assert secret not in _json.dumps(leaky.health.to_json())
+
+    # 4. Failure modes are provider states, never token verdicts.
+    for payload, status, expected in (
+        ({"code": 401, "error": "INVALID_API_KEY"}, 401, gmgn.AUTH_REJECTED),
+        ({"code": 429, "error": "RATE_LIMIT_EXCEEDED"}, 429, gmgn.RATE_LIMITED),
+        ({"code": 429, "error": "RATE_LIMIT_BANNED"}, 429, gmgn.RATE_LIMIT_BANNED),
+        ({"code": 500, "error": "boom"}, 500, gmgn.PROVIDER_DEGRADED),
+    ):
+        probe = gmgn.GmgnClient(
+            api_key=secret,
+            session=_Session(lambda m, u, k, p=payload, st=status: _Response(p, st)),
+        )
+        try:
+            await probe.trending(interval="1m")
+        except gmgn.GmgnError as exc:
+            assert exc.state == expected
+        else:  # pragma: no cover
+            raise AssertionError(f"{expected} must be raised, not swallowed")
+        assert expected in gmgn.UNKNOWN_STATES
+
+    # A rate limit is never retried into: that is how a 429 becomes a ban.
+    limited = gmgn.GmgnClient(
+        api_key=secret,
+        session=_Session(
+            lambda m, u, k: _Response({"code": 429, "error": "RATE_LIMIT_EXCEEDED"}, 429)
+        ),
+    )
+    with contextlib.suppress(gmgn.GmgnError):
+        await limited.trending(interval="1m")
+    assert len(limited._session.requests) == 1
+
+    # 5. An outage is UNKNOWN, never a safety pass.
+    down = gmgn.parse_security(None, mint=mint)
+    assert down.unknown and not down.hard_fail
+    silent = gmgn.parse_security({}, mint=mint)
+    assert silent.unknown and not silent.hard_fail
+    assert gmgn.parse_security({"is_honeypot": True}, mint=mint).hard_fail
+
+    # 6. Identity: a row without an exact mint is dropped, and a row about
+    #    another mint never answers for this one.
+    rows = gmgn.parse_rank_response(
+        {"rank": [{"address": mint}, {"symbol": "NOMINT"}, {"address": "nope"}]},
+        interval="1m",
+    )
+    assert [item.mint for item in rows] == [mint]
+    holders = gmgn.parse_participants(
+        {"holders": [{"address": "W1"}, {"address": "W2", "token_address": other}]},
+        mint=mint,
+    )
+    assert [item.wallet for item in holders] == ["W1"]
+
+    # 7. An unknown provider signal code is reported, never guessed at.
+    assert gmgn.classify_signal(12).name == "SMART_DEGEN_BUY"
+    unknown_signal = gmgn.classify_signal(999)
+    assert unknown_signal.name == gmgn.SIGNAL_UNKNOWN and not unknown_signal.demand
+
+    # 8. One mint keeps one life.
+    life = gmgn_stages.open_lifecycle(
+        mint,
+        stage=gmgn_stages.NEW_PAIR,
+        at=0,
+        market_cap_usd=Decimal("9000"),
+        source="pump_realtime",
+    )
+    life = gmgn_stages.advance(
+        life,
+        stage=gmgn_stages.TRENDING,
+        at=600,
+        market_cap_usd=Decimal("90000"),
+        source="gmgn_rank",
+    )
+    assert life.first_seen_market_cap_usd == Decimal("9000")
+    assert life.lead_over(gmgn_stages.NEW_PAIR, gmgn_stages.TRENDING) == 600
+    stale = gmgn_stages.advance(life, stage=gmgn_stages.EARLY_CURVE, at=610)
+    assert stale.stage == gmgn_stages.TRENDING, "a token does not un-graduate"
+
+    # 9. Every live gate is closed, and opening them all still trades nothing.
+    assert LiveTradingGates().all_open is False
+    assert set(LiveTradingGates().blocked_by()) == set(GATE_NAMES)
+    assert gates_from_settings(object()).all_open is False
+    provider = ShadowExecutionProvider(gates=LiveTradingGates(True, True, True))
+    receipt = await provider.submit(
+        ExecutionIntent(mint=mint, side="BUY", size_usd=Decimal("10"), mode=MODE_LIVE_AUTO)
+    )
+    assert not receipt.accepted and receipt.real_money_spent_usd == Decimal("0")
+    assert provider.can_trade is False and provider.recorded == []
+    shadow_receipt = await provider.submit(
+        ExecutionIntent(mint=mint, side="BUY", size_usd=Decimal("10"), signal_id="s1")
+    )
+    assert shadow_receipt.accepted and shadow_receipt.real_money_spent_usd == Decimal("0")
+
+    # 10. No shadow family or experiment was removed by this release.
+    from smart_money_bot.lab.shadow import (
+        DEFAULT_SHADOW_CONFIG,
+        GMGN_FAMILIES,
+        SIGNAL_FAMILIES,
+    )
+
+    for family in (
+        "FAST_WATCH",
+        "NOTABLE_TRADER_EARLY",
+        "TRENDING_NEW_ENTRY",
+        "PUMP_TRENCH_RUNNER",
+        "PUBLIC_TRENDING_MODEL",
+    ):
+        assert family in SIGNAL_FAMILIES, f"{family} must not be removed"
+    assert set(GMGN_FAMILIES) <= set(SIGNAL_FAMILIES)
+    assert DEFAULT_SHADOW_CONFIG.position_usd == Decimal("10")
+    assert DEFAULT_SHADOW_CONFIG.bankroll_usd == Decimal("100")
+    assert DEFAULT_SHADOW_CONFIG.max_concurrent_positions == 5
+    assert DEFAULT_SHADOW_CONFIG.max_total_exposure_usd == Decimal("50")
+
+    await client.close()
+    await leaky.close()
+    await limited.close()
 
 
 async def check_paper_laboratory() -> None:

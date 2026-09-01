@@ -67,6 +67,21 @@ def _int(name: str, default: int) -> int:
     return int(os.getenv(name, str(default)))
 
 
+def _gmgn_intervals(raw: str) -> tuple[str, ...]:
+    """Parse the configured GMGN rank intervals, keeping only documented ones.
+
+    An undocumented window is dropped rather than sent: it would not return a
+    smaller answer, it would return an error, and one typo would then silently
+    disable a whole timeframe.
+    """
+
+    from .gmgn.signals import RANK_INTERVALS
+
+    wanted = [item.strip().lower() for item in (raw or "").split(",") if item.strip()]
+    kept = tuple(dict.fromkeys(item for item in wanted if item in RANK_INTERVALS))
+    return kept or ("1m", "5m", "1h")
+
+
 def _decimal(name: str, default: str) -> Decimal:
     return Decimal(os.getenv(name, default))
 
@@ -344,6 +359,42 @@ class Settings:
     #: definition shared by every card; an operator may override it or set it
     #: empty to remove the button.  Nothing here logs in or reads it back.
     terminal_token_url_template: str
+
+    # --- GMGN OpenAPI research integration (v2.45) -------------------------
+    # Read operations only.  ``GMGN_API_KEY`` is the research credential; the
+    # separate request-signing key GMGN requires for swap and order routes is
+    # deliberately NOT read anywhere in this codebase, so the trading half of
+    # its API is unreachable rather than merely switched off.
+    gmgn_enabled: bool
+    gmgn_api_key: str
+    gmgn_host: str
+    gmgn_chain: str
+    gmgn_timeout_seconds: Decimal
+    gmgn_poll_seconds: int
+    gmgn_max_calls_per_minute: int
+    gmgn_max_calls_per_hour: int
+    gmgn_breaker_threshold: int
+    gmgn_breaker_seconds: int
+    gmgn_trending_intervals: tuple[str, ...]
+    gmgn_trending_limit: int
+    gmgn_trenches_enabled: bool
+    gmgn_trenches_limit: int
+    gmgn_smart_money_enabled: bool
+    gmgn_kol_enabled: bool
+    gmgn_hot_search_enabled: bool
+    gmgn_market_signals_enabled: bool
+    gmgn_holders_enabled: bool
+    gmgn_security_enabled: bool
+    #: Deep per-token enrichment is rationed: it is the expensive half.
+    gmgn_enrichment_per_scan: int
+
+    # --- future live-trading gates (v2.45, sections 74-83) ----------------
+    # All three default to FALSE and this release uses none of them.  No
+    # execution provider in this codebase can place an order, so these are the
+    # written-down shape of a future decision, not a switch that arms one.
+    live_trading_enabled: bool
+    gmgn_live_trading_enabled: bool
+    auto_trade_enabled: bool
 
     news_radar_enabled: bool
     x_news_stream_enabled: bool
@@ -808,6 +859,34 @@ class Settings:
             terminal_token_url_template=os.getenv(
                 "TERMINAL_TOKEN_URL_TEMPLATE", TERMINAL_TOKEN_URL_TEMPLATE
             ).strip(),
+            gmgn_enabled=_bool("GMGN_ENABLED", True),
+            # Read once, held in memory, never logged, never persisted, never
+            # formatted into an exception.  See gmgn.client.redact.
+            gmgn_api_key=os.getenv("GMGN_API_KEY", "").strip(),
+            gmgn_host=os.getenv("GMGN_HOST", "https://openapi.gmgn.ai").strip(),
+            gmgn_chain=os.getenv("GMGN_CHAIN", "sol").strip(),
+            gmgn_timeout_seconds=_decimal("GMGN_TIMEOUT_SECONDS", "12"),
+            gmgn_poll_seconds=_int("GMGN_POLL_SECONDS", 45),
+            gmgn_max_calls_per_minute=_int("GMGN_MAX_CALLS_PER_MINUTE", 60),
+            gmgn_max_calls_per_hour=_int("GMGN_MAX_CALLS_PER_HOUR", 900),
+            gmgn_breaker_threshold=_int("GMGN_BREAKER_THRESHOLD", 5),
+            gmgn_breaker_seconds=_int("GMGN_BREAKER_SECONDS", 120),
+            gmgn_trending_intervals=_gmgn_intervals(
+                os.getenv("GMGN_TRENDING_INTERVALS", "1m,5m,1h")
+            ),
+            gmgn_trending_limit=_int("GMGN_TRENDING_LIMIT", 50),
+            gmgn_trenches_enabled=_bool("GMGN_TRENCHES_ENABLED", True),
+            gmgn_trenches_limit=_int("GMGN_TRENCHES_LIMIT", 60),
+            gmgn_smart_money_enabled=_bool("GMGN_SMART_MONEY_ENABLED", True),
+            gmgn_kol_enabled=_bool("GMGN_KOL_ENABLED", True),
+            gmgn_hot_search_enabled=_bool("GMGN_HOT_SEARCH_ENABLED", True),
+            gmgn_market_signals_enabled=_bool("GMGN_MARKET_SIGNALS_ENABLED", True),
+            gmgn_holders_enabled=_bool("GMGN_HOLDERS_ENABLED", True),
+            gmgn_security_enabled=_bool("GMGN_SECURITY_ENABLED", True),
+            gmgn_enrichment_per_scan=_int("GMGN_ENRICHMENT_PER_SCAN", 6),
+            live_trading_enabled=_bool("LIVE_TRADING_ENABLED", False),
+            gmgn_live_trading_enabled=_bool("GMGN_LIVE_TRADING_ENABLED", False),
+            auto_trade_enabled=_bool("AUTO_TRADE_ENABLED", False),
             fomo_live_radar_channel_id=_optional_int("FOMO_LIVE_RADAR_CHANNEL_ID"),
             fomo_urgent_channel_id=_optional_int("FOMO_URGENT_CHANNEL_ID"),
             news_radar_enabled=_bool("NEWS_RADAR_ENABLED", True),
@@ -1248,6 +1327,31 @@ class Settings:
             raise ValueError("FOMO_SHADOW_MIN_FORWARD_SAMPLE must be between 1 and 10000")
         # Trending cadence is bounded on both sides: fast enough to be worth
         # having a separate lane for, never fast enough to hammer a source.
+        # --- GMGN research provider (v2.45) -----------------------------
+        if not 10 <= self.gmgn_poll_seconds <= 3_600:
+            raise ValueError("GMGN_POLL_SECONDS must be between 10 and 3600")
+        if not 1 <= self.gmgn_max_calls_per_minute <= 600:
+            raise ValueError("GMGN_MAX_CALLS_PER_MINUTE must be between 1 and 600")
+        if not 1 <= self.gmgn_max_calls_per_hour <= 20_000:
+            raise ValueError("GMGN_MAX_CALLS_PER_HOUR must be between 1 and 20000")
+        if self.gmgn_max_calls_per_minute > self.gmgn_max_calls_per_hour:
+            raise ValueError(
+                "GMGN_MAX_CALLS_PER_MINUTE cannot exceed GMGN_MAX_CALLS_PER_HOUR"
+            )
+        if not 1 <= self.gmgn_breaker_threshold <= 50:
+            raise ValueError("GMGN_BREAKER_THRESHOLD must be between 1 and 50")
+        if not 1 <= self.gmgn_trending_limit <= 100:
+            raise ValueError("GMGN_TRENDING_LIMIT must be between 1 and 100")
+        if not 0 <= self.gmgn_enrichment_per_scan <= 50:
+            raise ValueError("GMGN_ENRICHMENT_PER_SCAN must be between 0 and 50")
+        if not self.gmgn_host.startswith("https://"):
+            raise ValueError("GMGN_HOST must be an https URL")
+        # A credential must never reach a log, a database row or an exception.
+        # This is the cheapest possible check that it was not pasted somewhere
+        # it will be printed.
+        if self.gmgn_api_key and self.gmgn_api_key in self.gmgn_host:
+            raise ValueError("GMGN_API_KEY must not be embedded in GMGN_HOST")
+
         # --- early-candidate hot watch (v2.44) --------------------------
         # A watch that rechecks as slowly as the radar cycle is not a second
         # look, it is the same look later; and one that outlives the move it

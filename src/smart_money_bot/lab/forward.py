@@ -229,6 +229,38 @@ COHORT_STORY_AND_TRADER = "STORY_PLUS_TRADER"
 COHORT_THESIS_AND_TRADER = "THESIS_PLUS_TRADER"
 COHORT_TRENDING_AND_TRADER = "TRENDING_PLUS_TRADER"
 
+# --- v2.45 GMGN label cohorts (sections 66, 67) ------------------------------
+# The question these exist to answer, in one sentence: **does a provider label
+# add anything on top of the evidence we already had?**  A GMGN smart-money tag
+# is a classification, not a track record, and the only way to find out whether
+# it pays is to bucket entries by it at the time they were taken and read the
+# forward numbers later.
+COHORT_NO_GMGN_SMART_MONEY = "NO_GMGN_SMART_MONEY"
+COHORT_ONE_GMGN_SMART_MONEY = "ONE_GMGN_SMART_MONEY"
+COHORT_MULTI_GMGN_SMART_MONEY = "MULTI_INDEPENDENT_GMGN_SMART_MONEY"
+COHORT_GMGN_KOL_ONLY = "GMGN_KOL_ONLY"
+COHORT_GMGN_KOL_AND_SMART_MONEY = "GMGN_KOL_PLUS_SMART_MONEY"
+COHORT_GMGN_SMART_MONEY_AND_STORY = "GMGN_SMART_MONEY_PLUS_STORY"
+COHORT_GMGN_SMART_MONEY_AND_TRENDING = "GMGN_SMART_MONEY_PLUS_TRENDING"
+COHORT_GMGN_SMART_MONEY_AND_FLOW = "GMGN_SMART_MONEY_PLUS_INDEPENDENT_FLOW"
+COHORT_BUNDLER_HEAVY = "BUNDLER_HEAVY"
+COHORT_SNIPER_HEAVY = "SNIPER_HEAVY"
+COHORT_TOP_TRADERS_DISTRIBUTING = "TOP_TRADERS_DISTRIBUTING"
+
+GMGN_COHORTS: tuple[str, ...] = (
+    COHORT_NO_GMGN_SMART_MONEY,
+    COHORT_ONE_GMGN_SMART_MONEY,
+    COHORT_MULTI_GMGN_SMART_MONEY,
+    COHORT_GMGN_KOL_ONLY,
+    COHORT_GMGN_KOL_AND_SMART_MONEY,
+    COHORT_GMGN_SMART_MONEY_AND_STORY,
+    COHORT_GMGN_SMART_MONEY_AND_TRENDING,
+    COHORT_GMGN_SMART_MONEY_AND_FLOW,
+    COHORT_BUNDLER_HEAVY,
+    COHORT_SNIPER_HEAVY,
+    COHORT_TOP_TRADERS_DISTRIBUTING,
+)
+
 EVIDENCE_COHORTS: tuple[str, ...] = (
     COHORT_NO_KNOWN_TRADER,
     COHORT_ONE_KNOWN_TRADER,
@@ -240,6 +272,7 @@ EVIDENCE_COHORTS: tuple[str, ...] = (
     COHORT_STORY_AND_TRADER,
     COHORT_THESIS_AND_TRADER,
     COHORT_TRENDING_AND_TRADER,
+    *GMGN_COHORTS,
 )
 
 
@@ -253,6 +286,13 @@ def assign_cohorts(
     story_confirmed: bool = False,
     thesis_confirmed: bool = False,
     trending_confirmed: bool = False,
+    # ---- v2.45 provider labels (sections 66, 67) ----------------------
+    gmgn_smart_money_wallets: int = 0,
+    gmgn_kol_wallets: int = 0,
+    independent_market_flow: bool = False,
+    bundler_heavy: bool = False,
+    sniper_heavy: bool = False,
+    top_traders_distributing: bool = False,
 ) -> tuple[str, ...]:
     """Label one entry by the evidence that was present when it was taken.
 
@@ -287,6 +327,35 @@ def assign_cohorts(
             labels.append(COHORT_THESIS_AND_TRADER)
         if trending_confirmed:
             labels.append(COHORT_TRENDING_AND_TRADER)
+
+    # --- provider labels, kept strictly separate from our own reputation ---
+    if gmgn_smart_money_wallets <= 0:
+        labels.append(COHORT_NO_GMGN_SMART_MONEY)
+    elif gmgn_smart_money_wallets == 1:
+        labels.append(COHORT_ONE_GMGN_SMART_MONEY)
+    else:
+        labels.append(COHORT_MULTI_GMGN_SMART_MONEY)
+    if gmgn_kol_wallets > 0:
+        # "Famous bought it" and "a wallet with a record bought it" are
+        # different hypotheses, and the second is the one worth paying for.
+        labels.append(
+            COHORT_GMGN_KOL_AND_SMART_MONEY
+            if gmgn_smart_money_wallets > 0
+            else COHORT_GMGN_KOL_ONLY
+        )
+    if gmgn_smart_money_wallets > 0:
+        if story_confirmed:
+            labels.append(COHORT_GMGN_SMART_MONEY_AND_STORY)
+        if trending_confirmed:
+            labels.append(COHORT_GMGN_SMART_MONEY_AND_TRENDING)
+        if independent_market_flow:
+            labels.append(COHORT_GMGN_SMART_MONEY_AND_FLOW)
+    if bundler_heavy:
+        labels.append(COHORT_BUNDLER_HEAVY)
+    if sniper_heavy:
+        labels.append(COHORT_SNIPER_HEAVY)
+    if top_traders_distributing:
+        labels.append(COHORT_TOP_TRADERS_DISTRIBUTING)
     return tuple(dict.fromkeys(labels))
 
 

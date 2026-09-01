@@ -7,7 +7,13 @@ transactions, and mirrors every newly detected hot-wallet swap in PAPER mode. PA
 as either a forced source-price observation ledger or an executable Jupiter quote-shadow
 trial; the two answer different questions and are labeled separately.
 
-Version 2.43.0 gives the bot **its own terminal-grade intelligence, built from public
+Version 2.45.0 adds a **read-only GMGN OpenAPI integration** on top of that: professional
+trending, trenches, smart-money and holder data, joined to the bot's own on-chain engine and
+its story/thesis intelligence, with one lifecycle record per exact mint from new pair to
+second leg. Real-money trading remains completely off, and the execution interface that
+would one day carry it is built but implements no order path at all.
+
+Version 2.43.0 gave the bot **its own terminal-grade intelligence, built from public
 on-chain data**. v2.42 made Trending the primary universe but ran it on `TRENDING_PROXY` —
 DEX Screener's boost and profile ordering, which is *paid placement*. A token ranked there
 because someone bought a slot, not because anyone was trading it. That is now one small
@@ -1167,6 +1173,209 @@ The bot needs these Discord application permissions:
 - Use Application Commands
 
 No privileged Discord gateway intents are required.
+
+## GMGN-native alpha engine and lifecycle intelligence (v2.45)
+
+The bot now has three sources of edge instead of one: **professional GMGN data**, its own
+**public/on-chain engine**, and **story / thesis / social intelligence**. None of the three
+is allowed to be a single point of failure, and none of them is trusted on its own.
+
+Built against the official [`GMGNAI/gmgn-skills`](https://github.com/GMGNAI/gmgn-skills)
+client at commit `267ff6b` — `src/client/OpenApiClient.ts`, `src/client/signer.ts`,
+`src/config.ts` and `docs/cli-usage.md`. Every path, parameter, enum and error code below
+is what that client actually sends. Nothing is guessed.
+
+### Read-only, and structurally so
+
+GMGN's API has two auth modes. **Exist auth** is an API key plus a timestamp and a client
+id, and covers every market, token and user read. **Signed auth** additionally requires
+`GMGN_PRIVATE_KEY`, a request-signing key, and is what `/v1/trade/swap` and the order
+routes demand.
+
+This build implements exactly one of them.
+
+| | |
+| --- | --- |
+| Signed-auth mode | **not implemented** — no signer, no `X-Signature` header |
+| `GMGN_PRIVATE_KEY` | **never read**, anywhere in the codebase |
+| Order routes | absent, and listed in `ORDER_PATHS` only so a test can assert their absence |
+| Request path | asserts every call against a 14-entry read-only allow-list before building a request |
+
+So "cannot trade" is a property of the code rather than of a flag. The deploy self-check
+fails if the client gains a signer, an order path, or a `can_trade` provider — verified by
+reintroducing each and watching it fail.
+
+**The credential never escapes.** It is read from the environment, sent as an `X-APIKEY`
+header, and never logged, never put in an exception, never written to SQLite, never
+returned in a status payload and never rendered on a card. `redact()` strips it from every
+error string on the way out, so even a provider echoing the key back cannot leak it.
+
+### Honest provider states
+
+Ten states, and one inference the module refuses to make: **a provider that is down says
+nothing about a token.**
+
+`ACTIVE` · `ACTIVE_NO_EVENTS` · `AUTH_MISSING` · `AUTH_REJECTED` · `RATE_LIMITED` ·
+`RATE_LIMIT_BANNED` · `TIMEOUT` · `PROVIDER_DEGRADED` · `DISABLED_BY_CONFIG` · `UNKNOWN`
+
+Everything outside the first two is in `UNKNOWN_STATES`, and every field GMGN would have
+supplied then reads UNKNOWN — never "clear", never zero. An empty board is
+`ACTIVE_NO_EVENTS`, which is a real answer and a different thing from a provider that did
+not answer.
+
+### Rate-limit protection
+
+A cache only helps *after* the first call returns; **request coalescing** is the half people
+forget, and it is the one that matters under load. Six callers asking the same question in
+the same instant produce one request and five awaits.
+
+- Per-endpoint TTLs: a trending board is stale in 20 seconds, a creator's prior-token
+  history is not stale in an hour.
+- Rolling per-minute and per-hour budgets, so a burst cannot spend the hour in 90 seconds.
+- A 429 is **never retried into** — that is how a limit becomes a ban. The window GMGN
+  names in `x-ratelimit-reset` is honoured, converted from wall-clock to a duration so an
+  NTP step cannot turn a one-minute wait into an hour.
+- A circuit breaker opens after repeated failures and its skips are counted, so a dead
+  provider costs nothing rather than a second per call.
+
+### One mint, one life
+
+A token that graduates used to become a *new candidate* with no memory of having been
+watched at $18K twenty minutes earlier. Now there is one record per exact mint:
+
+```
+TOKEN_CREATED → NEW_PAIR → EARLY_CURVE → MID_CURVE → FINAL_STRETCH → NEAR_COMPLETION
+              → GRADUATING → RECENTLY_MIGRATED → PUMPSWAP → TRENDING → CONTINUATION
+```
+
+Every stage records the market cap and the time it was reached, which is what makes "first
+seen $100K, promoted $300K" a fact the card can state. Stages are derived from bonding
+progress and observable market state — not from a vendor label — so they survive a provider
+outage. A stale read cannot un-graduate a token, and `lead_over()` answers whether Pump
+realtime, GMGN trenches or a story watch actually saw something first.
+
+The operator's board groups them the way the workflow does: **NEW PAIRS**, **FINAL
+STRETCH**, **MIGRATED** (`/fomo trending view:lifecycle`). The board is for exploration —
+it does not replace being interrupted, because a board only helps someone who is looking at
+it.
+
+### What GMGN is used for
+
+| Feed | Path | Used as |
+| --- | --- | --- |
+| Trending | `GET /v1/market/rank` | Primary discovery, per documented interval (`1m`/`5m`/`1h`/`6h`/`24h`) |
+| Trenches | `POST /v1/trenches` | New creation / near completion / completed, mapped explicitly to our stages |
+| Market signals | `POST /v1/market/token_signal` | 21 documented types, named; unknown codes reported as unknown |
+| Hot searches | `POST /v1/market/hot_searches` | **Attention**, never demand |
+| Smart money | `GET /v1/user/smartmoney` | A classification |
+| KOLs | `GET /v1/user/kol` | Attention, explicitly not expectancy |
+| Top holders / traders | `GET /v1/market/token_top_{holders,traders}` | Deep enrichment, rationed |
+| Security | `GET /v1/token/security` | One input to safety, never the verdict |
+| Created tokens | `GET /v1/user/created_tokens` | Creator record, as context |
+| Pools, klines, token info | `/v1/token/pool_info`, `/v1/market/token_kline`, `/v1/token/info` | Cross-checks |
+
+Discovery priority is GMGN first, our public/on-chain engine alongside it as independent
+confirmation and fallback. Nothing was deleted: Pump realtime creation detection, the
+trenches engine, `PUBLIC_TRENDING_MODEL` and the story-first architecture all still run.
+
+### What a provider label is worth
+
+**A GMGN tag is a classification, not a track record.** The smart-money card shows the
+provider's label and this bot's own forward-measured reputation *side by side*, so a wallet
+GMGN calls smart money and our record calls a late chaser reads as exactly that.
+
+**A KOL is not smart money.** `GMGN_KOL` is a separate alert class that never pings: fame is
+attention, and attention belongs on the radar until the forward record says otherwise.
+`GMGN_SMART_MONEY` does ping, while the edge is live.
+
+**Twenty wallets from one funder are one actor** — whichever provider labelled them. The
+same cluster collapse this codebase already applies to its own notable wallets is applied to
+GMGN's tagged wallets before any of them count as confirmation.
+
+**A Dex ad is not demand.** Of the 21 documented signal types, five are demand
+(`SMART_DEGEN_BUY`, `LARGE_AMOUNT_BUY`, `MULTI_BUY`, `MULTI_LARGE_BUY`, `KOL_BUY`); ad
+placements, boosts and social-link edits are recorded and never made candidates.
+
+### Safety is still ours
+
+GMGN security is *one input*. A confirmed independent hard failure is not overridden by a
+provider saying "safe", and a provider outage produces `UNKNOWN` rather than a pass — an
+all-`None` security record reads as unknown, and only an explicit `honeypot: true` or
+`can_sell: false` is a hard fail.
+
+### The future execution interface — built, and off
+
+The worst time to design an execution layer is the day you decide to turn it on. So the
+shape exists now, while the stakes are zero:
+
+- **Three modes**, one implemented. `SHADOW` records; `MANUAL_CONFIRM` and `LIVE_AUTO` are
+  named so the state machine is complete, and both are refused.
+- **Three gates**, all default false: `LIVE_TRADING_ENABLED`, `GMGN_LIVE_TRADING_ENABLED`,
+  `AUTO_TRADE_ENABLED`. `blocked_by()` returns every closed gate, not the first.
+- **Opening all three still trades nothing** — the gates are necessary and never sufficient,
+  because no provider in this codebase can place an order.
+- **Idempotency by construction.** `client_order_id` is derived from signal + strategy +
+  mint + attempt, so a restart that replays a decision produces the *same* id rather than a
+  second order.
+- **Mode is a property of the record.** A shadow entry stays `SHADOW` if every flag flips
+  tomorrow; nothing re-reads the mode off a live switch mid-flight.
+- **The live precheck is a list, not a boolean** — eleven conditions, every unmet one
+  named, so a future operator gets the whole list instead of a game of whack-a-mole.
+
+**REAL MONEY SPENT = $0.00.** No swap submission, no order submission, no signer, no wallet,
+no SOL spend.
+
+### Shadow attribution
+
+Thirteen new GMGN families ride the existing Trending bankroll, separated by *attribution*
+rather than by a third $100 book — a separate book per provider would take three times as
+long to reach a readable sample and would not answer the question that matters.
+
+Eleven new cohorts (`lab/forward.py`) test whether the labels help at all: no GMGN smart
+money · one wallet · multiple independent wallets · KOL only · KOL + smart money · smart
+money with story / trending / independent flow · bundler-heavy · sniper-heavy · top traders
+distributing. Every label is assigned from evidence present **at entry**, so none can be
+applied with hindsight.
+
+**No experiment was reset.** The legacy book, the Trending book, every forward observation
+and every historical loss are untouched. `$100` bankroll, exactly `$10` per position, 5
+concurrent, `$50` max exposure — unchanged and asserted.
+
+### Discord
+
+`/fomo trending view:gmgn` is the truth panel: provider state, calls, cache, coalesced,
+429s, auth errors, timeouts, breaker skips, mean and p95 latency, feed errors, board counts,
+and the three live gates with `REAL MONEY SPENT = $0`. `view:lifecycle` is the board.
+`view:detail <mint>` is everything about one exact mint — lifecycle, holders, traders,
+independence after cluster collapse, GMGN security, recent observations. All views, no new
+command slots: the tree stays at 25.
+
+### Railway
+
+**REQUIRED:** none — the bot runs without GMGN and reports `AUTH_MISSING`.
+
+**ADD (research):** `GMGN_API_KEY` (the read-only research credential), `GMGN_ENABLED=true`.
+
+**ADD (live gates, all false):** `LIVE_TRADING_ENABLED=false`,
+`GMGN_LIVE_TRADING_ENABLED=false`. `AUTO_TRADE_ENABLED` defaults false when unset.
+
+**CHANGE:** none. No existing variable changes meaning.
+
+**OPTIONAL:** `GMGN_HOST`, `GMGN_CHAIN`, `GMGN_TIMEOUT_SECONDS`, `GMGN_POLL_SECONDS`,
+`GMGN_MAX_CALLS_PER_MINUTE`, `GMGN_MAX_CALLS_PER_HOUR`, `GMGN_BREAKER_THRESHOLD`,
+`GMGN_BREAKER_SECONDS`, `GMGN_TRENDING_INTERVALS`, `GMGN_TRENDING_LIMIT`,
+`GMGN_TRENCHES_ENABLED`, `GMGN_TRENCHES_LIMIT`, `GMGN_SMART_MONEY_ENABLED`,
+`GMGN_KOL_ENABLED`, `GMGN_HOT_SEARCH_ENABLED`, `GMGN_MARKET_SIGNALS_ENABLED`,
+`GMGN_HOLDERS_ENABLED`, `GMGN_SECURITY_ENABLED`, `GMGN_ENRICHMENT_PER_SCAN`.
+
+**Not required and not requested:** a GMGN trading credential. The research key is
+read-only and this release needs nothing else.
+
+### What this release does not claim
+
+That any of it makes money. Endpoints working is not evidence of edge; only forward net
+results are. The cohorts above exist so that claim can eventually be checked rather than
+asserted.
 
 ## Early-candidate promotion and top-trader intelligence (v2.44)
 

@@ -1051,7 +1051,7 @@ def test_the_concentration_vocabulary_is_shared_across_packages() -> None:
 def test_evidence_cohorts_are_assigned_from_what_was_known_at_entry() -> None:
     """Section 36: measure whether these additions actually improve results."""
 
-    assert assign_cohorts(proven_independent_traders=0) == (COHORT_NO_KNOWN_TRADER,)
+    assert COHORT_NO_KNOWN_TRADER in assign_cohorts(proven_independent_traders=0)
     assert COHORT_ONE_KNOWN_TRADER in assign_cohorts(proven_independent_traders=1)
     assert COHORT_MULTI_KNOWN_TRADER in assign_cohorts(proven_independent_traders=4)
     assert COHORT_STORY_AND_TRADER in assign_cohorts(
@@ -1066,7 +1066,9 @@ def test_evidence_cohorts_are_assigned_from_what_was_known_at_entry() -> None:
     assert COHORT_STORY_AND_TRADER not in assign_cohorts(
         proven_independent_traders=0, story_confirmed=True
     )
-    assert len(EVIDENCE_COHORTS) == 10
+    # v2.45 adds the provider-label cohorts alongside the evidence ones.
+    assert len(EVIDENCE_COHORTS) >= 10
+    assert len(set(EVIDENCE_COHORTS)) == len(EVIDENCE_COHORTS)
 
 
 def test_the_new_views_are_registered_without_taking_a_command_slot() -> None:

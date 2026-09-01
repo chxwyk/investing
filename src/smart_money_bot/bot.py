@@ -5842,6 +5842,31 @@ def _profit_exits_embed(report: ExitQualityReport) -> discord.Embed:
     return _clamp_embed(embed)
 
 
+def _gmgn_provider_line(live: object) -> str:
+    """The GMGN half of `/fomo profit view:providers` (section 86).
+
+    Latency percentiles, budget state and decision impact — everything except
+    the credential, which this codebase never puts anywhere it could be read.
+    """
+
+    if not isinstance(live, dict) or live.get("provider") != "gmgn":
+        return ""
+    parts = [
+        f"\nGMGN state `{live.get('state')}` — {live.get('human', '')}",
+        f"Cache `{live.get('cache_hits', 0)}` • coalesced `{live.get('coalesced', 0)}` • "
+        f"429s `{live.get('rate_limited', 0)}` • auth `{live.get('auth_errors', 0)}` • "
+        f"timeouts `{live.get('timeouts', 0)}` • breaker skips `{live.get('breaker_skips', 0)}`",
+        f"Latency mean `{live.get('mean_latency_ms')}ms` • p95 `{live.get('p95_latency_ms')}ms`",
+        f"Calls last minute `{live.get('calls_last_minute', 0)}` • hour "
+        f"`{live.get('calls_last_hour', 0)}`",
+        f"Decision impact `{live.get('decision_impacts', 0)}` • alert impact "
+        f"`{live.get('alert_impacts', 0)}`",
+    ]
+    if live.get("rate_limited_for_seconds"):
+        parts.append(f"⏳ backing off `{live['rate_limited_for_seconds']}s`")
+    return "\n".join(parts)
+
+
 def _profit_providers_embed(rows: list[dict[str, object]]) -> discord.Embed:
     """`/fomo profit providers` — where the money is wasted (section 24)."""
 
@@ -5880,6 +5905,7 @@ def _profit_providers_embed(rows: list[dict[str, object]]) -> discord.Embed:
                     else ""
                 )
                 + (f"\nLast error: `{report.last_error[:160]}`" if report.last_error else "")
+                + _gmgn_provider_line(item.get("live") or {})
             )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
             inline=False,
         )
@@ -6973,6 +6999,252 @@ def _trench_token_embed(payload: dict) -> discord.Embed:
             inline=False,
         )
     embed.set_footer(text="Every number belongs to this exact mint and no other.")
+    return _clamp_embed(embed)
+
+
+def _gmgn_status_embed(status: dict) -> discord.Embed:
+    """`view:gmgn` — the truth panel (section 87).
+
+    Every line is a fact about the provider or about our own loop.  None of it
+    is a claim about a token, and the credential appears nowhere: the status
+    payload is built without it by construction.
+    """
+
+    state = str(status.get("state") or "UNKNOWN")
+    marker = "🟢" if state in {"ACTIVE", "ACTIVE_NO_EVENTS"} else "🔴"
+    embed = discord.Embed(
+        title=f"{marker} GMGN RESEARCH PROVIDER",
+        description=(
+            f"`{state}` — {status.get('human', '')}\n"
+            "Read-only. This build implements none of GMGN's signed trading "
+            "routes, holds no signing key, and cannot place an order."
+        ),
+        colour=0x2ECC71 if marker == "🟢" else 0xE74C3C,
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(
+        name="Provider",
+        value=(
+            f"Configured `{status.get('configured')}` • enabled "
+            f"`{status.get('enabled')}` • chain `{status.get('chain')}`\n"
+            f"Calls `{status.get('calls', 0)}` • cache `{status.get('cache_hits', 0)}` • "
+            f"coalesced `{status.get('coalesced', 0)}`\n"
+            f"429s `{status.get('rate_limited', 0)}` • auth errors "
+            f"`{status.get('auth_errors', 0)}` • timeouts `{status.get('timeouts', 0)}` • "
+            f"breaker skips `{status.get('breaker_skips', 0)}`\n"
+            f"Latency mean `{status.get('mean_latency_ms')}ms` • p95 "
+            f"`{status.get('p95_latency_ms')}ms`\n"
+            f"Last success <t:{status.get('last_success_at') or 0}:R>"
+            if status.get("last_success_at")
+            else f"Calls `{status.get('calls', 0)}` • no successful call yet"
+        ),
+        inline=False,
+    )
+    board = status.get("board") or {}
+    embed.add_field(
+        name="Feeds",
+        value=(
+            f"Scans `{status.get('scans', 0)}` • candidates seen "
+            f"`{status.get('candidates_seen', 0)}` • lifecycles "
+            f"`{status.get('lifecycles', 0)}`\n"
+            f"Smart-money wallets `{status.get('smart_money_wallets', 0)}` • KOL wallets "
+            f"`{status.get('kol_wallets', 0)}`\n"
+            f"NEW PAIRS `{board.get('NEW_PAIRS', 0)}` • FINAL STRETCH "
+            f"`{board.get('FINAL_STRETCH', 0)}` • MIGRATED `{board.get('MIGRATED', 0)}`"
+        ),
+        inline=False,
+    )
+    last = status.get("last_scan") or {}
+    if last:
+        errors = last.get("errors") or []
+        embed.add_field(
+            name="Last scan",
+            value=(
+                f"<t:{last.get('at', 0)}:R> • candidates `{last.get('candidates', 0)}` • "
+                f"signals `{last.get('signals', 0)}`\n"
+                + (
+                    "⚠ " + "\n⚠ ".join(str(item)[:120] for item in errors[:3])
+                    if errors
+                    else "no feed errors"
+                )
+            ),
+            inline=False,
+        )
+    gates = status.get("live_gates") or {}
+    embed.add_field(
+        name="🔒 Real money",
+        value=(
+            f"**REAL MONEY SPENT = ${status.get('real_money_spent_usd', '0')}**\n"
+            f"Execution provider `{status.get('execution_provider')}` • can trade "
+            f"`{status.get('execution_can_trade')}`\n"
+            + "\n".join(
+                f"`{name}` = `{gates.get(name)}`"
+                for name in ("LIVE_TRADING_ENABLED", "GMGN_LIVE_TRADING_ENABLED",
+                             "AUTO_TRADE_ENABLED")
+            )
+        ),
+        inline=False,
+    )
+    embed.set_footer(text="Research only. The API key is never displayed, logged or stored.")
+    return _clamp_embed(embed)
+
+
+def _gmgn_board_embed(payload: dict) -> discord.Embed:
+    """`view:lifecycle` — NEW PAIRS / FINAL STRETCH / MIGRATED (sections 44, 89).
+
+    The board is for exploration.  It does not replace being interrupted: a
+    candidate that develops real evidence still pings, because a board only
+    helps someone who happens to be looking at it (section 45).
+    """
+
+    sections = payload.get("sections") or {}
+    embed = discord.Embed(
+        title="TOKEN LIFECYCLE BOARD",
+        description=(
+            "One record per exact mint, followed from new pair to second leg. A "
+            "token that changes stage keeps its history — it does not become a "
+            "new candidate."
+        ),
+        colour=0x1ABC9C,
+        timestamp=discord.utils.utcnow(),
+    )
+    for name in ("NEW_PAIRS", "FINAL_STRETCH", "MIGRATED"):
+        rows = sections.get(name) or []
+        if not rows:
+            embed.add_field(
+                name=name.replace("_", " "),
+                value="nothing here right now",
+                inline=False,
+            )
+            continue
+        lines = []
+        for row in rows[:6]:
+            marks = row.get("marks") or []
+            path = " → ".join(str(item.get("stage")) for item in marks[-4:])
+            lines.append(
+                f"`{str(row.get('mint'))[:12]}…` `{row.get('stage')}`\n"
+                f"  first seen {_money(row.get('first_seen_market_cap_usd'))} → now "
+                f"{_money(row.get('current_market_cap_usd'))} • peak "
+                f"{_money(row.get('peak_market_cap_usd'))}\n"
+                f"  {path or row.get('stage')}"
+            )
+        embed.add_field(
+            name=f"{name.replace('_', ' ')} ({len(rows)})",
+            value="\n".join(lines)[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+            inline=False,
+        )
+    embed.set_footer(
+        text="Exploration surface. Serious evidence still interrupts you separately."
+    )
+    return _clamp_embed(embed)
+
+
+def _gmgn_detail_embed(payload: dict) -> discord.Embed:
+    """`view:detail` — one exact mint, everything we have (section 90)."""
+
+    mint = str(payload.get("mint") or "")
+    lifecycle = payload.get("lifecycle") or {}
+    embed = discord.Embed(
+        title="TOKEN DETAIL",
+        description=(
+            f"`{mint}`\n"
+            "Every number below belongs to this exact mint. Nothing is inherited "
+            "from a token that shares its name."
+        ),
+        colour=0x3498DB,
+        timestamp=discord.utils.utcnow(),
+    )
+    if lifecycle:
+        marks = lifecycle.get("marks") or []
+        embed.add_field(
+            name="Lifecycle",
+            value=(
+                f"Stage `{lifecycle.get('stage')}`\n"
+                f"First seen {_money(lifecycle.get('first_seen_market_cap_usd'))} via "
+                f"`{lifecycle.get('first_seen_source')}` <t:"
+                f"{lifecycle.get('first_seen_at', 0)}:R>\n"
+                f"Now {_money(lifecycle.get('current_market_cap_usd'))} • peak "
+                f"{_money(lifecycle.get('peak_market_cap_usd'))}\n"
+                + (" → ".join(str(item.get("stage")) for item in marks[-6:]) or "")
+            ),
+            inline=False,
+        )
+    holders = payload.get("holders") or []
+    if holders:
+        embed.add_field(
+            name=f"Top holders ({len(holders)})",
+            value="\n".join(
+                f"`{str(item.get('wallet'))[:10]}…` {item.get('holding_percent') or '?'}%"
+                + (" • GMGN smart money" if item.get("is_smart_money") else "")
+                + (" • KOL" if item.get("is_kol") else "")
+                + (" • fresh" if item.get("fresh_wallet") else "")
+                + (" • sniper" if item.get("sniper") else "")
+                + (" • bundler" if item.get("bundler") else "")
+                for item in holders[:8]
+            )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+            inline=False,
+        )
+    traders = payload.get("traders") or []
+    if traders:
+        embed.add_field(
+            name=f"Top traders ({len(traders)})",
+            value="\n".join(
+                f"`{str(item.get('wallet'))[:10]}…` realized "
+                f"{_money(item.get('realized_pnl_usd'))} • unrealized "
+                f"{_money(item.get('unrealized_pnl_usd'))}"
+                for item in traders[:8]
+            )[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+            inline=False,
+        )
+    embed.add_field(
+        name="Independence",
+        value=(
+            f"Provider-tagged wallets, after collapsing clusters: "
+            f"**{payload.get('independent_tagged_wallets', 0)}**\n"
+            "Twenty wallets from one funder are one actor, whichever provider "
+            "labelled them."
+        ),
+        inline=False,
+    )
+    security = payload.get("security") or {}
+    if security:
+        embed.add_field(
+            name="GMGN security",
+            value=(
+                (
+                    "`UNKNOWN` — the provider did not answer. That is not the "
+                    "same as clean."
+                    if security.get("unknown")
+                    else (
+                        f"honeypot `{security.get('honeypot')}` • can sell "
+                        f"`{security.get('can_sell')}` • renounced "
+                        f"`{security.get('renounced')}`\n"
+                        f"LP burned `{security.get('lp_burned')}` • wash trading "
+                        f"`{security.get('wash_trading')}` • risk score "
+                        f"`{security.get('risk_score')}`"
+                    )
+                )
+                + ("\n🔴 **HARD FAIL**" if security.get("hard_fail") else "")
+            ),
+            inline=False,
+        )
+    observations = payload.get("observations") or []
+    if observations:
+        embed.add_field(
+            name="Recent GMGN observations",
+            value="\n".join(
+                f"`{item.get('kind')}` <t:{item.get('observed_at', 0)}:R>"
+                + (f" • {item.get('interval')} #{item.get('rank')}" if item.get("rank") else "")
+                for item in observations[:6]
+            ),
+            inline=False,
+        )
+    terminal = str(payload.get("terminal_url") or "")
+    if terminal:
+        embed.add_field(name="Navigation", value=f"[Open in Terminal]({terminal})", inline=False)
+    embed.set_footer(
+        text="GMGN is one source among several. A provider outage reads as UNKNOWN, never as safe."
+    )
     return _clamp_embed(embed)
 
 
@@ -8338,7 +8610,9 @@ class FomoCommands(
             "board/token/hotwatch/why: Fomo Trending • trenches/new/almostbonded/"
             "recentlybonded/hot: Pump.fun • public: our own model • latency: "
             "launch→observation • traders: top on-chain traders for a mint • "
-            "whynotpinged: every hot-watch decision and its exact reason"
+            "whynotpinged: every hot-watch decision and its exact reason • "
+            "gmgn: provider truth panel • lifecycle: new pairs/final stretch/"
+            "migrated • detail: everything about one exact mint"
         ),
         mint=(
             "Exact mint for view:token or view:trenchtoken. A name or ticker is "
@@ -8363,6 +8637,9 @@ class FomoCommands(
             "latency",
             "traders",
             "whynotpinged",
+            "gmgn",
+            "lifecycle",
+            "detail",
         ] = "board",
         mint: str | None = None,
     ) -> None:
@@ -8401,6 +8678,34 @@ class FomoCommands(
                     interaction, embed=_public_trending_embed(board, trench_status)
                 )
                 return
+            # --- v2.45 GMGN views -------------------------------------
+            if view == "gmgn":
+                await self._resolve_lab(
+                    interaction,
+                    embed=_gmgn_status_embed(await self.bot.engine.gmgn_status()),
+                )
+                return
+            if view == "lifecycle":
+                await self._resolve_lab(
+                    interaction,
+                    embed=_gmgn_board_embed(await self.bot.engine.gmgn_board()),
+                )
+                return
+            if view == "detail":
+                exact = (mint or "").strip()
+                if not exact:
+                    await self._resolve_lab(
+                        interaction,
+                        content=(
+                            "`view:detail` needs the **exact mint**. A ticker is not "
+                            "an identity and is never resolved to one here."
+                        ),
+                    )
+                    return
+                payload = await self.bot.engine.gmgn_token_detail(exact)
+                await self._resolve_lab(interaction, embed=_gmgn_detail_embed(payload))
+                return
+
             # --- v2.44 views ------------------------------------------
             if view == "whynotpinged":
                 report = await self.bot.engine.early_watch_report()

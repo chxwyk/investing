@@ -32,6 +32,7 @@ from .discord_render import (
     P_DIAGNOSTICS,
     P_EDGE,
     P_IDENTITY,
+    P_LIFECYCLE,
     P_LINKS,
     P_LIQUIDITY,
     P_MOMENTUM,
@@ -86,6 +87,14 @@ PUBLIC_TRENDING_ALERT = "PUBLIC_TRENDING"
 #: available.  This is the card the production failure in section 1 never got.
 EARLY_PROMOTION = "EARLY_PROMOTION"
 
+# --- GMGN participant alerts (v2.45, sections 22, 23) ------------------------
+#: A wallet GMGN classifies as smart money entered.  A classification, not a
+#: track record — the card says which it is.
+GMGN_SMART_MONEY_ALERT = "GMGN_SMART_MONEY"
+#: A KOL entered.  Attention, explicitly not expectancy.  Kept as its own class
+#: so the forward record can answer whether famous buyers are worth anything.
+GMGN_KOL_ALERT = "GMGN_KOL"
+
 ALERT_CLASSES: tuple[str, ...] = (
     FAST_WATCH,
     NOTABLE_TRADER_EARLY,
@@ -108,6 +117,8 @@ ALERT_CLASSES: tuple[str, ...] = (
     ALMOST_BONDED_ALERT,
     PUBLIC_TRENDING_ALERT,
     EARLY_PROMOTION,
+    GMGN_SMART_MONEY_ALERT,
+    GMGN_KOL_ALERT,
 )
 
 #: Classes that may interrupt the user.  A late observation never does — it is
@@ -135,6 +146,10 @@ PINGABLE: frozenset[str] = frozenset(
         # A promotion is by definition the moment the evidence became worth
         # an interruption, so it is the one card that must reach the human.
         EARLY_PROMOTION,
+        # A provider-classified smart-money entry is worth a look while the
+        # edge exists.  A KOL entry deliberately is NOT: fame is attention, and
+        # attention is what the radar lane is for.
+        GMGN_SMART_MONEY_ALERT,
     }
 )
 
@@ -170,6 +185,7 @@ URGENT_CLASSES: frozenset[str] = frozenset(
         # A promotion is the moment a watched near-miss became worth an
         # interruption, so it belongs in the lane interruptions live in.
         EARLY_PROMOTION,
+        GMGN_SMART_MONEY_ALERT,
     }
 )
 
@@ -2113,4 +2129,196 @@ def build_promotion_alert(
         token_mint=mint,
         lane=LANE_URGENT if trustworthy else LANE_RADAR,
         family=family,
+    )
+
+
+# --- GMGN participant cards (sections 21, 22, 23) ----------------------------
+
+
+def build_gmgn_participant_alert(
+    *,
+    mint: str,
+    name: str,
+    symbol: str,
+    fomo_url: str,
+    wallet: str,
+    wallet_label: str = "",
+    kind: str = GMGN_SMART_MONEY_ALERT,
+    trade_usd: Decimal | None = None,
+    wallet_entry_market_cap_usd: Decimal | None = None,
+    detection_market_cap_usd: Decimal | None = None,
+    current_market_cap_usd: Decimal | None = None,
+    seconds_late: int | None = None,
+    lifecycle_stage: str = "",
+    trending_rank: int | None = None,
+    trending_interval: str = "",
+    independent_wallets: int = 1,
+    cluster_note: str = "",
+    bot_reputation: str = "",
+    bot_reputation_samples: int = 0,
+    story_summary: str = "",
+    safety_status: str = "UNKNOWN",
+    identity_verified: bool = True,
+    symbol_collision: bool = False,
+    edge_consumed: bool = False,
+    image_url: str = "",
+    terminal_url: str = "",
+) -> FastAlert:
+    """The stage-1 card for a provider-classified wallet entering a mint.
+
+    Published before deep enrichment finishes, because that is the entire point
+    (section 21): an operator finding out four minutes later has found out that
+    they missed it.
+
+    Two honesty rules shape the wording.  **A GMGN tag is a classification, not
+    a track record** — the card says "GMGN classification" and shows this bot's
+    own forward-measured reputation separately, so a wallet GMGN calls smart
+    money and our record calls a late chaser reads as exactly that.  And **a KOL
+    is not smart money**: famous is attention, so the KOL card says KOL, never
+    borrows the smart-money headline, and never pings.
+    """
+
+    is_kol = kind == GMGN_KOL_ALERT
+    trustworthy = identity_verified and not edge_consumed
+    if not identity_verified:
+        title = "🔬 RESEARCH CANDIDATE — IDENTITY UNVERIFIED"
+    elif edge_consumed:
+        title = (
+            "⚠ KOL ACTIVITY — EDGE CONSUMED"
+            if is_kol
+            else "⚠ SMART MONEY BUY — EDGE CONSUMED"
+        )
+    elif is_kol:
+        title = "📣 KOL ACTIVITY — LOOK NOW"
+    else:
+        title = "🐋 SMART MONEY BUY — LOOK NOW"
+
+    display = wallet_label or f"{wallet[:6]}…{wallet[-4:] if len(wallet) > 10 else ''}"
+    current_mc = current_market_cap_usd
+    classification = "KOL" if is_kol else "SMART MONEY"
+
+    fields = [
+        CardField(
+            "WALLET",
+            (
+                f"**{display}**\n`{wallet}`\n"
+                f"GMGN classification: **{classification}**"
+                + (
+                    f"\nOur own forward record: `{bot_reputation}` "
+                    f"({bot_reputation_samples} samples)"
+                    if bot_reputation
+                    else "\nOur own forward record: `no sample yet`"
+                )
+                + (
+                    "\n_A provider label is a classification, not a track record._"
+                    if not bot_reputation
+                    else ""
+                )
+            ),
+            P_IDENTITY,
+        ),
+        CardField(
+            "ENTRY vs NOW",
+            (
+                f"Trade `{_money(trade_usd)}`\n"
+                f"Wallet entry MC `{_money(wallet_entry_market_cap_usd)}`\n"
+                f"Bot detected `{_money(detection_market_cap_usd)}`\n"
+                f"Current MC `{_money(current_market_cap_usd)}`\n"
+                "Move since wallet entry "
+                f"`{_percent_or(_move_percent(wallet_entry_market_cap_usd, current_mc))}`"
+                + (
+                    f" • seconds late `{seconds_late}`"
+                    if seconds_late is not None
+                    else ""
+                )
+            ),
+            P_DECISION,
+        ),
+        CardField(
+            "TOKEN STATE",
+            (
+                (f"Lifecycle `{lifecycle_stage}`\n" if lifecycle_stage else "")
+                + (
+                    f"GMGN Trending `{trending_interval} #{trending_rank}`\n"
+                    if trending_rank is not None
+                    else ""
+                )
+                + (f"Story: {story_summary}\n" if story_summary else "Story: none found\n")
+                + f"Safety: **{safety_status}** — validation running, not a safety pass"
+            ),
+            P_LIFECYCLE,
+        ),
+    ]
+
+    why: list[str] = []
+    if is_kol:
+        why.append("a KOL entered — this is attention, not proven expectancy")
+    else:
+        why.append("a wallet GMGN classifies as smart money entered")
+    if independent_wallets > 1:
+        why.append(f"{independent_wallets} independent tagged wallets, after cluster collapse")
+    if not edge_consumed:
+        why.append("current edge still available")
+    else:
+        why.append("the move was already made by the time we saw it")
+    if cluster_note:
+        why.append(cluster_note)
+    fields.append(
+        CardField(
+            "WHY YOU'RE SEEING THIS",
+            "\n".join(f"• {item}" for item in why),
+            P_WHY_SURFACED,
+        )
+    )
+
+    fields.append(
+        CardField(
+            "STATE",
+            (
+                f"Identity: **{'VERIFIED' if identity_verified else 'UNVERIFIED'}**"
+                f" • Symbol collision: **{'YES' if symbol_collision else 'NO'}**\n"
+                f"Safety: **{safety_status}**\n"
+                "Entry eligible: **NO** • Trade CTA: **DISABLED**"
+            ),
+            P_SAFETY,
+        )
+    )
+    links = _links(mint, fomo_url)
+    if terminal_url:
+        links += f" • [TERMINAL]({terminal_url})"
+    fields.append(CardField("LINKS", links, P_LIQUIDITY))
+
+    spec = CardSpec(
+        title=title,
+        description=(
+            f"**{name}** `${symbol}`\nMint: `{mint}`\n"
+            f"{display} • {classification}\n{links}"
+        ),
+        compact_description=(
+            f"{title}\n**{name}** `${symbol}`\n`{mint}`\n"
+            f"{display} ({classification}) • entry "
+            f"`{_money(wallet_entry_market_cap_usd)}` → now "
+            f"`{_money(current_market_cap_usd)}`"
+        ),
+        fields=tuple(fields),
+        footer=RESEARCH_ONLY_FOOTER,
+        thumbnail_url=image_url,
+        colour=0x95A5A6 if not trustworthy else (0x9B59B6 if is_kol else 0x2ECC71),
+    )
+    return FastAlert(
+        kind=kind,
+        mint=mint,
+        alert_key=f"{kind}:{mint}:{wallet}",
+        spec=spec,
+        # A KOL never interrupts: fame is attention, and attention belongs on
+        # the radar until the forward record says otherwise.
+        ping=trustworthy and not is_kol,
+        ping_reason=kind,
+        trade_eligible=False,
+        identity_verified=identity_verified,
+        symbol_collision=symbol_collision,
+        fingerprint=f"{kind}:{wallet}",
+        token_mint=mint,
+        lane=LANE_URGENT if (trustworthy and not is_kol) else LANE_RADAR,
+        family=kind,
     )

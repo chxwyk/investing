@@ -651,6 +651,11 @@ def test_only_earned_classes_may_interrupt_the_user() -> None:
     while the edge was still available.  It is the one card in the release that
     exists *because* it earned an interruption — the whole point of promoting a
     candidate is that waiting for the operator to scroll the radar is too late.
+
+    v2.45 adds GMGN_SMART_MONEY and, deliberately, *not* GMGN_KOL.  A wallet a
+    provider classifies as smart money entering while the edge is live is worth
+    a look; a famous account buying is attention, and attention belongs on the
+    radar until our own forward record says it is worth more than that.
     """
 
     assert set(fa.PINGABLE) == {
@@ -666,7 +671,9 @@ def test_only_earned_classes_may_interrupt_the_user() -> None:
         fa.ALMOST_BONDED_ALERT,
         fa.PUBLIC_TRENDING_ALERT,
         fa.EARLY_PROMOTION,
+        fa.GMGN_SMART_MONEY_ALERT,
     }
+    assert fa.GMGN_KOL_ALERT not in fa.PINGABLE
     assert fa.NOTABLE_TRADER_LATE not in fa.PINGABLE
     assert fa.CATALYST_WATCH not in fa.PINGABLE
     assert fa.EARLY_HEADS_UP not in fa.PINGABLE

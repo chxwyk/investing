@@ -100,6 +100,35 @@ def _early_watch_from_row(row: Any) -> dict[str, Any]:
     return payload
 
 
+def _lifecycle_from_row(row: Any) -> dict[str, Any]:
+    """Rebuild a lifecycle payload, protected first-seen columns winning."""
+
+    data = dict(row)
+    return {
+        "mint": data.get("mint"),
+        "chain": data.get("chain"),
+        "stage": data.get("stage"),
+        "first_seen_at": data.get("first_seen_at"),
+        "first_seen_market_cap_usd": data.get("first_seen_market_cap_usd"),
+        "first_seen_source": data.get("first_seen_source"),
+        "updated_at": data.get("updated_at"),
+        "current_market_cap_usd": data.get("current_market_cap_usd"),
+        "peak_market_cap_usd": data.get("peak_market_cap_usd"),
+        "marks": _json_any(data.get("marks_json")),
+        "sources": _json_list(data.get("sources_json")),
+    }
+
+
+def _json_any(raw: object) -> list[Any]:
+    if not raw:
+        return []
+    try:
+        loaded = json.loads(str(raw))
+    except ValueError:
+        return []
+    return loaded if isinstance(loaded, list) else []
+
+
 def _json_list(raw: object) -> list[str]:
     if not raw:
         return []
@@ -1602,6 +1631,48 @@ class Database:
             );
             CREATE INDEX IF NOT EXISTS idx_holder_samples_mint
                 ON holder_samples(mint, observed_at DESC);
+
+            -- One lifecycle per exact mint (v2.45, sections 9-11).  A token
+            -- that changes stage is the same token: it keeps its history, and
+            -- the first-seen columns are written once so lateness stays
+            -- measurable against what we actually knew first.
+            CREATE TABLE IF NOT EXISTS token_lifecycles (
+                mint TEXT PRIMARY KEY,
+                chain TEXT NOT NULL DEFAULT 'solana',
+                stage TEXT NOT NULL DEFAULT 'UNKNOWN',
+                first_seen_at INTEGER NOT NULL,
+                first_seen_market_cap_usd REAL,
+                first_seen_source TEXT NOT NULL DEFAULT '',
+                updated_at INTEGER NOT NULL DEFAULT 0,
+                current_market_cap_usd REAL,
+                peak_market_cap_usd REAL,
+                marks_json TEXT NOT NULL DEFAULT '[]',
+                sources_json TEXT NOT NULL DEFAULT '[]'
+            );
+            CREATE INDEX IF NOT EXISTS idx_token_lifecycles_stage
+                ON token_lifecycles(stage, updated_at DESC);
+
+            -- GMGN observations, attributed to the provider that supplied them
+            -- (sections 19, 20, 64).  A provider label is evidence about a
+            -- classification; it is never merged into our own forward-measured
+            -- reputation, which is why the source column is mandatory.
+            CREATE TABLE IF NOT EXISTS gmgn_observations (
+                observation_id TEXT PRIMARY KEY,
+                mint TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                observed_at INTEGER NOT NULL,
+                wallet TEXT NOT NULL DEFAULT '',
+                label TEXT NOT NULL DEFAULT '',
+                interval TEXT NOT NULL DEFAULT '',
+                rank INTEGER,
+                market_cap_usd REAL,
+                amount_usd REAL,
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_gmgn_observations_mint
+                ON gmgn_observations(mint, observed_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_gmgn_observations_kind
+                ON gmgn_observations(kind, observed_at DESC);
             """
         )
         await self._migrate_pump_launch_status_constraint()
@@ -5711,6 +5782,141 @@ class Database:
         )
         row = await cursor.fetchone()
         return None if row is None else _early_watch_from_row(row)
+
+    # ------------------------------------------------------------------
+    # token lifecycles and GMGN observations (v2.45)
+    # ------------------------------------------------------------------
+
+    #: Written once when a mint is first seen.  Every "this was late" statement
+    #: is a comparison against these, so an update that touched them would
+    #: delete the evidence of lateness rather than refresh it.
+    _LIFECYCLE_IMMUTABLE: tuple[str, ...] = (
+        "first_seen_at",
+        "first_seen_market_cap_usd",
+        "first_seen_source",
+    )
+
+    async def save_token_lifecycle(self, payload: dict[str, Any]) -> None:
+        columns = {
+            "mint": str(payload.get("mint") or ""),
+            "chain": str(payload.get("chain") or "solana"),
+            "stage": str(payload.get("stage") or "UNKNOWN"),
+            "first_seen_at": int(payload.get("first_seen_at") or 0),
+            "first_seen_market_cap_usd": _float_or_none(
+                payload.get("first_seen_market_cap_usd")
+            ),
+            "first_seen_source": str(payload.get("first_seen_source") or ""),
+            "updated_at": int(payload.get("updated_at") or 0),
+            "current_market_cap_usd": _float_or_none(payload.get("current_market_cap_usd")),
+            "peak_market_cap_usd": _float_or_none(payload.get("peak_market_cap_usd")),
+            "marks_json": json.dumps(payload.get("marks") or []),
+            "sources_json": json.dumps(list(payload.get("sources") or [])),
+        }
+        names = list(columns)
+        updatable = [
+            name for name in names if name not in {"mint", *self._LIFECYCLE_IMMUTABLE}
+        ]
+        await self.db.execute(
+            f"INSERT INTO token_lifecycles ({', '.join(names)}) "
+            f"VALUES ({', '.join('?' for _ in names)}) "
+            f"ON CONFLICT(mint) DO UPDATE SET "
+            + ", ".join(f"{name}=excluded.{name}" for name in updatable),
+            tuple(columns[name] for name in names),
+        )
+        await self.db.commit()
+
+    async def token_lifecycle_row(self, mint: str) -> dict[str, Any] | None:
+        cursor = await self.db.execute(
+            "SELECT * FROM token_lifecycles WHERE mint = ?", (mint,)
+        )
+        row = await cursor.fetchone()
+        return None if row is None else _lifecycle_from_row(row)
+
+    async def token_lifecycle_rows(
+        self,
+        *,
+        stages: tuple[str, ...] = (),
+        limit: int = 60,
+    ) -> list[dict[str, Any]]:
+        if stages:
+            placeholders = ", ".join("?" for _ in stages)
+            cursor = await self.db.execute(
+                f"SELECT * FROM token_lifecycles WHERE stage IN ({placeholders}) "
+                "ORDER BY updated_at DESC LIMIT ?",
+                (*stages, limit),
+            )
+        else:
+            cursor = await self.db.execute(
+                "SELECT * FROM token_lifecycles ORDER BY updated_at DESC LIMIT ?",
+                (limit,),
+            )
+        return [_lifecycle_from_row(row) for row in await cursor.fetchall()]
+
+    async def record_gmgn_observation(
+        self,
+        *,
+        observation_id: str,
+        mint: str,
+        kind: str,
+        observed_at: int,
+        wallet: str = "",
+        label: str = "",
+        interval: str = "",
+        rank: int | None = None,
+        market_cap_usd: float | None = None,
+        amount_usd: float | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> bool:
+        """Persist one provider observation.  Replays are ignored, not doubled.
+
+        ``observation_id`` is derived by the caller from the observation itself,
+        so a restart that re-reads the same board row records nothing new — the
+        forward sample must count events, not polls.
+        """
+
+        cursor = await self.db.execute(
+            "INSERT OR IGNORE INTO gmgn_observations ("
+            "observation_id, mint, kind, observed_at, wallet, label, interval, "
+            "rank, market_cap_usd, amount_usd, payload_json"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                observation_id,
+                mint,
+                kind,
+                observed_at,
+                wallet,
+                label,
+                interval,
+                rank,
+                market_cap_usd,
+                amount_usd,
+                json.dumps(payload or {}),
+            ),
+        )
+        await self.db.commit()
+        return bool(cursor.rowcount)
+
+    async def gmgn_observation_rows(
+        self,
+        *,
+        mint: str = "",
+        kind: str = "",
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if mint:
+            clauses.append("mint = ?")
+            params.append(mint)
+        if kind:
+            clauses.append("kind = ?")
+            params.append(kind)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        cursor = await self.db.execute(
+            f"SELECT * FROM gmgn_observations {where} ORDER BY observed_at DESC LIMIT ?",
+            (*params, limit),
+        )
+        return [dict(row) for row in await cursor.fetchall()]
 
     async def token_swap_rows(self, mint: str, *, limit: int = 200) -> list[dict[str, Any]]:
         """Every observed fill for one exact mint, newest first.

@@ -47,9 +47,12 @@ from .errors import (
     RpcError,
     UnknownLaunchResultError,
 )
+from .execution import ShadowExecutionProvider, gates_from_settings
 from .executor import ExecutionManager
 from .fast_alerts import (
     ALMOST_BONDED_ALERT,
+    GMGN_KOL_ALERT,
+    GMGN_SMART_MONEY_ALERT,
     PUBLIC_TRENDING_ALERT,
     TRENCH_RUNNER_ALERT,
     TRENDING_ACCELERATION_ALERT,
@@ -60,6 +63,7 @@ from .fast_alerts import (
     build_catalyst_alert,
     build_early_alert,
     build_fast_watch_alert,
+    build_gmgn_participant_alert,
     build_notable_trader_alert,
     build_promotion_alert,
     build_public_trending_alert,
@@ -70,6 +74,10 @@ from .fast_alerts import (
     build_trending_hot_watch_card,
     enrichment_from_evidence,
 )
+from .gmgn import BudgetConfig as GmgnBudgetConfig
+from .gmgn import GmgnClient
+from .gmgn import lifecycle as gmgn_stages
+from .gmgn_runtime import GmgnRuntime, independent_provider_wallets
 from .lab.actionability import RankedCandidate as LabRankedCandidate
 from .lab.actionability import rank_by_current_edge
 from .lab.catalyst import (
@@ -162,6 +170,7 @@ from .lab.shadow import (
     FAMILY_CONFLUENCE_WATCH,
     FAMILY_FAST_WATCH,
     FAMILY_FRESH_RUNNER,
+    FAMILY_GMGN_SMART_MONEY,
     FAMILY_LABELS,
     FAMILY_NOTABLE_EARLY,
     FAMILY_NOTABLE_LATE,
@@ -641,6 +650,34 @@ class SmartMoneyEngine:
         self._trending_hot_watch_task: asyncio.Task[None] | None = None
         self._trenches_task: asyncio.Task[None] | None = None
         # --- early-candidate hot watch (v2.44, sections 2, 3, 29) -------
+        # --- GMGN research provider (v2.45) -----------------------------
+        # Constructed even when unconfigured: an unconfigured client reports
+        # AUTH_MISSING and returns nothing, which is exactly what the rest of
+        # the bot needs in order to keep working without it.
+        self.gmgn = GmgnClient(
+            api_key=getattr(settings, "gmgn_api_key", ""),
+            enabled=bool(getattr(settings, "gmgn_enabled", False)),
+            host=getattr(settings, "gmgn_host", "https://openapi.gmgn.ai"),
+            chain=getattr(settings, "gmgn_chain", "sol"),
+            timeout_seconds=float(getattr(settings, "gmgn_timeout_seconds", 12)),
+            budget_config=GmgnBudgetConfig(
+                max_calls_per_minute=int(getattr(settings, "gmgn_max_calls_per_minute", 60)),
+                max_calls_per_hour=int(getattr(settings, "gmgn_max_calls_per_hour", 900)),
+                breaker_threshold=int(getattr(settings, "gmgn_breaker_threshold", 5)),
+                breaker_seconds=int(getattr(settings, "gmgn_breaker_seconds", 120)),
+            ),
+        )
+        self.gmgn_runtime = GmgnRuntime(
+            self.gmgn, database=self.database, settings=settings
+        )
+        self._gmgn_task: asyncio.Task[None] | None = None
+        self.gmgn_candidates_published = 0
+        self.gmgn_participant_alerts = 0
+        # The future execution interface, wired and switched off (sections
+        # 74-83).  The only provider that exists records intents; there is no
+        # order path behind any of these gates to turn on.
+        self.live_gates = gates_from_settings(settings)
+        self.execution = ShadowExecutionProvider(gates=self.live_gates)
         self._early_watch_task: asyncio.Task[None] | None = None
         self._early_watches: dict[str, EarlyWatchEntry] = {}
         self._holder_series: dict[str, HolderSeries] = {}
@@ -947,6 +984,13 @@ class SmartMoneyEngine:
                 self._run_early_watch(),
                 name="smart-money-early-watch",
             )
+        # GMGN is the primary professional feed; our public/on-chain engine
+        # keeps running alongside it as independent confirmation and fallback
+        # (section 8).  Neither is allowed to be a single point of failure.
+        if self.gmgn.configured:
+            self._gmgn_task = asyncio.create_task(
+                self._run_gmgn(), name="smart-money-gmgn"
+            )
         # Graduated discovery is retained as the SECONDARY universe.  It is
         # demoted, never deleted.
         if (
@@ -986,6 +1030,7 @@ class SmartMoneyEngine:
             self._trending_task,
             self._trending_hot_watch_task,
             self._early_watch_task,
+            self._gmgn_task,
             self._trenches_task,
             self._pump_creation_task,
             self._pump_creation_consumer_task,
@@ -1006,6 +1051,7 @@ class SmartMoneyEngine:
         self._trending_task = None
         self._trending_hot_watch_task = None
         self._early_watch_task = None
+        self._gmgn_task = None
         self._trenches_task = None
         self._pump_creation_task = None
         self._pump_creation_consumer_task = None
@@ -1863,6 +1909,176 @@ class SmartMoneyEngine:
         self.last_early_alert_at = now
         self.last_early_alert_mint = mint
         return True
+
+    # ------------------------------------------------------------------
+    # GMGN research provider (v2.45)
+    # ------------------------------------------------------------------
+
+    async def _run_gmgn(self) -> None:
+        """Poll GMGN on its own cadence.  Its failures never stop the bot."""
+
+        while True:
+            with suppress(asyncio.CancelledError):
+                try:
+                    await self._gmgn_cycle()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("GMGN cycle failed")
+            await asyncio.sleep(self.settings.gmgn_poll_seconds)
+
+    async def _gmgn_cycle(self) -> None:
+        """One poll, then hand the results to machinery that already exists.
+
+        The candidates go into the early lane, not into a parallel alerting
+        path: a GMGN-discovered token and a Pump-discovered token deserve the
+        same scrutiny, and a second alerting path would be a second place for
+        the identity and safety rules to be forgotten.
+        """
+
+        now = int(time.time())
+        result = await self.gmgn_runtime.scan(now=now)
+        for error in result.errors[:3]:
+            logger.info("GMGN feed unavailable: %s", error)
+        if not result.candidates:
+            return
+
+        budget = max(0, int(self.settings.gmgn_enrichment_per_scan))
+        for candidate in result.candidates[:budget]:
+            mint = candidate.mint
+            # The exact mint that GMGN reported is the exact mint that gets
+            # analysed.  Nothing between here and the card may substitute it.
+            assert_exact_propagation(mint, mint, stage="gmgn candidate → early lane")
+            with suppress(Exception):
+                if await self._early_lane_task(mint, now=now):
+                    self.gmgn_candidates_published += 1
+            # A GMGN observation on an already-watched candidate is new
+            # information: re-evaluate promotion now rather than at the next
+            # timer tick (section 47).
+            with suppress(Exception):
+                await self.note_early_watch_event(mint, trigger=f"gmgn:{candidate.family}")
+
+    async def note_gmgn_participant(
+        self,
+        *,
+        mint: str,
+        wallet: str,
+        trade_usd: Decimal | None = None,
+        entry_market_cap_usd: Decimal | None = None,
+        now: int | None = None,
+    ) -> bool:
+        """Publish the stage-1 card when a tagged wallet enters (sections 21-23).
+
+        Deliberately cheap: a DEX snapshot the bot already caches, the wallet's
+        provider tag, and our own reputation row.  Deep enrichment happens after
+        the operator has been told, not before.
+        """
+
+        moment = now if now is not None else int(time.time())
+        tags = self.gmgn_runtime.classify_wallet(wallet)
+        if not tags:
+            return False
+        kind = (
+            GMGN_SMART_MONEY_ALERT
+            if FAMILY_GMGN_SMART_MONEY in tags
+            else GMGN_KOL_ALERT
+        )
+        snapshot = await self.dex_screener.snapshot(mint)
+        if not snapshot.available:
+            return False
+        assert_exact_propagation(mint, mint, stage="gmgn participant → card")
+
+        name, symbol = await self._cached_token_names(mint)
+        reputation = await self._wallet_reputation(wallet)
+        lifecycle = self.gmgn_runtime.lifecycle_for(mint)
+        move = _move_percent_or_none(entry_market_cap_usd, snapshot.market_cap_usd)
+        alert = build_gmgn_participant_alert(
+            mint=mint,
+            name=name if name != "Unknown token" else (symbol or mint[:8]),
+            symbol=symbol,
+            fomo_url=self._fomo_url(mint),
+            wallet=wallet,
+            wallet_label=str(
+                getattr(
+                    self.gmgn_runtime.smart_money.get(wallet)
+                    or self.gmgn_runtime.kols.get(wallet),
+                    "label",
+                    "",
+                )
+                or ""
+            ),
+            kind=kind,
+            trade_usd=trade_usd,
+            wallet_entry_market_cap_usd=entry_market_cap_usd,
+            detection_market_cap_usd=snapshot.market_cap_usd,
+            current_market_cap_usd=snapshot.market_cap_usd,
+            lifecycle_stage=lifecycle.stage if lifecycle is not None else "",
+            bot_reputation=str(getattr(reputation, "state", "") or ""),
+            bot_reputation_samples=int(getattr(reputation, "samples", 0) or 0),
+            safety_status="UNKNOWN",
+            symbol_collision=await self._symbol_collides(mint, symbol),
+            # Past a doubling since the wallet entered, this is a record of what
+            # happened rather than a chance to join it (section 50).
+            edge_consumed=bool(move is not None and move >= Decimal("100")),
+            terminal_url=self._terminal_url(mint),
+        )
+        published = await self._publish_fast_alert(alert, now=moment)
+        if published:
+            self.gmgn_participant_alerts += 1
+            self._schedule_alert_enrichment(alert)
+            with suppress(Exception):
+                await self.note_early_watch_event(mint, trigger=f"gmgn:{kind}")
+        return published
+
+    async def gmgn_status(self) -> dict[str, Any]:
+        """The truth panel's GMGN half (section 87).  Never the credential."""
+
+        payload = dict(self.gmgn_runtime.status())
+        payload["live_gates"] = self.live_gates.to_json()
+        payload["execution_provider"] = self.execution.name
+        payload["execution_can_trade"] = self.execution.can_trade
+        payload["real_money_spent_usd"] = "0"
+        return payload
+
+    async def gmgn_board(self, *, limit: int = 12) -> dict[str, Any]:
+        """NEW PAIRS / FINAL STRETCH / MIGRATED (sections 44, 89).
+
+        Read from persistence rather than from memory so a redeploy does not
+        empty the operator's board.
+        """
+
+        sections: dict[str, list[dict[str, Any]]] = {}
+        for name, stage_set in gmgn_stages.BOARD_SECTIONS.items():
+            rows: list[dict[str, Any]] = []
+            with suppress(Exception):
+                rows = await self.database.token_lifecycle_rows(
+                    stages=tuple(sorted(stage_set)), limit=limit
+                )
+            sections[name] = rows
+        return {"sections": sections, "status": await self.gmgn_status()}
+
+    async def gmgn_token_detail(self, mint: str) -> dict[str, Any]:
+        """One exact mint, everything we have (section 90)."""
+
+        assert_exact_propagation(mint, mint, stage="gmgn detail → render")
+        payload: dict[str, Any] = {"mint": mint}
+        with suppress(Exception):
+            payload["lifecycle"] = await self.database.token_lifecycle_row(mint)
+        with suppress(Exception):
+            payload["observations"] = await self.database.gmgn_observation_rows(
+                mint=mint, limit=12
+            )
+        holders, traders = await self.gmgn_runtime.token_participants(mint)
+        payload["holders"] = [item.to_json() for item in holders]
+        payload["traders"] = [item.to_json() for item in traders]
+        payload["independent_tagged_wallets"] = independent_provider_wallets(
+            (*holders, *traders)
+        )
+        if self.settings.gmgn_security_enabled:
+            security = await self.gmgn.security(mint)
+            payload["security"] = security.to_json()
+        payload["terminal_url"] = self._terminal_url(mint)
+        return payload
 
     # ------------------------------------------------------------------
     # early-candidate HOT WATCH and event-driven promotion (v2.44)
@@ -4278,6 +4494,10 @@ class SmartMoneyEngine:
         live: dict[str, dict[str, Any]] = {}
         if self.discovery is not None and hasattr(self.discovery, "usage_snapshot"):
             live["solana_tracker"] = self.discovery.usage_snapshot()
+        # GMGN reports its own health, budget and latency percentiles.  The
+        # snapshot deliberately contains no credential — see gmgn.client.
+        with suppress(Exception):
+            live["gmgn"] = self.gmgn.usage_snapshot()
         risk = self.tracker_token_risk.usage_snapshot()
         if risk.get("degraded"):
             live.setdefault("solana_tracker", {})["degraded"] = True
@@ -9488,6 +9708,18 @@ def _int_or_none_engine(value: Any) -> int | None:
         return int(value)
     except Exception:
         return None
+
+
+def _move_percent_or_none(base: Decimal | None, current: Decimal | None) -> Decimal | None:
+    """Percentage move between two market caps, or ``None`` if either is absent.
+
+    ``None`` rather than zero: an unknown entry price must never render as "flat
+    since entry", which would make a late signal look early.
+    """
+
+    if base is None or current is None or base <= Decimal("0"):
+        return None
+    return ((current - base) / base * Decimal("100")).quantize(Decimal("0.01"))
 
 
 def _engine_decimal(value: Any) -> Decimal | None:
