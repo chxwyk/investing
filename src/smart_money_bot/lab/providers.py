@@ -45,6 +45,23 @@ CREDIT_STATUSES: frozenset[int] = frozenset({401, 402, 403, 429})
 #: retry loop, so hammering it is pure waste.
 BACKOFF_SECONDS: tuple[int, ...] = (60, 300, 900, 1_800, 3_600)
 
+#: Phrases that mean the plan is out of credits rather than momentarily busy.
+#: A quota does not refill in sixty seconds, so climbing the backoff ladder from
+#: the bottom just means an hour of pointless 403s — production logged exactly
+#: that on every discovery refresh.  These jump straight to the long window.
+EXHAUSTION_PHRASES: tuple[str, ...] = (
+    "insufficient credits",
+    "credit limit",
+    "quota exceeded",
+    "out of credits",
+    "plan limit",
+)
+
+
+def is_exhaustion(message: str) -> bool:
+    lowered = (message or "").lower()
+    return any(phrase in lowered for phrase in EXHAUSTION_PHRASES)
+
 #: After this many consecutive credit failures the provider is reported as
 #: EXHAUSTED rather than merely degraded, which is the state an operator needs
 #: to see on the dashboard.
@@ -143,13 +160,19 @@ def record_failure(
         )
 
     failures = state.consecutive_failures + 1
+    # A stable "insufficient credits" is not a transient throttle: it is the
+    # plan being spent, and it will still be spent in sixty seconds.  Open the
+    # long window immediately rather than rediscovering it five times (§30).
+    window = (
+        BACKOFF_SECONDS[-1] if is_exhaustion(message) else backoff_seconds(failures)
+    )
     return replace(
         state,
         calls=state.calls + 1,
         errors=state.errors + 1,
         credit_failures=state.credit_failures + 1,
         consecutive_failures=failures,
-        degraded_until=now + backoff_seconds(failures),
+        degraded_until=now + window,
         last_error=message or state.last_error,
     )
 

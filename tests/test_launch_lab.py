@@ -231,6 +231,12 @@ async def test_launch_check_spends_zero_sol_and_hides_credentials(settings, tmp_
 
 def _engine_for_launch(settings, *, balance=Decimal("0.03"), reserved=True):
     engine = object.__new__(SmartMoneyEngine)
+    # v2.46: the presentation cache is consulted on every publish, so a
+    # partial engine still needs it — empty, not mocked away.
+    engine._presentations = {}
+    engine._presentation_tasks = set()
+    engine.presentation_edits = 0
+    engine.presentation_unresolved = 0
     engine.settings = _configured(settings)
     j7 = SimpleNamespace(
         configured=True,

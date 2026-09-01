@@ -178,6 +178,19 @@ class RequestBudget:
     def breaker_open(self) -> bool:
         return time.monotonic() < self._breaker_open_until
 
+    def headroom(self, *, now: float | None = None) -> float:
+        """Fraction of the minute budget still unspent, 0..1.
+
+        The minute window is the one that bites first under a burst, so it is
+        the one tier shedding reacts to.  Reported rather than acted on here:
+        *which* call to drop is the endpoint registry's decision.
+        """
+
+        moment = now if now is not None else time.monotonic()
+        self._prune(moment)
+        ceiling = max(1, self.config.max_calls_per_minute)
+        return max(0.0, 1.0 - (len(self._minute_calls) / ceiling))
+
     # ---- cache and coalescing -----------------------------------------
 
     def cache_key(self, kind: str, **params: object) -> str:

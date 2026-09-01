@@ -896,6 +896,12 @@ def _engine(database, notifier, **settings):
     from smart_money_bot.engine import SmartMoneyEngine
 
     engine = object.__new__(SmartMoneyEngine)
+    # v2.46: the presentation cache is consulted on every publish, so a
+    # partial engine still needs it — empty, not mocked away.
+    engine._presentations = {}
+    engine._presentation_tasks = set()
+    engine.presentation_edits = 0
+    engine.presentation_unresolved = 0
     engine.database = database
     engine.notifier = notifier
     engine._lab_config = DEFAULT_LAB_CONFIG

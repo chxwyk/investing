@@ -41,6 +41,7 @@ from .budget import (
     BudgetConfig,
     RequestBudget,
 )
+from .endpoints import EndpointRegistry
 from .health import (
     AUTH_MISSING,
     AUTH_REJECTED,
@@ -58,13 +59,14 @@ from .models import (
     GmgnSecurity,
     GmgnSignal,
     GmgnToken,
+    GmgnWalletTrade,
     parse_hot_searches_response,
     parse_participants,
     parse_rank_response,
     parse_security,
     parse_signals,
     parse_trenches_response,
-    parse_wallet_directory,
+    parse_wallet_trades,
 )
 from .signals import (
     CHAIN_SOLANA,
@@ -183,6 +185,10 @@ class GmgnClient:
         self.chain = chain
         self.timeout_seconds = timeout_seconds
         self.budget = RequestBudget(config=budget_config or BudgetConfig())
+        # Health is per endpoint (section 17).  A 429 on an optional feed cools
+        # that feed; it does not silence discovery, which is exactly what the
+        # single global record did in production.
+        self.endpoints = EndpointRegistry()
         self._session = session
         self._owns_session = session is None
         self.health = ProviderHealth(
@@ -205,7 +211,7 @@ class GmgnClient:
         if self._session is None or getattr(self._session, "closed", False):
             self._session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=self.timeout_seconds),
-                headers={"User-Agent": "SmartMoneyCopyBot/2.45 gmgn-research"},
+                headers={"User-Agent": "SmartMoneyCopyBot/2.46 gmgn-research"},
             )
             self._owns_session = True
         return self._session
@@ -245,6 +251,22 @@ class GmgnClient:
         if not self._api_key:
             raise GmgnError("GMGN_API_KEY is not configured", state=AUTH_MISSING)
 
+        allowed, refusal = self.endpoints.admits(
+            kind, budget_headroom=self.budget.headroom()
+        )
+        if not allowed:
+            if refusal.startswith("SHED_"):
+                self.budget.budget_skips += 1
+                raise GmgnError(
+                    f"{kind} shed to protect the core GMGN budget", state=PROVIDER_DEGRADED
+                )
+            cooling_state = (
+                refusal
+                if refusal in {RATE_LIMITED, RATE_LIMIT_BANNED, DISABLED_BY_CONFIG}
+                else PROVIDER_DEGRADED
+            )
+            raise GmgnError(f"{kind} is cooling down ({refusal})", state=cooling_state)
+
         verdict = self.budget.admit(enabled=self.enabled)
         if verdict != ALLOW:
             if verdict == DENY_BREAKER_OPEN:
@@ -262,7 +284,7 @@ class GmgnClient:
         ttl = self.budget.ttl_for(kind)
         return await self.budget.run(
             key,
-            lambda: self._execute(method, path, query=query, body=body),
+            lambda: self._execute(method, path, kind=kind, query=query, body=body),
             ttl=ttl,
         )
 
@@ -271,6 +293,7 @@ class GmgnClient:
         method: str,
         path: str,
         *,
+        kind: str,
         query: dict[str, Any] | None,
         body: dict[str, Any] | None,
     ) -> Any:
@@ -291,10 +314,22 @@ class GmgnClient:
                 )
                 if exc.state in {RATE_LIMITED, RATE_LIMIT_BANNED}:
                     # Never retry into a rate limit; that is how a 429 becomes
-                    # a ban.  Respect the window the provider named.
-                    self.budget.note_rate_limited(reset_at_unix=exc.reset_at)
+                    # a ban.  The window the provider named cools **this
+                    # endpoint** — the global budget is only paused when a core
+                    # discovery feed is the one being limited, because pausing
+                    # everything for a hot-search 429 is the production bug.
+                    cooldown = _cooldown_seconds(exc.reset_at)
+                    self.endpoints.note_failure(
+                        kind,
+                        state=exc.state,
+                        error=str(exc),
+                        cooldown_seconds=cooldown,
+                    )
+                    if self.endpoints.get(kind).tier == "A":
+                        self.budget.note_rate_limited(reset_at_unix=exc.reset_at)
                     raise
                 self.budget.note_failure()
+                self.endpoints.note_failure(kind, state=exc.state, error=str(exc))
                 if exc.state in {AUTH_MISSING, AUTH_REJECTED, DISABLED_BY_CONFIG}:
                     raise
                 last = exc
@@ -305,6 +340,7 @@ class GmgnClient:
             else:
                 elapsed = int((time.monotonic() - started) * 1000)
                 self.budget.note_success()
+                self.endpoints.note_success(kind, rows=rows)
                 self.health = record_success(self.health, latency_ms=elapsed, rows=rows)
                 return data
         raise last or GmgnError("GMGN request failed", state=PROVIDER_DEGRADED)
@@ -488,8 +524,16 @@ class GmgnClient:
         )
         return parse_signals(data)
 
-    async def smart_money(self, *, limit: int = 100, chain: str | None = None):
-        """The provider's smart-money directory.  A label, not a track record."""
+    async def smart_money(
+        self, *, limit: int = 100, chain: str | None = None
+    ) -> tuple[GmgnWalletTrade, ...]:
+        """Recent trades by wallets GMGN tags ``smart_degen``.
+
+        This is a **trade feed**, not a wallet directory — the official skill is
+        explicit about it.  v2.45 parsed it as a directory, found no top-level
+        wallet address, and reported zero smart-money wallets forever.  A feed is
+        also the better shape: it is the event the fast card wants.
+        """
 
         data = await self._request(
             "GET",
@@ -497,15 +541,21 @@ class GmgnClient:
             kind="smartmoney",
             query={"chain": chain or self.chain, "limit": limit},
         )
-        return parse_wallet_directory(data, kind=TAG_GMGN_SMART_MONEY)
+        return parse_wallet_trades(data, tag=TAG_GMGN_SMART_MONEY)
 
-    async def kols(self, *, limit: int = 100, chain: str | None = None):
-        """The provider's KOL directory.  Attention, explicitly not expectancy."""
+    async def kols(
+        self, *, limit: int = 100, chain: str | None = None
+    ) -> tuple[GmgnWalletTrade, ...]:
+        """Recent trades by wallets GMGN tags ``kol``/``renowned``.
+
+        Kept separate from smart money on purpose: the same skill notes KOL
+        trades "carry social/marketing signal, not necessarily alpha".
+        """
 
         data = await self._request(
             "GET", PATH_KOL, kind="kol", query={"chain": chain or self.chain, "limit": limit}
         )
-        return parse_wallet_directory(data, kind=TAG_GMGN_KOL)
+        return parse_wallet_trades(data, tag=TAG_GMGN_KOL)
 
     async def top_holders(
         self, mint: str, *, limit: int = 20, chain: str | None = None
@@ -620,7 +670,23 @@ class GmgnClient:
             "chain": self.chain,
             **self.health.to_json(),
             **self.budget.snapshot(),
+            # The single ``state`` above is the last call's outcome; this is the
+            # honest picture across every feed (sections 17, 54).
+            "endpoint_health": self.endpoints.to_json(),
         }
+
+
+def _cooldown_seconds(reset_at_unix: int | None, *, default: int = 60) -> int:
+    """How long to leave this endpoint alone, from the provider's own answer.
+
+    Section 19: configuration values are budgets, not statements about the
+    plan.  When GMGN names a reset time we honour it; when it does not, one
+    minute is a conservative guess that does not extend a ban.
+    """
+
+    if reset_at_unix is None:
+        return default
+    return max(1, min(3_600, int(reset_at_unix - time.time()) + 1))
 
 
 def _classify_error(status: int, error: str, message: str) -> str:

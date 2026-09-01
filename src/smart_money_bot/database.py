@@ -100,6 +100,27 @@ def _early_watch_from_row(row: Any) -> dict[str, Any]:
     return payload
 
 
+def _presentation_from_row(row: Any) -> dict[str, Any]:
+    data = dict(row)
+    return {
+        "mint": data.get("mint"),
+        "chain": data.get("chain"),
+        "name": data.get("name"),
+        "symbol": data.get("symbol"),
+        "image_url": data.get("image_url"),
+        "description": data.get("description"),
+        "website": data.get("website"),
+        "twitter": data.get("twitter"),
+        "telegram": data.get("telegram"),
+        "source": data.get("source"),
+        "source_at": data.get("source_at"),
+        "resolved_at": data.get("resolved_at"),
+        "identity_verified": bool(data.get("identity_verified", 1)),
+        "resolution_failed": bool(data.get("resolution_failed")),
+        "sources": _json_list(data.get("sources_json")),
+    }
+
+
 def _lifecycle_from_row(row: Any) -> dict[str, Any]:
     """Rebuild a lifecycle payload, protected first-seen columns winning."""
 
@@ -1673,6 +1694,46 @@ class Database:
                 ON gmgn_observations(mint, observed_at DESC);
             CREATE INDEX IF NOT EXISTS idx_gmgn_observations_kind
                 ON gmgn_observations(kind, observed_at DESC);
+
+            -- How one exact mint is displayed, for its whole life (v2.46).
+            -- Keyed by mint and nothing else: a presentation cache keyed by
+            -- symbol is a same-name substitution waiting to happen.  It is
+            -- persisted so a shadow exit tomorrow still knows today's name and
+            -- icon rather than regressing to a question mark after a restart.
+            CREATE TABLE IF NOT EXISTS token_presentations (
+                mint TEXT PRIMARY KEY,
+                chain TEXT NOT NULL DEFAULT 'solana',
+                name TEXT NOT NULL DEFAULT '',
+                symbol TEXT NOT NULL DEFAULT '',
+                image_url TEXT NOT NULL DEFAULT '',
+                description TEXT NOT NULL DEFAULT '',
+                website TEXT NOT NULL DEFAULT '',
+                twitter TEXT NOT NULL DEFAULT '',
+                telegram TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL DEFAULT '',
+                source_at INTEGER NOT NULL DEFAULT 0,
+                resolved_at INTEGER NOT NULL DEFAULT 0,
+                identity_verified INTEGER NOT NULL DEFAULT 1,
+                resolution_failed INTEGER NOT NULL DEFAULT 0,
+                sources_json TEXT NOT NULL DEFAULT '[]'
+            );
+            CREATE INDEX IF NOT EXISTS idx_token_presentations_recent
+                ON token_presentations(resolved_at DESC);
+
+            -- Per-endpoint provider cooldowns, so a restart does not walk
+            -- straight back into a rate limit it was already serving (§21).
+            CREATE TABLE IF NOT EXISTS provider_endpoint_state (
+                provider TEXT NOT NULL,
+                endpoint TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'UNKNOWN',
+                cooldown_until INTEGER NOT NULL DEFAULT 0,
+                last_success_at INTEGER,
+                last_failure_at INTEGER,
+                rate_limit_hits INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT '',
+                updated_at INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (provider, endpoint)
+            );
             """
         )
         await self._migrate_pump_launch_status_constraint()
@@ -5795,6 +5856,135 @@ class Database:
         "first_seen_market_cap_usd",
         "first_seen_source",
     )
+
+    # ------------------------------------------------------------------
+    # exact-mint presentation and per-endpoint provider state (v2.46)
+    # ------------------------------------------------------------------
+
+    async def save_token_presentation(self, payload: dict[str, Any]) -> None:
+        """Upsert one mint's presentation.  Merging happens before this call.
+
+        Every column is overwritten because the caller has already merged the
+        new observation into the stored one — doing the merge here as well would
+        put the "never lose a field" rule in two places, and two copies of a
+        rule is one copy too many.
+        """
+
+        await self.db.execute(
+            """
+            INSERT INTO token_presentations (
+                mint, chain, name, symbol, image_url, description, website,
+                twitter, telegram, source, source_at, resolved_at,
+                identity_verified, resolution_failed, sources_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(mint) DO UPDATE SET
+                chain=excluded.chain,
+                name=excluded.name,
+                symbol=excluded.symbol,
+                image_url=excluded.image_url,
+                description=excluded.description,
+                website=excluded.website,
+                twitter=excluded.twitter,
+                telegram=excluded.telegram,
+                source=excluded.source,
+                source_at=excluded.source_at,
+                resolved_at=excluded.resolved_at,
+                identity_verified=excluded.identity_verified,
+                resolution_failed=excluded.resolution_failed,
+                sources_json=excluded.sources_json
+            """,
+            (
+                str(payload.get("mint") or ""),
+                str(payload.get("chain") or "solana"),
+                str(payload.get("name") or ""),
+                str(payload.get("symbol") or ""),
+                str(payload.get("image_url") or ""),
+                str(payload.get("description") or ""),
+                str(payload.get("website") or ""),
+                str(payload.get("twitter") or ""),
+                str(payload.get("telegram") or ""),
+                str(payload.get("source") or ""),
+                int(payload.get("source_at") or 0),
+                int(payload.get("resolved_at") or 0),
+                1 if payload.get("identity_verified", True) else 0,
+                1 if payload.get("resolution_failed") else 0,
+                json.dumps(list(payload.get("sources") or [])),
+            ),
+        )
+        await self.db.commit()
+
+    async def token_presentation_row(self, mint: str) -> dict[str, Any] | None:
+        cursor = await self.db.execute(
+            "SELECT * FROM token_presentations WHERE mint = ?", (mint,)
+        )
+        row = await cursor.fetchone()
+        return None if row is None else _presentation_from_row(row)
+
+    async def token_presentation_rows(self, *, limit: int = 500) -> list[dict[str, Any]]:
+        cursor = await self.db.execute(
+            "SELECT * FROM token_presentations ORDER BY resolved_at DESC LIMIT ?",
+            (limit,),
+        )
+        return [_presentation_from_row(row) for row in await cursor.fetchall()]
+
+    async def save_provider_endpoint_state(
+        self,
+        *,
+        provider: str,
+        endpoint: str,
+        state: str,
+        cooldown_until: int = 0,
+        last_success_at: int | None = None,
+        last_failure_at: int | None = None,
+        rate_limit_hits: int = 0,
+        last_error: str = "",
+        now: int = 0,
+    ) -> None:
+        await self.db.execute(
+            """
+            INSERT INTO provider_endpoint_state (
+                provider, endpoint, state, cooldown_until, last_success_at,
+                last_failure_at, rate_limit_hits, last_error, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(provider, endpoint) DO UPDATE SET
+                state=excluded.state,
+                cooldown_until=excluded.cooldown_until,
+                last_success_at=COALESCE(
+                    excluded.last_success_at, provider_endpoint_state.last_success_at
+                ),
+                last_failure_at=COALESCE(
+                    excluded.last_failure_at, provider_endpoint_state.last_failure_at
+                ),
+                rate_limit_hits=excluded.rate_limit_hits,
+                last_error=excluded.last_error,
+                updated_at=excluded.updated_at
+            """,
+            (
+                provider,
+                endpoint,
+                state,
+                cooldown_until,
+                last_success_at,
+                last_failure_at,
+                rate_limit_hits,
+                last_error[:200],
+                now,
+            ),
+        )
+        await self.db.commit()
+
+    async def provider_endpoint_rows(self, *, provider: str = "") -> list[dict[str, Any]]:
+        if provider:
+            cursor = await self.db.execute(
+                "SELECT * FROM provider_endpoint_state WHERE provider = ? "
+                "ORDER BY endpoint",
+                (provider,),
+            )
+        else:
+            cursor = await self.db.execute(
+                "SELECT * FROM provider_endpoint_state ORDER BY provider, endpoint"
+            )
+        return [dict(row) for row in await cursor.fetchall()]
 
     async def save_token_lifecycle(self, payload: dict[str, Any]) -> None:
         columns = {

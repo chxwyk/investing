@@ -7,7 +7,12 @@ transactions, and mirrors every newly detected hot-wallet swap in PAPER mode. PA
 as either a forced source-price observation ledger or an executable Jupiter quote-shadow
 trial; the two answer different questions and are labeled separately.
 
-Version 2.45.0 adds a **read-only GMGN OpenAPI integration** on top of that: professional
+Version 2.46.0 hardens that integration against real production traffic: one canonical
+name, ticker and icon per exact mint for a token's whole life, cards that publish
+immediately and are then edited in place, and per-endpoint GMGN health so an optional feed's
+rate limit can no longer mute discovery.
+
+Version 2.45.0 added a **read-only GMGN OpenAPI integration**: professional
 trending, trenches, smart-money and holder data, joined to the bot's own on-chain engine and
 its story/thesis intelligence, with one lifecycle record per exact mint from new pair to
 second leg. Real-money trading remains completely off, and the execution interface that
@@ -1173,6 +1178,147 @@ The bot needs these Discord application permissions:
 - Use Application Commands
 
 No privileged Discord gateway intents are required.
+
+## Production hardening: identity, images and endpoint health (v2.46)
+
+GMGN is genuinely live — 31+ calls, zero auth errors, ~144ms mean and 391ms p95, 1,274
+candidates seen, 429 lifecycles. Four things then broke in ways only real traffic reveals.
+
+### 1. Cards said `?` and `$?`
+
+The bot knew the exact mint the whole time. What it did not have was anywhere to *keep* a
+name. `_cached_token_names` read one source — the legacy graduated-runner row — which does
+not exist for a token discovered by GMGN or by the Pump creation stream. It returned
+nothing, the fallbacks collapsed to `symbol or "?"`, and a token whose symbol the trending
+row had already carried rendered as a question mark.
+
+**`token_presentation.py`** is now the canonical record: one name, symbol, image, socials and
+provenance per **chain + exact mint**, captured at the point of discovery and persisted.
+
+- **Mint is the key.** Never the name, never the ticker. A presentation cache keyed by symbol
+  is a same-name substitution waiting to happen, and `merge()` raises rather than folding two
+  mints together.
+- **Never move backwards.** Enrichment merges *into* what exists. A later partial observation
+  cannot blank a field, which is exactly how a promotion forgot an image the heads-up had.
+  Sources are ranked by how directly they name the address, so a token-info response corrects
+  a board row's abbreviated name but a runner row cannot overwrite it.
+- **Absent is not a value.** Nothing invents a name. A mint we cannot describe reads
+  `Metadata pending`; one where exact-mint resolution was tried and failed reads
+  `Metadata unavailable`. Both are honest and neither is a token called "?".
+
+### 2. Publish fast, then edit the same card
+
+Speed did not regress to fix cosmetics. `_publish_fast_alert` schedules metadata resolution
+**before** it awaits the notifier, so the operator gets the market card immediately and a
+named, illustrated version of *that same message* a moment later. No second ping.
+
+`EnrichmentUpdate` now carries `description`, `compact_description` and `thumbnail_url`, each
+applied only when supplied — an enrichment pass that learned nothing blanks nothing.
+
+Resolution order is DEX exact-mint snapshot → GMGN token info → runner row, all keyed on the
+address. **There is no ticker search anywhere in it.** On total failure the record is marked
+unresolved and the card says so, because substituting a same-symbol token is the one outcome
+worse than an ugly card.
+
+### 3. Every card, and every stage, now agrees
+
+Six builders were called with no image at all. All of them now route through
+`_identity_for_card(mint, …)`, which contributes what the caller knows and renders what the
+bot knows: early heads-up, promotion, GMGN smart money, KOL, trending, trench, public
+trending, notable trader, shadow entry and **shadow exit** — which used to render `"?"`
+outright whenever the candidate row had aged out of memory.
+
+Images are validated before they reach Discord: https only, `ipfs://` rewritten through the
+public gateway, and anything carrying an `api_key`, a signature or a session id refused. **No
+thumbnail is better than the wrong thumbnail**, and never another token's.
+
+Cards also now say *why the bot saw the token* — `GMGN Trending 1m • Pump on-chain realtime`
+— read from the mint's own lifecycle sources, capped at three so it stays phone-readable.
+
+### 4. A hot-search 429 muted the entire provider
+
+`POST /v1/market/hot_searches` returned `429 RATE_LIMIT_EXCEEDED`, provider health was a
+single global record, and the whole integration flipped to `RATE_LIMITED` while trending,
+trenches and signals were answering fine. Hot search is *attention* evidence — the least
+important thing GMGN tells us — and it took the most important things down with it.
+
+Health is now **per endpoint**, and calls are **tiered**:
+
+| Tier | Endpoints | Under pressure |
+| --- | --- | --- |
+| **A** | rank, trenches, token_signal | never shed — a last call goes to discovery |
+| **B** | smart money, KOL, top holders, top traders, security, token info | shed below 15% headroom |
+| **C** | hot searches, klines, pools, created tokens | shed first, below 35% |
+
+A 429 cools that endpoint for the window `x-ratelimit-reset` names, and only a **tier-A**
+limit pauses the shared budget. The overall state is a summary — `CORE_ACTIVE`,
+`PARTIAL_DEGRADATION`, `CORE_RATE_LIMITED` — so the panel tells the truth instead of one
+misleading word. Cooldowns persist across a restart, so a redeploy does not walk back into a
+limit it was already serving, and a cooling endpoint is never probed.
+
+### The live response contract, audited
+
+v2.45 was written against the official client without live traffic and guessed at several
+field names. With real responses to check against, four were wrong:
+
+| v2.45 guessed | The documented reality |
+| --- | --- |
+| trenches section `near_completion` | the API returns **`pump`** — reading it wrong lost the entire FINAL STRETCH section |
+| `holding_percentage` | **`amount_percentage`**, and it is a **0–1 fraction** — an 8.5% holder was rendering as 0.085% |
+| `is_smart_money` / `is_sniper` booleans | **do not exist.** Tags live in `tags` (`smart_degen`, `kol`, `fresh_wallet`, `wash_trader`) and `maker_token_tags` (`bundler`, `sniper`, `rat_trader`, `dev_team`) |
+| `/v1/user/smartmoney` as a wallet directory | it is a **trade feed** — which is why the panel read `Smart-money wallets: 0` forever |
+
+That last one is an upgrade, not just a fix: a trade feed is exactly the event the fast
+smart-money card wants, and it carries the token's symbol and logo. Also newly captured:
+`logo` (the card thumbnail), `addr_type` (a liquidity pool is not a holder),
+`native_transfer.from_address` (free cluster evidence), `sell_amount_percentage`, and the 1m
+/ 5m / 1h price-change fields.
+
+### Pump realtime: named, not guessed
+
+Production showed `RECONNECTING`, `subscribed: false`, 0 creations, 35+ reconnects — and the
+logs said **nothing at all**, so the cause could not be established. That silence was itself
+the defect.
+
+Two real bugs are fixed and the rest is now diagnosable. A stale socket returned *normally*,
+which reset the backoff to one second and turned one quiet connection into a permanent
+reconnect loop; a silent run is now a failure and the backoff is allowed to grow. And
+"connected but never acknowledged" is now its own state (`NO_SUBSCRIPTION_ACK`), distinct
+from "acknowledged and silent" — different faults with different fixes that used to look
+identical. The lane reports acks, notifications, stale rebuilds, missing acks and close
+codes, and logs each transition.
+
+When the socket is not delivering, `/fomo realtime` says `GMGN_TRENCH_FALLBACK: ACTIVE` and
+names the source as polling. **Polling is never described as a realtime websocket.**
+
+### Diagnostics worth reading
+
+- **On-chain:** `errors 27` is not a diagnosis. Failures are now counted per operation
+  (`bonding_curve`, `holder_snapshot`, `wallet_history`, …) and per cause — 429, 403,
+  method-unsupported, timeout, malformed, network — because an RPC that refuses a method and
+  one that is throttling need opposite responses.
+- **Solana Tracker:** a stable `Insufficient credits` now opens the maximum breaker window
+  immediately instead of climbing the ladder from sixty seconds. A quota does not refill in a
+  minute, and production logged the same 403 on every refresh. A 404 is still not a credit
+  failure.
+- **`/fomo realtime`** leads with the GMGN block: summary, per-endpoint state with retry
+  times, calls, cache, coalesced, 429s, p95, and the lifecycle board counts — then Pump
+  realtime with its fallback line. `/fomo profit view:providers` gains the same per-endpoint
+  breakdown. Neither renders the credential; the status payload is built without it.
+
+### Railway
+
+**REQUIRED:** none. **ADD:** nothing new — v2.45's variables are unchanged. **CHANGE:** none.
+**OPTIONAL:** `GMGN_HOT_SEARCH_ENABLED=false` cleanly disables just that endpoint now, and
+the core keeps running.
+
+### Unchanged
+
+No history reset of any kind: shadow books, Trending shadow, forward observations, GMGN
+attribution, lifecycles and alert history all preserved; every schema change is additive and
+idempotent. `$100` bankroll, exactly `$10` per position, 5 concurrent, `$50` max exposure.
+Every live gate still defaults false, no execution provider can place an order, and
+**REAL MONEY SPENT = $0.00**.
 
 ## GMGN-native alpha engine and lifecycle intelligence (v2.45)
 

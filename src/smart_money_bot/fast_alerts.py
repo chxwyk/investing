@@ -301,6 +301,45 @@ def _validation_pending_title(tier_label: str, *, late: bool = False) -> str:
     )
 
 
+#: How a discovery family reads on a card.  Compact on purpose: the operator
+#: needs "why did the bot see this", not a twenty-line provider dump — the
+#: detail belongs in `view:detail` (section 15).
+SOURCE_LABELS: dict[str, str] = {
+    "GMGN_TRENDING": "GMGN Trending",
+    "GMGN_TRENCH_NEW": "GMGN Trenches — new creation",
+    "GMGN_TRENCH_FINAL_STRETCH": "GMGN Trenches — final stretch",
+    "GMGN_TRENCH_MIGRATED": "GMGN Trenches — migrated",
+    "GMGN_MARKET_SIGNAL": "GMGN market signal",
+    "GMGN_HOT_SEARCH": "GMGN hot search",
+    "GMGN_SMART_MONEY": "GMGN Smart Money",
+    "GMGN_KOL": "GMGN KOL",
+    "pump_realtime": "Pump on-chain realtime",
+    "PUBLIC_TRENDING_MODEL": "our public Trending model",
+    "dex_snapshot": "DEX exact-mint snapshot",
+    "story_watch": "story watch",
+    "early_lane": "early lane",
+}
+
+
+def discovery_line(sources: Any, *, interval: str = "") -> str:
+    """``GMGN Trending 1m • Pump on-chain confirmed`` — one line, not twenty.
+
+    The first source is the one that found it; the rest are corroboration, and
+    only a couple are shown because a card that scrolls is a card nobody reads.
+    """
+
+    ordered = [str(item) for item in (sources or ()) if str(item)]
+    if not ordered:
+        return ""
+    primary = SOURCE_LABELS.get(ordered[0], ordered[0].replace("_", " ").title())
+    if interval and "Trending" in primary:
+        primary = f"{primary} {interval}"
+    others = [
+        SOURCE_LABELS.get(item, item.replace("_", " ").lower()) for item in ordered[1:3]
+    ]
+    return primary + (" • " + " • ".join(others) if others else "")
+
+
 def _links(mint: str, fomo_url: str) -> str:
     return (
         f"[FOMO]({fomo_url}) • [PUMP.FUN](https://pump.fun/coin/{mint}) • "
@@ -727,6 +766,7 @@ def build_early_alert(
     safety_status: str = "UNKNOWN",
     identity_verified: bool = True,
     symbol_collision: bool = False,
+    discovered_via: str = "",
 ) -> FastAlert:
     """The EARLY HEADS-UP / EARLY RUNNER card (sections 45, 46).
 
@@ -874,6 +914,8 @@ def build_early_alert(
                 P_WARNINGS,
             )
         )
+    if discovered_via:
+        fields.append(CardField("DISCOVERED VIA", discovered_via, P_WHY_SURFACED))
     fields.append(CardField("LINKS", _links(mint, fomo_url), P_LIQUIDITY))
 
     # Nothing from this lane is actionable, so nothing from it may use
@@ -1136,6 +1178,11 @@ class EnrichmentUpdate:
     fields: tuple[CardField, ...] = field(default_factory=tuple)
     footer: str = ""
     replace_fields: bool = False
+    #: Set when late-arriving exact-mint metadata should rewrite the card's
+    #: identity block — the name, ticker and thumbnail (v2.46, section 13).
+    description: str = ""
+    compact_description: str = ""
+    thumbnail_url: str = ""
 
     def apply(self, spec: CardSpec) -> CardSpec:
         from dataclasses import replace as _replace
@@ -1147,7 +1194,17 @@ class EnrichmentUpdate:
             for item in self.fields:
                 by_name[item.name] = item
             merged = tuple(by_name.values())
-        return _replace(spec, fields=merged, footer=self.footer or spec.footer)
+        return _replace(
+            spec,
+            fields=merged,
+            footer=self.footer or spec.footer,
+            # Each is applied only when supplied: an enrichment pass that
+            # learned nothing new must never blank a field the card already
+            # had, which is the whole "never move backwards" rule.
+            description=self.description or spec.description,
+            compact_description=self.compact_description or spec.compact_description,
+            thumbnail_url=self.thumbnail_url or spec.thumbnail_url,
+        )
 
 
 def enrichment_from_evidence(
@@ -1930,6 +1987,7 @@ def build_promotion_alert(
     symbol_collision: bool = False,
     image_url: str = "",
     terminal_url: str = "",
+    discovered_via: str = "",
 ) -> FastAlert:
     """The card a hot-watched near-miss earns when new evidence arrives.
 
@@ -2088,6 +2146,8 @@ def build_promotion_alert(
                 P_WARNINGS,
             )
         )
+    if discovered_via:
+        fields.append(CardField("DISCOVERED VIA", discovered_via, P_WHY_SURFACED))
     links = _links(mint, fomo_url)
     if terminal_url:
         links += f" • [TERMINAL]({terminal_url})"
@@ -2321,4 +2381,42 @@ def build_gmgn_participant_alert(
         token_mint=mint,
         lane=LANE_URGENT if (trustworthy and not is_kol) else LANE_RADAR,
         family=kind,
+    )
+
+
+def enrichment_from_presentation(
+    *,
+    alert_key: str,
+    mint: str,
+    presentation: Any,
+    fomo_url: str,
+    terminal_url: str = "",
+    headline: str = "",
+) -> EnrichmentUpdate:
+    """Rewrite a published card's identity block once metadata resolves.
+
+    This is the second half of the "publish fast, enrich in place" contract
+    (sections 4, 13).  The alert already went out — possibly reading
+    ``Metadata pending`` — and this edits *that same message* so the operator
+    ends up looking at a named token with its real icon, without a second ping
+    and without having waited for a metadata call before being told anything.
+
+    The presentation is passed whole rather than as loose strings so the card
+    cannot end up describing a different token than the one the record is for.
+    """
+
+    name = str(getattr(presentation, "display_name", "") or "")
+    symbol = str(getattr(presentation, "display_symbol", "") or "")
+    thumbnail = str(getattr(presentation, "thumbnail", "") or "")
+    links = _links(mint, fomo_url)
+    if terminal_url:
+        links += f" • [TERMINAL]({terminal_url})"
+    return EnrichmentUpdate(
+        alert_key=alert_key,
+        description=(
+            (f"{headline}\n" if headline else "")
+            + f"**{name}** `${symbol}`\nMint: `{mint}`\n{links}"
+        ),
+        compact_description=f"**{name}** `${symbol}`\n`{mint}`",
+        thumbnail_url=thumbnail,
     )

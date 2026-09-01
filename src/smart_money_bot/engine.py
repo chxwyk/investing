@@ -72,7 +72,9 @@ from .fast_alerts import (
     build_trench_runner_alert,
     build_trending_alert,
     build_trending_hot_watch_card,
+    discovery_line,
     enrichment_from_evidence,
+    enrichment_from_presentation,
 )
 from .gmgn import BudgetConfig as GmgnBudgetConfig
 from .gmgn import GmgnClient
@@ -300,6 +302,24 @@ from .token_identity import (
 )
 from .token_identity import (
     exact as exact_identity,
+)
+from .token_presentation import (
+    SOURCE_DEX_SNAPSHOT,
+    SOURCE_GMGN_BOARD,
+    SOURCE_GMGN_TOKEN_INFO,
+    SOURCE_PUMP_METADATA,
+    SOURCE_RUNNER_ROW,
+    TokenPresentation,
+    build_presentation,
+    mark_unresolved,
+    needs_enrichment,
+    presentation_from_json,
+)
+from .token_presentation import (
+    diff as presentation_diff,
+)
+from .token_presentation import (
+    merge as merge_presentation,
 )
 from .trenches import (
     CadenceConfig,
@@ -671,6 +691,14 @@ class SmartMoneyEngine:
             self.gmgn, database=self.database, settings=settings
         )
         self._gmgn_task: asyncio.Task[None] | None = None
+        # --- exact-mint presentation (v2.46) ---------------------------
+        # One name/symbol/image per mint, captured at discovery and kept
+        # for the token's whole life.  Its absence is what put `?` and
+        # `$?` on production cards.
+        self._presentations: dict[str, TokenPresentation] = {}
+        self.presentation_edits = 0
+        self.presentation_unresolved = 0
+        self._presentation_tasks: set[asyncio.Task[None]] = set()
         self.gmgn_candidates_published = 0
         self.gmgn_participant_alerts = 0
         # The future execution interface, wired and switched off (sections
@@ -978,6 +1006,8 @@ class SmartMoneyEngine:
         # board on purpose: the candidate that produced the section 1 failure
         # never appeared on a board at all, so a board-scoped watch could never
         # have caught it.
+        # Names and icons survive a redeploy (section 41).
+        await self._restore_presentations()
         if self.settings.fomo_early_watch_enabled:
             await self._restore_early_watches()
             self._early_watch_task = asyncio.create_task(
@@ -1841,10 +1871,21 @@ class SmartMoneyEngine:
         if not self._early_lane_allows(mint, verdict, now=now):
             return False
 
-        name, symbol = await self._cached_token_names(mint)
+        # Whatever this exact-mint snapshot already knows is captured before the
+        # card is built, so the fast path never publishes a token it could have
+        # named (section 6).
+        await self.note_presentation(
+            mint,
+            name=getattr(snapshot, "name", ""),
+            symbol=getattr(snapshot, "symbol", ""),
+            image_url=snapshot.image_url,
+            source=SOURCE_DEX_SNAPSHOT,
+            now=now,
+        )
+        name, symbol, image_url = self._card_identity(mint)
         alert = build_early_alert(
             mint=mint,
-            name=name if name != "Unknown token" else (symbol or mint[:8]),
+            name=name,
             symbol=symbol,
             fomo_url=self._fomo_url(mint),
             verdict=verdict,
@@ -1856,10 +1897,11 @@ class SmartMoneyEngine:
             liquidity_usd=snapshot.liquidity_usd,
             buys=snapshot.buys_5m,
             sells=snapshot.sells_5m,
-            image_url=snapshot.image_url,
+            image_url=image_url,
             safety_status="UNKNOWN",
             identity_verified=provenance.identity_verified,
             symbol_collision=await self._symbol_collides(mint, symbol),
+            discovered_via=self._discovered_via(mint),
         )
         published = await self._publish_fast_alert(alert, now=now)
         if not published:
@@ -1911,6 +1953,232 @@ class SmartMoneyEngine:
         return True
 
     # ------------------------------------------------------------------
+    # exact-mint presentation (v2.46, sections 3-13, 40-42)
+    # ------------------------------------------------------------------
+
+    async def _restore_presentations(self) -> None:
+        """Reload the presentation cache so a restart does not forget names.
+
+        Section 41: a shadow exit tomorrow must not regress to a question mark
+        because the process that learned the name has since been replaced.
+        """
+
+        with suppress(Exception):
+            for row in await self.database.token_presentation_rows(limit=1_000):
+                record = presentation_from_json(row)
+                if record.mint:
+                    self._presentations[record.mint] = record
+
+    async def note_presentation(
+        self,
+        mint: str,
+        *,
+        name: object = "",
+        symbol: object = "",
+        image_url: object = "",
+        description: object = "",
+        website: object = "",
+        twitter: object = "",
+        telegram: object = "",
+        source: str = "",
+        now: int | None = None,
+    ) -> TokenPresentation:
+        """Capture identity fields an exact-mint response already contained.
+
+        Called at the point of discovery.  The whole bug this fixes is that the
+        board row which found the token *already carried* its symbol and icon,
+        and the pipeline dropped them on the floor and then rendered ``?``.
+        """
+
+        if not mint:
+            return TokenPresentation(mint="")
+        moment = now if now is not None else int(time.time())
+        incoming = build_presentation(
+            mint,
+            name=name,
+            symbol=symbol,
+            image_url=image_url,
+            description=description,
+            website=website,
+            twitter=twitter,
+            telegram=telegram,
+            source=source,
+            at=moment,
+        )
+        current = self._presentations.get(mint)
+        if current is None:
+            with suppress(Exception):
+                row = await self.database.token_presentation_row(mint)
+                if row:
+                    current = presentation_from_json(row)
+        merged = merge_presentation(current, incoming)
+        if merged == current:
+            return merged
+        self._presentations[mint] = merged
+        with suppress(Exception):
+            await self.database.save_token_presentation(merged.to_json())
+        return merged
+
+    def presentation_for(self, mint: str) -> TokenPresentation:
+        """What this exact mint is called right now.  Never ``?``."""
+
+        return self._presentations.get(mint) or TokenPresentation(mint=mint)
+
+    async def _identity_for_card(
+        self,
+        mint: str,
+        *,
+        name: object = "",
+        symbol: object = "",
+        image_url: object = "",
+        source: str = SOURCE_DEX_SNAPSHOT,
+    ) -> tuple[str, str, str]:
+        """Contribute what this caller knows, then render what the bot knows.
+
+        Both halves matter.  A caller holding a fresh name improves the shared
+        record, and a caller holding nothing still gets the name some earlier
+        stage learned — which is how a shadow exit tomorrow avoids regressing
+        to a question mark (sections 12, 40).
+        """
+
+        if name or symbol or image_url:
+            await self.note_presentation(
+                mint, name=name, symbol=symbol, image_url=image_url, source=source
+            )
+        return self._card_identity(mint)
+
+    def _discovered_via(self, mint: str) -> str:
+        """One compact line naming why the bot saw this token (section 14).
+
+        Read from the mint's lifecycle, which already records every feed that
+        reported it, in the order they did — so the primary source is a fact
+        rather than whichever lane happened to build the card.
+        """
+
+        lifecycle = self.gmgn_runtime.lifecycle_for(mint)
+        sources = tuple(getattr(lifecycle, "sources", ()) or ())
+        if not sources and mint in self._early_published:
+            sources = ("early_lane",)
+        return discovery_line(sources)
+
+    def _card_identity(self, mint: str) -> tuple[str, str, str]:
+        """``(name, symbol, image)`` for a card, from the canonical record.
+
+        Every card builder in the bot goes through this, which is what keeps a
+        heads-up, a promotion, a smart-money card and a shadow exit agreeing
+        about one mint (section 40).
+        """
+
+        record = self.presentation_for(mint)
+        return record.display_name, record.display_symbol, record.thumbnail
+
+    def _schedule_presentation_enrichment(self, alert: FastAlert) -> None:
+        """Resolve metadata *after* publishing, then edit the same message.
+
+        Never before: the operator gets the market card immediately and a
+        prettier version of it a moment later (sections 4, 13, 45).
+        """
+
+        mint = alert.token_mint or alert.mint
+        if not mint or not needs_enrichment(self.presentation_for(mint)):
+            return
+        task = asyncio.create_task(
+            self._resolve_presentation(alert), name=f"presentation-{mint[:8]}"
+        )
+        self._presentation_tasks.add(task)
+        task.add_done_callback(self._presentation_tasks.discard)
+
+    async def _resolve_presentation(self, alert: FastAlert) -> bool:
+        """Fill in the exact mint's metadata, then edit the card in place."""
+
+        mint = alert.token_mint or alert.mint
+        before = self.presentation_for(mint)
+        after = await self.resolve_presentation(mint)
+        delta = presentation_diff(before, after)
+        if not delta.worth_editing:
+            return False
+        published = await self.notifier.on_fast_alert_enrichment(
+            alert,
+            enrichment_from_presentation(
+                alert_key=alert.alert_key,
+                mint=mint,
+                presentation=after,
+                fomo_url=self._fomo_url(mint),
+                terminal_url=self._terminal_url(mint),
+            ),
+        )
+        if published:
+            self.presentation_edits += 1
+        return bool(published)
+
+    async def resolve_presentation(self, mint: str) -> TokenPresentation:
+        """Ask every exact-mint source we already have for this token's identity.
+
+        Ordered cheapest-first, and every one of them is keyed on the address.
+        There is deliberately no name or ticker search anywhere in this method:
+        on total failure the record is marked unresolved and the card says so,
+        because substituting a same-symbol token is the one outcome worse than
+        an ugly card (section 7).
+        """
+
+        assert_exact_propagation(mint, mint, stage="presentation → exact-mint lookup")
+        resolved = self.presentation_for(mint)
+
+        with suppress(Exception):
+            snapshot = await self.dex_screener.snapshot(mint)
+            if snapshot.available and (snapshot.image_url or snapshot.symbol):
+                resolved = await self.note_presentation(
+                    mint,
+                    name=getattr(snapshot, "name", ""),
+                    symbol=getattr(snapshot, "symbol", ""),
+                    image_url=snapshot.image_url,
+                    source=SOURCE_DEX_SNAPSHOT,
+                )
+
+        if not resolved.complete and self.gmgn.configured:
+            with suppress(Exception):
+                info = await self.gmgn.token_info(mint)
+                if info:
+                    row = info.get("token") if isinstance(info.get("token"), dict) else info
+                    resolved = await self.note_presentation(
+                        mint,
+                        name=row.get("name"),
+                        symbol=row.get("symbol"),
+                        image_url=row.get("logo") or row.get("image_url") or row.get("image"),
+                        description=row.get("description"),
+                        website=row.get("website"),
+                        twitter=row.get("twitter_username") or row.get("twitter"),
+                        telegram=row.get("telegram"),
+                        source=SOURCE_GMGN_TOKEN_INFO,
+                    )
+
+        if not resolved.resolved:
+            with suppress(Exception):
+                payload = await self.database.runner_candidate_payload(mint)
+                candidate = (
+                    runner_candidate_from_json(payload) if payload else None
+                )
+                if candidate is not None:
+                    resolved = await self.note_presentation(
+                        mint,
+                        name=candidate.name,
+                        symbol=candidate.symbol,
+                        source=SOURCE_RUNNER_ROW,
+                    )
+
+        if not resolved.resolved:
+            # Exact-mint resolution failed.  Say so; never search the ticker.
+            self.presentation_unresolved += 1
+            failed = mark_unresolved(
+                self._presentations.get(mint), mint, at=int(time.time())
+            )
+            self._presentations[mint] = failed
+            with suppress(Exception):
+                await self.database.save_token_presentation(failed.to_json())
+            return failed
+        return resolved
+
+    # ------------------------------------------------------------------
     # GMGN research provider (v2.45)
     # ------------------------------------------------------------------
 
@@ -1942,6 +2210,20 @@ class SmartMoneyEngine:
             logger.info("GMGN feed unavailable: %s", error)
         if not result.candidates:
             return
+
+        # Section 6: the board row that found the token already carries its
+        # symbol, name and logo.  Capture them now — throwing them away and
+        # re-fetching later is exactly what produced `?` on production cards.
+        for candidate in result.candidates:
+            with suppress(Exception):
+                await self.note_presentation(
+                    candidate.mint,
+                    name=candidate.token.name,
+                    symbol=candidate.token.symbol,
+                    image_url=candidate.token.image_url,
+                    source=SOURCE_GMGN_BOARD,
+                    now=now,
+                )
 
         budget = max(0, int(self.settings.gmgn_enrichment_per_scan))
         for candidate in result.candidates[:budget]:
@@ -1988,13 +2270,21 @@ class SmartMoneyEngine:
             return False
         assert_exact_propagation(mint, mint, stage="gmgn participant → card")
 
-        name, symbol = await self._cached_token_names(mint)
+        await self.note_presentation(
+            mint,
+            name=getattr(snapshot, "name", ""),
+            symbol=getattr(snapshot, "symbol", ""),
+            image_url=snapshot.image_url,
+            source=SOURCE_DEX_SNAPSHOT,
+            now=moment,
+        )
+        name, symbol, image_url = self._card_identity(mint)
         reputation = await self._wallet_reputation(wallet)
         lifecycle = self.gmgn_runtime.lifecycle_for(mint)
         move = _move_percent_or_none(entry_market_cap_usd, snapshot.market_cap_usd)
         alert = build_gmgn_participant_alert(
             mint=mint,
-            name=name if name != "Unknown token" else (symbol or mint[:8]),
+            name=name,
             symbol=symbol,
             fomo_url=self._fomo_url(mint),
             wallet=wallet,
@@ -2016,6 +2306,7 @@ class SmartMoneyEngine:
             bot_reputation=str(getattr(reputation, "state", "") or ""),
             bot_reputation_samples=int(getattr(reputation, "samples", 0) or 0),
             safety_status="UNKNOWN",
+            image_url=image_url,
             symbol_collision=await self._symbol_collides(mint, symbol),
             # Past a doubling since the wallet entered, this is a record of what
             # happened rather than a chance to join it (section 50).
@@ -2438,12 +2729,23 @@ class SmartMoneyEngine:
 
         mint = entry.mint
         snapshot = await self.dex_screener.snapshot(mint)
-        name, symbol = await self._cached_token_names(mint)
+        # Section 11: the promotion inherits the exact mint's existing identity
+        # rather than rebuilding from a smaller object that only knows the mint
+        # and the market cap.  One mint, one presentation, whole lifecycle.
+        await self.note_presentation(
+            mint,
+            name=getattr(snapshot, "name", ""),
+            symbol=getattr(snapshot, "symbol", ""),
+            image_url=snapshot.image_url,
+            source=SOURCE_DEX_SNAPSHOT,
+            now=now,
+        )
+        name, symbol, image_url = self._card_identity(mint)
         confirmation = await self._known_trader_confirmation(mint, now=now)
         series = self._holder_series.get(mint)
         alert = build_promotion_alert(
             mint=mint,
-            name=name if name != "Unknown token" else (symbol or mint[:8]),
+            name=name,
             symbol=symbol,
             fomo_url=self._fomo_url(mint),
             decision=decision,
@@ -2468,8 +2770,9 @@ class SmartMoneyEngine:
             safety_status="UNKNOWN",
             identity_verified=True,
             symbol_collision=await self._symbol_collides(mint, symbol),
-            image_url=snapshot.image_url,
+            image_url=image_url,
             terminal_url=self._terminal_url(mint),
+            discovered_via=self._discovered_via(mint),
         )
         published = await self._publish_fast_alert(alert, now=now)
         if published:
@@ -3388,10 +3691,13 @@ class SmartMoneyEngine:
             return False
 
         paper = position.position
+        card_name, card_symbol, card_image = await self._identity_for_card(
+            signal.mint, name=signal.name, symbol=signal.symbol, image_url=image_url
+        )
         alert = build_shadow_entry_alert(
             mint=signal.mint,
-            name=signal.name,
-            symbol=signal.symbol,
+            name=card_name,
+            symbol=card_symbol,
             fomo_url=self._fomo_url(signal.mint),
             family=signal.family,
             family_label=FAMILY_LABELS.get(signal.family, signal.family),
@@ -3506,10 +3812,19 @@ class SmartMoneyEngine:
             return False
         journal = position.position.exits[-1]
         net_now = assessment.net.total_net_usd
+        # Section 12: an exit must not forget what the entry knew.  The
+        # presentation record is persisted, so a restart between them changes
+        # nothing — this used to render "?" whenever the candidate row had
+        # aged out of memory.
+        exit_name, exit_symbol, exit_image = await self._identity_for_card(
+            position.mint,
+            name=candidate.name if candidate else "",
+            symbol=candidate.symbol if candidate else "",
+        )
         alert = build_shadow_exit_alert(
             mint=position.mint,
-            name=(candidate.name if candidate else "") or position.mint[:8],
-            symbol=(candidate.symbol if candidate else "") or "?",
+            name=exit_name,
+            symbol=exit_symbol,
             fomo_url=self._fomo_url(position.mint),
             family=position.family,
             family_label=FAMILY_LABELS.get(position.family, position.family),
@@ -3531,6 +3846,7 @@ class SmartMoneyEngine:
             why=assessment.why,
             position_id=position.position_id,
             sequence=journal.sequence,
+            image_url=exit_image,
         )
         return await self._publish_fast_alert(alert, now=now)
 
@@ -4646,6 +4962,10 @@ class SmartMoneyEngine:
             self.fast_alerts_suppressed += 1
             return False
         self._fast_alerts[alert.alert_key] = alert
+        # Publish first, then resolve the exact mint's metadata and edit this
+        # same message.  Never the other way round: a pretty name is not worth
+        # a slower alert (sections 4, 45).
+        self._schedule_presentation_enrichment(alert)
         sent = await self.notifier.on_fast_alert(alert)
         if sent is False:
             self._fast_alerts.pop(alert.alert_key, None)
@@ -4970,17 +5290,23 @@ class SmartMoneyEngine:
             signal.reputation_state in {"PROVEN_EARLY", "USEFUL_CONFIRMATION"}
             and int(getattr(signal.reputation, "samples", 0) or 0) >= MIN_PROVEN_SAMPLES
         )
+        notable_name, notable_symbol, notable_image = await self._identity_for_card(
+            swap.token_mint,
+            name=context.get("name"),
+            symbol=context.get("symbol"),
+        )
         alert = build_notable_trader_alert(
             signal=signal,
             fomo_url=self._fomo_url(swap.token_mint),
-            name=str(context.get("name") or "Unknown token"),
-            symbol=str(context.get("symbol") or "?"),
+            name=notable_name,
+            symbol=notable_symbol,
             consensus=consensus if consensus.raw_wallets > 1 else None,
             ping_decision=ping,
             token_state=self._token_lifecycle_state(swap.token_mint),
             story_summary=str(context.get("story_summary") or ""),
             safety_status=str(context.get("safety_status") or "UNKNOWN"),
             proven=proven,
+            image_url=notable_image,
             terminal_url=self._terminal_url(swap.token_mint),
         )
         published = await self._publish_fast_alert(alert, now=now)
@@ -5155,11 +5481,27 @@ class SmartMoneyEngine:
         return {}
 
     async def _cached_token_names(self, mint: str) -> tuple[str, str]:
-        context = await self._cached_token_context(mint)
-        return (
-            str(context.get("name") or "Unknown token"),
-            str(context.get("symbol") or "?"),
-        )
+        """The exact mint's display name and ticker.  Never ``?``.
+
+        This used to read only the legacy graduated-runner row, which does not
+        exist for a token discovered by GMGN or by the Pump creation stream — so
+        it returned nothing, the fallbacks collapsed, and cards rendered ``?``
+        and ``$?`` for tokens whose symbol the discovery response had already
+        told us.  It now reads the canonical presentation record, and falls back
+        to the runner row only to *populate* that record.
+        """
+
+        record = self.presentation_for(mint)
+        if not record.resolved:
+            context = await self._cached_token_context(mint)
+            if context.get("name") or context.get("symbol"):
+                record = await self.note_presentation(
+                    mint,
+                    name=context.get("name"),
+                    symbol=context.get("symbol"),
+                    source=SOURCE_RUNNER_ROW,
+                )
+        return record.display_name, record.display_symbol
 
     # --- catalyst and confluence ---------------------------------------
 
@@ -5690,10 +6032,13 @@ class SmartMoneyEngine:
         with suppress(Exception):
             theses = await self.trending_store.about_for(entry.mint)
 
+        trend_name, trend_symbol, trend_image = await self._identity_for_card(
+            entry.mint, name=entry.name, symbol=entry.symbol
+        )
         alert = build_trending_alert(
             mint=entry.mint,
-            name=entry.name,
-            symbol=entry.symbol,
+            name=trend_name,
+            symbol=trend_symbol,
             fomo_url=entry.fomo_url or fomo_coin_url(entry.mint, self.settings.fomo_referral_code),
             kind=kind,
             entry=entry,
@@ -5708,6 +6053,7 @@ class SmartMoneyEngine:
             market_cap_velocity=candidate.market_cap_velocity,
             promoted_from_hot_watch=self.trending.is_hot_watched(candidate.mint),
             now=int(time.time()),
+            image_url=trend_image,
         )
         published = await self.notifier.on_fast_alert(alert)
         if published:
@@ -5771,10 +6117,13 @@ class SmartMoneyEngine:
         if position is None:
             return False
         paper = position.position
+        shadow_name, shadow_symbol, shadow_image = await self._identity_for_card(
+            entry.mint, name=signal.name, symbol=signal.symbol
+        )
         alert = build_shadow_entry_alert(
             mint=entry.mint,
-            name=signal.name,
-            symbol=signal.symbol,
+            name=shadow_name,
+            symbol=shadow_symbol,
             fomo_url=self._fomo_url(entry.mint),
             family=family,
             family_label=TRENDING_FAMILY_LABELS.get(family, family),
@@ -5789,6 +6138,7 @@ class SmartMoneyEngine:
             net_objective_usd=config.net_profit_objective_usd,
             signal_to_fill_seconds=max(0, now - (signal.timestamps.signal_at or now)),
             position_id=paper.position_id,
+            image_url=shadow_image,
         )
         if self.shadow_cards_enabled:
             await self._publish_fast_alert(alert, now=now)
@@ -5811,6 +6161,22 @@ class SmartMoneyEngine:
                 at=creation.observed_at,
                 created_at=creation.observed_at,
                 source=SOURCE_CREATION_STREAM,
+            )
+        # Open the mint's lifecycle at the earliest moment anything sees it, so
+        # source lead is measurable against a real first observation (§27).
+        with suppress(Exception):
+            await self.gmgn_runtime.observe(
+                creation.mint,
+                stage=gmgn_stages.TOKEN_CREATED,
+                at=creation.observed_at,
+                market_cap_usd=None,
+                source="pump_realtime",
+            )
+        with suppress(Exception):
+            await self.note_presentation(
+                creation.mint,
+                source=SOURCE_PUMP_METADATA,
+                now=creation.observed_at,
             )
 
     async def _enrich_trench(self, mint: str) -> dict[str, Any]:
@@ -5887,25 +6253,33 @@ class SmartMoneyEngine:
         fomo_url = self._fomo_url(candidate.mint)
         if kind == PUBLIC_TRENDING_ALERT:
             board = {row["mint"]: row["rank"] for row in await self.trenches.public_board(limit=50)}
+            pub_name, pub_symbol, pub_image = await self._identity_for_card(
+                candidate.mint, name=candidate.name, symbol=candidate.symbol
+            )
             alert = build_public_trending_alert(
                 mint=candidate.mint,
-                name=candidate.name,
-                symbol=candidate.symbol,
+                name=pub_name,
+                symbol=pub_symbol,
                 fomo_url=fomo_url,
                 candidate=candidate,
                 rank=board.get(candidate.mint),
                 notable_wallets=0,
                 now=int(time.time()),
+                image_url=pub_image,
             )
         else:
+            trench_name, trench_symbol, trench_image = await self._identity_for_card(
+                candidate.mint, name=candidate.name, symbol=candidate.symbol
+            )
             alert = build_trench_runner_alert(
                 mint=candidate.mint,
-                name=candidate.name,
-                symbol=candidate.symbol,
+                name=trench_name,
+                symbol=trench_symbol,
                 fomo_url=fomo_url,
                 kind=kind,
                 candidate=candidate,
                 now=int(time.time()),
+                image_url=trench_image,
             )
 
         published = await self.notifier.on_fast_alert(alert)
@@ -5975,10 +6349,13 @@ class SmartMoneyEngine:
         if position is None:
             return False
         paper = position.position
+        shadow_name, shadow_symbol, shadow_image = await self._identity_for_card(
+            candidate.mint, name=signal.name, symbol=signal.symbol
+        )
         alert = build_shadow_entry_alert(
             mint=candidate.mint,
-            name=signal.name,
-            symbol=signal.symbol,
+            name=shadow_name,
+            symbol=shadow_symbol,
             fomo_url=self._fomo_url(candidate.mint),
             family=family,
             family_label=FAMILY_LABELS.get(family, family),
@@ -5993,6 +6370,7 @@ class SmartMoneyEngine:
             net_objective_usd=self._trending_shadow_config.net_profit_objective_usd,
             signal_to_fill_seconds=0,
             position_id=paper.position_id,
+            image_url=shadow_image,
         )
         if self.shadow_cards_enabled:
             await self._publish_fast_alert(alert, now=now)

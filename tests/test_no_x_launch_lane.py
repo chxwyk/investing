@@ -41,6 +41,12 @@ async def test_no_x_candidate_alert_never_auto_launches() -> None:
     now = int(time.time())
     alert = _candidate(now).alert
     engine = object.__new__(SmartMoneyEngine)
+    # v2.46: the presentation cache is consulted on every publish, so a
+    # partial engine still needs it — empty, not mocked away.
+    engine._presentations = {}
+    engine._presentation_tasks = set()
+    engine.presentation_edits = 0
+    engine.presentation_unresolved = 0
     engine.settings = SimpleNamespace(
         news_min_score=45,
         news_launch_ready_score=72,

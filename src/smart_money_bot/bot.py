@@ -6330,6 +6330,8 @@ def _realtime_embed(
     shadow: dict[str, object] | None = None,
     early: dict[str, object] | None = None,
     trending: dict[str, object] | None = None,
+    *,
+    gmgn: dict[str, object] | None = None,
 ) -> discord.Embed:
     connected = bool(status.get("stream_connected"))
     age = status.get("stream_last_event_age")
@@ -6364,7 +6366,74 @@ def _realtime_embed(
         colour=0x2ECC71 if connected else 0xE67E22,
         timestamp=discord.utils.utcnow(),
     )
+    # --- GMGN block first: it is now the primary professional feed (§31, §32) ---
+    if gmgn is not None:
+        health = gmgn.get("endpoint_health") or {}
+        summary = str(health.get("summary") or gmgn.get("state") or "UNKNOWN")
+        icon = (
+            "🟢"
+            if summary == "CORE_ACTIVE"
+            else ("🟡" if summary == "PARTIAL_DEGRADATION" else "🔴")
+        )
+        lines = [
+            f"{icon} **{summary}** — "
+            f"{health.get('summary_label') or gmgn.get('human', '')}"
+        ]
+        for item in (health.get("endpoints") or [])[:8]:
+            mark = (
+                "✅" if item.get("healthy") else ("🟡" if item.get("cooling") else "🔴")
+            )
+            row = f"{mark} `{item.get('kind')}` tier {item.get('tier')} — {item.get('state')}"
+            if item.get("cooling"):
+                row += f" (retry in {item.get('cooldown_seconds')}s)"
+            lines.append(row)
+        lines.append(
+            f"Calls `{gmgn.get('calls', 0)}` • cache `{gmgn.get('cache_hits', 0)}` • "
+            f"coalesced `{gmgn.get('coalesced', 0)}` • 429s "
+            f"`{gmgn.get('rate_limited', 0)}` • p95 `{gmgn.get('p95_latency_ms')}ms`"
+        )
+        board = gmgn.get("board") or {}
+        lines.append(
+            f"NEW PAIRS `{board.get('NEW_PAIRS', 0)}` • FINAL STRETCH "
+            f"`{board.get('FINAL_STRETCH', 0)}` • MIGRATED "
+            f"`{board.get('MIGRATED', 0)}` • lifecycles `{gmgn.get('lifecycles', 0)}`"
+        )
+        embed.add_field(
+            name="GMGN ALPHA — real provider data",
+            value="\n".join(lines)[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+            inline=False,
+        )
+
     creation = status.get("creation_stream") or {}
+    if isinstance(creation, dict) and creation:
+        # Section 28: when the socket is not delivering, say what is standing in
+        # for it — and never call polling a realtime websocket.
+        pump_state = str(creation.get("state") or "UNKNOWN")
+        pump_icon = "🟢" if pump_state == "CONNECTED" else "🔴"
+        detail = [
+            f"{pump_icon} **PUMP_WS: {pump_state}** — {creation.get('detail', '')}",
+            f"subscribed `{creation.get('subscribed')}` • acks "
+            f"`{creation.get('subscribe_acks', 0)}` • notifications "
+            f"`{creation.get('notifications', 0)}` • creations "
+            f"`{creation.get('creations_seen', 0)}`",
+            f"reconnects `{creation.get('reconnects', 0)}` • stale rebuilds "
+            f"`{creation.get('stale_rebuilds', 0)}` • unacknowledged "
+            f"`{creation.get('ack_timeouts', 0)}`",
+        ]
+        if creation.get("last_error"):
+            detail.append(f"Last error: `{str(creation.get('last_error'))[:150]}`")
+        if creation.get("fallback_active"):
+            detail.append(
+                f"⚠ `GMGN_TRENCH_FALLBACK: ACTIVE` — discovery is coming from "
+                f"`{creation.get('fallback_source')}`, which is polling, not a "
+                "websocket."
+            )
+        embed.add_field(
+            name="PUMP REALTIME",
+            value="\n".join(detail)[:DISCORD_EMBED_FIELD_VALUE_LIMIT],
+            inline=False,
+        )
+
     if status.get("trenches_enabled"):
         embed.add_field(
             name="PUMP.FUN TRENCHES (primary universe)",
@@ -8833,8 +8902,12 @@ class FomoCommands(
             early = await self.bot.engine.early_lane_status()
         with suppress(Exception):
             trending = await self.bot.engine.trending_status()
+        gmgn = None
+        with suppress(Exception):
+            gmgn = await self.bot.engine.gmgn_status()
         await self._resolve_lab(
-            interaction, embed=_realtime_embed(status, alerts, shadow, early, trending)
+            interaction,
+            embed=_realtime_embed(status, alerts, shadow, early, trending, gmgn=gmgn),
         )
 
     @app_commands.command(

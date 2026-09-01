@@ -145,13 +145,29 @@ def test_a_credit_failure_opens_an_exponential_backoff_window() -> None:
     state = ProviderState(name="solana_tracker")
 
     for expected in BACKOFF_SECONDS[:3]:
-        state = record_failure(
-            state, now=1_000.0, status=403, message="Insufficient credits"
-        )
+        state = record_failure(state, now=1_000.0, status=403, message="throttled")
         assert state.degraded_until == 1_000.0 + expected
 
     assert state.is_degraded(now=1_000.0) is True
     assert state.health(now=1_000.0) == EXHAUSTED
+
+
+def test_a_spent_quota_skips_straight_to_the_long_window() -> None:
+    """v2.46: a plan that is out of credits will still be out in sixty seconds.
+
+    Production logged ``Solana Tracker HTTP 403: insufficient credits`` on every
+    discovery refresh — climbing the ladder from the bottom just rediscovered
+    the same fact five times before backing off for an hour.
+    """
+
+    exhausted = record_failure(
+        ProviderState(name="solana_tracker"),
+        now=1_000.0,
+        status=403,
+        message='{"error":"Insufficient credits for this request"}',
+    )
+
+    assert exhausted.degraded_until == 1_000.0 + BACKOFF_SECONDS[-1]
 
 
 def test_one_failure_degrades_but_only_repeated_ones_exhaust() -> None:

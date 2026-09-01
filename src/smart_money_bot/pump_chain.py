@@ -141,6 +141,45 @@ class WalletHistory:
     available: bool = False
 
 
+#: How an RPC failure is classified, so the panel can say which problem it is.
+RPC_RATE_LIMITED = "RPC_429_RATE_LIMITED"
+RPC_FORBIDDEN = "RPC_403_FORBIDDEN"
+RPC_UNSUPPORTED = "RPC_METHOD_UNSUPPORTED"
+RPC_TIMEOUT = "RPC_TIMEOUT"
+RPC_MALFORMED = "RPC_MALFORMED_RESPONSE"
+RPC_NETWORK = "RPC_NETWORK"
+RPC_OTHER = "RPC_OTHER"
+
+
+def classify_rpc_error(error: object) -> str:
+    """Name the failure, because "errors 27" tells an operator nothing.
+
+    A public RPC that refuses ``getTokenLargestAccounts`` and one that is
+    throttling us look identical in an error count and need opposite responses:
+    the first needs a different endpoint, the second needs backing off.
+    """
+
+    text = str(error).lower()
+    if "429" in text or "rate limit" in text or "too many requests" in text:
+        return RPC_RATE_LIMITED
+    if "403" in text or "forbidden" in text:
+        return RPC_FORBIDDEN
+    if (
+        "method not found" in text
+        or "unsupported" in text
+        or "-32601" in text
+        or "disabled" in text
+    ):
+        return RPC_UNSUPPORTED
+    if "timeout" in text or "timed out" in text:
+        return RPC_TIMEOUT
+    if "json" in text or "decode" in text or "unexpected" in text:
+        return RPC_MALFORMED
+    if isinstance(error, OSError) or "connect" in text or "reset" in text:
+        return RPC_NETWORK
+    return RPC_OTHER
+
+
 class PumpChainReader:
     """Public on-chain reads for the Trenches engine.  No vendor required."""
 
@@ -165,8 +204,28 @@ class PumpChainReader:
         self.cache_hits = 0
         self.errors = 0
         self.last_error: str = ""
+        # Section 29: "errors 27" is not a diagnosis.  Production showed
+        # 28 holder calls against 27 errors and no way to tell an RPC that
+        # refuses the method from one that is rate limiting us, which are
+        # opposite problems — one needs a different endpoint, the other needs
+        # patience.  Every failure is now counted by operation and by cause.
+        self.errors_by_operation: dict[str, int] = {}
+        self.errors_by_cause: dict[str, int] = {}
+        self.calls_by_operation: dict[str, int] = {}
 
-    def usage_snapshot(self) -> dict[str, int | str]:
+    def _note_error(self, operation: str, error: object) -> None:
+        """Record which call failed and why, not just that something did."""
+
+        self.errors += 1
+        self.errors_by_operation[operation] = self.errors_by_operation.get(operation, 0) + 1
+        cause = classify_rpc_error(error)
+        self.errors_by_cause[cause] = self.errors_by_cause.get(cause, 0) + 1
+        self.last_error = f"{operation}: {str(error)[:140]}"
+
+    def _note_call(self, operation: str) -> None:
+        self.calls_by_operation[operation] = self.calls_by_operation.get(operation, 0) + 1
+
+    def usage_snapshot(self) -> dict[str, Any]:
         return {
             "curve_reads": self.curve_reads,
             "holder_reads": self.holder_reads,
@@ -174,6 +233,13 @@ class PumpChainReader:
             "cache_hits": self.cache_hits,
             "errors": self.errors,
             "last_error": self.last_error,
+            "calls_by_operation": dict(self.calls_by_operation),
+            "errors_by_operation": dict(self.errors_by_operation),
+            "errors_by_cause": dict(self.errors_by_cause),
+            "success_by_operation": {
+                name: max(0, count - self.errors_by_operation.get(name, 0))
+                for name, count in self.calls_by_operation.items()
+            },
         }
 
     # ------------------------------------------------------------------
@@ -191,10 +257,10 @@ class PumpChainReader:
             return BondingCurveState(mint=mint, available=False, error=f"bad mint: {exc}")
         try:
             self.curve_reads += 1
+            self._note_call("bonding_curve")
             data = await self.rpc.get_account_data(address)
         except (RpcError, OSError) as exc:
-            self.errors += 1
-            self.last_error = str(exc)[:160]
+            self._note_error("bonding_curve", exc)
             return BondingCurveState(mint=mint, available=False, error=self.last_error)
         state = decode_bonding_curve(mint, data)
         self._curve_cache[mint] = (now, state)
@@ -226,8 +292,7 @@ class PumpChainReader:
             self.curve_reads += len(pending)
             raw = await self.rpc.get_multiple_account_data(list(pending))
         except (RpcError, OSError) as exc:
-            self.errors += 1
-            self.last_error = str(exc)[:160]
+            self._note_error("bonding_curves", exc)
             for mint in pending.values():
                 results[mint] = BondingCurveState(
                     mint=mint, available=False, error=self.last_error
@@ -260,11 +325,11 @@ class PumpChainReader:
             return cached[1]
         try:
             self.holder_reads += 1
+            self._note_call("holder_snapshot")
             largest = await self.rpc.get_token_largest_accounts(mint)
             supply = await self.rpc.get_token_supply(mint)
         except (RpcError, OSError) as exc:
-            self.errors += 1
-            self.last_error = str(exc)[:160]
+            self._note_error("holder_snapshot", exc)
             return HolderSnapshot(mint=mint, at=moment)
 
         total = _decimal(supply.get("amount"))
@@ -331,10 +396,10 @@ class PumpChainReader:
             return cached[1]
         try:
             self.wallet_reads += 1
+            self._note_call("wallet_history")
             signatures = await self.rpc.get_signatures_for_address(wallet, limit=200)
         except (RpcError, OSError) as exc:
-            self.errors += 1
-            self.last_error = str(exc)[:160]
+            self._note_error("wallet_history", exc)
             return WalletHistory(wallet=wallet, available=False)
 
         times = [
@@ -422,8 +487,7 @@ class PumpChainReader:
         try:
             signatures = await self.rpc.get_signatures_for_address(address, limit=limit)
         except (RpcError, OSError) as exc:
-            self.errors += 1
-            self.last_error = str(exc)[:160]
+            self._note_error("recent_trades", exc)
             return [], self.last_error
 
         trades: list[SlotTrade] = []

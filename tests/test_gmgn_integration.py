@@ -743,17 +743,29 @@ def test_one_wallet_carrying_two_tags_is_still_one_wallet() -> None:
 
 
 def test_participant_flags_are_read_from_documented_fields() -> None:
+    """v2.45 guessed at boolean flags that do not exist in the response.
+
+    The documented holder object carries two tag arrays — ``tags`` for the
+    wallet and ``maker_token_tags`` for what it did to *this* token — and no
+    ``is_smart_money``/``is_sniper`` booleans at all.  Looking for fields that
+    were never sent is why nothing was ever tagged at token level.
+    """
+
     parsed = parse_participants(
         {
             "holders": [
                 {
                     "address": "W1",
-                    "holding_percentage": "8.5",
-                    "is_smart_money": True,
-                    "is_sniper": True,
-                    "is_bundler": False,
+                    # A 0-1 fraction, not a percent.  Reading it as a percent
+                    # turns an 8.5% holder into "0.085%".
+                    "amount_percentage": 0.085,
                     "realized_profit": "1200",
-                    "tags": ["smart_money"],
+                    "sell_volume_cur": "2400",
+                    "sell_amount_percentage": "0.2",
+                    "buy_tx_count_cur": 3,
+                    "tags": ["smart_degen"],
+                    "maker_token_tags": ["sniper"],
+                    "native_transfer": {"from_address": "FUNDER1"},
                 }
             ]
         },
@@ -764,7 +776,72 @@ def test_participant_flags_are_read_from_documented_fields() -> None:
     assert parsed.sniper is True
     assert parsed.bundler is False
     assert parsed.realized_pnl_usd == D("1200")
-    assert parsed.holding_percent == D("8.5")
+    assert parsed.holding_percent == D("8.50")
+    assert parsed.sold_usd == D("2400")
+    assert parsed.sold_fraction == D("0.2")
+    assert parsed.buys == 3
+    # The funding edge arrives with the row: free cluster evidence.
+    assert parsed.funded_by == "FUNDER1"
+
+
+def test_a_liquidity_pool_is_not_reported_as_a_holder() -> None:
+    """``addr_type`` 2 is a DEX pool.  Counting one as a whale makes every
+    token look dangerously concentrated."""
+
+    rows = parse_participants(
+        {
+            "holders": [
+                {"address": "W1", "amount_percentage": 0.05, "addr_type": 0},
+                {"address": "POOL", "amount_percentage": 0.56, "addr_type": 2},
+            ]
+        },
+        mint=MINT,
+    )
+
+    by_wallet = {item.wallet: item for item in rows}
+    assert by_wallet["POOL"].address_type == 2
+    assert by_wallet["W1"].address_type == 0
+    assert by_wallet["POOL"].to_json()["is_pool"] is True
+
+
+def test_smart_money_and_kol_are_trade_feeds_not_wallet_directories() -> None:
+    """The exact cause of ``Smart-money wallets: 0`` in production.
+
+    ``/v1/user/smartmoney`` returns *trades* by platform-tagged wallets, not a
+    list of wallets.  v2.45 looked for a top-level ``wallet_address``, found
+    none, and reported zero forever.
+    """
+
+    from smart_money_bot.gmgn import parse_wallet_trades
+
+    trades = parse_wallet_trades(
+        {
+            "list": [
+                {
+                    "maker": "W9",
+                    "base_address": MINT,
+                    "side": "buy",
+                    "amount_usd": 4200,
+                    "timestamp": NOW,
+                    "is_open_or_close": 1,
+                    "base_token": {"symbol": "MDR", "logo": "https://x/mdr.png"},
+                    "maker_info": {"name": "Alpha", "tags": ["smart_degen", "gmgn"]},
+                },
+                {"maker": "W8", "base_address": MINT, "maker_info": {"tags": ["kol"]}},
+                {"maker": "W7", "base_address": "not-a-mint"},
+            ]
+        },
+        tag="GMGN_SMART_MONEY",
+    )
+
+    assert len(trades) == 2, "a row without a valid exact mint is dropped"
+    assert trades[0].is_smart_money is True and trades[0].is_kol is False
+    assert trades[1].is_kol is True and trades[1].is_smart_money is False
+    assert trades[0].amount_usd == D("4200")
+    # The feed carries the token's symbol and logo, which is what fills the
+    # presentation cache and stops cards rendering "?".
+    assert trades[0].symbol == "MDR"
+    assert trades[0].image_url == "https://x/mdr.png"
 
 
 # ===========================================================================

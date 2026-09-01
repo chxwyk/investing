@@ -236,13 +236,14 @@ async def main() -> None:
     await check_token_identity()
     await check_promotion_intelligence()
     await check_gmgn_integration()
+    await check_production_hardening()
 
     print(
         "SELF-CHECK PASSED: detector, scoring, database, discovery rotation, "
         "paper P&L, risk gate, PAPER laboratory, discovery-speed, realtime-alpha, "
         "SHADOW auto-trader, profit-optimization, early-alpha, Trending-first, "
-        "trenches-intelligence, token-identity, promotion-intelligence and "
-        "GMGN-integration invariants"
+        "trenches-intelligence, token-identity, promotion-intelligence, "
+        "GMGN-integration and production-hardening invariants"
     )
 
 
@@ -952,6 +953,221 @@ async def check_gmgn_integration() -> None:
     await client.close()
     await leaky.close()
     await limited.close()
+
+
+async def check_production_hardening() -> None:
+    """No card says "?", and one optional endpoint cannot mute the provider.
+
+    Both of these reached production.  Cards rendered ``?`` / ``$?`` for tokens
+    whose symbol the discovery response had already carried, and a hot-search
+    429 flipped the whole GMGN integration to RATE_LIMITED while trending,
+    trenches and signals were answering fine.
+    """
+
+    import inspect
+    import json as _json
+
+    import smart_money_bot.bot as bot_module
+    import smart_money_bot.fast_alerts as fast_alerts_module
+    from smart_money_bot.engine import SmartMoneyEngine
+    from smart_money_bot.gmgn import GmgnClient, GmgnError, parse_trenches_response
+    from smart_money_bot.gmgn.endpoints import (
+        CORE_ACTIVE,
+        PARTIAL_DEGRADATION,
+        EndpointRegistry,
+        tier_for,
+    )
+    from smart_money_bot.lab.providers import BACKOFF_SECONDS, ProviderState, record_failure
+    from smart_money_bot.pump_stream import PumpCreationStream
+    from smart_money_bot.token_presentation import (
+        PENDING_NAME,
+        SOURCE_GMGN_BOARD,
+        SOURCE_GMGN_TOKEN_INFO,
+        TokenPresentation,
+        build_presentation,
+        safe_image_url,
+    )
+    from smart_money_bot.token_presentation import (
+        merge as merge_presentation,
+    )
+
+    mint = "GPR7Ax4kQ2mVn8hLdT6yWc3JbRfE9uZsXqM1oP5tH4dK"
+    clone = "7TqH1d4Vf9QG578vB99Q7ewFQPoxSYqBDxSAzBpBpump"
+    secret = "gmgn-selfcheck-secret-0123456789abc"
+
+    # 1. A token we cannot name yet says so.  It never says "?".
+    blank = TokenPresentation(mint=mint)
+    assert blank.display_name == PENDING_NAME
+    assert "?" not in blank.display_name and blank.display_symbol != "?"
+    for accessor in (
+        SmartMoneyEngine._cached_token_names,
+        SmartMoneyEngine._card_identity,
+    ):
+        accessor_source = inspect.getsource(accessor)
+        assert "presentation_for" in accessor_source or "self._presentations" in (
+            accessor_source
+        ), f"{accessor.__name__} must read the canonical presentation record"
+        assert '"?"' not in accessor_source, (
+            f"the card fallback that produced `$?` must not come back in "
+            f"{accessor.__name__}"
+        )
+        assert '"Unknown token"' not in accessor_source
+
+    # 2. A field that is known stays known.
+    known = merge_presentation(
+        None,
+        build_presentation(
+            mint,
+            name="Moo Deng Returns",
+            symbol="MDR",
+            image_url="https://cdn.example/mdr.png",
+            source=SOURCE_GMGN_TOKEN_INFO,
+        ),
+    )
+    partial = merge_presentation(known, build_presentation(mint, source=SOURCE_GMGN_BOARD))
+    assert partial.name == "Moo Deng Returns" and partial.thumbnail
+
+    # 3. Two same-symbol tokens never share an identity.
+    other = merge_presentation(
+        None,
+        build_presentation(
+            clone,
+            name="Moo Deng Returns",
+            symbol="MDR",
+            image_url="https://cdn.example/clone.png",
+            source=SOURCE_GMGN_TOKEN_INFO,
+        ),
+    )
+    assert other.thumbnail != known.thumbnail
+    try:
+        merge_presentation(known, other)
+    except ValueError:
+        pass
+    else:  # pragma: no cover - the guard is the point
+        raise AssertionError("presentations must never merge across mints")
+
+    # 4. Only a safe image is ever rendered.
+    for unsafe in (
+        "http://x/a.png",
+        "/tmp/a.png",
+        "https://x/a.png?api_key=abc",
+        "https://x/a.png?X-Amz-Signature=abc",
+    ):
+        assert safe_image_url(unsafe) == "", unsafe
+    assert safe_image_url("ipfs://Qm1/a.png").startswith("https://")
+
+    # 5. Publish first, enrich the same message afterwards.
+    publish_source = inspect.getsource(SmartMoneyEngine._publish_fast_alert)
+    assert publish_source.index("_schedule_presentation_enrichment") < publish_source.index(
+        "await self.notifier.on_fast_alert(alert)"
+    ), "metadata resolution must never delay the alert"
+    resolve_source = inspect.getsource(SmartMoneyEngine.resolve_presentation)
+    for forbidden in ("symbol_search", "by_symbol", "narrative_match"):
+        assert forbidden not in resolve_source, (
+            "exact-mint resolution must never fall back to a ticker search"
+        )
+    update = fast_alerts_module.enrichment_from_presentation(
+        alert_key="k", mint=mint, presentation=known, fomo_url="https://fomo.family/coin"
+    )
+    assert "Moo Deng Returns" in update.description
+    assert update.thumbnail_url == "https://cdn.example/mdr.png"
+    # An empty update must not blank a card that already had content.
+    spec = fast_alerts_module.CardSpec(
+        title="t", description="**Real**", thumbnail_url="https://cdn.example/a.png"
+    )
+    kept = fast_alerts_module.EnrichmentUpdate(alert_key="k").apply(spec)
+    assert kept.description == "**Real**" and kept.thumbnail_url
+
+    # 6. The trenches response key is ``pump``; reading it wrong loses the
+    #    entire FINAL STRETCH section.
+    sections = parse_trenches_response({"pump": [{"address": mint}]})
+    assert "near_completion" in sections and "pump" not in sections
+
+    # 7. An optional endpoint's 429 cools that endpoint and nothing else.
+    class _Response:
+        def __init__(self, payload, status=200, headers=None):
+            self._payload, self.status = payload, status
+            self.headers = headers or {}
+
+        async def text(self):
+            return _json.dumps(self._payload)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _Session:
+        closed = False
+
+        def __init__(self, handler):
+            self._handler, self.requests = handler, []
+
+        def request(self, method, url, **kwargs):
+            self.requests.append(url)
+            return self._handler(method, url, kwargs)
+
+    def handler(method, url, kwargs):
+        if "hot_searches" in url:
+            return _Response({"code": 429, "error": "RATE_LIMIT_EXCEEDED"}, 429)
+        return _Response({"code": 0, "data": {"rank": [{"address": mint}]}})
+
+    client = GmgnClient(api_key=secret, session=_Session(handler))
+    with contextlib.suppress(GmgnError):
+        await client.hot_searches()
+    assert len(await client.trending(interval="1m")) == 1, (
+        "a hot-search rate limit must not stop core discovery"
+    )
+    health = client.endpoints.to_json()
+    assert health["summary"] == PARTIAL_DEGRADATION
+    by_kind = {item["kind"]: item for item in health["endpoints"]}
+    assert by_kind["hot_searches"]["cooling"] and by_kind["rank"]["healthy"]
+    before = len(client._session.requests)
+    with contextlib.suppress(GmgnError):
+        await client.hot_searches()
+    assert len(client._session.requests) == before, "no probing during a cooldown"
+    assert secret not in _json.dumps(client.usage_snapshot())
+    await client.close()
+
+    # 8. Discovery is protected; attention is shed first.
+    assert tier_for("rank") == "A" and tier_for("trenches") == "A"
+    assert tier_for("hot_searches") == "C"
+    registry = EndpointRegistry()
+    assert registry.admits("rank", budget_headroom=0.01)[0] is True
+    assert registry.admits("hot_searches", budget_headroom=0.2)[0] is False
+    registry.note_success("rank", rows=1)
+    registry.disable("hot_searches")
+    assert registry.summary() == CORE_ACTIVE, (
+        "an endpoint switched off on purpose is not a degradation"
+    )
+
+    # 9. The Pump lane names its fault and never calls polling a websocket.
+    stream = PumpCreationStream(rpc_url="https://api.mainnet-beta.solana.com")
+    status = stream.status()
+    for key in ("subscribe_acks", "notifications", "stale_rebuilds", "ack_timeouts"):
+        assert key in status, f"the Pump lane must report {key}"
+    assert status["fallback_source"] in {"", "GMGN_TRENCH_POLLING"}
+    assert "websocket" not in str(status["fallback_source"]).lower()
+    run_source = inspect.getsource(PumpCreationStream.run)
+    assert "healthy_run" in run_source, (
+        "a silent socket must not reset the backoff — that is the reconnect spin"
+    )
+
+    # 10. A spent quota backs off for the long window immediately.
+    exhausted = record_failure(
+        ProviderState(name="solana_tracker"),
+        now=0.0,
+        status=403,
+        message='{"error":"Insufficient credits for this request"}',
+    )
+    assert exhausted.degraded_until == BACKOFF_SECONDS[-1]
+
+    # 11. The realtime panel carries GMGN, and no credential.
+    realtime_source = inspect.getsource(bot_module._realtime_embed)
+    assert "GMGN ALPHA" in realtime_source and "PUMP REALTIME" in realtime_source
+    for forbidden in ("api_key", "X-APIKEY", "GMGN_API_KEY"):
+        assert forbidden not in realtime_source
 
 
 async def check_paper_laboratory() -> None:

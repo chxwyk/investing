@@ -91,6 +91,7 @@ from .models import (
     GmgnSecurity,
     GmgnSignal,
     GmgnToken,
+    GmgnWalletTrade,
     parse_hot_searches_response,
     parse_participants,
     parse_rank_response,
@@ -98,7 +99,7 @@ from .models import (
     parse_signals,
     parse_tokens,
     parse_trenches_response,
-    parse_wallet_directory,
+    parse_wallet_trades,
 )
 from .signals import (
     CHAIN_SOLANA,
@@ -201,6 +202,7 @@ __all__ = [
     "GmgnSecurity",
     "GmgnSignal",
     "GmgnToken",
+    "GmgnWalletTrade",
     "ProviderHealth",
     "RequestBudget",
     "SignalClassification",
@@ -222,7 +224,7 @@ __all__ = [
     "parse_signals",
     "parse_tokens",
     "parse_trenches_response",
-    "parse_wallet_directory",
+    "parse_wallet_trades",
     "record_failure",
     "record_success",
     "redact",
