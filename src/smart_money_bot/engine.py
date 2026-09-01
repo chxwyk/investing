@@ -133,6 +133,12 @@ from .lab.early import (
     WHY_NO_DATA as EARLY_WHY_NO_DATA,
 )
 from .lab.early import (
+    WHY_NOT_AN_ENTRY as EARLY_WHY_NOT_AN_ENTRY,
+)
+from .lab.early import (
+    WHY_SCAN_BUDGET as EARLY_WHY_SCAN_BUDGET,
+)
+from .lab.early import (
     WHY_SUSPECTED_CLONE as EARLY_WHY_SUSPECTED_CLONE,
 )
 from .lab.early import (
@@ -731,6 +737,7 @@ class SmartMoneyEngine:
         self.clone_suppressed = 0
         self.collision_suppressed = 0
         self.thin_quality_suppressed = 0
+        self.not_an_entry_suppressed = 0
         self.early_lane_evaluated = 0
         # The future execution interface, wired and switched off (sections
         # 74-83).  The only provider that exists records intents; there is no
@@ -1817,7 +1824,9 @@ class SmartMoneyEngine:
             logger.exception("Early lane failed for %s", mint[:8])
             return False
 
-    async def _early_lane_task(self, mint: str, *, now: int) -> bool:
+    async def _early_lane_task(
+        self, mint: str, *, now: int, may_publish: bool = True
+    ) -> bool:
         # The mint that entered this lane is the mint that leaves it.  The DEX
         # snapshot is fetched *by address* and its parser drops any pair whose
         # baseToken is not this exact mint, so a same-symbol clone cannot be
@@ -1902,6 +1911,30 @@ class SmartMoneyEngine:
         if not self._early_lane_allows(mint, verdict, now=now):
             return False
 
+        # v2.48.  A scan that has already spent its card budget on stronger
+        # candidates still finishes looking at this one: the first-seen market
+        # cap is a historical fact worth recording whether or not a card comes
+        # of it, and a near-miss belongs on the watch list either way.  What it
+        # does not get is a card.  Capping the *look* instead of the *card*
+        # would reintroduce the lateness this budget sits next to.
+        if not may_publish:
+            await self._record_suppression(
+                mint,
+                EARLY_WHY_SCAN_BUDGET,
+                now=now,
+                market_cap=snapshot.market_cap_usd,
+                tier=verdict.tier,
+            )
+            await self._open_early_watch(
+                mint,
+                verdict=verdict,
+                snapshot=snapshot,
+                first_seen_market_cap_usd=first_seen_mc,
+                independent_buyers=signals.independent_buyers_5m,
+                now=now,
+            )
+            return False
+
         # Whatever this exact-mint snapshot already knows is captured before the
         # card is built, so the fast path never publishes a token it could have
         # named (section 6).
@@ -1954,7 +1987,16 @@ class SmartMoneyEngine:
                 market_cap=snapshot.market_cap_usd,
                 tier=verdict.tier,
             )
-        if quality.weak():
+        if quality.disqualified:
+            self.not_an_entry_suppressed += 1
+            await self._record_suppression(
+                mint,
+                EARLY_WHY_NOT_AN_ENTRY,
+                now=now,
+                market_cap=snapshot.market_cap_usd,
+                tier=verdict.tier,
+            )
+        elif quality.weak():
             self.thin_quality_suppressed += 1
             await self._record_suppression(
                 mint,
@@ -2338,13 +2380,40 @@ class SmartMoneyEngine:
         width = max(1, int(getattr(self.settings, "gmgn_early_lane_concurrency", 8)))
         selected = [item.mint for item in ranked[:budget] if item.mint in by_mint]
 
+        # v2.48.  Evaluating widely and *alerting* widely are different
+        # things.  The first is how a runner gets found on the scan it appears
+        # in; the second is how an operator ends up scrolling past forty dead
+        # trench launches to reach it.  This scan keeps its wide look and is
+        # allowed a handful of cards, spent best-first because the list above
+        # is already ranked.
+        card_budget = max(1, int(getattr(self.settings, "gmgn_early_lane_max_cards_per_scan", 4)))
+        # A slot is *claimed* before the evaluation is awaited and released
+        # again if no card came of it.  Checking a published-count across an
+        # await would let every coroutine in a batch pass the test while the
+        # count was still zero, and the cap would overshoot by the width of
+        # the batch — which is the same "ten times the cards" bug in smaller
+        # print.
+        claimed = 0
+        published = 0
+
         async def evaluate(mint: str) -> None:
+            nonlocal claimed, published
             # The exact mint that GMGN reported is the exact mint that gets
             # analysed.  Nothing between here and the card may substitute it.
             assert_exact_propagation(mint, mint, stage="gmgn candidate → early lane")
+            may_publish = claimed < card_budget
+            if may_publish:
+                claimed += 1
+            made_a_card = False
             with suppress(Exception):
-                if await self._early_lane_task(mint, now=now):
-                    self.gmgn_candidates_published += 1
+                made_a_card = await self._early_lane_task(
+                    mint, now=now, may_publish=may_publish
+                )
+            if made_a_card:
+                self.gmgn_candidates_published += 1
+                published += 1
+            elif may_publish:
+                claimed -= 1
             # A GMGN observation on an already-watched candidate is new
             # information: re-evaluate promotion now rather than at the next
             # timer tick (section 47).
@@ -3077,6 +3146,14 @@ class SmartMoneyEngine:
             buys=getattr(token, "buys", None),
             sells=getattr(token, "sells", None),
             total_fee_sol=getattr(token, "total_fee", None),
+            # v2.48.  All three of these were already arriving on every board
+            # row and were being dropped on the floor.  They are the columns
+            # the operator reads on every terminal they use — 1m move, ATH MC,
+            # and the buy/sell split — and without them the scorer could not
+            # tell a run from a rug.
+            price_change_1m_percent=getattr(token, "price_change_1m_percent", None),
+            price_change_5m_percent=getattr(token, "price_change_5m_percent", None),
+            ath_market_cap_usd=getattr(token, "history_highest_market_cap_usd", None),
             top10_holder_rate=getattr(token, "top10_holder_rate", None),
             dev_hold_rate=getattr(token, "dev_team_hold_rate", None),
             bundler_rate=getattr(token, "bundler_rate", None),
@@ -3120,6 +3197,9 @@ class SmartMoneyEngine:
             market_cap_usd=getattr(snapshot, "market_cap_usd", None),
             buys=getattr(snapshot, "buys_5m", None),
             sells=getattr(snapshot, "sells_5m", None),
+            # The DEX pair carries a 5-minute move.  It has no all-time high,
+            # so drawdown stays unknown here rather than being guessed at.
+            price_change_5m_percent=getattr(snapshot, "price_change_5m_percent", None),
         )
 
     async def _peer_facts(self, subject: TokenFacts) -> list[TokenFacts]:
@@ -4911,6 +4991,10 @@ class SmartMoneyEngine:
             "suspected_clones": self.clone_suppressed,
             "unresolved_collisions": self.collision_suppressed,
             "thin_quality": self.thin_quality_suppressed,
+            "not_an_entry": self.not_an_entry_suppressed,
+            "cards_per_scan_cap": int(
+                getattr(self.settings, "gmgn_early_lane_max_cards_per_scan", 0)
+            ),
             "name_groups_tracked": len(self._token_facts),
         }
 

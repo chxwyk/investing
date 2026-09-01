@@ -44,6 +44,7 @@ from smart_money_bot.lab.early import (
     WHY_INSIDER_ONLY,
     WHY_MOVE_CONSUMED,
     WHY_NOT_SERIOUS,
+    WHY_SCAN_BUDGET,
     AlertTiming,
     EarlyConfig,
     EarlySignals,
@@ -1049,3 +1050,113 @@ def test_the_social_lane_reports_a_real_state_not_a_generic_healthy(
         "RATE_LIMITED",
     }
     assert status["state"] != "HEALTHY"
+
+
+# ===========================================================================
+# v2.48. The per-scan card budget caps the CARD, never the analysis.
+# ===========================================================================
+
+
+async def test_a_spent_card_budget_still_finishes_analysing_the_token(
+    settings, tmp_path
+) -> None:
+    """The operator's complaint was ten times the cards, not ten times the looks.
+
+    v2.47 raised evaluation from 6 to 60 candidates per scan and left publishing
+    uncapped, so a wide scan became a wide alert. The fix caps cards — but if it
+    capped the *look* instead, it would throw away the first-seen market cap
+    (the fact that makes "was this early?" answerable at all) and would stop a
+    near-miss ever reaching the watch list. That would be the lateness this
+    budget sits next to, rebuilt.
+    """
+
+    engine = await engine_for(settings, tmp_path, name="card-budget.db")
+    try:
+
+        async def _snapshot(mint, refresh=False):
+            return snapshot()
+
+        engine.dex_screener.snapshot = _snapshot
+
+        published = await engine._early_lane_task(MINT, now=NOW, may_publish=False)
+
+        # No card reached the operator.
+        assert published is False
+        assert not engine.notifier.cards
+
+        # But the token was fully analysed: the first market cap the bot ever
+        # saw for this mint is on the record, exactly as if it had published.
+        timeline = {
+            str(row["stage"]): row for row in await engine.database.alert_timeline(MINT)
+        }
+        assert timeline[STAGE_BOT_FIRST_SEEN]["market_cap_usd"] == 31180.0
+        assert STAGE_CHEAP_SIGNAL in timeline
+
+        # And "why wasn't I pinged?" still has an answer.
+        counts = await engine.database.suppression_counts()
+        assert counts.get(WHY_SCAN_BUDGET, 0) == 1
+    finally:
+        await engine.database.close()
+
+
+async def test_a_budget_skipped_token_is_offered_to_the_watch_list_identically(
+    settings, tmp_path
+) -> None:
+    """The near-miss path must survive the card budget.
+
+    A candidate the budget skipped is exactly the kind that should stay on the
+    radar: strong enough to look at, not strong enough to spend a card on. If
+    the budget path skipped ``_open_early_watch``, the section-2 promotion fix
+    would quietly stop working for every candidate past the fourth on a scan —
+    and that is the failure v2.44 exists to prevent.
+    """
+
+    seen: list[dict] = []
+
+    async def _capture(mint, **kwargs):
+        seen.append({"mint": mint, **kwargs})
+
+    async def _snapshot(mint, refresh=False):
+        return snapshot()
+
+    engine = await engine_for(settings, tmp_path, name="watch-skipped.db")
+    try:
+        engine.dex_screener.snapshot = _snapshot
+        engine._open_early_watch = _capture
+        await engine._early_lane_task(MINT, now=NOW, may_publish=False)
+    finally:
+        await engine.database.close()
+
+    control = await engine_for(settings, tmp_path, name="watch-published.db")
+    try:
+        control.dex_screener.snapshot = _snapshot
+        control._open_early_watch = _capture
+        await control._early_lane_task(MINT, now=NOW, may_publish=True)
+    finally:
+        await control.database.close()
+
+    assert len(seen) == 2, "the budget path skipped the watch list entirely"
+    skipped, published = seen
+    assert skipped["mint"] == published["mint"] == MINT
+    # Same evidence offered, on both paths. A watch opened from a weaker
+    # observation than the publish path would use is a silently different rule.
+    assert skipped["verdict"].tier == published["verdict"].tier
+    assert skipped["first_seen_market_cap_usd"] == published["first_seen_market_cap_usd"]
+    assert skipped["independent_buyers"] == published["independent_buyers"]
+
+
+async def test_the_same_token_publishes_when_the_budget_is_available(
+    settings, tmp_path
+) -> None:
+    # The control. Same mint, same snapshot, budget available: a card.
+    engine = await engine_for(settings, tmp_path, name="card-budget-ok.db")
+    try:
+
+        async def _snapshot(mint, refresh=False):
+            return snapshot()
+
+        engine.dex_screener.snapshot = _snapshot
+        assert await engine._early_lane_task(MINT, now=NOW, may_publish=True) is True
+        assert engine.notifier.cards
+    finally:
+        await engine.database.close()

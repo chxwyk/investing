@@ -35,6 +35,10 @@ HUNDRED = Decimal("100")
 CENT = Decimal("0.01")
 
 
+def _opt(value: Decimal | None) -> str | None:
+    return None if value is None else str(value)
+
+
 def ramp(value: Decimal | None, floor: Decimal, target: Decimal) -> Decimal:
     """0 at or below ``floor``, 1 at or above ``target``, linear between.
 
@@ -102,25 +106,71 @@ class QualityConfig:
     insider_good: Decimal = Decimal("0.10")
     insider_bad: Decimal = Decimal("0.35")
 
-    # ---- weights.  Fee velocity leads because it is the hardest to fake.
-    weight_fee_velocity: Decimal = Decimal("26")
-    weight_liquidity: Decimal = Decimal("16")
-    weight_volume: Decimal = Decimal("14")
-    weight_depth_ratio: Decimal = Decimal("10")
-    weight_holders: Decimal = Decimal("12")
-    weight_swaps: Decimal = Decimal("6")
-    weight_ownership: Decimal = Decimal("16")
+    # ---- direction (v2.48) ----------------------------------------------
+    # Momentum: the freshest signed move.  Flat earns nothing; the ramp opens
+    # above zero because "not falling" is not the same as "running".
+    momentum_floor_percent: Decimal = Decimal("0")
+    momentum_target_percent: Decimal = Decimal("25")
+    # Drawdown from the token's own high, as a rate.  Scored inverted: at its
+    # high is full credit, far below it is none.
+    drawdown_good: Decimal = Decimal("0.10")
+    drawdown_bad: Decimal = Decimal("0.55")
+    # Sells per buy.  One-for-one is a healthy two-way market; three sells per
+    # buy is an exit wearing a volume number.
+    sell_pressure_good: Decimal = Decimal("1.1")
+    sell_pressure_bad: Decimal = Decimal("2.5")
 
-    #: Below this, a candidate is thin enough that a ping would be noise.
-    ping_min_score: Decimal = Decimal("55")
-    #: The only score that actually *withholds* a ping, and it does so only for
-    #: a token we could see clearly.  Everything between this and
-    #: ``ping_min_score`` still reaches the operator — the operator's complaint
-    #: was fake coins getting through, not real ones being shown.
-    ping_block_score: Decimal = Decimal("30")
+    # ---- weights.  Fee velocity leads because it is the hardest to fake,
+    # and direction now outweighs every static level put together.
+    weight_fee_velocity: Decimal = Decimal("18")
+    weight_momentum: Decimal = Decimal("14")
+    weight_drawdown: Decimal = Decimal("12")
+    weight_buy_pressure: Decimal = Decimal("10")
+    weight_liquidity: Decimal = Decimal("9")
+    weight_volume: Decimal = Decimal("7")
+    weight_depth_ratio: Decimal = Decimal("7")
+    weight_holders: Decimal = Decimal("9")
+    weight_swaps: Decimal = Decimal("4")
+    weight_ownership: Decimal = Decimal("10")
+
+    # ---- hard disqualifiers (v2.48) --------------------------------------
+    # Three states that are not "low scoring" but "not an entry at all", and
+    # no amount of volume buys past them.  Each fires only on a value we
+    # actually measured: unknown is never disqualifying.
+    #: Below its own high by this much and the move already happened to
+    #: somebody else.  This is the "ATH MC" column on every board the
+    #: operator reads, finally used.
+    disqualify_drawdown: Decimal = Decimal("0.70")
+    #: More than this many sells per buy and the crowd is leaving, whatever
+    #: the volume figure says.  A rug prints the biggest volume of its life
+    #: on the way down.
+    disqualify_sell_pressure: Decimal = Decimal("3")
+    #: Fewer holders than this is not a market yet.
+    disqualify_holders: int = 10
+    #: A collapse this steep inside the freshest window is a chart falling
+    #: over, not a dip to buy.
+    disqualify_momentum_percent: Decimal = Decimal("-40")
+
+    #: Below this, a candidate we could actually see is thin enough that a
+    #: ping would be noise.  v2.47 set the real bar at 30 and let a token
+    #: down 99.8% through; this is that bar, raised to where it belongs.
+    ping_min_score: Decimal = Decimal("62")
     #: At least this fraction of the score must come from fields we actually
-    #: measured.  Otherwise a token wins by being unknown.
-    min_measured_fraction: Decimal = Decimal("0.5")
+    #: measured before the score bar is allowed to *withhold* anything.
+    #:
+    #: This is deliberately high, and the reason is the whole shape of the
+    #: problem.  A sixty-second-old token cannot have 120 holders, 9 SOL of
+    #: fees or a meaningful all-time high — it is thin because it is **early**,
+    #: which is the exact moment the operator asked to be told about it.  A
+    #: DEX-only snapshot sees about half the weight here and none of the four
+    #: most decisive families, so judging it against a mature token's bar
+    #: would silence every genuinely early alert.
+    #:
+    #: The protection against a *fake* token does not live here.  It lives in
+    #: the disqualifiers, which are absolute, work on partial data, and do not
+    #: care how much else we could see: three holders is not a market at any
+    #: age, and thirteen sells per buy is an exit at any age.
+    min_measured_fraction: Decimal = Decimal("0.62")
 
 
 DEFAULT_QUALITY_CONFIG = QualityConfig()
@@ -144,6 +194,14 @@ class QualityScore:
     fee_velocity_sol_per_minute: Decimal | None = None
     liquidity_usd: Decimal | None = None
     holder_count: int | None = None
+    momentum_percent: Decimal | None = None
+    drawdown_from_ath: Decimal | None = None
+    sell_pressure: Decimal | None = None
+    #: Why this is not an entry at all.  Empty for everything else.  A
+    #: disqualified token is still published — the operator asked to stop
+    #: being *recommended* dead charts, not to stop being able to see them —
+    #: it simply cannot interrupt anybody, at any score.
+    disqualifiers: tuple[str, ...] = field(default_factory=tuple)
 
     @property
     def measured_fraction(self) -> Decimal:
@@ -159,16 +217,27 @@ class QualityScore:
     def strong(self, *, config: QualityConfig = DEFAULT_QUALITY_CONFIG) -> bool:
         return self.score >= config.ping_min_score and self.confident(config=config)
 
-    def weak(self, *, config: QualityConfig = DEFAULT_QUALITY_CONFIG) -> bool:
-        """Measurable, and measured badly.  The only quality state that gates.
+    @property
+    def disqualified(self) -> bool:
+        return bool(self.disqualifiers)
 
-        An *unmeasured* token is never weak.  A DEX-only snapshot cannot see
-        fees, holders or ownership, and treating "we could not look" as "there
-        is nothing there" would silently switch off the whole Pump lane — the
-        opposite of what the operator asked for.
+    def weak(self, *, config: QualityConfig = DEFAULT_QUALITY_CONFIG) -> bool:
+        """Not fit to interrupt a human.  The one quality state that gates.
+
+        Two ways in.  A **disqualified** token is out whatever it scored — the
+        three states in the config are structural, and a big volume number is
+        exactly what a dying token produces.  Otherwise a token is weak when we
+        could see it clearly and it came in under the bar.
+
+        An *unmeasured* token is still never weak.  A DEX-only snapshot cannot
+        see fees, holders or ownership, and treating "we could not look" as
+        "there is nothing there" would silently switch off the whole Pump lane
+        — the opposite of what the operator asked for.
         """
 
-        return self.confident(config=config) and self.score < config.ping_block_score
+        if self.disqualified:
+            return True
+        return self.confident(config=config) and self.score < config.ping_min_score
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -185,6 +254,11 @@ class QualityScore:
             "confident": self.confident(),
             "strong": self.strong(),
             "weak": self.weak(),
+            "disqualified": self.disqualified,
+            "disqualifiers": list(self.disqualifiers),
+            "momentum_percent": _opt(self.momentum_percent),
+            "drawdown_from_ath": _opt(self.drawdown_from_ath),
+            "sell_pressure": _opt(self.sell_pressure),
             "components": [list(item) for item in self.components],
             "reasons": list(self.reasons),
             "concerns": list(self.concerns),
@@ -202,6 +276,28 @@ def score_quality(
     caller decides — which is what keeps a 47-holder token with smart money and
     a story reachable while a 50-holder token with nothing behind it is not.
     """
+
+    # ---- is this an entry at all? ---------------------------------------
+    # Before anything is scored.  Each test fires only on a value we actually
+    # measured, because "we could not look" must never read as "it is dead".
+    disqualifiers: list[str] = []
+    drawdown = facts.drawdown_from_ath
+    if drawdown is not None and drawdown >= config.disqualify_drawdown:
+        disqualifiers.append(
+            f"already down {(drawdown * HUNDRED).quantize(CENT)}% from its own high "
+            f"— this move happened to somebody else"
+        )
+    pressure = facts.sell_pressure
+    if pressure is not None and pressure >= config.disqualify_sell_pressure:
+        disqualifiers.append(
+            f"{pressure} sells for every buy — the crowd is leaving, whatever the "
+            f"volume says"
+        )
+    if facts.holder_count is not None and facts.holder_count < config.disqualify_holders:
+        disqualifiers.append(f"only {facts.holder_count} holders — not a market yet")
+    momentum = facts.momentum_percent
+    if momentum is not None and momentum <= config.disqualify_momentum_percent:
+        disqualifiers.append(f"{momentum}% in the last minute — the chart is falling over")
 
     parts: list[tuple[str, Decimal, Decimal, bool]] = []
 
@@ -222,10 +318,44 @@ def score_quality(
             facts.liquidity_usd is not None,
         )
     )
+    # Direction, in three parts.  v2.47 had none of this, which is how a mint
+    # down 99.8% with thirteen sells per buy earned full marks on volume,
+    # depth ratio and transactions at once.
+    parts.append(
+        (
+            "momentum",
+            ramp(momentum, config.momentum_floor_percent, config.momentum_target_percent),
+            config.weight_momentum,
+            momentum is not None,
+        )
+    )
+    parts.append(
+        (
+            "drawdown",
+            inverse_ramp(drawdown, config.drawdown_good, config.drawdown_bad),
+            config.weight_drawdown,
+            drawdown is not None,
+        )
+    )
+    parts.append(
+        (
+            "buy pressure",
+            inverse_ramp(pressure, config.sell_pressure_good, config.sell_pressure_bad),
+            config.weight_buy_pressure,
+            pressure is not None,
+        )
+    )
+    # Volume and transaction count are both scaled by which way the flow is
+    # going.  Unscaled, they are the two figures a dump maximises.
+    flow = (
+        inverse_ramp(pressure, config.sell_pressure_good, config.sell_pressure_bad)
+        if pressure is not None
+        else ONE
+    )
     parts.append(
         (
             "volume",
-            ramp(facts.volume_usd, config.volume_floor_usd, config.volume_target_usd),
+            ramp(facts.volume_usd, config.volume_floor_usd, config.volume_target_usd) * flow,
             config.weight_volume,
             facts.volume_usd is not None,
         )
@@ -234,7 +364,8 @@ def score_quality(
     parts.append(
         (
             "volume vs liquidity",
-            ramp(depth, config.volume_to_liquidity_floor, config.volume_to_liquidity_target),
+            ramp(depth, config.volume_to_liquidity_floor, config.volume_to_liquidity_target)
+            * flow,
             config.weight_depth_ratio,
             depth is not None,
         )
@@ -256,7 +387,7 @@ def score_quality(
     parts.append(
         (
             "transactions",
-            ramp(swaps, config.swaps_floor, config.swaps_target),
+            ramp(swaps, config.swaps_floor, config.swaps_target) * flow,
             config.weight_swaps,
             swaps is not None,
         )
@@ -305,12 +436,34 @@ def score_quality(
         if value is not None and value >= bad:
             concerns.append(f"{label} at {(value * HUNDRED).quantize(CENT)}%")
 
+    if momentum is not None and momentum >= config.momentum_target_percent:
+        reasons.append(f"+{momentum}% and still moving")
+    elif momentum is not None and momentum < ZERO:
+        concerns.append(f"{momentum}% over the last minute")
+    if drawdown is not None and drawdown <= config.drawdown_good:
+        reasons.append("trading at or near its own high")
+    elif drawdown is not None and drawdown >= config.drawdown_bad:
+        concerns.append(f"{(drawdown * HUNDRED).quantize(CENT)}% below its high")
+    if pressure is not None and pressure <= config.sell_pressure_good:
+        reasons.append(f"{pressure} sells per buy — buyers still arriving")
+    elif pressure is not None and pressure >= config.sell_pressure_bad:
+        concerns.append(f"{pressure} sells for every buy")
+
+    # A disqualified token scores zero.  Not "scores low" — the three states
+    # above are structural, and leaving a residual score would let a big
+    # volume number keep a dying chart near the top of the ranking.
+    final_score = ZERO if disqualifiers else earned.quantize(CENT)
+
     return QualityScore(
         mint=facts.mint,
         fee_velocity_sol_per_minute=fee_velocity,
         liquidity_usd=facts.liquidity_usd,
         holder_count=facts.holder_count,
-        score=(earned).quantize(CENT),
+        momentum_percent=momentum,
+        drawdown_from_ath=drawdown,
+        sell_pressure=pressure,
+        disqualifiers=tuple(disqualifiers),
+        score=final_score,
         measured_weight=measured_weight,
         total_weight=total_weight,
         components=tuple(

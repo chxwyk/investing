@@ -238,13 +238,15 @@ async def main() -> None:
     await check_gmgn_integration()
     await check_production_hardening()
     await check_clone_defence()
+    await check_direction_not_level()
 
     print(
         "SELF-CHECK PASSED: detector, scoring, database, discovery rotation, "
         "paper P&L, risk gate, PAPER laboratory, discovery-speed, realtime-alpha, "
         "SHADOW auto-trader, profit-optimization, early-alpha, Trending-first, "
         "trenches-intelligence, token-identity, promotion-intelligence, "
-        "GMGN-integration, production-hardening and clone-defence invariants"
+        "GMGN-integration, production-hardening, clone-defence and\n        "
+        "direction-not-level invariants"
     )
 
 
@@ -1351,6 +1353,155 @@ async def check_clone_defence() -> None:
             'getenv("GMGN_PRIVATE_KEY"',
         ):
             assert forbidden not in source, f"{module.__name__} must stay pure logic"
+
+
+async def check_direction_not_level() -> None:
+    """A dying token produces the biggest volume of its life.  v2.47 rewarded it.
+
+    The deploy gate for v2.48, built from two rows the operator screenshotted.
+    POKEMON at -99.8% with 3,400 sells against 252 buys scored 42/100 and
+    passed; ISABELLA with three holders and -47.1% on every timeframe scored
+    56.88 and returned ``strong() is True``.  Both earned *full* marks on
+    volume, depth ratio and transactions, because the scorer measured levels
+    and levels cannot tell a run from a rug.
+    """
+
+    import inspect
+    from decimal import Decimal as _Decimal
+
+    from smart_money_bot.config import Settings
+    from smart_money_bot.engine import SmartMoneyEngine
+    from smart_money_bot.lab.clone import TokenFacts
+    from smart_money_bot.lab.tokenquality import rank_candidates, score_quality
+
+    pokemon = TokenFacts(
+        mint="POKEMONmint", name="Pokemon", symbol="POKEMON", age_seconds=7_200,
+        liquidity_usd=_Decimal("3500"), volume_usd=_Decimal("40000"),
+        market_cap_usd=_Decimal("1700"), ath_market_cap_usd=_Decimal("850000"),
+        holder_count=252, buys=252, sells=3_400, total_fee_sol=_Decimal("0.021"),
+        price_change_5m_percent=_Decimal("-30"),
+    )
+    isabella = TokenFacts(
+        mint="ISABELLAmint", name="Isabella Cognita", symbol="ISABELLA", age_seconds=34,
+        liquidity_usd=_Decimal("6260"), volume_usd=_Decimal("12000"),
+        market_cap_usd=_Decimal("3080"), holder_count=3, buys=2, sells=1,
+        total_fee_sol=_Decimal("0.575"), price_change_1m_percent=_Decimal("-20.3"),
+    )
+
+    # 1. Both are refused outright, and score zero rather than merely low — a
+    #    residual score would keep a dying chart near the top of the ranking.
+    for facts in (pokemon, isabella):
+        result = score_quality(facts)
+        assert result.disqualified, f"{facts.symbol} still passes"
+        assert result.score == 0
+        assert result.weak() is True
+        assert result.strong() is False
+
+    # 2. The specific v2.47 defect: volume, depth ratio and transactions are
+    #    the three figures a dump maximises, and all three paid full marks.
+    components = dict(score_quality(pokemon).components)
+    for family in ("volume", "volume vs liquidity", "transactions"):
+        assert _Decimal(components[family]) == 0, f"{family} still rewards a dump"
+
+    # 2b. Each refusal must stand on its own.  POKEMON trips two of them at
+    #     once, so it cannot prove either: these are one-at-a-time cases with
+    #     everything else healthy.
+    only_selling = TokenFacts(
+        mint="S", name="S", symbol="S", age_seconds=600,
+        liquidity_usd=_Decimal("20000"), volume_usd=_Decimal("80000"),
+        market_cap_usd=_Decimal("50000"), ath_market_cap_usd=_Decimal("51000"),
+        holder_count=400, buys=100, sells=420, total_fee_sol=_Decimal("4"),
+        price_change_1m_percent=_Decimal("5"),
+    )
+    assert score_quality(only_selling).disqualified, "sell-pressure refusal is off"
+    only_drawn_down = TokenFacts(
+        mint="D", name="D", symbol="D", age_seconds=600,
+        liquidity_usd=_Decimal("20000"), volume_usd=_Decimal("80000"),
+        market_cap_usd=_Decimal("15000"), ath_market_cap_usd=_Decimal("120000"),
+        holder_count=400, buys=300, sells=250, total_fee_sol=_Decimal("4"),
+        price_change_1m_percent=_Decimal("2"),
+    )
+    assert score_quality(only_drawn_down).disqualified, "drawdown refusal is off"
+    only_empty = TokenFacts(
+        mint="E", name="E", symbol="E", age_seconds=600,
+        liquidity_usd=_Decimal("20000"), volume_usd=_Decimal("80000"),
+        market_cap_usd=_Decimal("50000"), ath_market_cap_usd=_Decimal("51000"),
+        holder_count=4, buys=300, sells=250, total_fee_sol=_Decimal("4"),
+        price_change_1m_percent=_Decimal("5"),
+    )
+    assert score_quality(only_empty).disqualified, "holder-floor refusal is off"
+    only_collapsing = TokenFacts(
+        mint="C", name="C", symbol="C", age_seconds=600,
+        liquidity_usd=_Decimal("20000"), volume_usd=_Decimal("80000"),
+        market_cap_usd=_Decimal("50000"), ath_market_cap_usd=_Decimal("51000"),
+        holder_count=400, buys=300, sells=250, total_fee_sol=_Decimal("4"),
+        price_change_1m_percent=_Decimal("-70"),
+    )
+    assert score_quality(only_collapsing).disqualified, "collapse refusal is off"
+
+    # 3. The same token while it is actually running still pings.  Refusing
+    #    corpses is only half the job; refusing everything is not the other half.
+    running = TokenFacts(
+        mint="RETAmint", name="peptidezz", symbol="RETA", age_seconds=120,
+        liquidity_usd=_Decimal("22600"), volume_usd=_Decimal("27500"),
+        market_cap_usd=_Decimal("131000"), ath_market_cap_usd=_Decimal("133000"),
+        holder_count=191, buys=140, sells=91, total_fee_sol=_Decimal("0.42"),
+        price_change_1m_percent=_Decimal("45.0"), top10_holder_rate=_Decimal("0.34"),
+        dev_hold_rate=_Decimal("0.02"), bundler_rate=_Decimal("0.005"),
+        sniper_hold_rate=_Decimal("0.09"), insider_rate=_Decimal("0.21"),
+    )
+    assert score_quality(running).strong() is True
+    assert rank_candidates([pokemon, isabella, running])[0][0].mint == "RETAmint"
+
+    # 4. A sixty-second-old token is thin because it is EARLY, which is the
+    #    moment the operator asked to hear about it.  The score bar must not
+    #    withhold anything from a token we could not properly see.
+    grok = TokenFacts(
+        mint="GROKmint", name="Grok Pocket", symbol="GROK", age_seconds=60,
+        liquidity_usd=_Decimal("6900"), volume_usd=_Decimal("5200"),
+        market_cap_usd=_Decimal("31180"), buys=26, sells=6,
+        price_change_5m_percent=_Decimal("14"),
+    )
+    early = score_quality(grok)
+    assert early.disqualified is False
+    assert early.confident() is False
+    assert early.weak() is False
+
+    # 5. Unknown is never disqualifying.  The rule v2.47 established, extended.
+    blind = TokenFacts(mint="U", name="U", symbol="U", liquidity_usd=_Decimal("12000"))
+    assert score_quality(blind).disqualified is False
+
+    # 6. The three columns that make all this possible were already arriving on
+    #    every board row and were being dropped.
+    facts_source = inspect.getsource(SmartMoneyEngine._facts_from_gmgn)
+    for field in (
+        "price_change_1m_percent",
+        "history_highest_market_cap_usd",
+    ):
+        assert field in facts_source, f"{field} dropped from the GMGN row again"
+
+    # 7. Looking widely and alerting widely are different things.  v2.47 raised
+    #    evaluation 6 -> 60 and left publishing uncapped, which is the ten times
+    #    the cards the operator reported.
+    cycle_source = inspect.getsource(SmartMoneyEngine._gmgn_cycle)
+    assert "card_budget" in cycle_source
+    assert cycle_source.index("rank_candidates(") < cycle_source.index("card_budget")
+    settings_fields = set(Settings.__dataclass_fields__)
+    assert "gmgn_early_lane_max_cards_per_scan" in settings_fields
+
+    # 8. ...but the cap gates the CARD, never the analysis: the first-seen
+    #    market cap and the watch list both survive a spent budget.
+    lane_source = inspect.getsource(SmartMoneyEngine._early_lane_task)
+    assert "may_publish" in lane_source
+    skip_at = lane_source.index("if not may_publish:")
+    assert lane_source.index("STAGE_BOT_FIRST_SEEN") < skip_at, (
+        "the card budget must not skip recording the first market cap we saw"
+    )
+    assert "_open_early_watch" in lane_source[skip_at:], (
+        "a budget-skipped candidate must still reach the watch list"
+    )
+    assert "EARLY_WHY_SCAN_BUDGET" in lane_source
+
 
 
 async def check_paper_laboratory() -> None:

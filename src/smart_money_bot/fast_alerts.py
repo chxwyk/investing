@@ -901,6 +901,21 @@ def build_early_alert(
             body += "\n" + "\n".join(f"⚠ {item}" for item in concerns_list[:4])
         fields.append(CardField("REAL MONEY", body, P_DEMAND))
 
+    # v2.48.  When the answer is "this is not an entry", say it at the top of
+    # the card in the plainest words available, with the number that decided
+    # it.  The operator's complaint was fake charts reaching them looking like
+    # opportunities; a card that buries the reason is the same failure.
+    disqualifiers = tuple(getattr(quality, "disqualifiers", ()) or ())
+    if disqualifiers:
+        fields.append(
+            CardField(
+                "⛔ NOT AN ENTRY",
+                "\n".join(f"• {item}" for item in disqualifiers[:3])
+                + "\nShown so you can see it exists. It cannot ping you.",
+                P_WARNINGS,
+            )
+        )
+
     if clone_verdict is not None and getattr(clone_verdict, "collision", False):
         fields.append(
             CardField(

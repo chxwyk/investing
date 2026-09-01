@@ -722,6 +722,7 @@ def test_a_wide_scan_evaluates_the_strongest_first_and_evaluates_far_more_than_s
         gmgn_enrichment_per_scan=6,
         gmgn_early_lane_per_scan=60,
         gmgn_early_lane_concurrency=8,
+        gmgn_early_lane_max_cards_per_scan=4,
     )
 
     def _token(mint, *, name, symbol, fee, liquidity, volume, holders):
@@ -780,7 +781,7 @@ def test_a_wide_scan_evaluates_the_strongest_first_and_evaluates_far_more_than_s
 
     evaluated: list[str] = []
 
-    async def _early_lane_task(mint, *, now):
+    async def _early_lane_task(mint, *, now, may_publish=True):
         evaluated.append(mint)
         return False
 
@@ -1027,3 +1028,416 @@ def test_the_new_strategy_modules_hold_no_network_database_or_signer() -> None:
             "cookies=",
         ):
             assert forbidden not in source, f"{module.__name__} must stay pure logic"
+
+
+# ===========================================================================
+# 10. v2.48 — direction, not level.  Built from the operator's screenshots.
+# ===========================================================================
+"""v2.47 made the lane ten times faster and left the selection bar alone, so
+the operator got ten times the cards at the same quality. Their words: *"the
+coins you're giving me are all fucking terrible research coins"*, *"it's the
+fakest chart I've seen in my life"*.
+
+Two of the cards they screenshotted, scored by v2.47:
+
+    POKEMON   MC $1.7K at -99.8%, 252 buys / 3,400 sells   ->  42.00, passed
+    ISABELLA  3 holders, -47.1% on every timeframe         ->  56.88, STRONG
+
+Both earned marks for *volume* and *transactions*, because a token dying
+produces the largest volume and transaction counts of its life. The scorer
+measured levels and could not tell a run from a rug. These tests are those two
+rows, plus the one the operator said they wanted and missed.
+"""
+
+
+def _pokemon() -> TokenFacts:
+    """Straight off the Terminal Trending screenshot."""
+
+    return TokenFacts(
+        mint="POKEMONmint",
+        name="Pokemon",
+        symbol="POKEMON",
+        age_seconds=7_200,
+        liquidity_usd=Decimal("3500"),
+        volume_usd=Decimal("40000"),
+        market_cap_usd=Decimal("1700"),
+        ath_market_cap_usd=Decimal("850000"),
+        holder_count=252,
+        buys=252,
+        sells=3_400,
+        total_fee_sol=Decimal("0.021"),
+        price_change_5m_percent=Decimal("-30"),
+    )
+
+
+def _isabella() -> TokenFacts:
+    """The token-detail screenshot: 3 holders, -47.1% on every timeframe."""
+
+    return TokenFacts(
+        mint="5EBcssFtURviaiVQpump",
+        name="Isabella Cognita",
+        symbol="ISABELLA",
+        age_seconds=34,
+        liquidity_usd=Decimal("6260"),
+        volume_usd=Decimal("12000"),
+        market_cap_usd=Decimal("3080"),
+        holder_count=3,
+        buys=2,
+        sells=1,
+        total_fee_sol=Decimal("0.575"),
+        top10_holder_rate=Decimal("0.05"),
+        dev_hold_rate=Decimal("0"),
+        bundler_rate=Decimal("0.02"),
+        sniper_hold_rate=Decimal("0"),
+        insider_rate=Decimal("0"),
+        price_change_1m_percent=Decimal("-20.3"),
+    )
+
+
+def test_a_token_down_ninety_nine_percent_is_not_an_entry_however_big_its_volume() -> None:
+    score = score_quality(_pokemon())
+    assert score.disqualified is True
+    assert score.score == 0
+    assert score.weak() is True
+    joined = " ".join(score.disqualifiers)
+    assert "own high" in joined
+    assert "sells for every buy" in joined
+
+
+def test_a_dump_can_no_longer_earn_marks_for_volume_or_transactions() -> None:
+    # The specific v2.47 defect: $40K of volume on $3.5K of liquidity and 3.6K
+    # transactions scored 14/14, 10/10 and 6/6 — full marks, three times over,
+    # on the three figures a rug maximises.
+    components = dict(score_quality(_pokemon()).components)
+    for family in ("volume", "volume vs liquidity", "transactions"):
+        assert Decimal(components[family]) == 0, f"{family} still rewards the dump"
+
+
+def test_three_holders_is_not_a_market_at_any_age_or_score() -> None:
+    score = score_quality(_isabella())
+    assert score.disqualified is True
+    assert score.strong() is False
+    assert score.weak() is True
+    assert any("holders" in item for item in score.disqualifiers)
+
+
+def test_the_isabella_card_can_never_ping_and_says_why() -> None:
+    alert = _card(quality=score_quality(_isabella()))
+    assert alert.ping is False
+    assert alert.lane == fa.LANE_RADAR
+    names = [field.name for field in alert.spec.fields]
+    assert "⛔ NOT AN ENTRY" in names
+    panel = next(field for field in alert.spec.fields if field.name == "⛔ NOT AN ENTRY")
+    assert "3 holders" in panel.value
+    # Shown, not hidden. The operator asked to stop being *recommended* dead
+    # charts, not to lose the ability to see that one exists.
+    assert alert.spec.title
+
+
+def test_the_same_token_running_is_still_pinged() -> None:
+    # RETA, at the moment the operator described watching it: $131K and moving,
+    # near its own high, buyers outnumbering sellers. This is the alert they
+    # said they wanted and did not get.
+    running = TokenFacts(
+        mint="RETAmint",
+        name="peptidezz",
+        symbol="RETA",
+        age_seconds=120,
+        liquidity_usd=Decimal("22600"),
+        volume_usd=Decimal("27500"),
+        market_cap_usd=Decimal("131000"),
+        ath_market_cap_usd=Decimal("133000"),
+        holder_count=191,
+        buys=140,
+        sells=91,
+        total_fee_sol=Decimal("0.42"),
+        price_change_1m_percent=Decimal("45.0"),
+        top10_holder_rate=Decimal("0.34"),
+        dev_hold_rate=Decimal("0.02"),
+        bundler_rate=Decimal("0.005"),
+        sniper_hold_rate=Decimal("0.09"),
+        insider_rate=Decimal("0.21"),
+    )
+    score = score_quality(running)
+    assert score.disqualified is False
+    assert score.strong() is True
+    assert _card(quality=score).ping is True
+
+
+def test_the_same_token_after_the_move_is_refused() -> None:
+    # RETA as the screenshot actually caught it: $61.6K against a $222.2K high.
+    # Same token, same name, same holders — a different question entirely, and
+    # the ATH column is what separates them.
+    late = TokenFacts(
+        mint="RETAmint",
+        name="peptidezz",
+        symbol="RETA",
+        age_seconds=120,
+        liquidity_usd=Decimal("22600"),
+        volume_usd=Decimal("27500"),
+        market_cap_usd=Decimal("61600"),
+        ath_market_cap_usd=Decimal("222200"),
+        holder_count=191,
+        buys=114,
+        sells=117,
+        total_fee_sol=Decimal("0.42"),
+        price_change_1m_percent=Decimal("-60.4"),
+    )
+    assert score_quality(late).disqualified is True
+    assert _card(quality=score_quality(late)).ping is False
+
+
+def test_an_early_thin_token_is_still_allowed_to_ping() -> None:
+    # The other half of the trade, and the one easy to break while fixing the
+    # first. A sixty-second-old token cannot have 120 holders, 9 SOL of fees or
+    # a meaningful high — it is thin because it is EARLY, which is exactly when
+    # the operator asked to hear about it. Only the structural refusals apply.
+    grok_pocket = TokenFacts(
+        mint="GROKmint",
+        name="Grok Pocket",
+        symbol="GROK",
+        age_seconds=60,
+        liquidity_usd=Decimal("6900"),
+        volume_usd=Decimal("5200"),
+        market_cap_usd=Decimal("31180"),
+        buys=26,
+        sells=6,
+        price_change_5m_percent=Decimal("14"),
+    )
+    score = score_quality(grok_pocket)
+    assert score.disqualified is False
+    # Not confident — four of the decisive families are simply unmeasurable at
+    # this age — so the score bar withholds nothing.
+    assert score.confident() is False
+    assert score.weak() is False
+    assert _card(quality=score).ping is True
+
+
+def test_sell_pressure_scales_volume_rather_than_being_averaged_away() -> None:
+    # Two tokens identical except for which way the flow runs. If sell pressure
+    # were merely one more component, the loser would keep most of its volume
+    # marks; scaling is what stops that.
+    base = dict(
+        mint="X",
+        name="X",
+        symbol="X",
+        age_seconds=600,
+        liquidity_usd=Decimal("20000"),
+        volume_usd=Decimal("60000"),
+        market_cap_usd=Decimal("50000"),
+        ath_market_cap_usd=Decimal("52000"),
+        holder_count=200,
+        total_fee_sol=Decimal("2"),
+    )
+    buying = score_quality(TokenFacts(**base, buys=300, sells=200))
+    selling = score_quality(TokenFacts(**base, buys=100, sells=280))
+    assert buying.score > selling.score
+    assert Decimal(dict(buying.components)["volume"]) > Decimal(
+        dict(selling.components)["volume"]
+    )
+
+
+def test_an_unknown_measurement_never_disqualifies() -> None:
+    # No ATH, no buy/sell split, no holder count. That is a token we could not
+    # look at, which is not the same as a token with nothing in it — the same
+    # rule v2.47 established, extended to the new refusals.
+    unknown = TokenFacts(
+        mint="U", name="U", symbol="U", age_seconds=300, liquidity_usd=Decimal("12000")
+    )
+    assert score_quality(unknown).disqualified is False
+
+
+def test_ranking_puts_a_running_token_above_a_dumping_one() -> None:
+    running = TokenFacts(
+        mint="run",
+        name="R",
+        symbol="R",
+        age_seconds=180,
+        liquidity_usd=Decimal("18000"),
+        volume_usd=Decimal("30000"),
+        market_cap_usd=Decimal("90000"),
+        ath_market_cap_usd=Decimal("92000"),
+        holder_count=220,
+        buys=200,
+        sells=120,
+        total_fee_sol=Decimal("3"),
+        price_change_1m_percent=Decimal("30"),
+    )
+    ranked = rank_candidates([_pokemon(), _isabella(), running])
+    assert ranked[0][0].mint == "run"
+    # And both corpses sit at the bottom on a score of zero.
+    assert all(item[1].score == 0 for item in ranked[1:])
+
+
+def test_the_gmgn_row_supplies_momentum_and_the_all_time_high() -> None:
+    # All three were already arriving on every board row and were dropped.
+    engine = _partial_engine()
+    token = SimpleNamespace(
+        mint="M",
+        name="M",
+        symbol="M",
+        created_at=1_000_000,
+        open_at=None,
+        liquidity_usd=Decimal("10000"),
+        volume_usd=Decimal("20000"),
+        market_cap_usd=Decimal("61600"),
+        holder_count=191,
+        buys=114,
+        sells=117,
+        total_fee=Decimal("0.42"),
+        price_change_1m_percent=Decimal("-60.4"),
+        price_change_5m_percent=Decimal("-30"),
+        history_highest_market_cap_usd=Decimal("222200"),
+        top10_holder_rate=Decimal("0.2"),
+        dev_team_hold_rate=Decimal("0.02"),
+        bundler_rate=Decimal("0.05"),
+        sniper_hold_rate=Decimal("0.05"),
+        insider_rate=Decimal("0.05"),
+    )
+    facts = engine._facts_from_gmgn(token, now=1_000_120)
+    assert facts.price_change_1m_percent == Decimal("-60.4")
+    assert facts.ath_market_cap_usd == Decimal("222200")
+    assert facts.drawdown_from_ath > Decimal("0.7")
+    assert facts.sell_pressure > 1
+
+
+def test_a_wide_scan_does_not_become_a_wide_alert() -> None:
+    """The whole complaint, reproduced.
+
+    v2.47 raised evaluation from 6 to 60 per scan and left publishing uncapped,
+    so a scan that *looked at* sixty candidates could tell the operator about
+    sixty of them. Every one of these fifty candidates would publish; only the
+    card budget may reach Discord.
+    """
+
+    from smart_money_bot.engine import SmartMoneyEngine
+
+    engine = _partial_engine()
+    engine.gmgn_candidates_published = 0
+    engine.early_lane_evaluated = 0
+    engine.settings = SimpleNamespace(
+        gmgn_enrichment_per_scan=6,
+        gmgn_early_lane_per_scan=60,
+        gmgn_early_lane_concurrency=8,
+        gmgn_early_lane_max_cards_per_scan=4,
+    )
+
+    candidates = [
+        SimpleNamespace(
+            mint=f"cand{index:03d}",
+            family="TRENDING",
+            token=SimpleNamespace(
+                mint=f"cand{index:03d}",
+                name=f"Cand {index}",
+                symbol=f"C{index}",
+                image_url="",
+                created_at=1_000_000,
+                open_at=None,
+                liquidity_usd=Decimal("15000") + index,
+                volume_usd=Decimal("40000"),
+                market_cap_usd=Decimal("50000"),
+                holder_count=300,
+                buys=200,
+                sells=120,
+                total_fee=Decimal("5"),
+                price_change_1m_percent=Decimal("20"),
+                price_change_5m_percent=Decimal("30"),
+                history_highest_market_cap_usd=Decimal("51000"),
+                top10_holder_rate=Decimal("0.2"),
+                dev_team_hold_rate=Decimal("0.02"),
+                bundler_rate=Decimal("0.05"),
+                sniper_hold_rate=Decimal("0.05"),
+                insider_rate=Decimal("0.05"),
+            ),
+        )
+        for index in range(50)
+    ]
+
+    evaluated: list[str] = []
+
+    async def _early_lane_task(mint, *, now, may_publish=True):
+        evaluated.append(mint)
+        return may_publish  # every single one would publish, if allowed
+
+    async def _noop(*_args, **_kwargs):
+        return None
+
+    async def _scan(*, now):
+        return SimpleNamespace(candidates=tuple(candidates), errors=())
+
+    engine._early_lane_task = _early_lane_task
+    engine.note_presentation = _noop
+    engine.note_early_watch_event = _noop
+    engine.gmgn_runtime = SimpleNamespace(scan=_scan)
+
+    asyncio.run(SmartMoneyEngine._gmgn_cycle(engine))
+
+    # Every one was still looked at — the first-seen market cap is a
+    # historical fact whether or not a card came of it, and a near-miss
+    # belongs on the watch list either way.
+    assert len(evaluated) == 50
+    # ...and the operator was told about four of them.
+    assert engine.gmgn_candidates_published == 4
+
+
+def test_the_card_cap_is_spent_best_first() -> None:
+    # A cap that took feed order would just be the old lateness with a smaller
+    # number: the ranking has to run before the budget is spent.
+    import smart_money_bot.engine as engine_module
+
+    source = inspect.getsource(engine_module.SmartMoneyEngine._gmgn_cycle)
+    assert source.index("rank_candidates(") < source.index("card_budget")
+
+
+def test_the_card_cap_is_smaller_than_the_evaluation_budget(settings) -> None:
+    assert settings.gmgn_early_lane_max_cards_per_scan < settings.gmgn_early_lane_per_scan
+    assert settings.gmgn_early_lane_max_cards_per_scan <= 6
+
+
+def test_not_an_entry_has_its_own_answerable_reason() -> None:
+    from smart_money_bot.lab.early import WHY_NOT_AN_ENTRY
+
+    assert HUMAN_WHY[WHY_NOT_AN_ENTRY]
+    import smart_money_bot.engine as engine_module
+
+    source = inspect.getsource(engine_module.SmartMoneyEngine._early_lane_task)
+    assert "EARLY_WHY_NOT_AN_ENTRY" in source
+
+
+def test_each_refusal_stands_on_its_own() -> None:
+    """POKEMON trips two refusals at once, so it proves neither individually.
+
+    A single failing case that happens to satisfy several rules is how a rule
+    quietly stops working: disable it and the case still fails, for the other
+    reason. Each of the four is exercised alone, with everything else healthy.
+    """
+
+    healthy = dict(
+        mint="X",
+        name="X",
+        symbol="X",
+        age_seconds=600,
+        liquidity_usd=Decimal("20000"),
+        volume_usd=Decimal("80000"),
+        market_cap_usd=Decimal("50000"),
+        ath_market_cap_usd=Decimal("51000"),
+        holder_count=400,
+        buys=300,
+        sells=250,
+        total_fee_sol=Decimal("4"),
+        price_change_1m_percent=Decimal("5"),
+    )
+    assert score_quality(TokenFacts(**healthy)).disqualified is False
+
+    for label, broken in (
+        ("sell pressure", {"buys": 100, "sells": 420}),
+        ("drawdown", {"market_cap_usd": Decimal("15000"),
+                      "ath_market_cap_usd": Decimal("120000")}),
+        ("holder floor", {"holder_count": 4}),
+        ("collapse", {"price_change_1m_percent": Decimal("-70")}),
+    ):
+        facts = TokenFacts(**{**healthy, **broken})
+        score = score_quality(facts)
+        assert score.disqualified is True, f"{label} refusal is not firing"
+        assert score.score == 0
+        assert len(score.disqualifiers) == 1, f"{label} case trips more than one rule"

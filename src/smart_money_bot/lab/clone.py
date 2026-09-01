@@ -111,6 +111,20 @@ class TokenFacts:
     #: Cumulative fees paid, in SOL.  Money actually moving, and much harder to
     #: fake than a market cap.
     total_fee_sol: Decimal | None = None
+
+    # ---- direction (v2.48) ------------------------------------------------
+    # v2.47 scored levels only, and levels cannot tell a run from a rug: a
+    # token down 99.8% with 3,400 sells against 252 buys earned *full* marks
+    # on volume, depth ratio and transactions, because a dump generates all
+    # three.  These are the fields that say which way it is going.
+    #:
+    #: Percent change over the last minute / five minutes, signed.
+    price_change_1m_percent: Decimal | None = None
+    price_change_5m_percent: Decimal | None = None
+    #: The highest market cap this token has ever held.  A mint at $61K whose
+    #: high was $222K is not an entry, it is someone else's exit — this is the
+    #: "ATH MC" column the operator reads on every board they use.
+    ath_market_cap_usd: Decimal | None = None
     #: Provider risk rates, 0..1 where supplied.
     top10_holder_rate: Decimal | None = None
     dev_hold_rate: Decimal | None = None
@@ -148,6 +162,54 @@ class TokenFacts:
         )
 
     @property
+    def drawdown_from_ath(self) -> Decimal | None:
+        """How far below its own high this token is trading, as 0..1.
+
+        The single cheapest way to tell "this is running" from "this already
+        ran".  ``None`` when we have no high to compare against — unknown, not
+        zero, because zero would read as a token sitting at its peak.
+        """
+
+        if (
+            self.ath_market_cap_usd is None
+            or self.market_cap_usd is None
+            or self.ath_market_cap_usd <= ZERO
+        ):
+            return None
+        if self.market_cap_usd >= self.ath_market_cap_usd:
+            return ZERO
+        return (
+            (self.ath_market_cap_usd - self.market_cap_usd) / self.ath_market_cap_usd
+        ).quantize(Decimal("0.0001"))
+
+    @property
+    def sell_pressure(self) -> Decimal | None:
+        """Sells per buy.  Above 1 means more people leaving than arriving.
+
+        Counted rather than inferred from price, because price can be held up
+        by one buyer while everyone else is getting out.
+        """
+
+        if self.buys is None or self.sells is None:
+            return None
+        if self.buys <= 0:
+            return Decimal(self.sells) if self.sells else None
+        return (Decimal(self.sells) / Decimal(self.buys)).quantize(CENT)
+
+    @property
+    def momentum_percent(self) -> Decimal | None:
+        """The freshest signed move we have.  Minute first, then five minutes.
+
+        The operator's words: *"if a new coin that just came out is moving and
+        it's actually real"*.  Movement is a rate, and the shortest window we
+        hold is the one closest to now.
+        """
+
+        if self.price_change_1m_percent is not None:
+            return self.price_change_1m_percent
+        return self.price_change_5m_percent
+
+    @property
     def volume_to_liquidity(self) -> Decimal | None:
         if self.volume_usd is None or not self.liquidity_usd or self.liquidity_usd <= ZERO:
             return None
@@ -170,6 +232,12 @@ class TokenFacts:
             "total_fee_sol": _s(self.total_fee_sol),
             "fee_velocity_sol_per_minute": _s(self.fee_velocity_sol_per_minute),
             "volume_to_liquidity": _s(self.volume_to_liquidity),
+            "price_change_1m_percent": _s(self.price_change_1m_percent),
+            "price_change_5m_percent": _s(self.price_change_5m_percent),
+            "ath_market_cap_usd": _s(self.ath_market_cap_usd),
+            "drawdown_from_ath": _s(self.drawdown_from_ath),
+            "sell_pressure": _s(self.sell_pressure),
+            "momentum_percent": _s(self.momentum_percent),
         }
 
 

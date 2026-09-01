@@ -7,7 +7,18 @@ transactions, and mirrors every newly detected hot-wallet swap in PAPER mode. PA
 as either a forced source-price observation ledger or an executable Jupiter quote-shadow
 trial; the two answer different questions and are labeled separately.
 
-Version 2.47.0 answers the two questions the operator was left to guess at: **is this a
+Version 2.48.0 fixes what v2.47 got wrong. That release made the early lane ten times
+faster and left the selection bar where it was, so the operator got ten times the cards at
+the same quality — and the scorer underneath it measured **levels, not direction**, which
+means a token down 99.8% with thirteen sells for every buy earned *full marks* on volume,
+depth ratio and transaction count, because those are the three figures a dying token
+maximises. Direction is now first-class: the freshest signed move, the distance below the
+token's own all-time high, and the buy/sell split — all three already arriving on every
+GMGN board row and all three previously discarded. Four states are refused outright at any
+score, one scan may publish a handful of cards rather than sixty, and a genuinely early
+token is still judged as early rather than against a mature token's numbers.
+
+Version 2.47.0 answered the two questions the operator was left to guess at: **is this a
 copy of a token that already exists**, and **is real money actually going into it**. Two
 live mints wearing the same name are now ranked against each other by who came first and
 whose fees are being paid, the copy is shown with a warning instead of a ping, and every
@@ -1187,6 +1198,83 @@ The bot needs these Discord application permissions:
 
 No privileged Discord gateway intents are required.
 
+## Direction, not level (v2.48)
+
+v2.47 raised early-lane evaluation from 6 to 60 candidates per scan and left the selection
+bar alone. Looking at ten times as many candidates and *telling the operator about* ten
+times as many are different things, and only the first was the point.
+
+Underneath that, a worse bug. The v2.47 scorer measured **levels**: how much liquidity, how
+much volume, how many transactions. Levels cannot tell a run from a rug, because **a token
+dying produces the largest volume and transaction count of its life.** Two rows the
+operator screenshotted, scored by the code that was live:
+
+| | v2.47 | v2.48 |
+|---|---|---|
+| POKEMON — MC $1.7K at **−99.8%**, 252 buys / 3,400 sells | **42.00, passed** — full marks on volume, depth ratio *and* transactions | **0, refused** |
+| ISABELLA — 3 holders, **−47.1%** on every timeframe | **56.88, `strong() = True`** — would ping | **0, refused** |
+
+### Direction is first-class
+
+Three fields were already arriving on every GMGN board row and were being dropped:
+
+- **`price_change_1m_percent`** — the freshest signed move. Movement is a rate, and the
+  shortest window we hold is the one closest to now.
+- **`history_highest_market_cap_usd`** — the **ATH MC** column on every board the operator
+  reads. A mint at $61K whose high was $222K is not an entry, it is someone else's exit.
+- **the buy/sell split** — collected since v2.45 and never once used. Price can be held up
+  by one buyer while everyone else leaves; counted sells cannot.
+
+Volume, depth ratio and transaction count are now **scaled by which way the flow is
+running**. Unscaled, they are exactly what a dump maximises.
+
+### Four refusals, absolute
+
+Not low scores — refusals. Each fires only on a value actually measured, and no volume
+figure gets past them:
+
+| Refusal | Threshold |
+|---|---|
+| Already below its own high | ≥ 70% drawdown |
+| Selling into the move | ≥ 3 sells per buy |
+| Not a market yet | < 10 holders |
+| Chart falling over | ≤ −40% in the freshest window |
+
+A refused token still publishes, with a **⛔ NOT AN ENTRY** panel naming the number that
+decided it. The operator asked to stop being *recommended* dead charts, not to lose the
+ability to see one exists.
+
+### Early is not the same as thin
+
+The trap in the other direction, and the one easy to fall into while fixing the first: a
+sixty-second-old token cannot have 120 holders, 9 SOL of fees or a meaningful all-time high.
+**It is thin because it is early** — the exact moment the operator asked to hear about it.
+
+So the score bar only withholds a ping from a token we could genuinely see (62% of the
+weight measured, which a DEX-only snapshot never reaches). Protection against a *fake*
+token does not live in the bar; it lives in the four refusals, which are absolute and work
+on partial data. Three holders is not a market at any age.
+
+Verified both ways in the deploy gate: the Grok Pocket case (60s old, +14%, 26 buys vs 6
+sells) still pings, and the real $SNP500 winner still scores 72.34.
+
+### A wide scan is not a wide alert
+
+| Setting | Default | Rations |
+|---|---|---|
+| `GMGN_EARLY_LANE_PER_SCAN` | 60 | candidates **evaluated** |
+| `GMGN_EARLY_LANE_MAX_CARDS_PER_SCAN` | 4 | candidates **alerted on** |
+
+The cap gates the **card, never the analysis**. A budget-skipped candidate is still fully
+evaluated: its first-seen market cap is recorded (the fact that makes "was this early?"
+answerable at all), it still reaches the hot-watch list, and the skip is logged as
+`SCAN_CARD_BUDGET_SPENT` so "why wasn't I pinged?" keeps its answer. Capping the *look*
+would have rebuilt the lateness this budget sits next to.
+
+The budget is spent best-first — the ranking runs before it — and a slot is claimed
+*before* its evaluation is awaited, because checking a published-count across an await lets
+every coroutine in a batch pass the test while the count is still zero.
+
 ## Copies, real money and speed (v2.47)
 
 Two alerts arrived minutes apart. Both were titled **Sock and Pussy 500 · $SNP500**, both
@@ -1702,7 +1790,7 @@ command slots: the tree stays at 25.
 `GMGN_KOL_ENABLED`, `GMGN_HOT_SEARCH_ENABLED`, `GMGN_MARKET_SIGNALS_ENABLED`,
 `GMGN_HOLDERS_ENABLED`, `GMGN_SECURITY_ENABLED`, `GMGN_ENRICHMENT_PER_SCAN`,
 `GMGN_EARLY_LANE_PER_SCAN` (v2.47, default 60), `GMGN_EARLY_LANE_CONCURRENCY`
-(v2.47, default 8).
+(v2.47, default 8), `GMGN_EARLY_LANE_MAX_CARDS_PER_SCAN` (v2.48, default 4).
 
 **Not required and not requested:** a GMGN trading credential. The research key is
 read-only and this release needs nothing else.

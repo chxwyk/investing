@@ -400,6 +400,14 @@ class Settings:
     #: Evaluations in flight at once.  Bounded so a wide scan cannot bury the
     #: radar loop or stampede the DEX provider.
     gmgn_early_lane_concurrency: int
+    #: How many cards one scan may actually publish (v2.48).
+    #:
+    #: v2.47 raised evaluation from 6 to 60 per scan and left the selection
+    #: bar alone, so the operator got ten times the cards at the same quality
+    #: — which is ten times the noise, and is exactly what they reported.
+    #: Looking at more candidates and telling them about more candidates are
+    #: two different things: the first is the point, the second is the bug.
+    gmgn_early_lane_max_cards_per_scan: int
 
     # --- future live-trading gates (v2.45, sections 74-83) ----------------
     # All three default to FALSE and this release uses none of them.  No
@@ -899,6 +907,9 @@ class Settings:
             gmgn_enrichment_per_scan=_int("GMGN_ENRICHMENT_PER_SCAN", 6),
             gmgn_early_lane_per_scan=_int("GMGN_EARLY_LANE_PER_SCAN", 60),
             gmgn_early_lane_concurrency=_int("GMGN_EARLY_LANE_CONCURRENCY", 8),
+            gmgn_early_lane_max_cards_per_scan=_int(
+                "GMGN_EARLY_LANE_MAX_CARDS_PER_SCAN", 4
+            ),
             live_trading_enabled=_bool("LIVE_TRADING_ENABLED", False),
             gmgn_live_trading_enabled=_bool("GMGN_LIVE_TRADING_ENABLED", False),
             auto_trade_enabled=_bool("AUTO_TRADE_ENABLED", False),
@@ -1363,6 +1374,10 @@ class Settings:
             raise ValueError("GMGN_EARLY_LANE_PER_SCAN must be between 0 and 400")
         if not 1 <= self.gmgn_early_lane_concurrency <= 32:
             raise ValueError("GMGN_EARLY_LANE_CONCURRENCY must be between 1 and 32")
+        if not 1 <= self.gmgn_early_lane_max_cards_per_scan <= 25:
+            raise ValueError(
+                "GMGN_EARLY_LANE_MAX_CARDS_PER_SCAN must be between 1 and 25"
+            )
         if not self.gmgn_host.startswith("https://"):
             raise ValueError("GMGN_HOST must be an https URL")
         # A credential must never reach a log, a database row or an exception.

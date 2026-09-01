@@ -6324,6 +6324,11 @@ def _early_lane_lines(early: dict[str, object]) -> str:
         f"Copies withheld `{early.get('suspected_clones', 0)}` • unresolved name "
         f"collisions `{early.get('unresolved_collisions', 0)}` • thin "
         f"`{early.get('thin_quality', 0)}`\n"
+        # v2.48.  The count that matters after a release that shipped ten
+        # times the cards: how many dead charts were refused, and how many
+        # cards one scan is allowed at all.
+        f"Not an entry `{early.get('not_an_entry', 0)}` • cards capped at "
+        f"`{early.get('cards_per_scan_cap', 0)}`/scan\n"
         f"Wallet stream "
         f"`{'CONNECTED' if early.get('stream_connected') else 'DISCONNECTED'}` • "
         f"subscriptions `{early.get('stream_subscriptions', 0)}` • reconnects "

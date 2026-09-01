@@ -168,6 +168,14 @@ WHY_SUSPECTED_CLONE = "SUSPECTED_NAME_CLONE"
 #: Several live tokens share this name and none of them is clearly the
 #: original.  Saying so is a real answer; guessing between them is not.
 WHY_NAME_COLLISION = "UNRESOLVED_NAME_COLLISION"
+#: This scan had already spent its card budget on stronger candidates.  The
+#: token was still fully evaluated — first-seen market cap recorded, hot watch
+#: opened — it just did not get a card of its own on this pass (v2.48).
+WHY_SCAN_BUDGET = "SCAN_CARD_BUDGET_SPENT"
+#: Structurally not an entry: already far below its own high, more sellers
+#: than buyers by a wide margin, or too few holders to be a market at all.
+#: Absolute — no score and no volume figure gets past it (v2.48).
+WHY_NOT_AN_ENTRY = "NOT_AN_ENTRY"
 #: We could see enough of this token to judge it, and what we saw was thin:
 #: fees barely moving, shallow liquidity, few holders.  Not hidden — just not
 #: worth an interruption (section 37).
@@ -200,6 +208,14 @@ HUMAN_WHY: dict[str, str] = {
     WHY_THIN_QUALITY: (
         "Fees, liquidity and holders were all measurable and all thin — real money "
         "was not moving into this yet"
+    ),
+    WHY_SCAN_BUDGET: (
+        "Stronger candidates on the same scan used the card budget; this one was "
+        "still analysed and is on the watch list"
+    ),
+    WHY_NOT_AN_ENTRY: (
+        "The chart had already happened: far below its own high, or selling into "
+        "the move, or too few holders to be a market"
     ),
 }
 
