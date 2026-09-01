@@ -646,6 +646,11 @@ def test_only_earned_classes_may_interrupt_the_user() -> None:
     published where the operator can read them, and none of them earns a ping.
     TRENDING_HOT_WATCH is the newest member of that quiet set — a hot watch is a
     promise to look again in seconds, not an interruption (section 44).
+
+    v2.44 adds EARLY_PROMOTION: a watched near-miss whose evidence developed
+    while the edge was still available.  It is the one card in the release that
+    exists *because* it earned an interruption — the whole point of promoting a
+    candidate is that waiting for the operator to scroll the radar is too late.
     """
 
     assert set(fa.PINGABLE) == {
@@ -660,6 +665,7 @@ def test_only_earned_classes_may_interrupt_the_user() -> None:
         fa.TRENCH_RUNNER_ALERT,
         fa.ALMOST_BONDED_ALERT,
         fa.PUBLIC_TRENDING_ALERT,
+        fa.EARLY_PROMOTION,
     }
     assert fa.NOTABLE_TRADER_LATE not in fa.PINGABLE
     assert fa.CATALYST_WATCH not in fa.PINGABLE
@@ -898,6 +904,10 @@ def _engine(database, notifier, **settings):
     # the fast lane's own behaviour, so the shadow trader is present but off.
     engine.shadow_enabled = False
     engine._shadow_config = DEFAULT_SHADOW_CONFIG
+    # The early-lane hot watch is a separate subsystem; these tests assert the
+    # notable-wallet path, so it is present and empty rather than mocked away.
+    engine._early_watches = {}
+    engine._early_published = {}
     defaults = {
         "fomo_fast_watch_enabled": True,
         "fomo_fast_watch_publish_enabled": True,
@@ -1077,6 +1087,11 @@ def _notable_engine(database, notifier, **settings):
         "fomo_notable_min_trade_usd": D("250"),
         "fomo_notable_ping_enabled": False,
         "fomo_notable_max_signal_age_seconds": 900,
+        # No admin-supplied Terminal link in tests: the default really is "no
+        # button", and that is the behaviour worth exercising here.
+        "terminal_token_url_template": "",
+        "fomo_top_traders_enabled": True,
+        "fomo_top_traders_limit": 10,
     }
     for key, value in defaults.items():
         if not hasattr(engine.settings, key):

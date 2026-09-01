@@ -233,12 +233,13 @@ async def main() -> None:
     await check_trending_alpha()
     await check_trenches_intelligence()
     await check_token_identity()
+    await check_promotion_intelligence()
 
     print(
         "SELF-CHECK PASSED: detector, scoring, database, discovery rotation, "
         "paper P&L, risk gate, PAPER laboratory, discovery-speed, realtime-alpha, "
         "SHADOW auto-trader, profit-optimization, early-alpha, Trending-first, "
-        "trenches-intelligence and token-identity invariants"
+        "trenches-intelligence, token-identity and promotion-intelligence invariants"
     )
 
 
@@ -470,6 +471,261 @@ async def check_token_identity() -> None:
     assert "return None" in lane_source, (
         "unknown independence must be distinguishable from zero independence"
     )
+
+
+async def check_promotion_intelligence() -> None:
+    """A strong near-miss must get a second look, and exactly one interrupt.
+
+    This gate exists because of one production card: a three-minute-old token at
+    $71.93K with 78 buys against 48 sells and price up 46.48% scored 76/100 —
+    twenty-one points clear of the runner bar — and never reached anyone.  Each
+    assertion below is one link in the chain that failed.
+    """
+
+    import inspect
+    import pathlib
+
+    import smart_money_bot.bot as bot_module
+    import smart_money_bot.engine as engine_module
+    import smart_money_bot.fast_alerts as fast_alerts_module
+    from smart_money_bot.constants import TERMINAL_TOKEN_URL_TEMPLATE
+    from smart_money_bot.lab.early import EarlySignals, evaluate_early_signal
+    from smart_money_bot.lab.promotion import (
+        CONCENTRATION_WORSENING,
+        FAMILY_KNOWN_TRADER,
+        WHY_ALREADY_PROMOTED,
+        WHY_CONCENTRATION_WORSENING,
+        WHY_EDGE_CONSUMED,
+        WHY_KNOWN_MONEY_LEAVING,
+        WHY_NO_NEW_EVIDENCE,
+        PromotionEvidence,
+        entry_from_json,
+        evaluate_promotion,
+        open_early_watch,
+        should_open_watch,
+    )
+    from smart_money_bot.lab.toptraders import (
+        FLOW_DISTRIBUTING,
+        TraderFill,
+        build_positions,
+        independent_confirmations,
+        join_known_traders,
+    )
+
+    mint = "GPR7Ax4kQ2mVn8hLdT6yWc3JbRfE9uZsXqM1oP5tH4dK"
+    other = "7TqH1d4Vf9QG578vB99Q7ewFQPoxSYqBDxSAzBpBpump"
+    now = 1_700_000_000
+
+    # 1. The production candidate is reproduced, and it opens a watch.
+    signals = EarlySignals(
+        mint=mint,
+        now=now,
+        first_seen_at=now - 5,
+        pair_age_seconds=180,
+        market_cap_usd=Decimal("71930"),
+        first_seen_market_cap_usd=Decimal("71930"),
+        liquidity_usd=Decimal("21090"),
+        volume_5m_usd=Decimal("21090") * Decimal("1.214"),
+        price_change_5m_percent=Decimal("46.48"),
+        buys_5m=78,
+        sells_5m=48,
+        route_available=True,
+    )
+    verdict = evaluate_early_signal(signals)
+    assert verdict.score == Decimal("76.00") and not verdict.may_ping, (
+        "the reproduction of the reported card drifted; the diagnosis below is "
+        "only meaningful if this is still the same candidate"
+    )
+    assert verdict.evidence_categories == (), (
+        "the suppression cause was an empty evidence-category set, not a low score"
+    )
+    assert should_open_watch(verdict), (
+        "a 76/100 near-miss with live edge must get a second look (section 2)"
+    )
+
+    entry = open_early_watch(
+        mint,
+        verdict=verdict,
+        now=now,
+        market_cap_usd=Decimal("71930"),
+        first_seen_market_cap_usd=Decimal("71930"),
+        liquidity_usd=Decimal("21090"),
+        buys=78,
+        holder_count=26,
+    )
+
+    # 2. Promotion requires *new* information, not another look at the old.
+    stalled = evaluate_promotion(
+        entry, PromotionEvidence(now=now + 30, score=Decimal("77"), buys=80, holder_count=27)
+    )
+    assert not stalled.decision.promote
+    assert stalled.entry.suppression_reason == WHY_NO_NEW_EVIDENCE
+
+    promoted = evaluate_promotion(
+        entry,
+        PromotionEvidence(
+            now=now + 40,
+            score=Decimal("77"),
+            proven_independent_traders=2,
+            known_money_flow="KNOWN_MONEY_ACCUMULATING",
+            trigger="known_trader_buy",
+        ),
+    )
+    assert promoted.decision.promote and promoted.decision.family == FAMILY_KNOWN_TRADER
+    assert promoted.should_ping
+
+    # 3. Exactly one interrupt per candidate, and never after the move.
+    again = evaluate_promotion(
+        promoted.entry,
+        PromotionEvidence(
+            now=now + 200, score=Decimal("99"), buys=900, proven_independent_traders=9
+        ),
+    )
+    assert not again.decision.promote and not again.should_ping
+    assert again.entry.suppression_reason == WHY_ALREADY_PROMOTED
+
+    spent = evaluate_promotion(
+        entry,
+        PromotionEvidence(
+            now=now + 300,
+            score=Decimal("95"),
+            buys=400,
+            edge_available=False,
+            proven_independent_traders=4,
+        ),
+    )
+    assert spent.entry.suppression_reason == WHY_EDGE_CONSUMED
+
+    # 4. The two things that look like good news and are not.
+    tightening = evaluate_promotion(
+        entry,
+        PromotionEvidence(
+            now=now + 120,
+            score=Decimal("77"),
+            holder_count=94,
+            holders_per_minute=Decimal("34"),
+            concentration_trend=CONCENTRATION_WORSENING,
+        ),
+    )
+    assert tightening.entry.suppression_reason == WHY_CONCENTRATION_WORSENING, (
+        "holders growing into fewer hands is accumulation, not distribution"
+    )
+    leaving = evaluate_promotion(
+        entry,
+        PromotionEvidence(
+            now=now + 120,
+            score=Decimal("77"),
+            proven_independent_traders=3,
+            known_money_flow=FLOW_DISTRIBUTING,
+        ),
+    )
+    assert leaving.entry.suppression_reason == WHY_KNOWN_MONEY_LEAVING
+
+    # The vocabularies really do line up across package boundaries; a drift here
+    # would make both guards above silently unreachable.
+    from smart_money_bot.trenches.holders import (
+        CONCENTRATION_WORSENING as TRENCH_WORSENING,
+    )
+
+    assert CONCENTRATION_WORSENING == TRENCH_WORSENING
+
+    # 5. The baseline survives every recheck.  It is the comparison itself.
+    walked = entry
+    for index in range(4):
+        walked = evaluate_promotion(
+            walked,
+            PromotionEvidence(now=now + 30 * (index + 1), score=Decimal("77"), buys=80),
+        ).entry
+    assert walked.entry_score == Decimal("76.00") and walked.entry_buys == 78
+    assert entry_from_json(walked.to_json()) == walked
+
+    # 6. Five wallets behind one funder are one confirmation (section 8).
+    fills = [
+        TraderFill(f"wallet{key}", mint, "BUY", now, Decimal("1000"), Decimal("100"))
+        for key in "ABCDE"
+    ]
+    positions = build_positions(fills, mint=mint)
+    known = join_known_traders(
+        positions,
+        mint=mint,
+        registry={f"wallet{key}": key for key in "ABCDE"},
+        reputations={f"wallet{key}": ("PROVEN_EARLY", 20) for key in "ABCDE"},
+        clusters={f"wallet{key}": "funder:X" for key in "ABCDE"},
+    )
+    confirmation = independent_confirmations(known, mint=mint)
+    assert confirmation.wallet_count == 5 and confirmation.independent_count == 1, (
+        "a sybil group must not be able to manufacture its own consensus"
+    )
+
+    # 7. A wallet's history on a same-ticker token never reaches this one.
+    crossed = build_positions(
+        [TraderFill("walletA", other, "BUY", now, Decimal("90000"), Decimal("50000"))],
+        mint=mint,
+    )
+    assert crossed == (), "trader evidence must be exact-mint or absent"
+
+    # 8. The promotion card labels what it does not know and hands out no buy.
+    alert = fast_alerts_module.build_promotion_alert(
+        mint=mint,
+        name="Grok Pocket",
+        symbol="GPRO",
+        fomo_url=f"https://fomo.family/coin?address={mint}",
+        decision=promoted.decision,
+        entry=entry,
+        current_market_cap_usd=Decimal("78200"),
+        liquidity_usd=Decimal("21090"),
+        safety_status="UNKNOWN",
+    )
+    state = {field.name: field.value for field in alert.spec.fields}["STATE"]
+    assert "Safety: **UNKNOWN**" in state and "this is not a safety pass" in state
+    assert "Entry eligible: **NO**" in state and "Trade CTA: **DISABLED**" in state
+    assert alert.trade_eligible is False, "no promotion may hand out a buy control"
+    assert mint in alert.spec.description and other not in alert.spec.description
+    assert alert.alert_key == f"{fast_alerts_module.EARLY_PROMOTION}:{mint}"
+    unverified = fast_alerts_module.build_promotion_alert(
+        mint=mint,
+        name="Grok Pocket",
+        symbol="GPRO",
+        fomo_url="https://fomo.family/coin",
+        decision=promoted.decision,
+        entry=entry,
+        identity_verified=False,
+    )
+    assert "LOOK NOW" not in unverified.spec.title and not unverified.ping, (
+        "identity outranks evidence: an unidentified token is never actionable"
+    )
+
+    # 9. The engine really is wired to open a watch and to react to an event.
+    lane = inspect.getsource(engine_module.SmartMoneyEngine._early_lane_task)
+    assert "_open_early_watch" in lane
+    notable = inspect.getsource(engine_module.SmartMoneyEngine._maybe_publish_notable)
+    assert "note_early_watch_event" in notable, (
+        "a known trader entering a watched candidate must not wait for the timer"
+    )
+
+    # 10. Terminal is navigation, from one definition, and never a data source.
+    assert "{mint}" in TERMINAL_TOKEN_URL_TEMPLATE
+    assert mint in fast_alerts_module._terminal_url(mint)
+    assert bot_module._terminal_token_url("https://x.example/{mint}", mint).endswith(mint)
+    assert bot_module._terminal_token_url("https://x.example/token", mint) == ""
+    root = pathlib.Path(engine_module.__file__).parent
+    for path in root.rglob("*.py"):
+        text = path.read_text().lower()
+        for forbidden in ("cookies=", "set_cookie", "cookiejar"):
+            assert forbidden not in text, (
+                f"{path.name} looks like it carries a third-party session"
+            )
+
+    # 11. Nothing on the promotion path can move real money (section 38).
+    for module in ("lab/promotion.py", "lab/toptraders.py"):
+        text = (root / module).read_text()
+        for forbidden in ("Keypair", "send_transaction", "sign_transaction", "aiohttp"):
+            assert forbidden not in text, f"{module} must stay signer- and provider-free"
+
+    # 12. Shadow history is untouched by this release.
+    from smart_money_bot.lab.shadow import SIGNAL_FAMILIES
+
+    assert len(SIGNAL_FAMILIES) >= 8, "no shadow signal family may be removed"
 
 
 async def check_paper_laboratory() -> None:

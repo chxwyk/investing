@@ -61,6 +61,7 @@ from .fast_alerts import (
     build_early_alert,
     build_fast_watch_alert,
     build_notable_trader_alert,
+    build_promotion_alert,
     build_public_trending_alert,
     build_shadow_entry_alert,
     build_shadow_exit_alert,
@@ -82,6 +83,9 @@ from .lab.catalyst import (
     classify_catalyst_alert,
 )
 from .lab.config import lab_config_from_settings
+from .lab.early import (
+    EDGE_AVAILABLE as EARLY_EDGE_AVAILABLE,
+)
 from .lab.early import (
     HUMAN_WHY as HUMAN_EARLY_WHY,
 )
@@ -132,6 +136,17 @@ from .lab.notable import (
     build_consensus,
     decide_ping,
 )
+from .lab.promotion import (
+    EarlyWatchEntry,
+    PromotionEvidence,
+    early_watch_config_from_settings,
+    open_early_watch,
+    should_open_watch,
+)
+from .lab.promotion import entry_from_json as early_watch_from_json
+from .lab.promotion import evaluate_promotion as evaluate_early_promotion
+from .lab.promotion import prune as prune_early_watches
+from .lab.promotion import summarise as summarise_early_watches
 from .lab.providers import (
     PROVIDER_FEATURES,
     ProviderState,
@@ -163,6 +178,15 @@ from .lab.shadow import (
 )
 from .lab.shadow_exits import RunnerEvidence as ShadowRunnerEvidence
 from .lab.smartmoney import WalletReputation
+from .lab.toptraders import (
+    MIN_PROVEN_SAMPLES,
+    TraderConfirmation,
+    TraderFill,
+    build_positions,
+    independent_confirmations,
+    join_known_traders,
+    known_money_flow,
+)
 from .lab.venues import classify_graduation
 from .lab_runtime import QUALIFIED_STAGES as LAB_QUALIFIED_STAGES
 from .lab_runtime import LabEvaluation, LabRuntime
@@ -273,7 +297,10 @@ from .trenches import (
     TokenMetadata,
     detect_reuse,
 )
+from .trenches.holders import HolderSnapshot as TrenchHolderSnapshot
+from .trenches.holders import assess_concentration_trend
 from .trenches.lifecycle import STAGE_ALMOST_BONDED, STAGE_GRADUATING
+from .trenches.participants import BuyerRecord, detect_clusters
 from .trenches_runtime import (
     SOURCE_CREATION_STREAM,
     TrenchCandidate,
@@ -295,6 +322,7 @@ from .trending import (
     family_for_reasons,
     source_from_settings,
 )
+from .trending.holders import HolderSample, HolderSeries
 from .trending_runtime import TrendingCandidate, TrendingRuntime
 from .trending_source import build_trending_client
 from .trending_store import TrendingStore
@@ -612,6 +640,14 @@ class SmartMoneyEngine:
         self._trending_task: asyncio.Task[None] | None = None
         self._trending_hot_watch_task: asyncio.Task[None] | None = None
         self._trenches_task: asyncio.Task[None] | None = None
+        # --- early-candidate hot watch (v2.44, sections 2, 3, 29) -------
+        self._early_watch_task: asyncio.Task[None] | None = None
+        self._early_watches: dict[str, EarlyWatchEntry] = {}
+        self._holder_series: dict[str, HolderSeries] = {}
+        self._early_watch_config = early_watch_config_from_settings(settings)
+        self.early_watches_opened = 0
+        self.early_promotions = 0
+        self.early_watch_event_rechecks = 0
         self._pump_creation_task: asyncio.Task[None] | None = None
         self._pump_creation_consumer_task: asyncio.Task[None] | None = None
         self.trending_hot_watch_cards = 0
@@ -901,6 +937,16 @@ class SmartMoneyEngine:
                     self._run_trending_hot_watch(),
                     name="smart-money-trending-hot-watch",
                 )
+        # The early lane's own second look.  It is independent of the Trending
+        # board on purpose: the candidate that produced the section 1 failure
+        # never appeared on a board at all, so a board-scoped watch could never
+        # have caught it.
+        if self.settings.fomo_early_watch_enabled:
+            await self._restore_early_watches()
+            self._early_watch_task = asyncio.create_task(
+                self._run_early_watch(),
+                name="smart-money-early-watch",
+            )
         # Graduated discovery is retained as the SECONDARY universe.  It is
         # demoted, never deleted.
         if (
@@ -939,6 +985,7 @@ class SmartMoneyEngine:
             self._runner_digest_task,
             self._trending_task,
             self._trending_hot_watch_task,
+            self._early_watch_task,
             self._trenches_task,
             self._pump_creation_task,
             self._pump_creation_consumer_task,
@@ -958,6 +1005,7 @@ class SmartMoneyEngine:
         self._runner_digest_task = None
         self._trending_task = None
         self._trending_hot_watch_task = None
+        self._early_watch_task = None
         self._trenches_task = None
         self._pump_creation_task = None
         self._pump_creation_consumer_task = None
@@ -1795,6 +1843,17 @@ class SmartMoneyEngine:
                 market_cap_usd=snapshot.market_cap_usd,
                 tier=verdict.tier,
             )
+        # Section 2: a strong near-miss is not finished being interesting just
+        # because it did not clear the bar on its first look.  This is the exact
+        # step whose absence produced the section 1 failure.
+        await self._open_early_watch(
+            mint,
+            verdict=verdict,
+            snapshot=snapshot,
+            first_seen_market_cap_usd=first_seen_mc,
+            independent_buyers=signals.independent_buyers_5m,
+            now=now,
+        )
         self._early_published[mint] = now
         if verdict.tier in EARLY_PINGABLE_TIERS:
             self._early_runner_times.append(now)
@@ -1804,6 +1863,462 @@ class SmartMoneyEngine:
         self.last_early_alert_at = now
         self.last_early_alert_mint = mint
         return True
+
+    # ------------------------------------------------------------------
+    # early-candidate HOT WATCH and event-driven promotion (v2.44)
+    # ------------------------------------------------------------------
+
+    async def _restore_early_watches(self) -> None:
+        """Reload open watches so a redeploy does not lose a live candidate."""
+
+        now = int(time.time())
+        with suppress(Exception):
+            for row in await self.database.early_watch_rows(open_only=True, now=now, limit=200):
+                entry = early_watch_from_json(row)
+                if entry.mint:
+                    self._early_watches[entry.mint] = entry
+
+    async def _open_early_watch(
+        self,
+        mint: str,
+        *,
+        verdict: Any,
+        snapshot: Any,
+        first_seen_market_cap_usd: Decimal | None,
+        independent_buyers: int | None,
+        now: int,
+    ) -> bool:
+        """Keep looking at a strong near-miss instead of publishing once (section 2).
+
+        This is the direct fix for the section 1 failure.  That candidate scored
+        76/100 with no serious evidence category, which is exactly the shape this
+        opens a watch on: real evidence, not yet a reason to interrupt anyone.
+        """
+
+        if not self.settings.fomo_early_watch_enabled:
+            return False
+        if not should_open_watch(verdict, config=self._early_watch_config):
+            return False
+        if mint in self._early_watches:
+            return False
+        live = prune_early_watches(self._early_watches.values(), now=now)
+        self._early_watches = {entry.mint: entry for entry in live}
+        if len(self._early_watches) >= self._early_watch_config.max_entries:
+            return False
+
+        holders = await self._holder_count(mint, now=now)
+        entry = open_early_watch(
+            mint,
+            verdict=verdict,
+            now=now,
+            market_cap_usd=snapshot.market_cap_usd,
+            first_seen_market_cap_usd=first_seen_market_cap_usd,
+            liquidity_usd=snapshot.liquidity_usd,
+            buys=snapshot.buys_5m,
+            independent_buyers=independent_buyers,
+            holder_count=holders,
+            config=self._early_watch_config,
+        )
+        self._early_watches[mint] = entry
+        self.early_watches_opened += 1
+        with suppress(Exception):
+            await self.database.save_early_watch(entry.to_json(), now=now)
+        return True
+
+    async def _run_early_watch(self) -> None:
+        """Timer-driven rechecks.  Events do not wait for this (section 29)."""
+
+        while True:
+            with suppress(asyncio.CancelledError):
+                try:
+                    await self._recheck_early_watches(now=int(time.time()))
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("Early hot-watch recheck failed")
+            await asyncio.sleep(self.settings.fomo_early_watch_recheck_seconds)
+
+    async def note_early_watch_event(self, mint: str, *, trigger: str) -> bool:
+        """Re-evaluate one watched candidate immediately (section 29).
+
+        A known trader buying at second 12 of a 45-second timer is news at
+        second 12.  Waiting for the next tick is how a promotion arrives after
+        the move it was meant to catch.
+        """
+
+        if mint not in self._early_watches:
+            return False
+        self.early_watch_event_rechecks += 1
+        return await self._recheck_early_watches(
+            now=int(time.time()), trigger=trigger, mints=(mint,)
+        )
+
+    async def _recheck_early_watches(
+        self,
+        *,
+        now: int,
+        trigger: str = "timer",
+        mints: tuple[str, ...] | None = None,
+    ) -> bool:
+        """Evaluate due watches against *new* evidence and promote what earned it."""
+
+        promoted_any = False
+        targets = mints if mints is not None else tuple(self._early_watches)
+        for mint in targets:
+            entry = self._early_watches.get(mint)
+            if entry is None:
+                continue
+            if trigger == "timer" and not entry.due(now=now, config=self._early_watch_config):
+                continue
+            evidence = await self._promotion_evidence(mint, entry, now=now, trigger=trigger)
+            if evidence is None:
+                continue
+            outcome = evaluate_early_promotion(
+                entry, evidence, config=self._early_watch_config
+            )
+            self._early_watches[mint] = outcome.entry
+            with suppress(Exception):
+                await self.database.save_early_watch(outcome.entry.to_json(), now=now)
+            if outcome.expired or outcome.entry.promoted:
+                self._early_watches.pop(mint, None)
+            if outcome.decision.promote:
+                promoted_any = await self._publish_promotion(
+                    outcome.entry, outcome.decision, now=now
+                ) or promoted_any
+            else:
+                await self._record_suppression(
+                    mint, outcome.entry.suppression_reason, now=now, tier=entry.entry_tier
+                )
+        return promoted_any
+
+    async def _promotion_evidence(
+        self,
+        mint: str,
+        entry: EarlyWatchEntry,
+        *,
+        now: int,
+        trigger: str,
+    ) -> PromotionEvidence | None:
+        """Gather what is knowable cheaply.  Unknown stays ``None``, never zero.
+
+        Everything here is already-fetched or free: the cached DEX snapshot, the
+        bot's own persisted swaps, and public RPC concentration.  No new paid
+        provider is introduced by this loop.
+        """
+
+        snapshot = await self.dex_screener.snapshot(mint)
+        if not snapshot.available or snapshot.market_cap_usd is None:
+            return None
+        assert_exact_propagation(mint, mint, stage="early watch → DEX snapshot")
+
+        signals = EarlySignals(
+            mint=mint,
+            now=now,
+            first_seen_at=entry.opened_at,
+            pair_age_seconds=(
+                snapshot.pair_age_minutes * 60 if snapshot.pair_age_minutes is not None else None
+            ),
+            market_cap_usd=snapshot.market_cap_usd,
+            first_seen_market_cap_usd=entry.first_seen_market_cap_usd,
+            liquidity_usd=snapshot.liquidity_usd,
+            volume_5m_usd=snapshot.volume_5m_usd,
+            price_change_5m_percent=snapshot.price_change_5m_percent,
+            buys_5m=snapshot.buys_5m or 0,
+            sells_5m=snapshot.sells_5m or 0,
+            buys_1h=snapshot.buys_1h,
+            sells_1h=snapshot.sells_1h,
+            route_available=True,
+            independent_buyers_5m=await self._independent_buyers_5m(mint, now=now),
+            **await self._early_corroboration(mint),
+        )
+        verdict = evaluate_early_signal(signals, config=self._early_config)
+
+        confirmation = await self._known_trader_confirmation(mint, now=now)
+        holders = await self._holder_count(mint, now=now)
+        series = self._holder_series.get(mint)
+        concentration = await self._concentration_trend(mint, now=now)
+        return PromotionEvidence(
+            now=now,
+            score=verdict.score,
+            edge_available=verdict.edge_state == EARLY_EDGE_AVAILABLE,
+            market_cap_usd=snapshot.market_cap_usd,
+            liquidity_usd=snapshot.liquidity_usd,
+            buys=snapshot.buys_5m,
+            sells=snapshot.sells_5m,
+            independent_buyers=signals.independent_buyers_5m,
+            holder_count=holders,
+            holders_per_minute=series.per_minute if series is not None else None,
+            concentration_trend=concentration,
+            proven_independent_traders=(
+                confirmation.proven_independent_count if confirmation is not None else 0
+            ),
+            known_money_flow=(
+                known_money_flow(confirmation) if confirmation is not None else ""
+            ),
+            story_state=str(signals.story_state or ""),
+            story_relationship=str(signals.story_relationship or ""),
+            catalyst_confidence=str(signals.catalyst_confidence or ""),
+            trigger=trigger,
+        )
+
+    async def _holder_count(self, mint: str, *, now: int) -> int | None:
+        """The holder count when a source actually supplies one (sections 10, 11).
+
+        The public RPC methods this bot uses cannot count holders — the largest
+        accounts call returns twenty and nothing more — so this reads the count
+        the Trending board publishes for tokens that are on it, and returns
+        ``None`` otherwise.  A guessed holder count would feed the promotion
+        gate a number nobody measured.
+        """
+
+        count: int | None = None
+        with suppress(Exception):
+            entry = self.trending.entry_for(mint)
+            if entry is not None:
+                count = entry.holder_count
+        if count is None:
+            return None
+        series = self._holder_series.get(mint) or HolderSeries(mint=mint)
+        self._holder_series[mint] = series.record(
+            HolderSample(at=now, holder_count=count)
+        )
+        with suppress(Exception):
+            await self.database.record_holder_sample(
+                mint=mint, observed_at=now, holder_count=count
+            )
+        return count
+
+    async def _concentration_trend(self, mint: str, *, now: int) -> str:
+        """Whether ownership is broadening or tightening (section 12)."""
+
+        with suppress(Exception):
+            snapshot = await self.pump_chain.holder_snapshot(mint, at=now)
+            if snapshot.top10_percent is None:
+                return ""
+            await self.database.record_holder_sample(
+                mint=mint,
+                observed_at=now,
+                holder_count=int(snapshot.holder_count or 0),
+                top10_percent=float(snapshot.top10_percent),
+            )
+            # The trend is read across every recorded sample, not against the
+            # single previous one: one noisy read must not flip the verdict.
+            history = [
+                TrenchHolderSnapshot(
+                    mint=mint,
+                    at=int(row["observed_at"]),
+                    top10_percent=Decimal(str(row["top10_percent"])),
+                )
+                for row in await self.database.holder_samples(mint, limit=24)
+                if row.get("top10_percent") is not None
+            ]
+            return assess_concentration_trend(mint, history).state
+        return ""
+
+    async def _known_trader_confirmation(
+        self, mint: str, *, now: int
+    ) -> TraderConfirmation | None:
+        """Which registry wallets hold this exact mint, and how independent they are.
+
+        Built from the bot's own persisted swaps, so it costs nothing and it can
+        never attribute another token's activity to this one.
+        """
+
+        if not self.settings.fomo_top_traders_enabled:
+            return None
+        try:
+            rows = await self.database.token_swap_rows(
+                mint, limit=self.settings.fomo_top_traders_limit * 20
+            )
+        except Exception:
+            return None
+        if not rows:
+            return None
+        fills = [
+            TraderFill(
+                wallet=str(row.get("trader_address") or ""),
+                mint=mint,
+                side=str(row.get("side") or ""),
+                at=int(row.get("block_time") or 0),
+                amount_usd=_engine_decimal(row.get("usd_value")) or Decimal("0"),
+                tokens=_engine_decimal(row.get("token_amount")) or Decimal("0"),
+                # The swaps table stores a price, not a market cap; an entry
+                # market cap is only stated when a source actually supplied one.
+                market_cap_usd=None,
+                signature=str(row.get("signature") or ""),
+            )
+            for row in rows
+        ]
+        positions = build_positions(fills, mint=mint)
+        if not positions:
+            return None
+
+        registry: dict[str, str] = {}
+        reputations: dict[str, tuple[str, int]] = {}
+        for position in positions:
+            profile = await self._notable_wallet(position.wallet, alias="")
+            if profile is None:
+                continue
+            registry[position.wallet] = str(getattr(profile, "display_name", "") or "")
+            reputation = await self._wallet_reputation(position.wallet)
+            reputations[position.wallet] = (
+                str(getattr(reputation, "state", "UNKNOWN") or "UNKNOWN"),
+                int(getattr(reputation, "samples", 0) or 0),
+            )
+        if not registry:
+            return None
+
+        clusters = await self._wallet_clusters(tuple(registry), mint=mint)
+        known = join_known_traders(
+            positions,
+            mint=mint,
+            registry=registry,
+            reputations=reputations,
+            clusters=clusters,
+        )
+        confirmation = independent_confirmations(known, mint=mint)
+        with suppress(Exception):
+            for position in positions[: self.settings.fomo_top_traders_limit]:
+                await self.database.record_token_trader(
+                    mint=mint,
+                    wallet=position.wallet,
+                    position=position.to_json(),
+                    cluster_id=clusters.get(position.wallet, ""),
+                    now=now,
+                )
+        return confirmation
+
+    async def _wallet_clusters(self, wallets: tuple[str, ...], *, mint: str) -> dict[str, str]:
+        """Group wallets that share a funder, so they count once (section 8)."""
+
+        records: list[BuyerRecord] = []
+        for wallet in wallets:
+            funder = ""
+            funded_at: int | None = None
+            with suppress(Exception):
+                history = await self.pump_chain.wallet_history(wallet)
+                funder = str(getattr(history, "funded_by", "") or "")
+                funded_at = getattr(history, "funded_at", None)
+            if funder:
+                records.append(
+                    BuyerRecord(wallet=wallet, at=0, funded_by=funder, funded_at=funded_at)
+                )
+        if not records:
+            return {}
+        mapping: dict[str, str] = {}
+        for cluster in detect_clusters(records):
+            for wallet in cluster.wallets:
+                mapping.setdefault(wallet, cluster.cluster_id)
+        return mapping
+
+    async def _publish_promotion(
+        self,
+        entry: EarlyWatchEntry,
+        decision: Any,
+        *,
+        now: int,
+    ) -> bool:
+        """The card the section 1 candidate never got."""
+
+        mint = entry.mint
+        snapshot = await self.dex_screener.snapshot(mint)
+        name, symbol = await self._cached_token_names(mint)
+        confirmation = await self._known_trader_confirmation(mint, now=now)
+        series = self._holder_series.get(mint)
+        alert = build_promotion_alert(
+            mint=mint,
+            name=name if name != "Unknown token" else (symbol or mint[:8]),
+            symbol=symbol,
+            fomo_url=self._fomo_url(mint),
+            decision=decision,
+            entry=entry,
+            age_seconds=(
+                snapshot.pair_age_minutes * 60 if snapshot.pair_age_minutes is not None else None
+            ),
+            current_market_cap_usd=snapshot.market_cap_usd,
+            liquidity_usd=snapshot.liquidity_usd,
+            change_5m_percent=snapshot.price_change_5m_percent,
+            buys=snapshot.buys_5m,
+            sells=snapshot.sells_5m,
+            holder_series=series.render() if series is not None else "",
+            holders_added=series.added if series is not None else None,
+            holder_window_seconds=series.span_seconds if series is not None else None,
+            independent_buyers=await self._independent_buyers_5m(mint, now=now),
+            known_traders=confirmation.traders if confirmation is not None else (),
+            known_money_flow=(
+                known_money_flow(confirmation) if confirmation is not None else ""
+            ),
+            cluster_note="; ".join(confirmation.notes) if confirmation is not None else "",
+            safety_status="UNKNOWN",
+            identity_verified=True,
+            symbol_collision=await self._symbol_collides(mint, symbol),
+            image_url=snapshot.image_url,
+            terminal_url=self._terminal_url(mint),
+        )
+        published = await self._publish_fast_alert(alert, now=now)
+        if published:
+            self.early_promotions += 1
+            self._schedule_alert_enrichment(alert)
+            with suppress(Exception):
+                await self.database.record_alert_stage(
+                    mint=mint,
+                    stage=STAGE_EARLY_RUNNER,
+                    occurred_at=now,
+                    market_cap_usd=snapshot.market_cap_usd,
+                    liquidity_usd=snapshot.liquidity_usd,
+                    tier="EARLY_PROMOTION",
+                    evidence={"families": list(decision.families)},
+                )
+        return published
+
+    def _terminal_url(self, mint: str) -> str:
+        """An admin-supplied Terminal deep link, or nothing (section 20).
+
+        Navigation only.  The template comes from a Railway variable an operator
+        set from documented product behaviour; this codebase never guesses one,
+        never logs in, and never reads an authenticated page.
+        """
+
+        template = self.settings.terminal_token_url_template
+        if not template or "{mint}" not in template:
+            return ""
+        return template.replace("{mint}", mint)
+
+    async def early_watch_report(self, *, limit: int = 25) -> dict[str, Any]:
+        """Everything section 30 asks to be answerable after the fact."""
+
+        now = int(time.time())
+        rows: list[dict[str, Any]] = []
+        with suppress(Exception):
+            rows = await self.database.early_watch_rows(limit=limit)
+        entries = [early_watch_from_json(row) for row in rows]
+        status = summarise_early_watches(entries, now=now)
+        return {
+            "now": now,
+            "status": status.to_json(),
+            "entries": [entry.to_json() for entry in entries],
+            "live": [entry.to_json() for entry in self._early_watches.values()],
+            "opened": self.early_watches_opened,
+            "promotions": self.early_promotions,
+            "event_rechecks": self.early_watch_event_rechecks,
+        }
+
+    async def top_traders_report(self, mint: str, *, limit: int = 12) -> dict[str, Any]:
+        """`view:traders` — our own top-trader board for one exact mint (section 21)."""
+
+        now = int(time.time())
+        rows: list[dict[str, Any]] = []
+        with suppress(Exception):
+            rows = await self.database.token_trader_rows(mint, limit=limit)
+        confirmation = await self._known_trader_confirmation(mint, now=now)
+        return {
+            "mint": mint,
+            "now": now,
+            "rows": rows,
+            "confirmation": confirmation.to_json() if confirmation is not None else None,
+            "flow": known_money_flow(confirmation) if confirmation is not None else "",
+            "terminal_url": self._terminal_url(mint),
+        }
 
     async def _independent_buyers_5m(self, mint: str, *, now: int) -> int | None:
         """Distinct independent buyers behind the recent flow, when knowable.
@@ -4228,6 +4743,13 @@ class SmartMoneyEngine:
                 )
                 self.forward_pings_withheld += 1
 
+        # Section 7: a wallet earns the louder headline from its forward record,
+        # never from its size.  ``MIN_PROVEN_SAMPLES`` is part of the question —
+        # PROVEN_EARLY on three observations is a coincidence with a label.
+        proven = bool(
+            signal.reputation_state in {"PROVEN_EARLY", "USEFUL_CONFIRMATION"}
+            and int(getattr(signal.reputation, "samples", 0) or 0) >= MIN_PROVEN_SAMPLES
+        )
         alert = build_notable_trader_alert(
             signal=signal,
             fomo_url=self._fomo_url(swap.token_mint),
@@ -4235,12 +4757,38 @@ class SmartMoneyEngine:
             symbol=str(context.get("symbol") or "?"),
             consensus=consensus if consensus.raw_wallets > 1 else None,
             ping_decision=ping,
+            token_state=self._token_lifecycle_state(swap.token_mint),
+            story_summary=str(context.get("story_summary") or ""),
+            safety_status=str(context.get("safety_status") or "UNKNOWN"),
+            proven=proven,
+            terminal_url=self._terminal_url(swap.token_mint),
         )
         published = await self._publish_fast_alert(alert, now=now)
         if published:
             self._schedule_alert_enrichment(alert)
             await self._run_shadow_notable(signal, alert=alert, context=context, now=now)
+            # Section 29: a known wallet entering a hot-watched candidate is news
+            # now, not at the next timer tick.  Re-evaluate promotion immediately.
+            if swap.side.value == "BUY":
+                with suppress(Exception):
+                    await self.note_early_watch_event(
+                        swap.token_mint, trigger="known_trader_buy"
+                    )
         return published
+
+    def _token_lifecycle_state(self, mint: str) -> str:
+        """Where this exact mint sits in the pipeline right now (section 6)."""
+
+        if mint in self._early_watches:
+            return "HOT WATCH"
+        with suppress(Exception):
+            if self.trending.is_hot_watched(mint):
+                return "TRENDING HOT WATCH"
+            if self.trending.entry_for(mint) is not None:
+                return "TRENDING"
+        if mint in self._early_published:
+            return "EARLY"
+        return ""
 
     async def _run_shadow_notable(
         self,

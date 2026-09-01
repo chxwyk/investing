@@ -165,11 +165,26 @@ def _fomo_coin_url(mint: str, referral_code: str | None = None) -> str:
     return fomo_coin_url(mint, referral_code)
 
 
+def _terminal_token_url(template: str, mint: str) -> str:
+    """An admin-supplied Terminal deep link for one exact mint (section 20).
+
+    Navigation only, and only from a template an operator set from documented
+    product behaviour.  Nothing here logs in, reuses a session, reads an
+    authenticated page or guesses a URL shape — an unset template simply means
+    no button, which is the honest outcome when no documented link exists.
+    """
+
+    if not template or "{mint}" not in template or not mint:
+        return ""
+    return template.replace("{mint}", mint)
+
+
 def _token_view(
     mint: str,
     fomo_referral_code: str | None = None,
     *,
     trade_eligible: bool = False,
+    terminal_url: str = "",
 ) -> discord.ui.View:
     """Link buttons for one exact mint.
 
@@ -227,6 +242,15 @@ def _token_view(
             row=1,
         )
     )
+    if terminal_url:
+        view.add_item(
+            discord.ui.Button(
+                label="Open in Terminal",
+                style=discord.ButtonStyle.link,
+                url=terminal_url,
+                row=1,
+            )
+        )
     view.add_item(
         discord.ui.Button(
             label="Solscan",
@@ -3201,6 +3225,10 @@ class SmartMoneyBot(commands.Bot):
                     # Research links stay either way; only the call to action
                     # requires eligibility.
                     trade_eligible=alert.trade_eligible,
+                    terminal_url=_terminal_token_url(
+                        getattr(self.settings, "terminal_token_url_template", ""),
+                        alert.token_mint,
+                    ),
                 )
                 if alert.token_mint
                 else None
@@ -6948,6 +6976,174 @@ def _trench_token_embed(payload: dict) -> discord.Embed:
     return _clamp_embed(embed)
 
 
+def _why_not_pinged_embed(report: dict) -> discord.Embed:
+    """`view:whynotpinged` — the answer to section 30, from the record.
+
+    Every hot-watched candidate carries the baseline it was opened with, how
+    many times it was looked at again, and the exact reason it did or did not
+    interrupt anyone.  None of it is reconstructed after the fact.
+    """
+
+    status = report.get("status") or {}
+    embed = discord.Embed(
+        title="WHY WASN'T I PINGED?",
+        description=(
+            "Every strong near-miss the early lane opened a **hot watch** on, and "
+            "what happened to it. A heads-up that never becomes a ping is a "
+            "decision, and this is the record of that decision."
+        ),
+        colour=0x9B59B6,
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(
+        name="Watches",
+        value=(
+            f"Live `{status.get('live', 0)}` • promoted `{status.get('promoted', 0)}` • "
+            f"expired without promotion `{status.get('expired_without_promotion', 0)}`\n"
+            f"Opened this run `{report.get('opened', 0)}` • promotions "
+            f"`{report.get('promotions', 0)}` • event-driven rechecks "
+            f"`{report.get('event_rechecks', 0)}`"
+        ),
+        inline=False,
+    )
+    counts = status.get("suppression_counts") or []
+    if counts:
+        embed.add_field(
+            name="Why they did not ping",
+            value="\n".join(
+                f"`{str(reason).replace('_', ' ').lower()}` × {count}"
+                for reason, count in counts[:8]
+            ),
+            inline=False,
+        )
+    entries = report.get("entries") or []
+    if not entries:
+        embed.add_field(
+            name="No watches yet",
+            value=(
+                "Nothing has reached the hot-watch bar since this deployment "
+                "started. That is a real answer, not a missing one."
+            ),
+            inline=False,
+        )
+    for entry in entries[:6]:
+        promoted = bool(entry.get("promoted"))
+        headline = (
+            f"✅ PROMOTED on {str(entry.get('promotion_family') or '').replace('_', ' ')}"
+            if promoted
+            else f"⏸ {str(entry.get('suppression_reason') or '').replace('_', ' ').lower()}"
+        )
+        embed.add_field(
+            name=f"{headline} • {str(entry.get('mint') or '')[:10]}…",
+            value=(
+                f"`{entry.get('mint')}`\n"
+                f"Opened at tier `{entry.get('entry_tier')}` score "
+                f"`{entry.get('entry_score')}` → best `{entry.get('best_score')}` "
+                f"(+{entry.get('score_gain')})\n"
+                f"Rechecks `{entry.get('rechecks')}` "
+                f"(event-driven `{entry.get('event_rechecks')}`)\n"
+                f"At the heads-up: buys `{entry.get('entry_buys')}` • holders "
+                f"`{entry.get('entry_holder_count')}` • evidence "
+                f"`{', '.join(entry.get('entry_evidence') or []) or 'none'}`\n"
+                f"{entry.get('human_reason')}"
+            ),
+            inline=False,
+        )
+    embed.set_footer(
+        text="Every row belongs to one exact mint. Research only — nothing here is entry eligible."
+    )
+    return _clamp_embed(embed)
+
+
+def _top_traders_embed(report: dict) -> discord.Embed:
+    """`view:traders` — our own top-trader board, not anyone else's UI (section 21)."""
+
+    mint = str(report.get("mint") or "")
+    confirmation = report.get("confirmation") or {}
+    embed = discord.Embed(
+        title="TOP ON-CHAIN TRADERS",
+        description=(
+            f"`{mint}`\n"
+            "Built from public fills for **this exact mint**. A wallet's activity "
+            "on a same-ticker token is a different token's history and never "
+            "appears here."
+        ),
+        colour=0x1ABC9C,
+        timestamp=discord.utils.utcnow(),
+    )
+    rows = report.get("rows") or []
+    if not rows:
+        embed.add_field(
+            name="No observed participants",
+            value=(
+                "No fills for this mint are in the bot's own record yet. That is "
+                "an absence of observation, not evidence that nobody is buying."
+            ),
+            inline=False,
+        )
+    for row in rows[:8]:
+        wallet = str(row.get("wallet") or "")
+        entry_mc = row.get("first_buy_market_cap_usd")
+        embed.add_field(
+            name=f"{str(row.get('state') or 'UNKNOWN').replace('_', ' ')} • {wallet[:10]}…",
+            value=(
+                f"`{wallet}`\n"
+                f"Bought `{_money(row.get('bought_usd'))}` over "
+                f"`{row.get('buys', 0)}` fill(s) • sold "
+                f"`{_money(row.get('sold_usd'))}` over `{row.get('sells', 0)}`\n"
+                + (
+                    f"Entry MC `{_money(entry_mc)}`\n"
+                    if entry_mc
+                    else "Entry MC `unknown`\n"
+                )
+                + (
+                    f"⚠ cluster `{row.get('cluster_id')}` — counted once, not once "
+                    "per wallet"
+                    if row.get("cluster_id")
+                    else "No cluster link observed"
+                )
+            ),
+            inline=False,
+        )
+    if confirmation:
+        embed.add_field(
+            name="Independence",
+            value=(
+                f"{confirmation.get('wallet_count', 0)} known wallet(s) → "
+                f"**{confirmation.get('independent_count', 0)}** independent actor(s)"
+                f" • proven `{confirmation.get('proven_independent_count', 0)}`\n"
+                f"Supportive `{confirmation.get('supportive', 0)}` • distributing "
+                f"`{confirmation.get('distributing', 0)}`\n"
+                + (
+                    "\n".join(confirmation.get("notes") or [])
+                    or "No shared-funder link was observed between them."
+                )
+            ),
+            inline=False,
+        )
+    flow = str(report.get("flow") or "")
+    if flow:
+        embed.add_field(
+            name="Known-money flow",
+            value=(
+                f"`{flow.replace('_', ' ')}`\n"
+                "Known wallets adding and known wallets selling into new buyers "
+                "print the same candle. This says which one this is."
+            ),
+            inline=False,
+        )
+    terminal = str(report.get("terminal_url") or "")
+    if terminal:
+        embed.add_field(name="Terminal", value=f"[Open in Terminal]({terminal})", inline=False)
+    embed.set_footer(
+        text=(
+            "Ranked by observed size; weighted by forward history, never by size. "
+            "Research only."
+        )
+    )
+    return _clamp_embed(embed)
+
+
 def _trench_latency_embed(latency: dict, status: dict) -> discord.Embed:
     """`view:latency` — launch → observation, the v2.43 question (section 73)."""
 
@@ -8141,7 +8337,8 @@ class FomoCommands(
         view=(
             "board/token/hotwatch/why: Fomo Trending • trenches/new/almostbonded/"
             "recentlybonded/hot: Pump.fun • public: our own model • latency: "
-            "launch→observation"
+            "launch→observation • traders: top on-chain traders for a mint • "
+            "whynotpinged: every hot-watch decision and its exact reason"
         ),
         mint=(
             "Exact mint for view:token or view:trenchtoken. A name or ticker is "
@@ -8164,6 +8361,8 @@ class FomoCommands(
             "public",
             "trenchtoken",
             "latency",
+            "traders",
+            "whynotpinged",
         ] = "board",
         mint: str | None = None,
     ) -> None:
@@ -8201,6 +8400,26 @@ class FomoCommands(
                 await self._resolve_lab(
                     interaction, embed=_public_trending_embed(board, trench_status)
                 )
+                return
+            # --- v2.44 views ------------------------------------------
+            if view == "whynotpinged":
+                report = await self.bot.engine.early_watch_report()
+                await self._resolve_lab(interaction, embed=_why_not_pinged_embed(report))
+                return
+            if view == "traders":
+                exact = (mint or "").strip()
+                if not exact:
+                    await self._resolve_lab(
+                        interaction,
+                        content=(
+                            "`view:traders` needs the **exact mint**. A ticker is "
+                            "not an identity, and a wallet's history on a "
+                            "same-ticker token is not evidence about this one."
+                        ),
+                    )
+                    return
+                report = await self.bot.engine.top_traders_report(exact)
+                await self._resolve_lab(interaction, embed=_top_traders_embed(report))
                 return
             if view == "latency":
                 trench_status = await self.bot.engine.trenches_status()

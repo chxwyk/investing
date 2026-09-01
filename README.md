@@ -1168,6 +1168,130 @@ The bot needs these Discord application permissions:
 
 No privileged Discord gateway intents are required.
 
+## Early-candidate promotion and top-trader intelligence (v2.44)
+
+A production card read `RESEARCH CANDIDATE — VALIDATION PENDING (EARLY HEADS-UP)`:
+a three-minute-old token at **$71.93K** with **$21.09K** liquidity, **78 buys against 48
+sells**, five-minute volume at **1.21x liquidity** and price **up 46.48%**. It scored
+**76/100** — twenty-one points clear of the runner bar of 55 — and never interrupted anyone.
+
+### The exact reason, reconstructed
+
+The verdict was correct at the instant it was made. A runner needs a *serious evidence
+category*, and none was present: `EV_ORGANIC` wanted a 2.0 buy/sell ratio and the flow was
+1.625; no large buy had been observed, so there was no market-structure impulse; and there
+was no story, wallet or catalyst evidence yet. The persisted suppression reason was
+`NO_SERIOUS_EVIDENCE_CATEGORY`, with `edge_state = EDGE_AVAILABLE`.
+
+**It did not enter Hot Watch**, so there were no rechecks and no promotion. Hot Watch
+existed, but only the Trending board could open one — and this candidate came from the early
+lane and never appeared on a board. The early lane published one card and moved on.
+
+That is the whole gap: **a strong near-miss got a single look.**
+
+### What changed
+
+| | Before | After |
+| --- | --- | --- |
+| Near-miss handling | One card, then a 15-minute cooldown | `should_open_watch()` opens a bounded hot watch on any visible, non-late, unpinged candidate at ≥45 |
+| Re-evaluation | Only the radar cycle | A 30-second timer **and** event-driven rechecks that bypass it entirely |
+| Promotion | None from the early lane | `evaluate_promotion()` against the baseline captured at the heads-up |
+| The record | A suppression row | The full baseline, every recheck, and the exact decision — queryable |
+
+### Promotion is a difference, not a retry
+
+Every decision compares the picture *now* against the baseline captured when the watch
+opened. A score drifting from 76 to 77 is not news. Seven evidence families can promote —
+`MARKET_ACCELERATION`, `KNOWN_TRADER`, `HOLDER_EXPANSION`, `STORY`, `THESIS`, `CATALYST`,
+`TRENDING` — and two *independent* ones become `MULTI_SOURCE_CONFLUENCE`. Market
+acceleration and a trending-board move collapse to one family between them, so a single
+market observation cannot manufacture its own corroboration.
+
+Three things look like good news and are not:
+
+- **Holders growing while ownership concentrates** is accumulation by someone, not
+  distribution to many → `OWNERSHIP_CONCENTRATION_WORSENING`.
+- **Known wallets present but selling** into the people arriving now →
+  `KNOWN_MONEY_DISTRIBUTING`.
+- **Evidence that arrives after the move** → `EDGE_CONSUMED_BEFORE_PROMOTION`.
+
+Promotion latches: exactly one operator ping per candidate, at the moment of promotion, and
+`EARLY_PROMOTION:<mint>` is the deduplicator behind that latch.
+
+### Who is actually buying
+
+`lab/toptraders.py` builds a participant picture for **one exact mint** from public fills.
+It is built around three refusals:
+
+- **A large wallet is not a smart wallet.** Size decides *ranking*; forward history decides
+  *weight*, and a `PROVEN_EARLY` label on fewer than 8 observed outcomes carries none.
+- **Five wallets sharing one funder are one actor.** Confirmations collapse per cluster
+  before they are counted, so a sybil group cannot confirm itself.
+- **A position is a story over time.** `BUYING → ADDING → HOLDING → PARTIAL_SELLING →
+  DISTRIBUTING → EXITED`, decided on *tokens* rather than dollars — a wallet that sold half
+  its tokens into a tripling price took more money out than it put in while still holding
+  half the position, and a dollar rule calls that distribution.
+
+`known_money_flow()` then says which side the wallets that already know this token are on.
+Accumulating and distributing print the same candle.
+
+### Holders as a shape
+
+`26 → 51 → 94`, with the time between observations. Acceleration needs three samples,
+because it takes two rates to compare rates — two samples return `None`, never "flat". A
+stale read racing a fresh one is dropped rather than folded in, so it cannot invent a dip.
+Concentration is tracked as a trend across every recorded sample: `48% → 31%` and
+`20% → 42%` are opposite stories about the same level.
+
+Holder *counts* come from the Trending board when it publishes them and are `None`
+otherwise. The public RPC methods this bot uses cannot count holders — the largest-accounts
+call returns twenty — and a guessed count would feed the promotion gate a number nobody
+measured.
+
+### Discord
+
+`/fomo trending view:whynotpinged` answers section 30 from the record: every watch, its
+baseline, its rechecks, and why it did or did not interrupt you.
+`/fomo trending view:traders <mint>` is our own top-trader board — not anyone else's UI —
+with the independence collapse shown explicitly. Both are views, not commands: Discord
+allows 25 children per group and this product is at 25.
+
+`Open in Terminal` is navigation only, built from the exact mint, from a single template in
+`constants.py` that every card shares. `TERMINAL_TOKEN_URL_TEMPLATE` overrides it and an
+empty value removes the button. Nothing authenticates against it, reads it back, or treats
+it as a data source.
+
+### Section 32 and the hotfix, reconciled
+
+The v2.43.1 hotfix forbids actionable language on an unvalidated card. Section 32 of this
+release permits a research alert with `SAFETY: UNKNOWN` *if clearly labelled*. Both hold:
+the early lane's first card stays `RESEARCH CANDIDATE — VALIDATION PENDING`, and a
+**promotion** — which by definition developed serious evidence — may lead with
+`🚨 EARLY RUNNER — LOOK NOW`, provided it states the safety it does not know and hands out
+no buy control. Identity still outranks evidence: an unverified mint loses the actionable
+title regardless of how good the market case is.
+
+### Railway
+
+Nothing is required. Every value has a safe code default and the loop runs on data the bot
+already fetches. Optional: `FOMO_EARLY_WATCH_ENABLED` (default `true`),
+`FOMO_EARLY_WATCH_SECONDS` (`1800`), `FOMO_EARLY_WATCH_RECHECK_SECONDS` (`30`),
+`FOMO_EARLY_WATCH_MAX` (`40`), `FOMO_EARLY_WATCH_MIN_SCORE` (`45`),
+`FOMO_EARLY_PROMOTION_MIN_SCORE_GAIN` (`6`), `FOMO_EARLY_PROMOTION_MIN_NEW_BUYS` (`25`),
+`FOMO_EARLY_PROMOTION_MIN_NEW_HOLDERS` (`15`),
+`FOMO_EARLY_PROMOTION_LARGE_BUY_USD` (`2500`), `FOMO_TOP_TRADERS_ENABLED` (`true`),
+`FOMO_TOP_TRADERS_LIMIT` (`10`), `TERMINAL_TOKEN_URL_TEMPLATE`.
+
+### Does any of it help?
+
+Ten evidence cohorts (`lab/forward.py`) are assigned from evidence that existed *at entry*,
+so none can be labelled with hindsight: no known trader, one, two-or-more independent,
+holder expansion, concentration improving, dev distributing, fresh-wallet cluster, and story
+/ thesis / trending each combined with a trader. Forward NET, expectancy, profit factor,
+MFE, MAE, drawdown and severe-failure rate are measured per cohort with the same maths the
+signal families use. Nothing here claims an edge; the cohorts exist so the claim can be
+checked.
+
 ## Token identity is chain + exact mint (v2.43.1 hotfix)
 
 A card once reached the operator for `7TqH1d4Vf9QG578vB99Q7ewFQPoxSYqBDxSAzBpBpump` — a

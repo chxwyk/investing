@@ -146,3 +146,130 @@ def assess_holders(
         independent_buyers=independent_buyers,
         buys=buys,
     )
+
+
+# --- the series, not the number (section 11) --------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class HolderSample:
+    """One observation of the holder count, with the time it was taken."""
+
+    at: int
+    holder_count: int
+    top10_percent: Decimal | None = None
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "at": self.at,
+            "holder_count": self.holder_count,
+            "top10_percent": _s(self.top10_percent),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class HolderSeries:
+    """``26 → 51 → 94`` and how long each step took.
+
+    A single holder count is almost content-free: 26 holders is early promise on
+    a two-minute-old token and a dead end on an hour-old one.  What a trader
+    reads is the *shape* — and specifically whether the rate itself is rising,
+    because steady growth and accelerating growth are different trades.
+    """
+
+    mint: str
+    samples: tuple[HolderSample, ...] = ()
+
+    @property
+    def latest(self) -> HolderSample | None:
+        return self.samples[-1] if self.samples else None
+
+    @property
+    def span_seconds(self) -> int:
+        if len(self.samples) < 2:
+            return 0
+        return self.samples[-1].at - self.samples[0].at
+
+    @property
+    def added(self) -> int | None:
+        if len(self.samples) < 2:
+            return None
+        return self.samples[-1].holder_count - self.samples[0].holder_count
+
+    @property
+    def per_minute(self) -> Decimal | None:
+        added, span = self.added, self.span_seconds
+        if added is None or span <= 0:
+            return None
+        return (Decimal(added) * Decimal(60) / Decimal(span)).quantize(Decimal("0.01"))
+
+    @property
+    def accelerating(self) -> bool | None:
+        """Whether the most recent step grew faster than the one before it.
+
+        Needs three samples: two give a rate, and it takes two rates to say
+        anything about acceleration.  Fewer than three returns ``None`` rather
+        than guessing, because an unknown trend must not read as a flat one.
+        """
+
+        if len(self.samples) < 3:
+            return None
+        recent = _rate(self.samples[-2], self.samples[-1])
+        earlier = _rate(self.samples[-3], self.samples[-2])
+        if recent is None or earlier is None:
+            return None
+        return recent > earlier
+
+    def render(self, *, limit: int = 5) -> str:
+        """``26 → 51 → 94`` — the tail of the series, most recent last."""
+
+        tail = self.samples[-limit:]
+        return " → ".join(str(item.holder_count) for item in tail)
+
+    def record(self, sample: HolderSample, *, max_samples: int = 24) -> HolderSeries:
+        """Append an observation.  Out-of-order samples are dropped, not sorted.
+
+        A sample older than the last one we already have is a stale read racing a
+        fresh one, and folding it in would invent a dip that never happened.
+        """
+
+        if self.samples and sample.at <= self.samples[-1].at:
+            return self
+        return HolderSeries(mint=self.mint, samples=(*self.samples, sample)[-max_samples:])
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "mint": self.mint,
+            "samples": [item.to_json() for item in self.samples],
+            "added": self.added,
+            "span_seconds": self.span_seconds,
+            "per_minute": _s(self.per_minute),
+            "accelerating": self.accelerating,
+            "render": self.render(),
+        }
+
+
+def _rate(first: HolderSample, second: HolderSample) -> Decimal | None:
+    span = second.at - first.at
+    if span <= 0:
+        return None
+    return Decimal(second.holder_count - first.holder_count) * Decimal(60) / Decimal(span)
+
+
+def series_from_json(payload: dict[str, object]) -> HolderSeries:
+    """Rebuild a series from its persisted form, order preserved."""
+
+    raw = payload.get("samples") or ()
+    samples: list[HolderSample] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        top10 = item.get("top10_percent")
+        samples.append(
+            HolderSample(
+                at=int(item.get("at") or 0),
+                holder_count=int(item.get("holder_count") or 0),
+                top10_percent=None if top10 in (None, "") else Decimal(str(top10)),
+            )
+        )
+    return HolderSeries(mint=str(payload.get("mint") or ""), samples=tuple(samples))

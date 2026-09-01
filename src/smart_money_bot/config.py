@@ -5,7 +5,12 @@ from dataclasses import dataclass
 from decimal import Decimal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .constants import LIVE_ACK_TEXT, PUMP_LAUNCH_ACK_TEXT, USDC_MINT
+from .constants import (
+    LIVE_ACK_TEXT,
+    PUMP_LAUNCH_ACK_TEXT,
+    TERMINAL_TOKEN_URL_TEMPLATE,
+    USDC_MINT,
+)
 
 DEFAULT_X_CRYPTO_TRUSTED_ACCOUNTS = "|".join(
     (
@@ -318,6 +323,27 @@ class Settings:
     #: Attribution-only Trench cohort inside the Trending shadow book, or its own
     #: bankroll when clean separation is explicitly wanted.
     fomo_trench_shadow_separate_bankroll: bool
+
+    # --- early-candidate HOT WATCH and promotion (v2.44) -------------------
+    # The production failure this closes: a 76/100 heads-up with no serious
+    # evidence category got one look and was never revisited.  Every value has a
+    # safe code default, and the whole loop runs on data the bot already fetches.
+    fomo_early_watch_enabled: bool
+    fomo_early_watch_seconds: int
+    fomo_early_watch_recheck_seconds: int
+    fomo_early_watch_max: int
+    fomo_early_watch_min_score: Decimal
+    fomo_early_promotion_min_score_gain: Decimal
+    fomo_early_promotion_min_new_buys: int
+    fomo_early_promotion_min_new_holders: int
+    fomo_early_promotion_large_buy_usd: Decimal
+    #: Known-trader intelligence for the exact mint (sections 5-9, 21).
+    fomo_top_traders_enabled: bool
+    fomo_top_traders_limit: int
+    #: The Terminal deep link, containing ``{mint}``.  Navigation only, and one
+    #: definition shared by every card; an operator may override it or set it
+    #: empty to remove the button.  Nothing here logs in or reads it back.
+    terminal_token_url_template: str
 
     news_radar_enabled: bool
     x_news_stream_enabled: bool
@@ -759,6 +785,29 @@ class Settings:
             fomo_trench_shadow_separate_bankroll=_bool(
                 "FOMO_TRENCH_SHADOW_SEPARATE_BANKROLL", False
             ),
+            fomo_early_watch_enabled=_bool("FOMO_EARLY_WATCH_ENABLED", True),
+            fomo_early_watch_seconds=_int("FOMO_EARLY_WATCH_SECONDS", 1_800),
+            fomo_early_watch_recheck_seconds=_int("FOMO_EARLY_WATCH_RECHECK_SECONDS", 30),
+            fomo_early_watch_max=_int("FOMO_EARLY_WATCH_MAX", 40),
+            fomo_early_watch_min_score=_decimal("FOMO_EARLY_WATCH_MIN_SCORE", "45"),
+            fomo_early_promotion_min_score_gain=_decimal(
+                "FOMO_EARLY_PROMOTION_MIN_SCORE_GAIN", "6"
+            ),
+            fomo_early_promotion_min_new_buys=_int("FOMO_EARLY_PROMOTION_MIN_NEW_BUYS", 25),
+            fomo_early_promotion_min_new_holders=_int(
+                "FOMO_EARLY_PROMOTION_MIN_NEW_HOLDERS", 15
+            ),
+            fomo_early_promotion_large_buy_usd=_decimal(
+                "FOMO_EARLY_PROMOTION_LARGE_BUY_USD", "2500"
+            ),
+            fomo_top_traders_enabled=_bool("FOMO_TOP_TRADERS_ENABLED", True),
+            fomo_top_traders_limit=_int("FOMO_TOP_TRADERS_LIMIT", 10),
+            # Defaults to the public per-token page every trench card already
+            # links to, so one definition serves every surface.  Set it empty to
+            # remove the button, or point it elsewhere.
+            terminal_token_url_template=os.getenv(
+                "TERMINAL_TOKEN_URL_TEMPLATE", TERMINAL_TOKEN_URL_TEMPLATE
+            ).strip(),
             fomo_live_radar_channel_id=_optional_int("FOMO_LIVE_RADAR_CHANNEL_ID"),
             fomo_urgent_channel_id=_optional_int("FOMO_URGENT_CHANNEL_ID"),
             news_radar_enabled=_bool("NEWS_RADAR_ENABLED", True),
@@ -1199,6 +1248,43 @@ class Settings:
             raise ValueError("FOMO_SHADOW_MIN_FORWARD_SAMPLE must be between 1 and 10000")
         # Trending cadence is bounded on both sides: fast enough to be worth
         # having a separate lane for, never fast enough to hammer a source.
+        # --- early-candidate hot watch (v2.44) --------------------------
+        # A watch that rechecks as slowly as the radar cycle is not a second
+        # look, it is the same look later; and one that outlives the move it
+        # was opened for is just a memory leak with a ping attached.
+        if not 120 <= self.fomo_early_watch_seconds <= 7_200:
+            raise ValueError("FOMO_EARLY_WATCH_SECONDS must be between 120 and 7200")
+        if not 10 <= self.fomo_early_watch_recheck_seconds <= 600:
+            raise ValueError("FOMO_EARLY_WATCH_RECHECK_SECONDS must be between 10 and 600")
+        if self.fomo_early_watch_recheck_seconds >= self.fomo_early_watch_seconds:
+            raise ValueError(
+                "FOMO_EARLY_WATCH_RECHECK_SECONDS must be shorter than "
+                "FOMO_EARLY_WATCH_SECONDS"
+            )
+        if not 1 <= self.fomo_early_watch_max <= 500:
+            raise ValueError("FOMO_EARLY_WATCH_MAX must be between 1 and 500")
+        if not 0 <= self.fomo_early_watch_min_score <= 100:
+            raise ValueError("FOMO_EARLY_WATCH_MIN_SCORE must be between 0 and 100")
+        if not 0 <= self.fomo_early_promotion_min_score_gain <= 100:
+            raise ValueError(
+                "FOMO_EARLY_PROMOTION_MIN_SCORE_GAIN must be between 0 and 100"
+            )
+        if not 1 <= self.fomo_top_traders_limit <= 50:
+            raise ValueError("FOMO_TOP_TRADERS_LIMIT must be between 1 and 50")
+        # Navigation only, and only to a link an administrator supplied.  A
+        # template without the exact mint in it would resolve a token by
+        # something other than its address, which is the one thing identity
+        # rules forbid.
+        template = self.terminal_token_url_template
+        if template:
+            if "{mint}" not in template:
+                raise ValueError(
+                    "TERMINAL_TOKEN_URL_TEMPLATE must contain {mint} — a link that "
+                    "does not carry the exact mint is not a link to this token"
+                )
+            if not template.startswith("https://"):
+                raise ValueError("TERMINAL_TOKEN_URL_TEMPLATE must be an https URL")
+
         if not 15 <= self.fomo_trending_poll_seconds <= 3_600:
             raise ValueError("FOMO_TRENDING_POLL_SECONDS must be between 15 and 3600")
         if not 5 <= self.fomo_trending_max_tracked <= 500:

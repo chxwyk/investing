@@ -34,8 +34,80 @@ def _d(value: Any) -> Decimal:
     return Decimal(str(value or 0))
 
 
-def _float_or_none(value: Decimal | None) -> float | None:
-    return None if value is None else float(value)
+def _float_or_none(value: object) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def _float_or_zero(value: object) -> float:
+    return _float_or_none(value) or 0.0
+
+
+def _early_watch_from_row(row: Any) -> dict[str, Any]:
+    """Rebuild a watch payload with the protected baseline columns winning.
+
+    ``payload_json`` is a convenience snapshot and the upsert rewrites it every
+    recheck, so reading the baseline back out of it would hand back whatever the
+    last write happened to contain.  The write-once columns are the record, and
+    they are applied last so they cannot be shadowed.
+    """
+
+    data = dict(row)
+    payload: dict[str, Any] = {}
+    raw = data.get("payload_json")
+    if raw:
+        try:
+            loaded = json.loads(raw)
+            if isinstance(loaded, dict):
+                payload = loaded
+        except ValueError:
+            payload = {}
+    payload.update(
+        {
+            "mint": data.get("mint"),
+            "origin": data.get("origin"),
+            "expires_at": data.get("expires_at"),
+            "rechecks": data.get("rechecks"),
+            "event_rechecks": data.get("event_rechecks"),
+            "last_recheck_at": data.get("last_recheck_at"),
+            "last_score": data.get("last_score"),
+            "best_score": data.get("best_score"),
+            "best_market_cap_usd": data.get("best_market_cap_usd"),
+            "promoted": bool(data.get("promoted")),
+            "promoted_at": data.get("promoted_at"),
+            "promotion_family": data.get("promotion_family"),
+            "promotion_families": _json_list(data.get("promotion_families_json")),
+            "suppression_reason": data.get("suppression_reason"),
+            "notes": _json_list(data.get("notes_json")),
+            # --- write-once baseline, applied last on purpose -------------
+            "opened_at": data.get("opened_at"),
+            "entry_tier": data.get("entry_tier"),
+            "entry_score": data.get("entry_score"),
+            "entry_market_cap_usd": data.get("entry_market_cap_usd"),
+            "first_seen_market_cap_usd": data.get("first_seen_market_cap_usd"),
+            "entry_liquidity_usd": data.get("entry_liquidity_usd"),
+            "entry_buys": data.get("entry_buys"),
+            "entry_independent_buyers": data.get("entry_independent_buyers"),
+            "entry_holder_count": data.get("entry_holder_count"),
+            "entry_evidence": _json_list(data.get("entry_evidence_json")),
+            "entry_why_not_pinged": _json_list(data.get("entry_why_json")),
+        }
+    )
+    return payload
+
+
+def _json_list(raw: object) -> list[str]:
+    if not raw:
+        return []
+    try:
+        loaded = json.loads(str(raw))
+    except ValueError:
+        return []
+    return [str(item) for item in loaded] if isinstance(loaded, list) else []
 
 
 class Database:
@@ -1457,6 +1529,79 @@ class Database:
             );
             CREATE INDEX IF NOT EXISTS idx_benchmark_snapshots_recent
                 ON benchmark_snapshots(captured_at DESC);
+
+            -- Early-lane HOT WATCH, and the record that answers "why wasn't I
+            -- pinged?" after the fact (v2.44, sections 2, 3, 30).  Every
+            -- ``entry_*`` column is written once when the watch opens: they are
+            -- the baseline promotion is measured against, so an enrichment pass
+            -- that overwrote them would delete the comparison itself.
+            CREATE TABLE IF NOT EXISTS early_watches (
+                mint TEXT PRIMARY KEY,
+                origin TEXT NOT NULL DEFAULT 'early_lane',
+                opened_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                entry_tier TEXT NOT NULL DEFAULT '',
+                entry_score REAL NOT NULL DEFAULT 0,
+                entry_market_cap_usd REAL,
+                first_seen_market_cap_usd REAL,
+                entry_liquidity_usd REAL,
+                entry_buys INTEGER,
+                entry_independent_buyers INTEGER,
+                entry_holder_count INTEGER,
+                entry_evidence_json TEXT NOT NULL DEFAULT '[]',
+                entry_why_json TEXT NOT NULL DEFAULT '[]',
+                rechecks INTEGER NOT NULL DEFAULT 0,
+                event_rechecks INTEGER NOT NULL DEFAULT 0,
+                last_recheck_at INTEGER NOT NULL DEFAULT 0,
+                last_score REAL NOT NULL DEFAULT 0,
+                best_score REAL NOT NULL DEFAULT 0,
+                best_market_cap_usd REAL,
+                promoted INTEGER NOT NULL DEFAULT 0,
+                promoted_at INTEGER,
+                promotion_family TEXT NOT NULL DEFAULT '',
+                promotion_families_json TEXT NOT NULL DEFAULT '[]',
+                suppression_reason TEXT NOT NULL DEFAULT '',
+                notes_json TEXT NOT NULL DEFAULT '[]',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                updated_at INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_early_watches_open
+                ON early_watches(promoted, expires_at DESC);
+
+            -- Top traders on one exact mint (sections 5, 9, 21).  The primary
+            -- key is (mint, wallet) because a wallet's behaviour on a
+            -- same-ticker token is not evidence about this one.
+            CREATE TABLE IF NOT EXISTS token_traders (
+                mint TEXT NOT NULL,
+                wallet TEXT NOT NULL,
+                buys INTEGER NOT NULL DEFAULT 0,
+                sells INTEGER NOT NULL DEFAULT 0,
+                bought_usd REAL NOT NULL DEFAULT 0,
+                sold_usd REAL NOT NULL DEFAULT 0,
+                tokens_bought REAL NOT NULL DEFAULT 0,
+                tokens_sold REAL NOT NULL DEFAULT 0,
+                first_buy_at INTEGER,
+                first_buy_market_cap_usd REAL,
+                last_event_at INTEGER,
+                state TEXT NOT NULL DEFAULT 'UNKNOWN',
+                cluster_id TEXT NOT NULL DEFAULT '',
+                updated_at INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (mint, wallet)
+            );
+            CREATE INDEX IF NOT EXISTS idx_token_traders_mint
+                ON token_traders(mint, bought_usd DESC);
+
+            -- Holder counts over time (section 11).  A single count says almost
+            -- nothing; 26 -> 51 -> 94 with timestamps is the actual signal.
+            CREATE TABLE IF NOT EXISTS holder_samples (
+                mint TEXT NOT NULL,
+                observed_at INTEGER NOT NULL,
+                holder_count INTEGER NOT NULL,
+                top10_percent REAL,
+                PRIMARY KEY (mint, observed_at)
+            );
+            CREATE INDEX IF NOT EXISTS idx_holder_samples_mint
+                ON holder_samples(mint, observed_at DESC);
             """
         )
         await self._migrate_pump_launch_status_constraint()
@@ -5464,6 +5609,209 @@ class Database:
                 if mint and symbol:
                     known.setdefault(mint, symbol)
         return known
+
+    # ------------------------------------------------------------------
+    # early-lane hot watch, top traders and holder series (v2.44)
+    # ------------------------------------------------------------------
+
+    #: Columns captured when a watch opens and never rewritten.  They are the
+    #: baseline a promotion is measured against; letting an update touch them
+    #: would silently delete the comparison (this is the same write-once
+    #: discipline the Trending ledger uses for first-observation fields).
+    _EARLY_WATCH_IMMUTABLE: tuple[str, ...] = (
+        "opened_at",
+        "entry_tier",
+        "entry_score",
+        "entry_market_cap_usd",
+        "first_seen_market_cap_usd",
+        "entry_liquidity_usd",
+        "entry_buys",
+        "entry_independent_buyers",
+        "entry_holder_count",
+        "entry_evidence_json",
+        "entry_why_json",
+    )
+
+    async def save_early_watch(self, payload: dict[str, Any], *, now: int) -> None:
+        """Upsert one watch.  Baseline columns are absent from the UPDATE clause."""
+
+        columns = {
+            "mint": str(payload.get("mint") or ""),
+            "origin": str(payload.get("origin") or "early_lane"),
+            "opened_at": int(payload.get("opened_at") or 0),
+            "expires_at": int(payload.get("expires_at") or 0),
+            "entry_tier": str(payload.get("entry_tier") or ""),
+            "entry_score": _float_or_zero(payload.get("entry_score")),
+            "entry_market_cap_usd": _float_or_none(payload.get("entry_market_cap_usd")),
+            "first_seen_market_cap_usd": _float_or_none(
+                payload.get("first_seen_market_cap_usd")
+            ),
+            "entry_liquidity_usd": _float_or_none(payload.get("entry_liquidity_usd")),
+            "entry_buys": payload.get("entry_buys"),
+            "entry_independent_buyers": payload.get("entry_independent_buyers"),
+            "entry_holder_count": payload.get("entry_holder_count"),
+            "entry_evidence_json": json.dumps(list(payload.get("entry_evidence") or [])),
+            "entry_why_json": json.dumps(list(payload.get("entry_why_not_pinged") or [])),
+            "rechecks": int(payload.get("rechecks") or 0),
+            "event_rechecks": int(payload.get("event_rechecks") or 0),
+            "last_recheck_at": int(payload.get("last_recheck_at") or 0),
+            "last_score": _float_or_zero(payload.get("last_score")),
+            "best_score": _float_or_zero(payload.get("best_score")),
+            "best_market_cap_usd": _float_or_none(payload.get("best_market_cap_usd")),
+            "promoted": 1 if payload.get("promoted") else 0,
+            "promoted_at": payload.get("promoted_at"),
+            "promotion_family": str(payload.get("promotion_family") or ""),
+            "promotion_families_json": json.dumps(
+                list(payload.get("promotion_families") or [])
+            ),
+            "suppression_reason": str(payload.get("suppression_reason") or ""),
+            "notes_json": json.dumps(list(payload.get("notes") or [])),
+            "payload_json": json.dumps(payload),
+            "updated_at": now,
+        }
+        names = list(columns)
+        updatable = [
+            name
+            for name in names
+            if name not in {"mint", *self._EARLY_WATCH_IMMUTABLE}
+        ]
+        await self.db.execute(
+            f"INSERT INTO early_watches ({', '.join(names)}) "
+            f"VALUES ({', '.join('?' for _ in names)}) "
+            f"ON CONFLICT(mint) DO UPDATE SET "
+            + ", ".join(f"{name}=excluded.{name}" for name in updatable),
+            tuple(columns[name] for name in names),
+        )
+        await self.db.commit()
+
+    async def early_watch_rows(
+        self,
+        *,
+        limit: int = 50,
+        open_only: bool = False,
+        now: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Read watches back with the protected baseline winning over the payload."""
+
+        clause = ""
+        params: list[Any] = []
+        if open_only:
+            clause = "WHERE promoted = 0 AND expires_at > ?"
+            params.append(int(now or 0))
+        cursor = await self.db.execute(
+            f"SELECT * FROM early_watches {clause} ORDER BY opened_at DESC LIMIT ?",
+            (*params, limit),
+        )
+        rows = await cursor.fetchall()
+        return [_early_watch_from_row(row) for row in rows]
+
+    async def early_watch_row(self, mint: str) -> dict[str, Any] | None:
+        cursor = await self.db.execute(
+            "SELECT * FROM early_watches WHERE mint = ?", (mint,)
+        )
+        row = await cursor.fetchone()
+        return None if row is None else _early_watch_from_row(row)
+
+    async def token_swap_rows(self, mint: str, *, limit: int = 200) -> list[dict[str, Any]]:
+        """Every observed fill for one exact mint, newest first.
+
+        Keyed on ``token_mint`` and nothing else: a wallet's fills on a
+        same-ticker token are a different token's history and must never be
+        folded into this one's participant picture.
+        """
+
+        cursor = await self.db.execute(
+            "SELECT signature, trader_address, block_time, side, token_mint, "
+            "token_amount, usd_value, token_price_usd FROM swaps "
+            "WHERE token_mint = ? ORDER BY block_time DESC LIMIT ?",
+            (mint, limit),
+        )
+        return [dict(row) for row in await cursor.fetchall()]
+
+    async def record_token_trader(
+        self,
+        *,
+        mint: str,
+        wallet: str,
+        position: dict[str, Any],
+        cluster_id: str = "",
+        now: int,
+    ) -> None:
+        """Persist one wallet's position in one exact mint (sections 5, 9)."""
+
+        await self.db.execute(
+            """
+            INSERT INTO token_traders (
+                mint, wallet, buys, sells, bought_usd, sold_usd, tokens_bought,
+                tokens_sold, first_buy_at, first_buy_market_cap_usd, last_event_at,
+                state, cluster_id, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(mint, wallet) DO UPDATE SET
+                buys=excluded.buys,
+                sells=excluded.sells,
+                bought_usd=excluded.bought_usd,
+                sold_usd=excluded.sold_usd,
+                tokens_bought=excluded.tokens_bought,
+                tokens_sold=excluded.tokens_sold,
+                last_event_at=excluded.last_event_at,
+                state=excluded.state,
+                cluster_id=excluded.cluster_id,
+                updated_at=excluded.updated_at
+            """,
+            (
+                mint,
+                wallet,
+                int(position.get("buys") or 0),
+                int(position.get("sells") or 0),
+                _float_or_zero(position.get("bought_usd")),
+                _float_or_zero(position.get("sold_usd")),
+                _float_or_zero(position.get("tokens_bought")),
+                _float_or_zero(position.get("tokens_sold")),
+                position.get("first_buy_at"),
+                _float_or_none(position.get("first_buy_market_cap_usd")),
+                position.get("last_event_at"),
+                str(position.get("state") or "UNKNOWN"),
+                cluster_id,
+                now,
+            ),
+        )
+        await self.db.commit()
+
+    async def token_trader_rows(self, mint: str, *, limit: int = 25) -> list[dict[str, Any]]:
+        cursor = await self.db.execute(
+            "SELECT * FROM token_traders WHERE mint = ? "
+            "ORDER BY bought_usd DESC LIMIT ?",
+            (mint, limit),
+        )
+        return [dict(row) for row in await cursor.fetchall()]
+
+    async def record_holder_sample(
+        self,
+        *,
+        mint: str,
+        observed_at: int,
+        holder_count: int,
+        top10_percent: float | None = None,
+    ) -> None:
+        """Append one holder observation.  Re-observing the same second is a no-op."""
+
+        await self.db.execute(
+            "INSERT OR IGNORE INTO holder_samples "
+            "(mint, observed_at, holder_count, top10_percent) VALUES (?, ?, ?, ?)",
+            (mint, observed_at, holder_count, top10_percent),
+        )
+        await self.db.commit()
+
+    async def holder_samples(self, mint: str, *, limit: int = 24) -> list[dict[str, Any]]:
+        """Oldest-first so the series reads left to right the way it happened."""
+
+        cursor = await self.db.execute(
+            "SELECT observed_at, holder_count, top10_percent FROM holder_samples "
+            "WHERE mint = ? ORDER BY observed_at DESC LIMIT ?",
+            (mint, limit),
+        )
+        rows = [dict(row) for row in await cursor.fetchall()]
+        return list(reversed(rows))
 
     async def record_alert_stage(
         self,

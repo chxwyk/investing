@@ -208,6 +208,152 @@ def measure_families(
     return stats
 
 
+# --- v2.44 evidence cohorts (section 36) -------------------------------------
+# The families above answer "which lane found it".  These answer a different
+# and, for this release, more pointed question: **do the new signals actually
+# help?**  A holder-expansion promotion and a known-trader promotion are both
+# EARLY_PROMOTION, and if only one of them makes money we need to be able to
+# see that rather than average them together.
+#
+# Every label is derived from evidence that existed *at entry*, so a cohort can
+# never be assigned with hindsight.
+
+COHORT_NO_KNOWN_TRADER = "NO_KNOWN_TRADER"
+COHORT_ONE_KNOWN_TRADER = "ONE_KNOWN_TRADER"
+COHORT_MULTI_KNOWN_TRADER = "TWO_PLUS_INDEPENDENT_KNOWN_TRADERS"
+COHORT_HOLDER_EXPANSION = "HOLDER_EXPANSION"
+COHORT_CONCENTRATION_IMPROVING = "CONCENTRATION_IMPROVING"
+COHORT_DEV_DISTRIBUTING = "DEV_DISTRIBUTING"
+COHORT_FRESH_WALLET_CLUSTER = "FRESH_WALLET_CLUSTER"
+COHORT_STORY_AND_TRADER = "STORY_PLUS_TRADER"
+COHORT_THESIS_AND_TRADER = "THESIS_PLUS_TRADER"
+COHORT_TRENDING_AND_TRADER = "TRENDING_PLUS_TRADER"
+
+EVIDENCE_COHORTS: tuple[str, ...] = (
+    COHORT_NO_KNOWN_TRADER,
+    COHORT_ONE_KNOWN_TRADER,
+    COHORT_MULTI_KNOWN_TRADER,
+    COHORT_HOLDER_EXPANSION,
+    COHORT_CONCENTRATION_IMPROVING,
+    COHORT_DEV_DISTRIBUTING,
+    COHORT_FRESH_WALLET_CLUSTER,
+    COHORT_STORY_AND_TRADER,
+    COHORT_THESIS_AND_TRADER,
+    COHORT_TRENDING_AND_TRADER,
+)
+
+
+def assign_cohorts(
+    *,
+    proven_independent_traders: int = 0,
+    holder_expansion: bool = False,
+    concentration_trend: str = "",
+    dev_posture: str = "",
+    fresh_wallet_cluster: bool = False,
+    story_confirmed: bool = False,
+    thesis_confirmed: bool = False,
+    trending_confirmed: bool = False,
+) -> tuple[str, ...]:
+    """Label one entry by the evidence that was present when it was taken.
+
+    A candidate lands in several cohorts at once on purpose — "two known traders"
+    and "story plus trader" are different questions about the same trade, and
+    forcing a single bucket would make both unanswerable.
+    """
+
+    labels: list[str] = []
+    if proven_independent_traders <= 0:
+        labels.append(COHORT_NO_KNOWN_TRADER)
+    elif proven_independent_traders == 1:
+        labels.append(COHORT_ONE_KNOWN_TRADER)
+    else:
+        labels.append(COHORT_MULTI_KNOWN_TRADER)
+    if holder_expansion:
+        labels.append(COHORT_HOLDER_EXPANSION)
+    # "IMPROVING" is the holder modules' own value; see
+    # ``lab.promotion`` for why it is restated rather than imported.
+    if concentration_trend == "IMPROVING":
+        labels.append(COHORT_CONCENTRATION_IMPROVING)
+    if dev_posture in {"DEV_HOLDING_SELLING", "DEV_HOLDING_EXITED"}:
+        labels.append(COHORT_DEV_DISTRIBUTING)
+    if fresh_wallet_cluster:
+        labels.append(COHORT_FRESH_WALLET_CLUSTER)
+    # The combination cohorts require a known trader *and* the other evidence:
+    # a story on its own is already measured by the STORY family.
+    if proven_independent_traders > 0:
+        if story_confirmed:
+            labels.append(COHORT_STORY_AND_TRADER)
+        if thesis_confirmed:
+            labels.append(COHORT_THESIS_AND_TRADER)
+        if trending_confirmed:
+            labels.append(COHORT_TRENDING_AND_TRADER)
+    return tuple(dict.fromkeys(labels))
+
+
+def measure_cohorts(
+    trades: Sequence[ShadowTradeRecord],
+    *,
+    cohorts: Mapping[str, Sequence[str]],
+    as_of: int,
+) -> dict[str, FamilyStats]:
+    """Forward record per evidence cohort, using the same maths as the families.
+
+    ``cohorts`` maps a ``position_id`` to the labels assigned at entry.  A trade
+    with no labels is simply absent: guessing a cohort after the fact is exactly
+    the hindsight this measurement exists to avoid.
+    """
+
+    closed = [
+        trade
+        for trade in trades
+        if not trade.open and trade.closed_at is not None and trade.closed_at <= as_of
+    ]
+    stats: dict[str, FamilyStats] = {}
+    for cohort in EVIDENCE_COHORTS:
+        members = [
+            trade for trade in closed if cohort in tuple(cohorts.get(trade.position_id, ()))
+        ]
+        if not members:
+            continue
+        stats[cohort] = _cohort_stats(cohort, members)
+    return stats
+
+
+def _cohort_stats(name: str, members: Sequence[ShadowTradeRecord]) -> FamilyStats:
+    nets = [trade.net_pnl_usd for trade in members]
+    wins = [value for value in nets if value > 0]
+    losses = [value for value in nets if value <= 0]
+    loss_total = sum((abs(value) for value in losses), ZERO)
+
+    equity = ZERO
+    peak = ZERO
+    drawdown = ZERO
+    for trade in sorted(members, key=lambda item: item.closed_at or 0):
+        equity += trade.net_pnl_usd
+        peak = max(peak, equity)
+        drawdown = max(drawdown, peak - equity)
+
+    return FamilyStats(
+        family=name,
+        sample=len(members),
+        wins=len(wins),
+        losses=len(losses),
+        net_pnl_usd=sum(nets, ZERO).quantize(Decimal("0.000001")),
+        expectancy_usd=(sum(nets, ZERO) / Decimal(len(members))).quantize(
+            Decimal("0.000001")
+        ),
+        profit_factor=(
+            (sum(wins, ZERO) / loss_total).quantize(CENT) if loss_total > 0 else None
+        ),
+        max_drawdown_usd=drawdown.quantize(Decimal("0.000001")),
+        severe_failures=sum(
+            1 for trade in members if trade.close_reason in SEVERE_CLOSE_REASONS
+        ),
+        average_mfe_percent=_mean([trade.max_favourable_percent for trade in members]),
+        average_mae_percent=_mean([trade.max_adverse_percent for trade in members]),
+    )
+
+
 def calibrate_families(
     trades: Sequence[ShadowTradeRecord],
     *,

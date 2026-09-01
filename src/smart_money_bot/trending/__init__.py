@@ -63,7 +63,10 @@ from .holders import (
     GROWTH_ACCELERATING,
     GROWTH_GROWING,
     HolderProfile,
+    HolderSample,
+    HolderSeries,
     assess_holders,
+    series_from_json,
 )
 from .hotwatch import (
     DEFAULT_HOT_WATCH_CONFIG,
@@ -312,6 +315,8 @@ __all__ = [
     "CrossMintEvidenceError",
     "EvidencePerformance",
     "HolderProfile",
+    "HolderSample",
+    "HolderSeries",
     "HotWatchConfig",
     "HotWatchEntry",
     "HotWatchOutcome",
@@ -348,6 +353,7 @@ __all__ = [
     "UniverseTrade",
     "assert_same_mint",
     "assess_holders",
+    "series_from_json",
     "assess_lane_health",
     "assess_social_health",
     "board_diff",

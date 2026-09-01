@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
 
+from .constants import TERMINAL_TOKEN_URL_TEMPLATE
 from .discord_render import (
     P_ABOUT,
     P_DECISION,
@@ -34,6 +35,7 @@ from .discord_render import (
     P_LINKS,
     P_LIQUIDITY,
     P_MOMENTUM,
+    P_OPPORTUNITY,
     P_SAFETY,
     P_SMART_MONEY,
     P_SOCIAL,
@@ -79,6 +81,11 @@ TRENCH_HEADS_UP_ALERT = "PUMP_TRENCH_HEADS_UP"
 ALMOST_BONDED_ALERT = "ALMOST_BONDED_MOMENTUM"
 PUBLIC_TRENDING_ALERT = "PUBLIC_TRENDING"
 
+# --- early-candidate promotion (sections 3, 29, 35) --------------------------
+#: A hot-watched near-miss whose evidence developed while the edge was still
+#: available.  This is the card the production failure in section 1 never got.
+EARLY_PROMOTION = "EARLY_PROMOTION"
+
 ALERT_CLASSES: tuple[str, ...] = (
     FAST_WATCH,
     NOTABLE_TRADER_EARLY,
@@ -100,6 +107,7 @@ ALERT_CLASSES: tuple[str, ...] = (
     TRENCH_HEADS_UP_ALERT,
     ALMOST_BONDED_ALERT,
     PUBLIC_TRENDING_ALERT,
+    EARLY_PROMOTION,
 )
 
 #: Classes that may interrupt the user.  A late observation never does — it is
@@ -124,6 +132,9 @@ PINGABLE: frozenset[str] = frozenset(
         TRENCH_RUNNER_ALERT,
         ALMOST_BONDED_ALERT,
         PUBLIC_TRENDING_ALERT,
+        # A promotion is by definition the moment the evidence became worth
+        # an interruption, so it is the one card that must reach the human.
+        EARLY_PROMOTION,
     }
 )
 
@@ -156,6 +167,9 @@ URGENT_CLASSES: frozenset[str] = frozenset(
         TRENCH_RUNNER_ALERT,
         ALMOST_BONDED_ALERT,
         PUBLIC_TRENDING_ALERT,
+        # A promotion is the moment a watched near-miss became worth an
+        # interruption, so it belongs in the lane interruptions live in.
+        EARLY_PROMOTION,
     }
 )
 
@@ -390,22 +404,33 @@ def build_notable_trader_alert(
     ping_decision: Any = None,
     catalyst_note: str = "checking",
     image_url: str = "",
+    token_state: str = "",
+    story_summary: str = "",
+    safety_status: str = "UNKNOWN",
+    proven: bool = False,
+    terminal_url: str = "",
 ) -> FastAlert:
     """The small, fast notable-wallet card (sections 6, 7, 8).
 
     Entry market cap versus current market cap is mandatory and always present,
     and a late observation is published with its lateness quantified rather than
     hidden.
+
+    A wallet whose *forward history* has earned weight gets the louder headline
+    and does not wait for deep enrichment.  A wallet that is merely large does
+    not: size is not a track record, and calling every whale smart money is how
+    a channel stops meaning anything.
     """
 
     trade = signal.trade
     late = not signal.may_chase()
     kind = NOTABLE_TRADER_LATE if late else NOTABLE_TRADER_EARLY
-    title = (
-        "🐋 NOTABLE TRADER BUY — LATE OBSERVATION"
-        if late
-        else "🐋 NOTABLE TRADER BUY — EARLY DATA"
-    )
+    if late:
+        title = "🐋 NOTABLE TRADER BUY — LATE OBSERVATION"
+    elif proven:
+        title = "🐋 KNOWN TRADER BUY — LOOK NOW"
+    else:
+        title = "🐋 NOTABLE TRADER BUY — EARLY DATA"
     delay = trade.detection_delay_seconds
     age = signal.signal_age_seconds
     age_text = f"{age}s" if age is not None else "unknown"
@@ -472,6 +497,22 @@ def build_notable_trader_alert(
         why.append(f"{consensus.independent_wallets} independent notable wallets agree")
     fields.append(_family_field(kind, why))
 
+    # Section 6: what the token itself is doing, and what we do *not* yet know
+    # about it.  The card is published before deep enrichment finishes, so the
+    # honest thing is to name the gap rather than leave it implied.
+    fields.append(
+        CardField(
+            "TOKEN STATE",
+            (
+                (f"Stage `{token_state}`\n" if token_state else "")
+                + (f"Story: {story_summary}\n" if story_summary else "Story: none found\n")
+                + f"Safety: **{safety_status}** — this is not a safety pass\n"
+                + "Entry eligible: **NO** • Trade CTA: **DISABLED**"
+            ),
+            P_SAFETY,
+        )
+    )
+
     warnings = signal.warnings()
     if warnings:
         fields.append(CardField("WARNINGS", "\n".join(warnings), P_WARNINGS))
@@ -483,6 +524,7 @@ def build_notable_trader_alert(
             f"**{name}** `${symbol}`\n`{trade.mint}`\n"
             + (f"{reason}\n" if reason else "")
             + _links(trade.mint, fomo_url)
+            + (f" • [TERMINAL]({terminal_url})" if terminal_url else "")
         ),
         compact_description=(
             f"🐋 **{name}** `${symbol}` — {signal.display_name} "
@@ -1439,7 +1481,7 @@ def _terminal_url(mint: str) -> str:
     the link is derived from the mint rather than from a name.
     """
 
-    return f"https://trade.padre.gg/trade/solana/{mint}"
+    return TERMINAL_TOKEN_URL_TEMPLATE.replace("{mint}", mint)
 
 
 def _trench_links(mint: str, fomo_url: str) -> str:
@@ -1813,3 +1855,262 @@ def _duration(seconds: int | None) -> str:
         return f"{minutes}m {remainder:02d}s"
     hours, minutes = divmod(minutes, 60)
     return f"{hours}h {minutes:02d}m"
+
+
+# --- the promotion card (sections 3, 29, 35) ---------------------------------
+
+
+def _known_trader_lines(traders: Any) -> tuple[str, ...]:
+    """Render at most a few known wallets, always with what they are doing."""
+
+    lines: list[str] = []
+    for trader in list(traders or ())[:4]:
+        state = str(getattr(trader, "state", "") or "UNKNOWN").replace("_", " ").lower()
+        wallet = str(getattr(trader, "wallet", ""))
+        name = str(getattr(trader, "display_name", "") or wallet[:6] + "…")
+        reputation = str(getattr(trader, "reputation_state", "UNKNOWN"))
+        samples = int(getattr(trader, "reputation_samples", 0) or 0)
+        position = getattr(trader, "position", None)
+        entry = getattr(position, "first_buy_market_cap_usd", None)
+        amount = getattr(position, "bought_usd", None)
+        line = f"**{name}** `{reputation}` ({samples} samples) • {state}"
+        if amount is not None and entry is not None:
+            line += f"\n  entered `{_money(amount)}` @ `{_money(entry)}` MC"
+        lines.append(line)
+    return tuple(lines)
+
+
+def build_promotion_alert(
+    *,
+    mint: str,
+    name: str,
+    symbol: str,
+    fomo_url: str,
+    decision: Any,
+    entry: Any,
+    age_seconds: int | None = None,
+    current_market_cap_usd: Decimal | None = None,
+    liquidity_usd: Decimal | None = None,
+    change_1m_percent: Decimal | None = None,
+    change_5m_percent: Decimal | None = None,
+    buys: int | None = None,
+    sells: int | None = None,
+    holder_series: str = "",
+    holders_added: int | None = None,
+    holder_window_seconds: int | None = None,
+    top10_percent: Decimal | None = None,
+    concentration_trend: str = "",
+    dev_percent: Decimal | None = None,
+    dev_posture: str = "",
+    fresh_wallets: int | None = None,
+    independent_buyers: int | None = None,
+    known_traders: Any = (),
+    known_money_flow: str = "",
+    cluster_note: str = "",
+    story_summary: str = "",
+    thesis_summary: str = "",
+    safety_status: str = "UNKNOWN",
+    identity_verified: bool = True,
+    symbol_collision: bool = False,
+    image_url: str = "",
+    terminal_url: str = "",
+) -> FastAlert:
+    """The card a hot-watched near-miss earns when new evidence arrives.
+
+    This is the answer to the section 1 failure.  The heads-up card said what was
+    true at second three; this one says what changed between then and now, and it
+    leads with the *reason it is interrupting you* rather than with a score.
+
+    Identity still gates the language.  Section 32 permits an actionable research
+    alert while safety is UNKNOWN provided the card says so plainly — but an
+    unverified mint is a different thing entirely, and no amount of market
+    evidence makes a card about a token we could not identify actionable.
+    """
+
+    family = str(getattr(decision, "family", "") or "")
+    families = tuple(getattr(decision, "families", ()) or ())
+    reasons = tuple(getattr(decision, "reasons", ()) or ())
+    trustworthy = identity_verified
+    title = (
+        "🚨 EARLY RUNNER — LOOK NOW"
+        if trustworthy
+        else "🔬 RESEARCH CANDIDATE — IDENTITY UNVERIFIED"
+    )
+
+    entry_mc = getattr(entry, "entry_market_cap_usd", None)
+    first_seen_mc = getattr(entry, "first_seen_market_cap_usd", None)
+    fields = [
+        CardField(
+            "WHY THIS IS INTERRUPTING YOU",
+            (
+                f"**{family.replace('_', ' ')}**"
+                + (
+                    f" • {len(families) - 1} other famil"
+                    + ("y" if len(families) == 2 else "ies")
+                    if len(families) > 1
+                    else ""
+                )
+                + "\n"
+                + ("\n".join(f"• {item}" for item in reasons[:5]) or "• evidence developed")
+            ),
+            P_DECISION,
+        ),
+        CardField(
+            "MARKET CAP",
+            (
+                f"First seen `{_money(first_seen_mc)}`\n"
+                f"At heads-up `{_money(entry_mc)}`\n"
+                f"**Now `{_money(current_market_cap_usd)}`**\n"
+                f"Move since heads-up "
+                f"`{_percent_or(_move_percent(entry_mc, current_market_cap_usd))}`"
+            ),
+            P_OPPORTUNITY,
+        ),
+        CardField(
+            "MOMENTUM",
+            (
+                f"Age `{age_seconds if age_seconds is not None else '?'}s` • 1m "
+                f"`{_percent_or(change_1m_percent)}` • 5m `{_percent_or(change_5m_percent)}`\n"
+                f"Liquidity `{_money(liquidity_usd)}` • flow "
+                f"`{buys if buys is not None else '?'}` buys / "
+                f"`{sells if sells is not None else '?'}` sells"
+            ),
+            P_MOMENTUM,
+        ),
+    ]
+
+    if holder_series or holders_added is not None:
+        window = (
+            f" in {holder_window_seconds // 60}m"
+            if holder_window_seconds and holder_window_seconds >= 60
+            else (f" in {holder_window_seconds}s" if holder_window_seconds else "")
+        )
+        fields.append(
+            CardField(
+                "HOLDERS",
+                (
+                    (f"`{holder_series}`" if holder_series else "")
+                    + (
+                        f"\n**+{holders_added}**{window}"
+                        if holders_added is not None
+                        else ""
+                    )
+                    + (
+                        f"\nTop 10 `{top10_percent}%`"
+                        if top10_percent is not None
+                        else ""
+                    )
+                    + (
+                        f" • concentration `{concentration_trend.replace('CONCENTRATION_', '')}`"
+                        if concentration_trend
+                        else ""
+                    )
+                ).strip()
+                or "unknown",
+                P_DEMAND,
+            )
+        )
+
+    if known_traders:
+        lines = _known_trader_lines(known_traders)
+        fields.append(
+            CardField(
+                "KNOWN TRADERS ON THIS EXACT MINT",
+                "\n".join(lines)
+                + (f"\n{known_money_flow.replace('_', ' ').lower()}" if known_money_flow else "")
+                + (f"\n⚠ {cluster_note}" if cluster_note else ""),
+                P_SMART_MONEY,
+            )
+        )
+
+    participation: list[str] = []
+    if independent_buyers is not None:
+        participation.append(f"Independent buyers `{independent_buyers}`")
+    if fresh_wallets is not None:
+        participation.append(f"Fresh wallets `{fresh_wallets}`")
+    if dev_percent is not None or dev_posture:
+        participation.append(
+            f"Dev `{dev_percent}%`" if dev_percent is not None else "Dev `?`"
+            + (f" • {dev_posture.replace('DEV_HOLDING_', '').lower()}" if dev_posture else "")
+        )
+    if participation:
+        fields.append(CardField("PARTICIPATION", " • ".join(participation), P_DEMAND))
+
+    if story_summary or thesis_summary:
+        fields.append(
+            CardField(
+                "STORY & THESIS",
+                (f"Story: {story_summary}\n" if story_summary else "Story: none found\n")
+                + (f"Thesis: {thesis_summary}" if thesis_summary else "Thesis: none graded"),
+                P_SOCIAL,
+            )
+        )
+
+    # Section 32: an actionable research alert may fire while safety is unknown,
+    # but only if the card says so in the same breath.  It is never a claim that
+    # the token is safe, and it never comes with a way to buy.
+    fields.append(
+        CardField(
+            "STATE",
+            (
+                f"Identity: **{'VERIFIED' if identity_verified else 'UNVERIFIED'}**"
+                f" • Symbol collision: **{'YES' if symbol_collision else 'NO'}**\n"
+                f"Safety: **{safety_status}** — this is not a safety pass\n"
+                "Entry eligible: **NO** • Trade CTA: **DISABLED**"
+            ),
+            P_SAFETY,
+        )
+    )
+    if symbol_collision:
+        fields.append(
+            CardField(
+                "⚠ SYMBOL COLLISION",
+                (
+                    f"Other live tokens use `${symbol}`. Every number above belongs "
+                    f"to `{mint}` and no other."
+                ),
+                P_WARNINGS,
+            )
+        )
+    links = _links(mint, fomo_url)
+    if terminal_url:
+        links += f" • [TERMINAL]({terminal_url})"
+    fields.append(CardField("LINKS", links, P_LIQUIDITY))
+
+    spec = CardSpec(
+        title=title,
+        description=(
+            f"**{name}** `${symbol}`\n"
+            f"Mint: `{mint}`\n"
+            f"Heads-up `{_money(entry_mc)}` → now `{_money(current_market_cap_usd)}` "
+            f"({_percent_or(_move_percent(entry_mc, current_market_cap_usd))})\n"
+            f"{links}"
+        ),
+        compact_description=(
+            f"{title}\n**{name}** `${symbol}`\n`{mint}`\n"
+            f"{family.replace('_', ' ')} • heads-up `{_money(entry_mc)}` → "
+            f"`{_money(current_market_cap_usd)}`"
+        ),
+        fields=tuple(fields),
+        footer=RESEARCH_ONLY_FOOTER,
+        thumbnail_url=image_url,
+        colour=0xE74C3C if trustworthy else 0x95A5A6,
+    )
+    return FastAlert(
+        kind=EARLY_PROMOTION,
+        mint=mint,
+        # One key per mint per promotion: a candidate is promoted exactly once,
+        # and the deduplicator is the second guarantee behind that latch.
+        alert_key=f"{EARLY_PROMOTION}:{mint}",
+        spec=spec,
+        ping=trustworthy,
+        ping_reason=", ".join(families[:2]),
+        # Real money stays disabled everywhere (section 38).
+        trade_eligible=False,
+        identity_verified=identity_verified,
+        symbol_collision=symbol_collision,
+        fingerprint=f"{family}:{int(getattr(decision, 'promote', False))}",
+        token_mint=mint,
+        lane=LANE_URGENT if trustworthy else LANE_RADAR,
+        family=family,
+    )
