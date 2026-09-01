@@ -160,6 +160,18 @@ WHY_DUPLICATE = "DUPLICATE_SUPPRESSED"
 WHY_RATE_LIMITED = "RATE_LIMITED"
 WHY_COOLDOWN = "TIER_COOLDOWN_ACTIVE"
 WHY_DISABLED = "EARLY_LANE_DISABLED"
+#: Another live token was demonstrably using this name first (v2.47).  The
+#: candidate stays visible on the radar — it is still real information — it
+#: just never interrupts anybody, because being second with someone else's
+#: name is the definition of the thing the operator asked us to stop showing.
+WHY_SUSPECTED_CLONE = "SUSPECTED_NAME_CLONE"
+#: Several live tokens share this name and none of them is clearly the
+#: original.  Saying so is a real answer; guessing between them is not.
+WHY_NAME_COLLISION = "UNRESOLVED_NAME_COLLISION"
+#: We could see enough of this token to judge it, and what we saw was thin:
+#: fees barely moving, shallow liquidity, few holders.  Not hidden — just not
+#: worth an interruption (section 37).
+WHY_THIN_QUALITY = "NOT_ENOUGH_REAL_MONEY"
 
 HUMAN_WHY: dict[str, str] = {
     WHY_NO_EARLY_SIGNAL: "Nothing in the cheap evidence was moving yet",
@@ -179,6 +191,16 @@ HUMAN_WHY: dict[str, str] = {
     WHY_RATE_LIMITED: "The hourly ceiling for this lane was reached",
     WHY_COOLDOWN: "This mint was inside its per-tier cooldown",
     WHY_DISABLED: "The early lane is switched off",
+    WHY_SUSPECTED_CLONE: (
+        "Another live token was using this name first — this one looks like the copy"
+    ),
+    WHY_NAME_COLLISION: (
+        "Several live tokens share this name and none is clearly the original"
+    ),
+    WHY_THIN_QUALITY: (
+        "Fees, liquidity and holders were all measurable and all thin — real money "
+        "was not moving into this yet"
+    ),
 }
 
 

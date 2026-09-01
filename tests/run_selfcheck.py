@@ -237,13 +237,14 @@ async def main() -> None:
     await check_promotion_intelligence()
     await check_gmgn_integration()
     await check_production_hardening()
+    await check_clone_defence()
 
     print(
         "SELF-CHECK PASSED: detector, scoring, database, discovery rotation, "
         "paper P&L, risk gate, PAPER laboratory, discovery-speed, realtime-alpha, "
         "SHADOW auto-trader, profit-optimization, early-alpha, Trending-first, "
         "trenches-intelligence, token-identity, promotion-intelligence, "
-        "GMGN-integration and production-hardening invariants"
+        "GMGN-integration, production-hardening and clone-defence invariants"
     )
 
 
@@ -1168,6 +1169,188 @@ async def check_production_hardening() -> None:
     assert "GMGN ALPHA" in realtime_source and "PUMP REALTIME" in realtime_source
     for forbidden in ("api_key", "X-APIKEY", "GMGN_API_KEY"):
         assert forbidden not in realtime_source
+
+
+async def check_clone_defence() -> None:
+    """Two live mints, one name, and both cards said "Symbol collision: NO".
+
+    The deploy gate for v2.47.  Three defects produced that alert pair and each
+    one is checked here directly, because each one is the kind that comes back
+    quietly: a table missing from a list, a budget shared between two unrelated
+    things, and a card builder that forgets to ask.
+    """
+
+    import inspect
+    from dataclasses import replace
+    from decimal import Decimal as _Decimal
+
+    import smart_money_bot.fast_alerts as fast_alerts_module
+    from smart_money_bot.database import Database
+    from smart_money_bot.engine import SmartMoneyEngine
+    from smart_money_bot.lab.clone import (
+        ORIGINAL,
+        SUSPECTED_CLONE,
+        TokenFacts,
+        classify_clone,
+    )
+    from smart_money_bot.lab.tokenquality import rank_candidates, score_quality
+
+    real_mint = "3DV5zV8sQhRtYwXnLp2CkAaB7mNfE9uJqZrGdTxfXUjp"
+    copy_mint = "J8GLnJ7Qk2m5t9WcQeF3bXn4Zr8vH1sYp6uJdLxAKpump"
+    real = TokenFacts(
+        mint=real_mint,
+        name="Sock And Pussy 500",
+        symbol="$SNP-500",
+        created_at=1_000_000,
+        first_seen_at=1_000_000,
+        age_seconds=420,
+        liquidity_usd=_Decimal("15180"),
+        volume_usd=_Decimal("64000"),
+        holder_count=520,
+        buys=450,
+        sells=438,
+        total_fee_sol=_Decimal("9.6"),
+        top10_holder_rate=_Decimal("0.19"),
+        dev_hold_rate=_Decimal("0.02"),
+        bundler_rate=_Decimal("0.08"),
+        sniper_hold_rate=_Decimal("0.11"),
+        insider_rate=_Decimal("0.07"),
+    )
+    copy = TokenFacts(
+        mint=copy_mint,
+        name="Sock and Pussy 500",
+        symbol="SNP500",
+        created_at=1_000_120,
+        first_seen_at=1_000_120,
+        age_seconds=300,
+        liquidity_usd=_Decimal("12080"),
+        volume_usd=_Decimal("21000"),
+        holder_count=180,
+        buys=399,
+        sells=334,
+        total_fee_sol=_Decimal("0.9"),
+        top10_holder_rate=_Decimal("0.42"),
+        dev_hold_rate=_Decimal("0.05"),
+        bundler_rate=_Decimal("0.22"),
+        sniper_hold_rate=_Decimal("0.28"),
+        insider_rate=_Decimal("0.18"),
+    )
+
+    # 1. Case and punctuation must not hide the collision.  "$SNP-500" against
+    #    "SNP500" is the whole reason the fold exists.
+    assert real.identity_key == copy.identity_key
+
+    # 2. The later mint is named a copy and loses its ping; the earlier one
+    #    keeps its alert.  Being imitated is not a reason to lose the signal.
+    assert classify_clone(copy, [real]).verdict == SUSPECTED_CLONE
+    assert classify_clone(copy, [real]).may_ping is False
+    assert classify_clone(real, [copy]).verdict == ORIGINAL
+    assert classify_clone(real, [copy]).may_ping is True
+
+    # 3. Order beats depth.  A copy that pumps harder for five minutes is still
+    #    a copy, and depth may never buy it an interruption.
+    loud = replace(
+        copy,
+        liquidity_usd=_Decimal("90000"),
+        volume_usd=_Decimal("400000"),
+        total_fee_sol=_Decimal("40"),
+    )
+    assert classify_clone(loud, [real]).may_ping is False
+
+    # 4. The copy is still published, with a warning.  Hiding it leaves the
+    #    operator exactly as blind as "Symbol collision: NO" did.
+    assert "SUSPECTED COPY" in classify_clone(copy, [real]).warning_line()
+
+    # 5. Fee velocity is a rate.  0.5 SOL in two minutes and 0.5 SOL in four
+    #    hours are different tokens wearing the same number.
+    assert real.fee_velocity_sol_per_minute > copy.fee_velocity_sol_per_minute
+    assert score_quality(real).score > score_quality(copy).score
+
+    # 6. An unmeasured token never wins by being unknown, and is never called
+    #    thin either — "we could not look" is not "there is nothing there".
+    blind = TokenFacts(mint="x", name="X", symbol="X", liquidity_usd=_Decimal("20000"))
+    assert score_quality(blind).confident() is False
+    assert score_quality(blind).weak() is False
+
+    # 7. Ranking, not feed order.  A real runner behind two hundred dead
+    #    launches was the 424-second alert.
+    dead = [
+        TokenFacts(
+            mint=f"dead{index}",
+            name=f"Dead {index}",
+            symbol=f"D{index}",
+            age_seconds=1_200,
+            liquidity_usd=_Decimal("500"),
+            volume_usd=_Decimal("50"),
+            holder_count=3,
+            buys=1,
+            sells=0,
+            total_fee_sol=_Decimal("0.001"),
+        )
+        for index in range(200)
+    ]
+    assert rank_candidates([*dead, real])[0][0].mint == real_mint
+
+    # 8. The collision check can see every table a mint can land in.  The bug
+    #    was never the query — it was the list.
+    known_source = inspect.getsource(Database.known_symbols)
+    for table in (
+        "token_presentations",
+        "gmgn_observations",
+        "pump_tokens",
+        "runner_candidates",
+    ):
+        assert table in known_source, f"known_symbols() cannot see {table}"
+
+    # 9. Evaluation has its own budget, and it is not GMGN's call budget.
+    #    Sharing one number between them was the whole of the lateness.
+    cycle_source = inspect.getsource(SmartMoneyEngine._gmgn_cycle)
+    assert "gmgn_early_lane_per_scan" in cycle_source
+    assert "gmgn_enrichment_per_scan" not in cycle_source
+    assert cycle_source.index("rank_candidates(") < cycle_source.index("ranked[:budget]")
+    # Every candidate is remembered even when only some are evaluated, or the
+    # copy cannot be recognised on the scan it appears in.
+    assert cycle_source.index("_note_token_facts") < cycle_source.index("budget = max(")
+
+    # 10. One publish path, one place the rule lives, and it runs before the
+    #     alert is reserved — reserving first would record a ping nobody got
+    #     and then dedupe the corrected card away.
+    publish_source = inspect.getsource(SmartMoneyEngine._publish_fast_alert)
+    assert publish_source.index("_withhold_ping_from_copies") < publish_source.index(
+        "reserve_fast_alert"
+    )
+
+    # 11. The card gates on both answers and prints both.
+    card_source = inspect.getsource(fast_alerts_module.build_early_alert)
+    assert "clone_ok" in card_source and "quality_ok" in card_source
+    assert "REAL MONEY" in card_source
+
+    # 12. The early lane can still answer "why wasn't I pinged?".
+    lane_source = inspect.getsource(SmartMoneyEngine._early_lane_task)
+    for reason in (
+        "EARLY_WHY_SUSPECTED_CLONE",
+        "EARLY_WHY_NAME_COLLISION",
+        "EARLY_WHY_THIN_QUALITY",
+    ):
+        assert reason in lane_source
+
+    # 13. The new strategy modules stay pure logic: no provider, no database,
+    #     no signer, and nothing that could spend a lamport.
+    import smart_money_bot.lab.clone as clone_module
+    import smart_money_bot.lab.tokenquality as quality_module
+
+    for module in (clone_module, quality_module):
+        source = inspect.getsource(module)
+        for forbidden in (
+            "import aiohttp",
+            "import requests",
+            "aiosqlite",
+            "from solders",
+            "private_key",
+            "cookies=",
+            'getenv("GMGN_PRIVATE_KEY"',
+        ):
+            assert forbidden not in source, f"{module.__name__} must stay pure logic"
 
 
 async def check_paper_laboratory() -> None:

@@ -387,6 +387,19 @@ class Settings:
     gmgn_security_enabled: bool
     #: Deep per-token enrichment is rationed: it is the expensive half.
     gmgn_enrichment_per_scan: int
+    #: How many ranked candidates per scan reach the early lane (v2.47).
+    #:
+    #: This used to be the same number as ``gmgn_enrichment_per_scan``, and
+    #: that was the lateness bug: six evaluations against roughly 255
+    #: candidates on a 45-second poll meant a real token waited many scans for
+    #: its first look.  Production showed a mint first seen at $9.87K that was
+    #: not evaluated until $40.71K.  Evaluation is cheap — a cached DEX
+    #: snapshot and pure logic — so it gets its own, much larger budget, and
+    #: the expensive GMGN calls keep the small one.
+    gmgn_early_lane_per_scan: int
+    #: Evaluations in flight at once.  Bounded so a wide scan cannot bury the
+    #: radar loop or stampede the DEX provider.
+    gmgn_early_lane_concurrency: int
 
     # --- future live-trading gates (v2.45, sections 74-83) ----------------
     # All three default to FALSE and this release uses none of them.  No
@@ -884,6 +897,8 @@ class Settings:
             gmgn_holders_enabled=_bool("GMGN_HOLDERS_ENABLED", True),
             gmgn_security_enabled=_bool("GMGN_SECURITY_ENABLED", True),
             gmgn_enrichment_per_scan=_int("GMGN_ENRICHMENT_PER_SCAN", 6),
+            gmgn_early_lane_per_scan=_int("GMGN_EARLY_LANE_PER_SCAN", 60),
+            gmgn_early_lane_concurrency=_int("GMGN_EARLY_LANE_CONCURRENCY", 8),
             live_trading_enabled=_bool("LIVE_TRADING_ENABLED", False),
             gmgn_live_trading_enabled=_bool("GMGN_LIVE_TRADING_ENABLED", False),
             auto_trade_enabled=_bool("AUTO_TRADE_ENABLED", False),
@@ -1344,6 +1359,10 @@ class Settings:
             raise ValueError("GMGN_TRENDING_LIMIT must be between 1 and 100")
         if not 0 <= self.gmgn_enrichment_per_scan <= 50:
             raise ValueError("GMGN_ENRICHMENT_PER_SCAN must be between 0 and 50")
+        if not 0 <= self.gmgn_early_lane_per_scan <= 400:
+            raise ValueError("GMGN_EARLY_LANE_PER_SCAN must be between 0 and 400")
+        if not 1 <= self.gmgn_early_lane_concurrency <= 32:
+            raise ValueError("GMGN_EARLY_LANE_CONCURRENCY must be between 1 and 32")
         if not self.gmgn_host.startswith("https://"):
             raise ValueError("GMGN_HOST must be an https URL")
         # A credential must never reach a log, a database row or an exception.

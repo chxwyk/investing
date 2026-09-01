@@ -902,6 +902,16 @@ def _engine(database, notifier, **settings):
     engine._presentation_tasks = set()
     engine.presentation_edits = 0
     engine.presentation_unresolved = 0
+    # v2.47: the publish path asks whether this mint is a copy of something
+    # already live, so a partial engine still needs the verdict cache — empty,
+    # not mocked away.
+    engine._token_facts = {}
+    engine._clone_verdicts = {}
+    engine._quality_scores = {}
+    engine.clone_suppressed = 0
+    engine.collision_suppressed = 0
+    engine.thin_quality_suppressed = 0
+    engine.early_lane_evaluated = 0
     engine.database = database
     engine.notifier = notifier
     engine._lab_config = DEFAULT_LAB_CONFIG

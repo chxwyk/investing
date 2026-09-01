@@ -237,6 +237,16 @@ def _engine_for_launch(settings, *, balance=Decimal("0.03"), reserved=True):
     engine._presentation_tasks = set()
     engine.presentation_edits = 0
     engine.presentation_unresolved = 0
+    # v2.47: the publish path asks whether this mint is a copy of something
+    # already live, so a partial engine still needs the verdict cache — empty,
+    # not mocked away.
+    engine._token_facts = {}
+    engine._clone_verdicts = {}
+    engine._quality_scores = {}
+    engine.clone_suppressed = 0
+    engine.collision_suppressed = 0
+    engine.thin_quality_suppressed = 0
+    engine.early_lane_evaluated = 0
     engine.settings = _configured(settings)
     j7 = SimpleNamespace(
         configured=True,

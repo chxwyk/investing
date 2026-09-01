@@ -43,6 +43,20 @@ from .catalyst import (
     assess_token_link,
     classify_catalyst_alert,
 )
+from .clone import (
+    AMBIGUOUS,
+    DEFAULT_CLONE_CONFIG,
+    ORIGINAL,
+    PINGABLE_VERDICTS,
+    SUSPECTED_CLONE,
+    UNIQUE,
+    CloneConfig,
+    CloneVerdict,
+    TokenFacts,
+    classify_clone,
+    group_by_identity,
+    normalise,
+)
 from .config import (
     CHALLENGER_STRATEGY_VERSION,
     DEFAULT_LAB_CONFIG,
@@ -367,6 +381,15 @@ from .smartmoney import (
     decay_reputation,
 )
 from .timeline import Provenance, TokenEvent, TokenTimeline, observation_events
+from .tokenquality import (
+    DEFAULT_QUALITY_CONFIG,
+    QualityConfig,
+    QualityScore,
+    inverse_ramp,
+    ramp,
+    rank_candidates,
+    score_quality,
+)
 from .toptraders import (
     EXIT_STATES,
     FLOW_ACCUMULATING,
@@ -516,7 +539,26 @@ __all__ = [
     "CHALLENGER_STRATEGY_VERSION",
     "COUNTERFACTUAL_POLICIES",
     "CURATED_ACCOUNTS",
+    "AMBIGUOUS",
     "CatalystAlert",
+    "CloneConfig",
+    "CloneVerdict",
+    "DEFAULT_CLONE_CONFIG",
+    "DEFAULT_QUALITY_CONFIG",
+    "ORIGINAL",
+    "PINGABLE_VERDICTS",
+    "QualityConfig",
+    "QualityScore",
+    "SUSPECTED_CLONE",
+    "TokenFacts",
+    "UNIQUE",
+    "classify_clone",
+    "group_by_identity",
+    "inverse_ramp",
+    "normalise",
+    "ramp",
+    "rank_candidates",
+    "score_quality",
     "CatalystEvent",
     "CatalystTimingReport",
     "CollisionGroup",

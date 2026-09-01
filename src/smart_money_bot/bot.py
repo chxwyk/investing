@@ -6315,6 +6315,15 @@ def _early_lane_lines(early: dict[str, object]) -> str:
         f"Last early alert {_relative_age(early.get('last_early_alert_at'))}\n"
         f"Deep-analysis timeouts `{early.get('analysis_timeouts', 0)}` • errors "
         f"`{early.get('analysis_errors', 0)}`\n"
+        # v2.47.  Throughput, not just outcomes.  A lane that evaluates six of
+        # 255 candidates per scan produces late alerts and healthy-looking
+        # counters at the same time, and only this line tells them apart.
+        f"Evaluated `{early.get('candidates_evaluated', 0)}` • budget "
+        f"`{early.get('per_scan_budget', 0)}`/scan × `{early.get('concurrency', 1)}` "
+        f"at once • names tracked `{early.get('name_groups_tracked', 0)}`\n"
+        f"Copies withheld `{early.get('suspected_clones', 0)}` • unresolved name "
+        f"collisions `{early.get('unresolved_collisions', 0)}` • thin "
+        f"`{early.get('thin_quality', 0)}`\n"
         f"Wallet stream "
         f"`{'CONNECTED' if early.get('stream_connected') else 'DISCONNECTED'}` • "
         f"subscriptions `{early.get('stream_subscriptions', 0)}` • reconnects "

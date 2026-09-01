@@ -5723,6 +5723,13 @@ class Database:
 
         known: dict[str, str] = {}
         for table, mint_column, symbol_column in (
+            # Every table that can hold a mint we have seen.  The first two were
+            # the only ones consulted before v2.47, and a GMGN-discovered token
+            # is written to neither — so the collision check answered "NO" to a
+            # question it could not see, and two live $SNP500 cards both told
+            # the operator there was no collision.
+            ("token_presentations", "mint", "symbol"),
+            ("gmgn_observations", "mint", "label"),
             ("pump_tokens", "mint", "symbol"),
             ("runner_candidates", "mint", "symbol"),
         ):
@@ -5860,6 +5867,38 @@ class Database:
     # ------------------------------------------------------------------
     # exact-mint presentation and per-endpoint provider state (v2.46)
     # ------------------------------------------------------------------
+
+    async def known_token_names(self, *, limit: int = 800) -> list[dict[str, Any]]:
+        """Every mint we can name, with the market facts needed to rank copies.
+
+        Deliberately keyed by mint, like every other identity lookup here: a
+        name-keyed index is the substitution bug waiting to be written.  The
+        caller groups these by folded name to find collisions; this method never
+        decides anything about which token is which.
+        """
+
+        rows: dict[str, dict[str, Any]] = {}
+        cursor = await self.db.execute(
+            "SELECT p.mint AS mint, p.name AS name, p.symbol AS symbol, "
+            "l.first_seen_at AS first_seen_at, l.first_seen_market_cap_usd AS first_mc, "
+            "l.current_market_cap_usd AS current_mc, l.updated_at AS updated_at "
+            "FROM token_presentations AS p "
+            "LEFT JOIN token_lifecycles AS l ON l.mint = p.mint "
+            "WHERE p.symbol != '' OR p.name != '' "
+            "ORDER BY p.resolved_at DESC LIMIT ?",
+            (limit,),
+        )
+        for row in await cursor.fetchall():
+            data = dict(row)
+            rows[str(data["mint"])] = {
+                "mint": data.get("mint"),
+                "name": data.get("name") or "",
+                "symbol": data.get("symbol") or "",
+                "first_seen_at": data.get("first_seen_at"),
+                "market_cap_usd": data.get("current_mc") or data.get("first_mc"),
+                "updated_at": data.get("updated_at"),
+            }
+        return list(rows.values())
 
     async def save_token_presentation(self, payload: dict[str, Any]) -> None:
         """Upsert one mint's presentation.  Merging happens before this call.

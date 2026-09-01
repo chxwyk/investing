@@ -53,6 +53,7 @@ from .fast_alerts import (
     ALMOST_BONDED_ALERT,
     GMGN_KOL_ALERT,
     GMGN_SMART_MONEY_ALERT,
+    LANE_RADAR,
     PUBLIC_TRENDING_ALERT,
     TRENCH_RUNNER_ALERT,
     TRENDING_ACCELERATION_ALERT,
@@ -79,7 +80,7 @@ from .fast_alerts import (
 from .gmgn import BudgetConfig as GmgnBudgetConfig
 from .gmgn import GmgnClient
 from .gmgn import lifecycle as gmgn_stages
-from .gmgn_runtime import GmgnRuntime, independent_provider_wallets
+from .gmgn_runtime import GmgnCandidate, GmgnRuntime, independent_provider_wallets
 from .lab.actionability import RankedCandidate as LabRankedCandidate
 from .lab.actionability import rank_by_current_edge
 from .lab.catalyst import (
@@ -91,6 +92,14 @@ from .lab.catalyst import (
     assess_event,
     assess_token_link,
     classify_catalyst_alert,
+)
+from .lab.clone import (
+    AMBIGUOUS as CLONE_AMBIGUOUS,
+)
+from .lab.clone import (
+    CloneVerdict,
+    TokenFacts,
+    classify_clone,
 )
 from .lab.config import lab_config_from_settings
 from .lab.early import (
@@ -118,7 +127,16 @@ from .lab.early import (
     WHY_DUPLICATE as EARLY_WHY_DUPLICATE,
 )
 from .lab.early import (
+    WHY_NAME_COLLISION as EARLY_WHY_NAME_COLLISION,
+)
+from .lab.early import (
     WHY_NO_DATA as EARLY_WHY_NO_DATA,
+)
+from .lab.early import (
+    WHY_SUSPECTED_CLONE as EARLY_WHY_SUSPECTED_CLONE,
+)
+from .lab.early import (
+    WHY_THIN_QUALITY as EARLY_WHY_THIN_QUALITY,
 )
 from .lab.exits import (
     EXIT_LIQUIDITY_DETERIORATION,
@@ -189,6 +207,7 @@ from .lab.shadow import (
 )
 from .lab.shadow_exits import RunnerEvidence as ShadowRunnerEvidence
 from .lab.smartmoney import WalletReputation
+from .lab.tokenquality import QualityScore, rank_candidates, score_quality
 from .lab.toptraders import (
     MIN_PROVEN_SAMPLES,
     TraderConfirmation,
@@ -701,6 +720,18 @@ class SmartMoneyEngine:
         self._presentation_tasks: set[asyncio.Task[None]] = set()
         self.gmgn_candidates_published = 0
         self.gmgn_participant_alerts = 0
+        # --- same-name detection (v2.47) --------------------------------
+        # The market facts for every mint this process has looked at, kept so
+        # that when two tokens turn up wearing the same name we can say which
+        # one arrived first and which one has the money.  Keyed by mint, never
+        # by name: a name-keyed cache is the substitution bug itself.
+        self._token_facts: dict[str, TokenFacts] = {}
+        self._clone_verdicts: dict[str, CloneVerdict] = {}
+        self._quality_scores: dict[str, QualityScore] = {}
+        self.clone_suppressed = 0
+        self.collision_suppressed = 0
+        self.thin_quality_suppressed = 0
+        self.early_lane_evaluated = 0
         # The future execution interface, wired and switched off (sections
         # 74-83).  The only provider that exists records intents; there is no
         # order path behind any of these gates to turn on.
@@ -1883,6 +1914,56 @@ class SmartMoneyEngine:
             now=now,
         )
         name, symbol, image_url = self._card_identity(mint)
+
+        # v2.47.  Two questions the operator asked for by name, answered
+        # before the card is built rather than after they have already
+        # clicked buy: *is this a copy of something that already exists*, and
+        # *is real money actually going into it*.
+        #
+        # Both are cheap — the DEX snapshot is already in hand and any GMGN
+        # board row for this mint is already cached — and neither hides the
+        # candidate.  A suspected copy still reaches the radar with a warning
+        # on it; what it loses is the right to interrupt anybody.
+        facts = self._note_token_facts(
+            self._facts_from_snapshot(
+                mint,
+                snapshot,
+                name=name,
+                symbol=symbol,
+                first_seen_at=first_seen_at,
+                now=now,
+            )
+        )
+        clone = await self._clone_check(facts)
+        quality = self._quality_check(facts)
+        if clone.suspected_clone:
+            self.clone_suppressed += 1
+            await self._record_suppression(
+                mint,
+                EARLY_WHY_SUSPECTED_CLONE,
+                now=now,
+                market_cap=snapshot.market_cap_usd,
+                tier=verdict.tier,
+            )
+        elif clone.verdict == CLONE_AMBIGUOUS:
+            self.collision_suppressed += 1
+            await self._record_suppression(
+                mint,
+                EARLY_WHY_NAME_COLLISION,
+                now=now,
+                market_cap=snapshot.market_cap_usd,
+                tier=verdict.tier,
+            )
+        if quality.weak():
+            self.thin_quality_suppressed += 1
+            await self._record_suppression(
+                mint,
+                EARLY_WHY_THIN_QUALITY,
+                now=now,
+                market_cap=snapshot.market_cap_usd,
+                tier=verdict.tier,
+            )
+
         alert = build_early_alert(
             mint=mint,
             name=name,
@@ -1902,6 +1983,8 @@ class SmartMoneyEngine:
             identity_verified=provenance.identity_verified,
             symbol_collision=await self._symbol_collides(mint, symbol),
             discovered_via=self._discovered_via(mint),
+            clone_verdict=clone,
+            quality=quality,
         )
         published = await self._publish_fast_alert(alert, now=now)
         if not published:
@@ -2225,9 +2308,37 @@ class SmartMoneyEngine:
                     now=now,
                 )
 
-        budget = max(0, int(self.settings.gmgn_enrichment_per_scan))
-        for candidate in result.candidates[:budget]:
-            mint = candidate.mint
+        # v2.47.  The board row already carries fees, liquidity, holders and
+        # ownership for every candidate, so scoring all of them costs nothing
+        # and is done before anything is chosen.  Two things follow from it.
+        #
+        # First, order.  The old code took the feed's own order and the first
+        # six of it, which is how a mint first seen at $9.87K went unevaluated
+        # until $40.71K — it was simply behind two hundred dead launches.  The
+        # strongest candidate on the scan now goes first.
+        #
+        # Second, memory.  Every candidate lands in the same-name cache whether
+        # or not it is evaluated, which is what lets the copy of a token be
+        # recognised on the scan it appears in rather than a scan later.
+        facts: list[TokenFacts] = []
+        by_mint: dict[str, GmgnCandidate] = {}
+        for candidate in result.candidates:
+            with suppress(Exception):
+                facts.append(
+                    self._note_token_facts(self._facts_from_gmgn(candidate.token, now=now))
+                )
+                by_mint[candidate.mint] = candidate
+        ranked = [item for item, _ in rank_candidates(facts)]
+
+        # Evaluation is cheap — a cached DEX snapshot and pure logic — so it
+        # gets its own budget, far larger than the one rationing GMGN's
+        # expensive per-token calls.  Sharing that small number between the two
+        # was the whole of the lateness.
+        budget = max(0, int(getattr(self.settings, "gmgn_early_lane_per_scan", 60)))
+        width = max(1, int(getattr(self.settings, "gmgn_early_lane_concurrency", 8)))
+        selected = [item.mint for item in ranked[:budget] if item.mint in by_mint]
+
+        async def evaluate(mint: str) -> None:
             # The exact mint that GMGN reported is the exact mint that gets
             # analysed.  Nothing between here and the card may substitute it.
             assert_exact_propagation(mint, mint, stage="gmgn candidate → early lane")
@@ -2238,7 +2349,19 @@ class SmartMoneyEngine:
             # information: re-evaluate promotion now rather than at the next
             # timer tick (section 47).
             with suppress(Exception):
-                await self.note_early_watch_event(mint, trigger=f"gmgn:{candidate.family}")
+                await self.note_early_watch_event(
+                    mint, trigger=f"gmgn:{by_mint[mint].family}"
+                )
+
+        for start in range(0, len(selected), width):
+            batch = selected[start : start + width]
+            # ``_early_lane_task`` already swallows its own failures; gather
+            # returns exceptions rather than raising so one bad mint can never
+            # cost the rest of the scan its turn.
+            await asyncio.gather(
+                *(evaluate(mint) for mint in batch), return_exceptions=True
+            )
+            self.early_lane_evaluated += len(batch)
 
     async def note_gmgn_participant(
         self,
@@ -2279,6 +2402,22 @@ class SmartMoneyEngine:
             now=moment,
         )
         name, symbol, image_url = self._card_identity(mint)
+        # A tagged wallet buying a copy is still a tagged wallet buying a copy.
+        # Recording the verdict here is what lets the publish-time backstop
+        # withhold the ping for a mint that never passed through the early lane.
+        with suppress(Exception):
+            await self._clone_check(
+                self._note_token_facts(
+                    self._facts_from_snapshot(
+                        mint,
+                        snapshot,
+                        name=name,
+                        symbol=symbol,
+                        first_seen_at=moment,
+                        now=moment,
+                    )
+                )
+            )
         reputation = await self._wallet_reputation(wallet)
         lifecycle = self.gmgn_runtime.lifecycle_for(mint)
         move = _move_percent_or_none(entry_market_cap_usd, snapshot.market_cap_usd)
@@ -2856,6 +2995,201 @@ class SmartMoneyEngine:
                 # organic gate exists to stop.
                 return len({str(item[0] if isinstance(item, tuple) else item) for item in buyers})
         return None
+
+    # ------------------------------------------------------------------
+    # same-name detection and money-quality (v2.47)
+    # ------------------------------------------------------------------
+
+    #: How many mints stay in the comparison cache.  A copy shows up within
+    #: minutes of the original, so a few thousand recent mints is a wide
+    #: enough window and keeps the walk over it trivially cheap.
+    MAX_TOKEN_FACTS = 2_000
+
+    def _note_token_facts(self, facts: TokenFacts) -> TokenFacts:
+        """Merge one observation of a mint into the same-name comparison cache.
+
+        Merging rather than overwriting, because the observations arrive from
+        different places and each sees different things: a GMGN board row knows
+        fees, holders and ownership; a DEX snapshot knows the live pair.  Taking
+        only the newest would keep throwing half the picture away, and a token
+        with half a picture is exactly the one that loses a comparison it should
+        have won.
+
+        Birth is the one field that only ever moves earlier.  It is a historical
+        fact, and a later observation reporting a later start is a worse
+        measurement of it, never a correction.
+        """
+
+        if not facts.mint:
+            return facts
+        previous = self._token_facts.get(facts.mint)
+        if previous is not None:
+            merged_fields: dict[str, Any] = {}
+            for field_name in TokenFacts.__slots__:
+                new_value = getattr(facts, field_name)
+                old_value = getattr(previous, field_name)
+                if new_value in (None, "") and old_value not in (None, ""):
+                    merged_fields[field_name] = old_value
+            births = [
+                value
+                for value in (facts.created_at, previous.created_at)
+                if value is not None
+            ]
+            if births:
+                merged_fields["created_at"] = min(births)
+            seen = [
+                value
+                for value in (facts.first_seen_at, previous.first_seen_at)
+                if value is not None
+            ]
+            if seen:
+                merged_fields["first_seen_at"] = min(seen)
+            if merged_fields:
+                facts = replace(facts, **merged_fields)
+        self._token_facts[facts.mint] = facts
+        while len(self._token_facts) > self.MAX_TOKEN_FACTS:
+            self._token_facts.pop(next(iter(self._token_facts)))
+        return facts
+
+    def _facts_from_gmgn(self, token: Any, *, now: int) -> TokenFacts:
+        """Everything the board row already told us, typed for comparison.
+
+        Free: this is the row that found the token.  Building it for every
+        candidate rather than only the enriched few is what lets a copy be
+        recognised on the same scan it appears in.
+        """
+
+        created_at = getattr(token, "created_at", None) or getattr(token, "open_at", None)
+        age_seconds = None
+        if created_at:
+            age_seconds = max(0, now - int(created_at))
+        return TokenFacts(
+            mint=token.mint,
+            name=getattr(token, "name", "") or "",
+            symbol=getattr(token, "symbol", "") or "",
+            created_at=int(created_at) if created_at else None,
+            first_seen_at=now,
+            age_seconds=age_seconds,
+            liquidity_usd=getattr(token, "liquidity_usd", None),
+            volume_usd=getattr(token, "volume_usd", None),
+            market_cap_usd=getattr(token, "market_cap_usd", None),
+            holder_count=getattr(token, "holder_count", None),
+            buys=getattr(token, "buys", None),
+            sells=getattr(token, "sells", None),
+            total_fee_sol=getattr(token, "total_fee", None),
+            top10_holder_rate=getattr(token, "top10_holder_rate", None),
+            dev_hold_rate=getattr(token, "dev_team_hold_rate", None),
+            bundler_rate=getattr(token, "bundler_rate", None),
+            sniper_hold_rate=getattr(token, "sniper_hold_rate", None),
+            insider_rate=getattr(token, "insider_rate", None),
+        )
+
+    def _facts_from_snapshot(
+        self,
+        mint: str,
+        snapshot: Any,
+        *,
+        name: str,
+        symbol: str,
+        first_seen_at: int,
+        now: int,
+    ) -> TokenFacts:
+        """What the cheap DEX pair knows, in the same shape.
+
+        Narrower than the GMGN row on purpose — no fees, no holders, no
+        ownership — and the gaps stay ``None`` rather than zero.  A provider
+        that did not answer must never read as a token with nothing in it.
+        """
+
+        age_seconds = None
+        pair_age_minutes = getattr(snapshot, "pair_age_minutes", None)
+        if pair_age_minutes is not None:
+            age_seconds = int(pair_age_minutes) * 60
+        volume = getattr(snapshot, "volume_1h_usd", None) or getattr(
+            snapshot, "volume_5m_usd", None
+        )
+        return TokenFacts(
+            mint=mint,
+            name=name,
+            symbol=symbol,
+            created_at=(now - age_seconds) if age_seconds is not None else None,
+            first_seen_at=first_seen_at,
+            age_seconds=age_seconds,
+            liquidity_usd=getattr(snapshot, "liquidity_usd", None),
+            volume_usd=volume,
+            market_cap_usd=getattr(snapshot, "market_cap_usd", None),
+            buys=getattr(snapshot, "buys_5m", None),
+            sells=getattr(snapshot, "sells_5m", None),
+        )
+
+    async def _peer_facts(self, subject: TokenFacts) -> list[TokenFacts]:
+        """Every other mint that could be wearing this one's name.
+
+        Two sources, in order of how much they know.  The live cache holds real
+        market facts for anything this process has looked at, which is what
+        makes a verdict possible at all.  The database adds mints from before
+        the last restart — name, ticker and when we first saw them — so a
+        restart degrades the *confidence* of a comparison without blinding it.
+        """
+
+        key = subject.identity_key
+        peers: dict[str, TokenFacts] = {
+            facts.mint: facts
+            for facts in self._token_facts.values()
+            if facts.mint != subject.mint and facts.identity_key == key
+        }
+        with suppress(Exception):
+            for row in await self.database.known_token_names(limit=800):
+                mint = str(row.get("mint") or "")
+                if not mint or mint == subject.mint or mint in peers:
+                    continue
+                candidate = TokenFacts(
+                    mint=mint,
+                    name=str(row.get("name") or ""),
+                    symbol=str(row.get("symbol") or ""),
+                    first_seen_at=(
+                        int(row["first_seen_at"])
+                        if row.get("first_seen_at") is not None
+                        else None
+                    ),
+                    market_cap_usd=_engine_decimal(row.get("market_cap_usd")),
+                )
+                if candidate.identity_key == key:
+                    peers[mint] = candidate
+        return list(peers.values())
+
+    async def _clone_check(self, facts: TokenFacts) -> CloneVerdict:
+        """Original, copy, or genuinely too close to call.
+
+        The production failure this answers: two live mints both titled
+        *Sock and Pussy 500 · $SNP500*, both cards printing ``Symbol collision:
+        NO``, and no way for the operator to tell which one had the buyers.
+        """
+
+        try:
+            verdict = classify_clone(facts, await self._peer_facts(facts))
+        except Exception:
+            logger.exception("Clone check failed for %s", facts.mint[:8])
+            return CloneVerdict(mint=facts.mint)
+        self._clone_verdicts[facts.mint] = verdict
+        return verdict
+
+    def _quality_check(self, facts: TokenFacts) -> QualityScore:
+        """Score how much real money is actually in this, and remember it."""
+
+        try:
+            score = score_quality(facts)
+        except Exception:
+            logger.exception("Quality scoring failed for %s", facts.mint[:8])
+            return QualityScore(mint=facts.mint)
+        self._quality_scores[facts.mint] = score
+        return score
+
+    def clone_verdict_for(self, mint: str) -> CloneVerdict | None:
+        return self._clone_verdicts.get(mint)
+
+    def quality_for(self, mint: str) -> QualityScore | None:
+        return self._quality_scores.get(mint)
 
     async def _symbol_collides(self, mint: str, symbol: str) -> bool:
         """Whether other live tokens answer to this one's ticker (hotfix §3).
@@ -4566,6 +4900,18 @@ class SmartMoneyEngine:
             "stream_connected": bool(getattr(self.stream, "connected", False)),
             "stream_subscriptions": int(getattr(self.stream, "subscription_count", 0) or 0),
             "stream_reconnects": int(getattr(self.stream, "reconnects", 0) or 0),
+            # v2.47.  How much of the feed the lane actually looked at, and how
+            # many copies it caught.  The old numbers said nothing about
+            # *throughput*, which is why six evaluations against 255 candidates
+            # per scan looked healthy right up until the operator noticed the
+            # alerts were arriving at four times the first-seen market cap.
+            "candidates_evaluated": self.early_lane_evaluated,
+            "per_scan_budget": int(getattr(self.settings, "gmgn_early_lane_per_scan", 0)),
+            "concurrency": int(getattr(self.settings, "gmgn_early_lane_concurrency", 1)),
+            "suspected_clones": self.clone_suppressed,
+            "unresolved_collisions": self.collision_suppressed,
+            "thin_quality": self.thin_quality_suppressed,
+            "name_groups_tracked": len(self._token_facts),
         }
 
     async def shadow_refusals(self, *, since: int = 0) -> dict[str, int]:
@@ -4944,6 +5290,7 @@ class SmartMoneyEngine:
 
         if alert.entry_eligible:  # pragma: no cover - structurally impossible
             raise AssertionError("a fast alert can never be entry eligible")
+        alert = self._withhold_ping_from_copies(alert)
         if self.database.connection is None:
             return False
         try:
@@ -4976,6 +5323,27 @@ class SmartMoneyEngine:
         self.last_fast_alert_at = now
         self.last_fast_alert_kind = alert.kind
         return True
+
+    def _withhold_ping_from_copies(self, alert: FastAlert) -> FastAlert:
+        """No card of any kind interrupts a human on behalf of a copy (v2.47).
+
+        Every lane funnels through :meth:`_publish_fast_alert`, so the rule
+        lives here rather than being re-implemented in each card builder — one
+        place to read it, one place for it to stay true.  The early lane also
+        applies it while building its card, because it wants the warning
+        *printed* as well; this is the backstop that covers promotion cards,
+        participant cards and anything added later.
+
+        The card still publishes.  Suppressing it outright would hide the very
+        thing the operator needs to see — that two tokens are wearing one name
+        — and would leave them exactly as blind as the two ``Symbol collision:
+        NO`` cards did.
+        """
+
+        verdict = self._clone_verdicts.get(alert.token_mint or alert.mint)
+        if verdict is None or verdict.may_ping or not alert.ping:
+            return alert
+        return replace(alert, ping=False, lane=LANE_RADAR, symbol_collision=True)
 
     def _fast_watch_rate_limited(self, now: int) -> bool:
         while self._fast_watch_times and now - self._fast_watch_times[0] >= 3600:

@@ -767,6 +767,8 @@ def build_early_alert(
     identity_verified: bool = True,
     symbol_collision: bool = False,
     discovered_via: str = "",
+    clone_verdict: Any = None,
+    quality: Any = None,
 ) -> FastAlert:
     """The EARLY HEADS-UP / EARLY RUNNER card (sections 45, 46).
 
@@ -872,6 +874,51 @@ def build_early_alert(
             )
         )
 
+    # v2.47.  "You can tell when there's a fake coin" — so print the numbers
+    # that tell you.  Fees are the lead line because fees are money that has
+    # already left somebody's wallet, which is the one figure on this card that
+    # cannot be walked up on nothing.
+    if quality is not None:
+        measured = getattr(quality, "measured_fraction", None)
+        fees = getattr(quality, "fee_velocity_sol_per_minute", None)
+        holders = getattr(quality, "holder_count", None)
+        depth = getattr(quality, "liquidity_usd", None)
+        body = (
+            f"Real-money score **{getattr(quality, 'score', 0)}/100**"
+            + (f" • measured `{measured}` of the picture" if measured is not None else "")
+            # Fees first, and printed whether they are good or bad.  A number
+            # shown only once it clears a threshold is a number the operator
+            # cannot use to form their own judgement.
+            + f"\n**Fees `{fees if fees is not None else '?'}` SOL/min**"
+            + f" • liquidity `{_money(depth)}`"
+            + f" • holders `{holders if holders is not None else '?'}`"
+        )
+        strengths = tuple(getattr(quality, "reasons", ()) or ())
+        if strengths:
+            body += "\n" + "\n".join(f"• {item}" for item in strengths[:4])
+        concerns_list = tuple(getattr(quality, "concerns", ()) or ())
+        if concerns_list:
+            body += "\n" + "\n".join(f"⚠ {item}" for item in concerns_list[:4])
+        fields.append(CardField("REAL MONEY", body, P_DEMAND))
+
+    if clone_verdict is not None and getattr(clone_verdict, "collision", False):
+        fields.append(
+            CardField(
+                "⚠ ANOTHER TOKEN USES THIS NAME",
+                (
+                    f"{clone_verdict.warning_line()}\n"
+                    f"Verdict: **{getattr(clone_verdict, 'verdict', '')}** — "
+                    f"{clone_verdict.human()}\n"
+                    + (
+                        "\n".join(
+                            f"• {item}" for item in getattr(clone_verdict, "reasons", ())[:3]
+                        )
+                    )
+                ),
+                P_WARNINGS,
+            )
+        )
+
     # The early lane is cheap by design: it publishes before safety, identity and
     # deep validation have finished.  That is fine — being early is the point —
     # but the card must then say what it does not know, in the same breath as
@@ -942,13 +989,23 @@ def build_early_alert(
         thumbnail_url=image_url,
         colour=0x95A5A6 if late else (0xE74C3C if kind == EARLY_RUNNER else 0xF39C12),
     )
+    # v2.47.  Only an original — or a token nobody is imitating — may
+    # interrupt a human, and only if what we could measure of it was not
+    # measurably thin.  Neither test hides the card: both of these still
+    # publish to the radar, where the warning above is there to be read.  The
+    # operator's words were "stop recommending copied coins", not "stop
+    # showing me that they exist".
+    clone_ok = clone_verdict is None or bool(getattr(clone_verdict, "may_ping", True))
+    quality_ok = quality is None or not bool(quality.weak())
+    may_ping = kind == EARLY_RUNNER and not late and clone_ok and quality_ok
+
     return FastAlert(
         kind=kind,
         mint=mint,
         alert_key=f"{kind}:{mint}",
         spec=spec,
         # A late card never pings, whatever tier the evidence reached.
-        ping=kind == EARLY_RUNNER and not late,
+        ping=may_ping,
         ping_reason=", ".join(categories[:2]),
         # This lane publishes before validation finishes, so it can never hand
         # out a buy control.
@@ -957,7 +1014,7 @@ def build_early_alert(
         symbol_collision=symbol_collision,
         fingerprint=f"{tier}:{int(getattr(verdict, 'score', ZERO))}",
         token_mint=mint,
-        lane=LANE_URGENT if (kind == EARLY_RUNNER and not late) else LANE_RADAR,
+        lane=LANE_URGENT if may_ping else LANE_RADAR,
         family=tier,
     )
 

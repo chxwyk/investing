@@ -7,7 +7,15 @@ transactions, and mirrors every newly detected hot-wallet swap in PAPER mode. PA
 as either a forced source-price observation ledger or an executable Jupiter quote-shadow
 trial; the two answer different questions and are labeled separately.
 
-Version 2.46.0 hardens that integration against real production traffic: one canonical
+Version 2.47.0 answers the two questions the operator was left to guess at: **is this a
+copy of a token that already exists**, and **is real money actually going into it**. Two
+live mints wearing the same name are now ranked against each other by who came first and
+whose fees are being paid, the copy is shown with a warning instead of a ping, and every
+card prints fees in SOL/min, liquidity and holders whether those numbers are good or bad.
+The early lane also stopped rationing itself: evaluation has its own budget, candidates are
+scored before they are truncated, and the strongest one on a scan is looked at first.
+
+Version 2.46.0 hardened that integration against real production traffic: one canonical
 name, ticker and icon per exact mint for a token's whole life, cards that publish
 immediately and are then edited in place, and per-endpoint GMGN health so an optional feed's
 rate limit can no longer mute discovery.
@@ -1179,6 +1187,186 @@ The bot needs these Discord application permissions:
 
 No privileged Discord gateway intents are required.
 
+## Copies, real money and speed (v2.47)
+
+Two alerts arrived minutes apart. Both were titled **Sock and Pussy 500 · $SNP500**, both
+said **DISCOVERED VIA GMGN Trending**, and both printed **`Symbol collision: NO`**.
+
+```
+J8GLnJ…pump    first seen $14.41K  →  alerted $27.15K   liq $12.08K   399/334
+3DV5zV…fXUjp   first seen  $9.87K  →  alerted $40.71K   liq $15.18K   450/438
+```
+
+They were two different mints. One went on to $789K with 3,000 holders; the other was
+riding its name. The operator had no way to tell which was which, because the bot never
+told them there were two — and by the time either card fired, the move it was reporting
+had already happened.
+
+Three defects, three sections.
+
+### 1. The collision check was blind
+
+`known_symbols()` read `pump_tokens` and `runner_candidates`. A GMGN-discovered token is
+written to **neither**, so the check answered "NO" to a question it could not see. That is
+not a missing feature; it is a false statement printed on a card the operator was using to
+decide whether to spend money.
+
+It now reads every table a mint can land in — `token_presentations`, `gmgn_observations`,
+`pump_tokens`, `runner_candidates` — and the deploy gate asserts that list by name, because
+a new discovery lane writing somewhere unlisted would reintroduce the bug silently.
+
+The lookup stays keyed by **mint**, never by symbol. A symbol-keyed index is how a lookup
+that substitutes one token for another gets written by accident (v2.43.1).
+
+### 2. Nothing ranked the two against each other
+
+Knowing there are two is not the same as knowing which one to buy. `lab/clone.py` answers
+that, and it is deliberately conservative about when it will answer at all.
+
+Names are folded — case, spacing and punctuation stripped — so `Sock and Pussy 500 /
+$SNP500` and `Sock And Pussy 500 / $SNP-500` collapse together. **The fold is used only to
+group mints for comparison.** Nothing in this codebase resolves a token from one.
+
+At sixty seconds old, market data barely separates two same-name launches. Liquidity
+$15.18K against $12.08K and 450 buys against 399 are not a verdict. What does separate
+them:
+
+- **Who was here first.** Chain creation time, not the time we happened to look. A copy is
+  a copy because it came after. Under 45 seconds apart, that is two launches happening at
+  once and proves nothing.
+- **Whose money is deeper.** Liquidity and real volume follow the original, and must lead
+  by a material multiple before they count as evidence rather than noise.
+- **Whose fees are being paid.** Money that has already left someone's wallet, which is
+  much harder to fake than a market cap.
+
+Four verdicts come out of it:
+
+| Verdict | Meaning | Pings? |
+|---|---|---|
+| `ORIGINAL` | earliest and deepest token using this name | yes |
+| `UNIQUE` | nothing else answers to this name | yes |
+| `SUSPECTED_CLONE` | a later token trading on an existing name | **no** |
+| `AMBIGUOUS_COLLISION` | several live tokens, none clearly the original | **no** |
+
+**Order beats depth.** A copy that pumps harder than the original for five minutes is still
+a copy, and no amount of liquidity buys it the right to interrupt a human.
+
+**A missing measurement is never evidence.** A provider that did not answer must not read as
+a token with no liquidity; that conflation is how a degraded feed starts looking like a rug.
+
+**`AMBIGUOUS_COLLISION` is a real answer, not a failure to produce one.** An operator told
+"we cannot tell these two apart, here are both" is better served than one told a coin flip
+with confidence.
+
+**Nothing is hidden.** A suspected copy still publishes to the radar with the warning on it
+and the other mint named. Suppressing it outright would leave the operator exactly as blind
+as `Symbol collision: NO` did — the complaint was about being *recommended* copies, not
+about being shown that they exist.
+
+The rule lives in one place. Every lane funnels through `_publish_fast_alert`, so the
+backstop that withholds a ping from a copy sits there, before the alert is reserved —
+reserving first would record a ping nobody received and then dedupe the corrected card away.
+
+### 3. "You can tell when there's a fake coin"
+
+`lab/tokenquality.py` scores how much real money is in a token, using the operator's own
+manual filter as a **cohort, not a cliff**: Pump.fun only, no wash trading, age 2m–360m, MC
+$25K–$10M, liquidity ≥ $10K, 5m volume ≥ $5K, 5m transactions ≥ 40, total fees ≥ 0.5 SOL,
+holders ≥ 50, top 10 ≤ 40%, dev ≤ 10%, insiders ≤ 30%, bundlers ≤ 30%, snipers ≤ 30%.
+
+A token with 47 holders instead of 50, or 0.4 SOL of fees instead of 0.5, is not
+categorically different from one that clears — and if it also has smart money and
+accelerating rank, refusing to look at it is the expensive mistake. So every bar is a
+continuous ramp: falling short costs points, it does not delete the candidate.
+
+**Fee velocity leads the weighting**, at 26 of 100. Market cap can be walked up on almost
+nothing and liquidity can be parked and pulled, but fees are money that has already moved.
+It is a *rate*, never a total: 0.5 SOL in two minutes and 0.5 SOL in four hours are
+different tokens wearing the same number. On the two $SNP500 mints it was 1.37 SOL/min
+against 0.18 — by far the clearest separation the pair ever showed.
+
+**Ownership risk is one weighted family, not five.** Counting top-10, dev, bundler, sniper
+and insider rates separately would let concentration outvote every measure of real demand,
+and a genuine runner with a chunky top 10 would score as a rug.
+
+**An unmeasured field scores zero but says so.** `measured_fraction` reports how much of the
+score came from things actually observed, so a thin token cannot look strong by being
+unknown. It also means the only quality state that ever *withholds* a ping is **weak** —
+measurable, and measured badly. A DEX-only snapshot cannot see fees, holders or ownership;
+treating "we could not look" as "there is nothing there" would silently switch off the
+whole Pump lane.
+
+Every early card now carries a **REAL MONEY** panel printing fees in SOL/min, liquidity and
+holder count **unconditionally**. A number shown only once it clears a threshold is a number
+the operator cannot use to form their own judgement, and forming that judgement is the
+point.
+
+### 4. The lane was too slow to matter
+
+The operator asked to be able to buy at first sight. Instead:
+
+```
+first seen  $9.87K  →  alert $40.71K   (424s)
+first seen $14.41K  →  alert $27.15K   (748s)
+```
+
+`GMGN_ENRICHMENT_PER_SCAN` defaulted to **6** and gated *evaluation*, not just GMGN's
+expensive per-token calls — six looks at roughly 255 candidates on a 45-second poll. A real
+runner sat behind two hundred dead launches in feed order and waited many scans for its
+first look.
+
+Evaluation is cheap: a cached DEX snapshot and pure logic. It now has its own budget.
+
+| Setting | Default | What it rations |
+|---|---|---|
+| `GMGN_ENRICHMENT_PER_SCAN` | 6 | GMGN's expensive per-token calls |
+| `GMGN_EARLY_LANE_PER_SCAN` | 60 | candidates evaluated per scan |
+| `GMGN_EARLY_LANE_CONCURRENCY` | 8 | evaluations in flight at once |
+
+And order changed. Every candidate on a scan is scored from the board row that found it —
+which already carries fees, holders, liquidity and ownership, so this costs nothing — and
+**ranked before the list is truncated**. If truncation happened first, ranking would be
+decoration: the strongest candidate would already have been dropped.
+
+Every candidate is also written into the same-name cache whether or not it is evaluated.
+Caching only the evaluated few would leave the comparison blind to exactly the token the
+operator needs warning about.
+
+`/fomo realtime` gained the throughput numbers, because the old counters described a lane
+evaluating 6 of 255 per scan and a healthy one identically:
+
+```
+Evaluated `1,204` • budget `60`/scan × `8` at once • names tracked `1,973`
+Copies withheld `11` • unresolved name collisions `3` • thin `84`
+```
+
+### What did not change
+
+- **No real-money trading.** No signer, no private key, no order path, no SOL spend. Every
+  fast alert is `entry_eligible = False` by construction, and the early lane still publishes
+  before safety finishes, so it can never hand out a buy control.
+- **Mint is identity.** Both new modules take the facts of one exact mint and answer about
+  that mint. Neither accepts a name to look up.
+- **Pure logic.** `lab/clone.py` and `lab/tokenquality.py` contain no provider, no database
+  and no wallet — asserted by the deploy gate, not just by convention.
+- **No history reset.** No database, forward-observation, legacy-shadow or trending-shadow
+  history was touched, and the $100 / $10 / 5 / $50 experiment is unchanged.
+
+### On Terminal / trade.padre.gg
+
+The operator asked for trending and trenches data from `trade.padre.gg`. That is not wired,
+and this release does not pretend otherwise. Padre publishes no public API, every
+`padre.gg` host is blocked outbound from this environment, and reading a logged-in Terminal
+session would mean reusing someone's private credentials — explicitly out of bounds under
+every spec in this repo.
+
+**GMGN Trending and GMGN Trenches are the authorized equivalent, and they are already the
+primary feed.** The trenches board reads the same new/bonding/near-graduation population a
+Terminal trenches tab shows, and the fee figures the operator wanted to read off Padre are
+exactly what now leads the REAL MONEY panel. Pump.fun's own trending endpoint is likewise
+undocumented and blocked; GMGN's `NEW_PAIRS` and `FINAL_STRETCH` boards cover that
+population from a source we are permitted to read.
+
 ## Production hardening: identity, images and endpoint health (v2.46)
 
 GMGN is genuinely live — 31+ calls, zero auth errors, ~144ms mean and 391ms p95, 1,274
@@ -1512,7 +1700,9 @@ command slots: the tree stays at 25.
 `GMGN_BREAKER_SECONDS`, `GMGN_TRENDING_INTERVALS`, `GMGN_TRENDING_LIMIT`,
 `GMGN_TRENCHES_ENABLED`, `GMGN_TRENCHES_LIMIT`, `GMGN_SMART_MONEY_ENABLED`,
 `GMGN_KOL_ENABLED`, `GMGN_HOT_SEARCH_ENABLED`, `GMGN_MARKET_SIGNALS_ENABLED`,
-`GMGN_HOLDERS_ENABLED`, `GMGN_SECURITY_ENABLED`, `GMGN_ENRICHMENT_PER_SCAN`.
+`GMGN_HOLDERS_ENABLED`, `GMGN_SECURITY_ENABLED`, `GMGN_ENRICHMENT_PER_SCAN`,
+`GMGN_EARLY_LANE_PER_SCAN` (v2.47, default 60), `GMGN_EARLY_LANE_CONCURRENCY`
+(v2.47, default 8).
 
 **Not required and not requested:** a GMGN trading credential. The research key is
 read-only and this release needs nothing else.
