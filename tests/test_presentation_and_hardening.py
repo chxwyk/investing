@@ -375,7 +375,10 @@ def test_metadata_enrichment_is_scheduled_after_publication_not_before() -> None
 
     source = inspect.getsource(SmartMoneyEngine._publish_fast_alert)
     schedule = source.index("_schedule_presentation_enrichment")
-    notify = source.index("await self.notifier.on_fast_alert(alert)")
+    # v2.51: the send moved behind the universal dispatcher, which is now the
+    # only path to Discord. The invariant is unchanged — enrichment is
+    # scheduled, never awaited, before the card goes out.
+    notify = source.index("await self._dispatch_card(alert)")
     assert schedule < notify, "scheduling must not await the metadata call"
     assert "await self._resolve_presentation" not in source
 

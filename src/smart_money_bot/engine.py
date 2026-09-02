@@ -5454,7 +5454,7 @@ class SmartMoneyEngine:
         # same message.  Never the other way round: a pretty name is not worth
         # a slower alert (sections 4, 45).
         self._schedule_presentation_enrichment(alert)
-        sent = await self.notifier.on_fast_alert(alert)
+        sent = await self._dispatch_card(alert)
         if sent is False:
             self._fast_alerts.pop(alert.alert_key, None)
             with suppress(Exception):
@@ -5464,6 +5464,29 @@ class SmartMoneyEngine:
         self.last_fast_alert_at = now
         self.last_fast_alert_kind = alert.kind
         return True
+
+    async def _dispatch_card(self, alert: FastAlert) -> bool:
+        """The only path from this bot to a Discord card.  No exceptions.
+
+        v2.50 put the quality and clone guard inside ``_publish_fast_alert`` and
+        called the problem solved.  It was not: an audit of this file found the
+        guard covering exactly **one** call site while fifteen others reached
+        the notifier directly — among them ``_publish_trending``,
+        ``_publish_trench`` and the trending radar, which are the cards the
+        operator sees most.  Those three did not even reserve a dedupe row.
+
+        A builder-specific check can only ever protect the builders somebody
+        remembered to change.  So authorization moved to the one place every
+        card must physically pass through, and the architecture test asserts
+        that this method contains the only ``on_fast_alert`` call in the
+        codebase.  A future card builder that forgets every rule in this file
+        is still gated, because it cannot reach Discord any other way.
+        """
+
+        guarded = self._guard_publication(alert)
+        if guarded is not alert:
+            self._fast_alerts[guarded.alert_key] = guarded
+        return await self.notifier.on_fast_alert(guarded)
 
     def _guard_publication(self, alert: FastAlert) -> FastAlert:
         """No card of any kind interrupts a human on behalf of a copy (v2.47).
@@ -6601,7 +6624,7 @@ class SmartMoneyEngine:
             now=int(time.time()),
             image_url=trend_image,
         )
-        published = await self.notifier.on_fast_alert(alert)
+        published = await self._dispatch_card(alert)
         if published:
             self.fast_alerts_published += 1
             self.last_fast_alert_at = int(time.time())
@@ -6828,7 +6851,7 @@ class SmartMoneyEngine:
                 image_url=trench_image,
             )
 
-        published = await self.notifier.on_fast_alert(alert)
+        published = await self._dispatch_card(alert)
         if published:
             self.fast_alerts_published += 1
             self.last_fast_alert_at = int(time.time())
@@ -7082,7 +7105,7 @@ class SmartMoneyEngine:
                         now=int(time.time()),
                     )
                     with suppress(Exception):
-                        if await self.notifier.on_fast_alert(card):
+                        if await self._dispatch_card(card):
                             self.trending_hot_watch_cards += 1
             except asyncio.CancelledError:
                 raise
