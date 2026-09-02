@@ -237,3 +237,65 @@ def test_research_only_cannot_be_switched_off(settings) -> None:
 
 def test_a_backfill_is_bounded_rather_than_from_genesis(settings) -> None:
     assert 0 < settings.stonks_backfill_blocks <= 5_000_000
+
+
+# --- the production verification script --------------------------------------
+
+
+def test_the_verification_script_is_read_only_by_construction() -> None:
+    """The operator runs this where the network works; it must never write.
+
+    Its whole job is to print a bytecode digest and a chain id so an adapter
+    can be configured. Printing a digest is not the same as trusting one — the
+    script enables nothing, and the operator still compares what it prints
+    against an independent source.
+    """
+
+    import ast
+    import pathlib
+
+    source = pathlib.Path("scripts/stonks_verify.py").read_text()
+    tree = ast.parse(source)
+    # Strip docstrings: the module explains at length that it signs nothing,
+    # and grepping prose would flag the promise rather than a violation.
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Module | ast.ClassDef | ast.FunctionDef):
+            body = node.body
+            if (
+                body
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)
+            ):
+                body.pop(0)
+    code = ast.unparse(tree)
+
+    for forbidden in (
+        "eth_sendRawTransaction",
+        "eth_sendTransaction",
+        "eth_sign",
+        "personal_",
+        "private_key",
+        "sqlite",
+        ".write(",
+        "json.dump(",
+    ):
+        assert forbidden not in code, f"the diagnostic must stay read-only: {forbidden}"
+
+    # And it imports nothing that could persist anything. (`urlopen` legitimately
+    # contains the substring "open(", so the check above is deliberately about
+    # write *methods* rather than any name containing "open".)
+    imported = {
+        alias.name.split(".")[0]
+        for node in ast.walk(tree)
+        for alias in (node.names if isinstance(node, ast.Import) else [])
+    } | {
+        node.module.split(".")[0]
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module
+    }
+    assert imported <= {"json", "sys", "urllib", "hashlib", "__future__"}, imported
+
+    # Only these RPC methods, all of them reads.
+    for method in ("eth_chainId", "eth_blockNumber", "eth_getCode"):
+        assert method in code
