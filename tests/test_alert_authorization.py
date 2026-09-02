@@ -159,6 +159,8 @@ def test_a_guarded_card_is_the_one_that_gets_sent() -> None:
     engine._fast_alerts = {}
     engine._quality_scores = {}
     engine._clone_verdicts = {}
+    engine._gate_reports = {}
+    engine.gate_refusals = 0
     engine.refused_publications = 0
 
     alert = fa.FastAlert(

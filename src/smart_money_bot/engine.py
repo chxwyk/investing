@@ -155,6 +155,9 @@ from .lab.exits import ExitContext as LabExitContext
 from .lab.fastwatch import evaluate_fast_watch, signals_from_candidate, still_current
 from .lab.forward import EdgeInputs as ForwardEdgeInputs
 from .lab.forward import PingVerdict, forward_edge_score, should_ping
+from .lab.hardgates import (
+    GateReport,
+)
 from .lab.latency import HISTORICAL as LAB_HISTORICAL
 from .lab.latency import UNKNOWN as LAB_UNKNOWN
 from .lab.latency import LatencySample as LabLatencySample
@@ -737,6 +740,11 @@ class SmartMoneyEngine:
         self._token_facts: dict[str, TokenFacts] = {}
         self._clone_verdicts: dict[str, CloneVerdict] = {}
         self._quality_scores: dict[str, QualityScore] = {}
+        # v2.51 phase 1.  The last hard-gate report for each mint, written by
+        # whichever lane last evaluated it and read by the single dispatcher.
+        # One record, one decision, every card path.
+        self._gate_reports: dict[str, GateReport] = {}
+        self.gate_refusals = 0
         self.clone_suppressed = 0
         self.collision_suppressed = 0
         self.thin_quality_suppressed = 0
@@ -5518,6 +5526,35 @@ class SmartMoneyEngine:
         # instruction in its title.  "🚨 EARLY RUNNER — LOOK NOW" printed above
         # a body reading -63.70% over five minutes is the card telling the
         # operator two opposite things and letting the louder one win.
+        # v2.51 phase 1.  The hard-gate report outranks everything else here,
+        # because it is the only thing in the system that asked whether the
+        # token can actually be sold.  A card whose gates say UNSAFE MOMENTUM
+        # may not carry an instruction, whichever builder produced it and
+        # however good its own private opinion was.
+        report = self._gate_reports.get(mint)
+        if report is not None and not report.may_ping and alert.ping:
+            self.gate_refusals += 1
+            blocking = report.reasons()[:3]
+            alert = replace(
+                alert,
+                ping=False,
+                lane=LANE_RADAR,
+                trade_eligible=False,
+                spec=replace(
+                    alert.spec,
+                    title=strip_actionable(alert.spec.title),
+                    fields=(
+                        CardField(
+                            f"⛔ {report.classify().replace('_', ' ')}",
+                            "\n".join(f"• {item}" for item in blocking)
+                            + f"\n{report.human()}",
+                            0,
+                        ),
+                        *alert.spec.fields,
+                    ),
+                ),
+            )
+
         quality = self._quality_scores.get(mint)
         if quality is not None and quality.disqualified:
             self.refused_publications += 1

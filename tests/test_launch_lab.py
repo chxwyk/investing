@@ -243,6 +243,8 @@ def _engine_for_launch(settings, *, balance=Decimal("0.03"), reserved=True):
     engine._token_facts = {}
     engine._clone_verdicts = {}
     engine._quality_scores = {}
+    engine._gate_reports = {}
+    engine.gate_refusals = 0
     engine.clone_suppressed = 0
     engine.collision_suppressed = 0
     engine.thin_quality_suppressed = 0

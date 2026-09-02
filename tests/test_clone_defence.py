@@ -835,6 +835,8 @@ def _partial_engine():
     engine._token_facts = {}
     engine._clone_verdicts = {}
     engine._quality_scores = {}
+    engine._gate_reports = {}
+    engine.gate_refusals = 0
     engine.refused_publications = 0
     return engine
 

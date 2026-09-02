@@ -53,6 +53,8 @@ async def test_no_x_candidate_alert_never_auto_launches() -> None:
     engine._token_facts = {}
     engine._clone_verdicts = {}
     engine._quality_scores = {}
+    engine._gate_reports = {}
+    engine.gate_refusals = 0
     engine.clone_suppressed = 0
     engine.collision_suppressed = 0
     engine.thin_quality_suppressed = 0
