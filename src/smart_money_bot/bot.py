@@ -6329,6 +6329,9 @@ def _early_lane_lines(early: dict[str, object]) -> str:
         # cards one scan is allowed at all.
         f"Not an entry `{early.get('not_an_entry', 0)}` • cards capped at "
         f"`{early.get('cards_per_scan_cap', 0)}`/scan\n"
+        "Alerting feed: **"
+        + ("GMGN TRENDING ONLY" if early.get("trending_only") else "ALL GMGN FEEDS")
+        + "**\n"
         f"Wallet stream "
         f"`{'CONNECTED' if early.get('stream_connected') else 'DISCONNECTED'}` • "
         f"subscriptions `{early.get('stream_subscriptions', 0)}` • reconnects "

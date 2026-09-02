@@ -56,6 +56,7 @@ from smart_money_bot.lab.early import (
     WHY_SUSPECTED_CLONE,
     WHY_THIN_QUALITY,
 )
+from smart_money_bot.lab.shadow import FAMILY_GMGN_TRENDING
 from smart_money_bot.lab.tokenquality import (
     DEFAULT_QUALITY_CONFIG,
     QualityScore,
@@ -750,7 +751,7 @@ def test_a_wide_scan_evaluates_the_strongest_first_and_evaluates_far_more_than_s
     candidates = [
         SimpleNamespace(
             mint=f"dead{index}",
-            family="NEW_PAIR",
+            family=FAMILY_GMGN_TRENDING,
             token=_token(
                 f"dead{index}",
                 name=f"Dead {index}",
@@ -766,7 +767,7 @@ def test_a_wide_scan_evaluates_the_strongest_first_and_evaluates_far_more_than_s
     candidates.append(
         SimpleNamespace(
             mint=REAL_MINT,
-            family="TRENDING",
+            family=FAMILY_GMGN_TRENDING,
             token=_token(
                 REAL_MINT,
                 name="Sock and Pussy 500",
@@ -1325,7 +1326,7 @@ def test_a_wide_scan_does_not_become_a_wide_alert() -> None:
     candidates = [
         SimpleNamespace(
             mint=f"cand{index:03d}",
-            family="TRENDING",
+            family=FAMILY_GMGN_TRENDING,
             token=SimpleNamespace(
                 mint=f"cand{index:03d}",
                 name=f"Cand {index}",
@@ -1441,3 +1442,166 @@ def test_each_refusal_stands_on_its_own() -> None:
         assert score.disqualified is True, f"{label} refusal is not firing"
         assert score.score == 0
         assert len(score.disqualifiers) == 1, f"{label} case trips more than one rule"
+
+
+# ===========================================================================
+# 11. v2.49 — Trending only.  "Just start focusing on trending."
+# ===========================================================================
+
+
+def test_only_trending_candidates_can_produce_a_card() -> None:
+    """The trenches board was burying Trending in the same candidate list.
+
+    Three sections of up to sixty rows each — New, Almost bonded, Migrated —
+    of tokens that are by definition minutes old. They ranked alongside
+    Trending and, being numerous, took the cards.
+    """
+
+    from smart_money_bot.engine import SmartMoneyEngine
+    from smart_money_bot.lab.shadow import (
+        FAMILY_GMGN_HOT_SEARCH,
+        FAMILY_GMGN_TRENCH_NEW,
+    )
+
+    engine = _partial_engine()
+    engine.gmgn_candidates_published = 0
+    engine.early_lane_evaluated = 0
+    engine.settings = SimpleNamespace(
+        gmgn_enrichment_per_scan=6,
+        gmgn_early_lane_per_scan=60,
+        gmgn_early_lane_concurrency=8,
+        gmgn_early_lane_max_cards_per_scan=4,
+        gmgn_trending_only=True,
+    )
+
+    def _candidate(mint, family, *, fee):
+        return SimpleNamespace(
+            mint=mint,
+            family=family,
+            token=SimpleNamespace(
+                mint=mint,
+                name=f"Token {mint}",
+                symbol=mint.upper(),
+                image_url="",
+                created_at=1_000_000,
+                open_at=None,
+                liquidity_usd=Decimal("20000"),
+                volume_usd=Decimal("50000"),
+                market_cap_usd=Decimal("60000"),
+                holder_count=300,
+                buys=250,
+                sells=150,
+                total_fee=fee,
+                price_change_1m_percent=Decimal("30"),
+                price_change_5m_percent=Decimal("40"),
+                history_highest_market_cap_usd=Decimal("61000"),
+                top10_holder_rate=Decimal("0.2"),
+                dev_team_hold_rate=Decimal("0.02"),
+                bundler_rate=Decimal("0.05"),
+                sniper_hold_rate=Decimal("0.05"),
+                insider_rate=Decimal("0.05"),
+            ),
+        )
+
+    # The trench rows are deliberately given the *stronger* numbers. Ranking
+    # alone would hand them every card; only the family filter stops it.
+    candidates = [
+        _candidate(f"trench{i}", FAMILY_GMGN_TRENCH_NEW, fee=Decimal("50"))
+        for i in range(40)
+    ]
+    candidates += [
+        _candidate(f"hot{i}", FAMILY_GMGN_HOT_SEARCH, fee=Decimal("50")) for i in range(10)
+    ]
+    candidates += [
+        _candidate(f"trend{i}", FAMILY_GMGN_TRENDING, fee=Decimal("6")) for i in range(5)
+    ]
+
+    evaluated: list[str] = []
+
+    async def _early_lane_task(mint, *, now, may_publish=True):
+        evaluated.append(mint)
+        return may_publish
+
+    async def _noop(*_args, **_kwargs):
+        return None
+
+    async def _scan(*, now):
+        return SimpleNamespace(candidates=tuple(candidates), errors=())
+
+    engine._early_lane_task = _early_lane_task
+    engine.note_presentation = _noop
+    engine.note_early_watch_event = _noop
+    engine.gmgn_runtime = SimpleNamespace(scan=_scan)
+
+    asyncio.run(SmartMoneyEngine._gmgn_cycle(engine))
+
+    assert evaluated, "nothing was evaluated at all"
+    assert all(mint.startswith("trend") for mint in evaluated), (
+        f"a non-trending family reached the early lane: {sorted(set(evaluated))[:5]}"
+    )
+    # Every candidate still entered the same-name cache. The copy detection
+    # needs the wide view — a trench launch is exactly what clones a trending
+    # token — so the other feeds keep being observed, they just cannot alert.
+    assert len(engine._token_facts) == 55
+
+
+def test_the_other_feeds_come_back_when_the_switch_is_off() -> None:
+    from smart_money_bot.engine import SmartMoneyEngine
+    from smart_money_bot.lab.shadow import FAMILY_GMGN_TRENCH_NEW
+
+    engine = _partial_engine()
+    engine.gmgn_candidates_published = 0
+    engine.early_lane_evaluated = 0
+    engine.settings = SimpleNamespace(
+        gmgn_enrichment_per_scan=6,
+        gmgn_early_lane_per_scan=60,
+        gmgn_early_lane_concurrency=8,
+        gmgn_early_lane_max_cards_per_scan=4,
+        gmgn_trending_only=False,
+    )
+    candidate = SimpleNamespace(
+        mint="trench1",
+        family=FAMILY_GMGN_TRENCH_NEW,
+        token=SimpleNamespace(
+            mint="trench1", name="T", symbol="T", image_url="", created_at=1_000_000,
+            open_at=None, liquidity_usd=Decimal("20000"), volume_usd=Decimal("50000"),
+            market_cap_usd=Decimal("60000"), holder_count=300, buys=250, sells=150,
+            total_fee=Decimal("6"), price_change_1m_percent=Decimal("30"),
+            price_change_5m_percent=None, history_highest_market_cap_usd=Decimal("61000"),
+            top10_holder_rate=Decimal("0.2"), dev_team_hold_rate=Decimal("0.02"),
+            bundler_rate=Decimal("0.05"), sniper_hold_rate=Decimal("0.05"),
+            insider_rate=Decimal("0.05"),
+        ),
+    )
+    evaluated: list[str] = []
+
+    async def _early_lane_task(mint, *, now, may_publish=True):
+        evaluated.append(mint)
+        return may_publish
+
+    async def _noop(*_args, **_kwargs):
+        return None
+
+    async def _scan(*, now):
+        return SimpleNamespace(candidates=(candidate,), errors=())
+
+    engine._early_lane_task = _early_lane_task
+    engine.note_presentation = _noop
+    engine.note_early_watch_event = _noop
+    engine.gmgn_runtime = SimpleNamespace(scan=_scan)
+
+    asyncio.run(SmartMoneyEngine._gmgn_cycle(engine))
+    assert evaluated == ["trench1"]
+
+
+def test_trending_only_is_the_default(settings) -> None:
+    assert settings.gmgn_trending_only is True
+
+
+def test_the_family_filter_runs_after_the_same_name_cache_is_filled() -> None:
+    # Filtering before the cache would blind the copy detection to the trench
+    # launches, which are exactly what clones a trending token.
+    import smart_money_bot.engine as engine_module
+
+    source = inspect.getsource(engine_module.SmartMoneyEngine._gmgn_cycle)
+    assert source.index("_note_token_facts") < source.index("gmgn_trending_only")

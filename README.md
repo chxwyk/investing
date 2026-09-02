@@ -7,6 +7,14 @@ transactions, and mirrors every newly detected hot-wallet swap in PAPER mode. PA
 as either a forced source-price observation ledger or an executable Jupiter quote-shadow
 trial; the two answer different questions and are labeled separately.
 
+Version 2.49.0 narrows the alerting feed to **GMGN Trending only**, by instruction. The
+trenches board contributes three sections of up to sixty rows each — New, Almost bonded,
+Migrated — of tokens minutes old, and they were landing in the same candidate list as
+Trending and burying it. Every other feed is still *observed* (lifecycles recorded, signals
+persisted, every mint still entering the same-name cache so copy detection keeps its wide
+view); what they lose is the right to interrupt anybody. `GMGN_TRENDING_ONLY=false` restores
+the old behaviour.
+
 Version 2.48.0 fixes what v2.47 got wrong. That release made the early lane ten times
 faster and left the selection bar where it was, so the operator got ten times the cards at
 the same quality — and the scorer underneath it measured **levels, not direction**, which
@@ -1790,7 +1798,8 @@ command slots: the tree stays at 25.
 `GMGN_KOL_ENABLED`, `GMGN_HOT_SEARCH_ENABLED`, `GMGN_MARKET_SIGNALS_ENABLED`,
 `GMGN_HOLDERS_ENABLED`, `GMGN_SECURITY_ENABLED`, `GMGN_ENRICHMENT_PER_SCAN`,
 `GMGN_EARLY_LANE_PER_SCAN` (v2.47, default 60), `GMGN_EARLY_LANE_CONCURRENCY`
-(v2.47, default 8), `GMGN_EARLY_LANE_MAX_CARDS_PER_SCAN` (v2.48, default 4).
+(v2.47, default 8), `GMGN_EARLY_LANE_MAX_CARDS_PER_SCAN` (v2.48, default 4),
+`GMGN_TRENDING_ONLY` (v2.49, default true).
 
 **Not required and not requested:** a GMGN trading credential. The research key is
 read-only and this release needs nothing else.

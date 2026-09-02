@@ -197,6 +197,7 @@ from .lab.shadow import (
     FAMILY_FAST_WATCH,
     FAMILY_FRESH_RUNNER,
     FAMILY_GMGN_SMART_MONEY,
+    FAMILY_GMGN_TRENDING,
     FAMILY_LABELS,
     FAMILY_NOTABLE_EARLY,
     FAMILY_NOTABLE_LATE,
@@ -2371,6 +2372,23 @@ class SmartMoneyEngine:
                 )
                 by_mint[candidate.mint] = candidate
         ranked = [item for item, _ in rank_candidates(facts)]
+
+        # v2.49.  Trending only, by default and by instruction.  The trenches
+        # board is sixty rows per section of tokens minutes old, and it was
+        # landing in the same candidate list as Trending and burying it.
+        #
+        # Note where this sits: *after* every candidate has already been put
+        # into the same-name cache above.  The copy detection needs the wide
+        # view — a trench launch is exactly what clones a trending token — so
+        # the other feeds keep being observed.  They simply cannot produce a
+        # card any more.
+        if bool(getattr(self.settings, "gmgn_trending_only", True)):
+            ranked = [
+                item
+                for item in ranked
+                if by_mint.get(item.mint)
+                and by_mint[item.mint].family == FAMILY_GMGN_TRENDING
+            ]
 
         # Evaluation is cheap — a cached DEX snapshot and pure logic — so it
         # gets its own budget, far larger than the one rationing GMGN's
@@ -4992,6 +5010,7 @@ class SmartMoneyEngine:
             "unresolved_collisions": self.collision_suppressed,
             "thin_quality": self.thin_quality_suppressed,
             "not_an_entry": self.not_an_entry_suppressed,
+            "trending_only": bool(getattr(self.settings, "gmgn_trending_only", True)),
             "cards_per_scan_cap": int(
                 getattr(self.settings, "gmgn_early_lane_max_cards_per_scan", 0)
             ),

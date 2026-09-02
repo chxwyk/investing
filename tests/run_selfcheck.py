@@ -1489,6 +1489,18 @@ async def check_direction_not_level() -> None:
     settings_fields = set(Settings.__dataclass_fields__)
     assert "gmgn_early_lane_max_cards_per_scan" in settings_fields
 
+    # 7b. Trending only, by instruction.  The trenches board is three sections
+    #     of up to sixty rows each, all minutes old, and it was landing in the
+    #     same candidate list as Trending and burying it.
+    assert "gmgn_trending_only" in settings_fields
+    assert "FAMILY_GMGN_TRENDING" in cycle_source
+    # The filter must run AFTER the same-name cache is filled: the copy
+    # detection needs the wide view, because a trench launch is exactly what
+    # clones a trending token.
+    assert cycle_source.index("_note_token_facts") < cycle_source.index(
+        "gmgn_trending_only"
+    )
+
     # 8. ...but the cap gates the CARD, never the analysis: the first-seen
     #    market cap and the watch list both survive a spent budget.
     lane_source = inspect.getsource(SmartMoneyEngine._early_lane_task)

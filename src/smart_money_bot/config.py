@@ -400,6 +400,19 @@ class Settings:
     #: Evaluations in flight at once.  Bounded so a wide scan cannot bury the
     #: radar loop or stampede the DEX provider.
     gmgn_early_lane_concurrency: int
+    #: Only GMGN Trending may produce a card (v2.49).
+    #:
+    #: The operator's instruction, in their words: *"just start focusing on
+    #: trending"*.  The trenches board contributes up to sixty rows per
+    #: section — New, Almost bonded, Migrated — of tokens that are by
+    #: definition minutes old and mostly going nowhere, and they were landing
+    #: in the same candidate list as Trending and drowning it.
+    #:
+    #: Everything else still gets *observed*: lifecycles are recorded, signals
+    #: persisted, and every mint still enters the same-name cache so the copy
+    #: detection keeps its wide view.  What the other feeds lose is the right
+    #: to interrupt anybody.  Set false to let every family alert again.
+    gmgn_trending_only: bool
     #: How many cards one scan may actually publish (v2.48).
     #:
     #: v2.47 raised evaluation from 6 to 60 per scan and left the selection
@@ -905,6 +918,7 @@ class Settings:
             gmgn_holders_enabled=_bool("GMGN_HOLDERS_ENABLED", True),
             gmgn_security_enabled=_bool("GMGN_SECURITY_ENABLED", True),
             gmgn_enrichment_per_scan=_int("GMGN_ENRICHMENT_PER_SCAN", 6),
+            gmgn_trending_only=_bool("GMGN_TRENDING_ONLY", True),
             gmgn_early_lane_per_scan=_int("GMGN_EARLY_LANE_PER_SCAN", 60),
             gmgn_early_lane_concurrency=_int("GMGN_EARLY_LANE_CONCURRENCY", 8),
             gmgn_early_lane_max_cards_per_scan=_int(
