@@ -1059,10 +1059,11 @@ async def check_production_hardening() -> None:
         assert safe_image_url(unsafe) == "", unsafe
     assert safe_image_url("ipfs://Qm1/a.png").startswith("https://")
 
-    # 5. Publish first, enrich the same message afterwards.
+    # 5. Publish first, enrich the same message afterwards.  v2.51 moved the
+    #    send behind the universal dispatcher; the invariant is unchanged.
     publish_source = inspect.getsource(SmartMoneyEngine._publish_fast_alert)
     assert publish_source.index("_schedule_presentation_enrichment") < publish_source.index(
-        "await self.notifier.on_fast_alert(alert)"
+        "await self._dispatch_card(alert)"
     ), "metadata resolution must never delay the alert"
     resolve_source = inspect.getsource(SmartMoneyEngine.resolve_presentation)
     for forbidden in ("symbol_search", "by_symbol", "narrative_match"):
@@ -1186,6 +1187,7 @@ async def check_clone_defence() -> None:
     from dataclasses import replace
     from decimal import Decimal as _Decimal
 
+    import smart_money_bot.engine as engine_module
     import smart_money_bot.fast_alerts as fast_alerts_module
     from smart_money_bot.database import Database
     from smart_money_bot.engine import SmartMoneyEngine
@@ -1339,6 +1341,25 @@ async def check_clone_defence() -> None:
     assert promotion_source.index("_quality_check") < promotion_source.index(
         "build_promotion_alert"
     )
+
+    # 10b. v2.51: exactly one path in the codebase may send a card.  v2.50
+    #      guarded one call site out of sixteen and reported the bypass class
+    #      fixed; three builders — trending, trench and the trending radar —
+    #      were reaching Discord directly, skipping the dedupe reservation too.
+    import re as _re
+
+    engine_source = inspect.getsource(engine_module)
+    sites = _re.findall(r"notifier\.on_fast_alert\(", engine_source)
+    assert len(sites) == 1, (
+        f"{len(sites)} paths can send a card; exactly one (the dispatcher) may"
+    )
+    dispatch_source = inspect.getsource(SmartMoneyEngine._dispatch_card)
+    assert dispatch_source.index("_guard_publication") < dispatch_source.index(
+        "notifier.on_fast_alert"
+    )
+    # The guarded card is the one that goes out; guarding a copy and sending
+    # the original would be a silent no-op.
+    assert "on_fast_alert(guarded)" in dispatch_source
 
     # 11. The card gates on both answers and prints both.
     card_source = inspect.getsource(fast_alerts_module.build_early_alert)

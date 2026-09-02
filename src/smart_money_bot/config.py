@@ -86,6 +86,17 @@ def _decimal(name: str, default: str) -> Decimal:
     return Decimal(os.getenv(name, default))
 
 
+def _str(name: str, default: str = "") -> str:
+    """A trimmed environment string, with blanks treated as absent.
+
+    An operator who sets a variable to whitespace meant to leave it unset, and
+    for a factory address the difference between "" and " " decides whether an
+    adapter tries to verify nothing.
+    """
+
+    return os.getenv(name, default).strip() or default.strip()
+
+
 def _optional_int(name: str) -> int | None:
     raw = os.getenv(name, "").strip()
     return int(raw) if raw else None
@@ -400,6 +411,41 @@ class Settings:
     #: Evaluations in flight at once.  Bounded so a wide scan cannot bury the
     #: radar loop or stampede the DEX provider.
     gmgn_early_lane_concurrency: int
+    # --- Stonks Onchain: stock-anchored coins (v2.51) --------------------
+    #: The whole subsystem, off by default.  A lane that can alert must be
+    #: switched on deliberately, not arrive enabled because it was merged.
+    stonks_enabled: bool
+    #: Optional environment fallback.  The bound per-guild channel from
+    #: ``/stonks setup`` takes precedence; nothing is hardcoded.
+    stonks_channel_id: int | None
+    #: Research only, and not negotiable from configuration: there is no order
+    #: path behind this lane to switch on.  Present so the value appears in
+    #: diagnostics and on cards rather than being an unstated assumption.
+    stonks_research_only: bool
+    stonks_rpc_url: str
+    stonks_chain_id: int
+    #: How long a ``/rhj/assets`` snapshot may keep vouching for an address
+    #: after it was taken.  Past this it stops answering rather than serving
+    #: an unknown-age snapshot.
+    stonks_registry_ttl_seconds: int
+    stonks_poll_seconds: int
+    #: Blocks behind head before a launch is treated as settled.
+    stonks_confirmations: int
+    #: Bounded backfill on first run.  Never a scan from genesis.
+    stonks_backfill_blocks: int
+    #: Per-launchpad factory addresses and the independently obtained runtime
+    #: bytecode digests they must match.  Empty means that adapter stays
+    #: disabled — which is the correct behaviour, not a gap.
+    stonks_pons_factory: str
+    stonks_pons_digest: str
+    stonks_pair_factory: str
+    stonks_pair_digest: str
+    stonks_long_factory: str
+    stonks_long_digest: str
+    #: How much better a challenger must be before the crown changes, so two
+    #: near-tied coins do not flap the alert.
+    stonks_crown_hysteresis: Decimal
+
     #: Only GMGN Trending may produce a card (v2.49).
     #:
     #: The operator's instruction, in their words: *"just start focusing on
@@ -918,6 +964,24 @@ class Settings:
             gmgn_holders_enabled=_bool("GMGN_HOLDERS_ENABLED", True),
             gmgn_security_enabled=_bool("GMGN_SECURITY_ENABLED", True),
             gmgn_enrichment_per_scan=_int("GMGN_ENRICHMENT_PER_SCAN", 6),
+            stonks_enabled=_bool("STONKS_ONCHAIN_ENABLED", False),
+            stonks_channel_id=_optional_int("STONKS_ONCHAIN_CHANNEL_ID"),
+            stonks_research_only=_bool("STONKS_ONCHAIN_RESEARCH_ONLY", True),
+            stonks_rpc_url=_str(
+                "STONKS_RPC_URL", "https://rpc.mainnet.chain.robinhood.com"
+            ),
+            stonks_chain_id=_int("STONKS_CHAIN_ID", 4663),
+            stonks_registry_ttl_seconds=_int("STONKS_REGISTRY_TTL_SECONDS", 3600),
+            stonks_poll_seconds=_int("STONKS_POLL_SECONDS", 60),
+            stonks_confirmations=_int("STONKS_CONFIRMATIONS", 3),
+            stonks_backfill_blocks=_int("STONKS_BACKFILL_BLOCKS", 20000),
+            stonks_pons_factory=_str("STONKS_PONS_FACTORY", ""),
+            stonks_pons_digest=_str("STONKS_PONS_BYTECODE_SHA256", ""),
+            stonks_pair_factory=_str("STONKS_PAIR_FACTORY", ""),
+            stonks_pair_digest=_str("STONKS_PAIR_BYTECODE_SHA256", ""),
+            stonks_long_factory=_str("STONKS_LONG_FACTORY", ""),
+            stonks_long_digest=_str("STONKS_LONG_BYTECODE_SHA256", ""),
+            stonks_crown_hysteresis=_decimal("STONKS_CROWN_HYSTERESIS", "1.15"),
             gmgn_trending_only=_bool("GMGN_TRENDING_ONLY", True),
             gmgn_early_lane_per_scan=_int("GMGN_EARLY_LANE_PER_SCAN", 60),
             gmgn_early_lane_concurrency=_int("GMGN_EARLY_LANE_CONCURRENCY", 8),
@@ -1388,6 +1452,30 @@ class Settings:
             raise ValueError("GMGN_EARLY_LANE_PER_SCAN must be between 0 and 400")
         if not 1 <= self.gmgn_early_lane_concurrency <= 32:
             raise ValueError("GMGN_EARLY_LANE_CONCURRENCY must be between 1 and 32")
+        if self.stonks_chain_id != 4663:
+            # Robinhood Chain.  A different id here means the stock-token
+            # registry and the launch indexers would be reading different
+            # chains, which is the one mistake this lane cannot survive.
+            raise ValueError("STONKS_CHAIN_ID must be 4663 (Robinhood Chain)")
+        if not self.stonks_rpc_url.startswith("https://"):
+            raise ValueError("STONKS_RPC_URL must be an https URL")
+        if not 60 <= self.stonks_registry_ttl_seconds <= 86_400:
+            raise ValueError("STONKS_REGISTRY_TTL_SECONDS must be between 60 and 86400")
+        if not 10 <= self.stonks_poll_seconds <= 3_600:
+            raise ValueError("STONKS_POLL_SECONDS must be between 10 and 3600")
+        if not 0 <= self.stonks_confirmations <= 64:
+            raise ValueError("STONKS_CONFIRMATIONS must be between 0 and 64")
+        if not 0 <= self.stonks_backfill_blocks <= 5_000_000:
+            raise ValueError("STONKS_BACKFILL_BLOCKS must be between 0 and 5000000")
+        if self.stonks_crown_hysteresis < 1:
+            raise ValueError("STONKS_CROWN_HYSTERESIS must be at least 1")
+        if not self.stonks_research_only:
+            # There is no order path behind this lane.  Refusing the flag is
+            # cheaper than letting an operator believe setting it did anything.
+            raise ValueError(
+                "STONKS_ONCHAIN_RESEARCH_ONLY cannot be disabled: this release "
+                "has no execution path for the stock lane"
+            )
         if not 1 <= self.gmgn_early_lane_max_cards_per_scan <= 25:
             raise ValueError(
                 "GMGN_EARLY_LANE_MAX_CARDS_PER_SCAN must be between 1 and 25"
