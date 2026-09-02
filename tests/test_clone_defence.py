@@ -835,6 +835,7 @@ def _partial_engine():
     engine._token_facts = {}
     engine._clone_verdicts = {}
     engine._quality_scores = {}
+    engine.refused_publications = 0
     return engine
 
 
@@ -941,7 +942,7 @@ def test_the_publish_backstop_withholds_a_ping_from_a_copy() -> None:
     engine._clone_verdicts[REAL_MINT] = classify_clone(_copy(mint=REAL_MINT), [_real(mint="other")])
     alert = _card()
     assert alert.ping is True
-    guarded = engine._withhold_ping_from_copies(alert)
+    guarded = engine._guard_publication(alert)
     assert guarded.ping is False
     assert guarded.lane == fa.LANE_RADAR
     assert guarded.symbol_collision is True
@@ -951,13 +952,13 @@ def test_the_backstop_leaves_an_original_alone() -> None:
     engine = _partial_engine()
     engine._clone_verdicts[REAL_MINT] = classify_clone(_real(), [_copy()])
     alert = _card()
-    assert engine._withhold_ping_from_copies(alert).ping is True
+    assert engine._guard_publication(alert).ping is True
 
 
 def test_the_backstop_never_suppresses_the_card_itself() -> None:
     engine = _partial_engine()
     engine._clone_verdicts[REAL_MINT] = classify_clone(_copy(mint=REAL_MINT), [_real(mint="other")])
-    guarded = engine._withhold_ping_from_copies(_card())
+    guarded = engine._guard_publication(_card())
     assert guarded.spec.title
     assert guarded.mint == REAL_MINT
 
@@ -968,7 +969,7 @@ def test_the_backstop_is_reached_before_the_alert_is_reserved() -> None:
     import smart_money_bot.engine as engine_module
 
     source = inspect.getsource(engine_module.SmartMoneyEngine._publish_fast_alert)
-    assert source.index("_withhold_ping_from_copies") < source.index("reserve_fast_alert")
+    assert source.index("_guard_publication") < source.index("reserve_fast_alert")
 
 
 def test_a_clone_check_failure_can_never_break_a_scan() -> None:
@@ -1605,3 +1606,112 @@ def test_the_family_filter_runs_after_the_same_name_cache_is_filled() -> None:
 
     source = inspect.getsource(engine_module.SmartMoneyEngine._gmgn_cycle)
     assert source.index("_note_token_facts") < source.index("gmgn_trending_only")
+
+
+# ===========================================================================
+# 12. v2.50 — the promotion card bypassed every gate v2.47-2.49 added.
+# ===========================================================================
+
+
+def test_a_disqualified_token_cannot_ping_from_any_card_builder() -> None:
+    """The NORMIE card, and why three releases of fixes did not reach it.
+
+    Every gate v2.47-2.49 added lived in ``build_early_alert`` and the GMGN
+    scan loop. The cards the operator was actually complaining about came from
+    ``build_promotion_alert``, published off the hot-watch timer, which touches
+    neither — so a promotion could be titled **🚨 EARLY RUNNER — LOOK NOW**
+    while its own body reported -63.70% over five minutes and 819 sells against
+    765 buys.
+
+    v2.48 made it worse: capping cards per scan put every budget-skipped
+    candidate on the watch list, which feeds exactly this path. The front door
+    was capped and the back door widened.
+
+    So the guard moved to the one place every card must pass through.
+    """
+
+    normie = TokenFacts(
+        mint="7XRemzYVgQZ4auVMpxisWVZwyhivrowCF4Hq8TCepump",
+        name="normie",
+        symbol="NORMIE",
+        age_seconds=240,
+        liquidity_usd=Decimal("8410"),
+        market_cap_usd=Decimal("14670"),
+        buys=765,
+        sells=819,
+        price_change_1m_percent=None,  # the card said: 1m unknown
+        price_change_5m_percent=Decimal("-63.70"),
+    )
+    score = score_quality(normie)
+    assert score.disqualified is True
+
+    engine = _partial_engine()
+    engine._quality_scores[normie.mint] = score
+
+    # A card from a builder that knows nothing about any of this — the exact
+    # situation build_promotion_alert was in.
+    unguarded = fa.FastAlert(
+        kind=fa.EARLY_RUNNER,
+        mint=normie.mint,
+        alert_key=f"promotion:{normie.mint}",
+        spec=fa.CardSpec(
+            title="🚨 EARLY RUNNER — LOOK NOW",
+            description="normie $NORMIE",
+            fields=(fa.CardField("MOMENTUM", "5m -63.70%", 10),),
+        ),
+        ping=True,
+        lane=fa.LANE_URGENT,
+        token_mint=normie.mint,
+    )
+    assert unguarded.ping is True, "fixture must start actionable or it proves nothing"
+
+    guarded = engine._guard_publication(unguarded)
+    assert guarded.ping is False
+    assert guarded.lane == fa.LANE_RADAR
+    assert guarded.trade_eligible is False
+    # And it no longer *reads* as an instruction. A title saying LOOK NOW above
+    # a body saying -63.70% is the card telling the operator two opposite
+    # things and letting the louder one win.
+    assert "LOOK NOW" not in guarded.spec.title
+    names = [field.name for field in guarded.spec.fields]
+    assert names[0] == "⛔ NOT AN ENTRY"
+    assert "falling over" in guarded.spec.fields[0].value
+    assert engine.refused_publications == 1
+
+
+def test_the_guard_leaves_a_healthy_token_completely_alone() -> None:
+    engine = _partial_engine()
+    engine._quality_scores[REAL_MINT] = score_quality(_real())
+    alert = _card()
+    assert engine._guard_publication(alert) is alert or (
+        engine._guard_publication(alert).ping is True
+    )
+
+
+def test_the_promotion_path_scores_at_publish_time() -> None:
+    # A hot watch is opened minutes before it is promoted, and the point of a
+    # promotion is that something changed. Scoring at watch time would decide
+    # on numbers that are no longer on the screen.
+    import smart_money_bot.engine as engine_module
+
+    source = inspect.getsource(engine_module.SmartMoneyEngine._publish_promotion)
+    assert "_quality_check" in source, "the promotion path still never asks about quality"
+    assert "if quality.disqualified:" in source, "it asks, then ignores the answer"
+    assert "EARLY_WHY_NOT_AN_ENTRY" in source
+    # It must refuse before it builds the card, not after.
+    assert source.index("_quality_check") < source.index("build_promotion_alert")
+
+
+def test_every_card_builder_is_covered_by_one_choke_point() -> None:
+    # The structural claim. If a future builder is added and forgets the gates,
+    # it still cannot ping about a token that is falling over.
+    import smart_money_bot.engine as engine_module
+
+    publish = inspect.getsource(engine_module.SmartMoneyEngine._publish_fast_alert)
+    guard = inspect.getsource(engine_module.SmartMoneyEngine._guard_publication)
+    assert "_guard_publication" in publish
+    assert publish.index("_guard_publication") < publish.index("reserve_fast_alert")
+    # The guard consults quality, not only the clone verdict — that omission is
+    # what let the promotion cards through.
+    assert "_quality_scores" in guard
+    assert "disqualified" in guard

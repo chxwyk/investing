@@ -275,6 +275,24 @@ def _percent_plain(value: Decimal | None) -> str:
 _ACTIONABLE_PHRASES: tuple[str, ...] = ("LOOK NOW", "BUY NOW", "APE", "SEND IT")
 
 
+def strip_actionable(title: str) -> str:
+    """Take the instruction out of a title without taking the tier out (v2.50).
+
+    Used at the single publish choke point so that a card refused on quality
+    cannot lead with "LOOK NOW" no matter which builder produced it.  The
+    production case: a promotion card titled **🚨 EARLY RUNNER — LOOK NOW**
+    for a token its own body reported at **-63.70% over five minutes** with
+    819 sells against 765 buys.
+    """
+
+    cleaned = title
+    for phrase in _ACTIONABLE_PHRASES:
+        cleaned = cleaned.replace(f" — {phrase}", "").replace(f" - {phrase}", "")
+        cleaned = cleaned.replace(phrase, "")
+    cleaned = cleaned.strip(" —-•").strip()
+    return cleaned or "RESEARCH CANDIDATE"
+
+
 def _validation_pending_title(tier_label: str, *, late: bool = False) -> str:
     """Strip actionable language from a card whose validation is not finished.
 

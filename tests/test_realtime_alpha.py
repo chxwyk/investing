@@ -912,6 +912,7 @@ def _engine(database, notifier, **settings):
     engine.collision_suppressed = 0
     engine.thin_quality_suppressed = 0
     engine.not_an_entry_suppressed = 0
+    engine.refused_publications = 0
     engine.early_lane_evaluated = 0
     engine.database = database
     engine.notifier = notifier

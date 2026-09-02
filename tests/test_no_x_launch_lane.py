@@ -57,6 +57,7 @@ async def test_no_x_candidate_alert_never_auto_launches() -> None:
     engine.collision_suppressed = 0
     engine.thin_quality_suppressed = 0
     engine.not_an_entry_suppressed = 0
+    engine.refused_publications = 0
     engine.early_lane_evaluated = 0
     engine.settings = SimpleNamespace(
         news_min_score=45,

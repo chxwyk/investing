@@ -247,6 +247,7 @@ def _engine_for_launch(settings, *, balance=Decimal("0.03"), reserved=True):
     engine.collision_suppressed = 0
     engine.thin_quality_suppressed = 0
     engine.not_an_entry_suppressed = 0
+    engine.refused_publications = 0
     engine.early_lane_evaluated = 0
     engine.settings = _configured(settings)
     j7 = SimpleNamespace(

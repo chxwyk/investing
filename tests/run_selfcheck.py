@@ -1318,8 +1318,26 @@ async def check_clone_defence() -> None:
     #     alert is reserved — reserving first would record a ping nobody got
     #     and then dedupe the corrected card away.
     publish_source = inspect.getsource(SmartMoneyEngine._publish_fast_alert)
-    assert publish_source.index("_withhold_ping_from_copies") < publish_source.index(
+    assert publish_source.index("_guard_publication") < publish_source.index(
         "reserve_fast_alert"
+    )
+    # v2.50.  The guard must consult QUALITY as well as the clone verdict.
+    # Every gate v2.47-2.49 added lived in build_early_alert and the GMGN scan
+    # loop, and the cards the operator complained about came from
+    # build_promotion_alert off the hot-watch timer, which touches neither —
+    # so a promotion could be titled "EARLY RUNNER - LOOK NOW" above a body
+    # reporting -63.70% over five minutes.
+    guard_source = inspect.getsource(SmartMoneyEngine._guard_publication)
+    assert "_quality_scores" in guard_source
+    assert "disqualified" in guard_source
+    assert "strip_actionable" in guard_source
+    promotion_source = inspect.getsource(SmartMoneyEngine._publish_promotion)
+    assert "_quality_check" in promotion_source, (
+        "the promotion path still never asks whether this is an entry"
+    )
+    assert "if quality.disqualified:" in promotion_source
+    assert promotion_source.index("_quality_check") < promotion_source.index(
+        "build_promotion_alert"
     )
 
     # 11. The card gates on both answers and prints both.

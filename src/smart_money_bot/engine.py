@@ -59,6 +59,7 @@ from .fast_alerts import (
     TRENDING_ACCELERATION_ALERT,
     TRENDING_ALPHA,
     TRENDING_CONTINUATION_ALERT,
+    CardField,
     EnrichmentUpdate,
     FastAlert,
     build_catalyst_alert,
@@ -76,6 +77,7 @@ from .fast_alerts import (
     discovery_line,
     enrichment_from_evidence,
     enrichment_from_presentation,
+    strip_actionable,
 )
 from .gmgn import BudgetConfig as GmgnBudgetConfig
 from .gmgn import GmgnClient
@@ -739,6 +741,7 @@ class SmartMoneyEngine:
         self.collision_suppressed = 0
         self.thin_quality_suppressed = 0
         self.not_an_entry_suppressed = 0
+        self.refused_publications = 0
         self.early_lane_evaluated = 0
         # The future execution interface, wired and switched off (sections
         # 74-83).  The only provider that exists records intents; there is no
@@ -2967,6 +2970,41 @@ class SmartMoneyEngine:
             now=now,
         )
         name, symbol, image_url = self._card_identity(mint)
+
+        # v2.50.  Refresh the money picture at *publish* time, not at watch
+        # time.  A hot watch is opened minutes before it is promoted, and the
+        # whole point of a promotion is that something changed — so the
+        # numbers that decide whether this is still an entry have to be the
+        # ones on the screen now, not the ones that earned it a watch.
+        #
+        # This is the line whose absence produced the NORMIE card: a promotion
+        # titled "EARLY RUNNER — LOOK NOW" whose own body said -63.70% over
+        # five minutes, 819 sells against 765 buys, and safety FAIL.
+        facts = self._note_token_facts(
+            self._facts_from_snapshot(
+                mint,
+                snapshot,
+                name=name,
+                symbol=symbol,
+                first_seen_at=int(getattr(entry, "first_seen_at", now) or now),
+                now=now,
+            )
+        )
+        quality = self._quality_check(facts)
+        await self._clone_check(facts)
+        if quality.disqualified:
+            # A promotion is the most actionable card this bot produces.  A
+            # token that is falling over does not get one at all — it stays on
+            # the watch list, where it can be looked at without being sold.
+            self.not_an_entry_suppressed += 1
+            await self._record_suppression(
+                mint,
+                EARLY_WHY_NOT_AN_ENTRY,
+                now=now,
+                market_cap=snapshot.market_cap_usd,
+            )
+            return False
+
         confirmation = await self._known_trader_confirmation(mint, now=now)
         series = self._holder_series.get(mint)
         alert = build_promotion_alert(
@@ -5393,7 +5431,7 @@ class SmartMoneyEngine:
 
         if alert.entry_eligible:  # pragma: no cover - structurally impossible
             raise AssertionError("a fast alert can never be entry eligible")
-        alert = self._withhold_ping_from_copies(alert)
+        alert = self._guard_publication(alert)
         if self.database.connection is None:
             return False
         try:
@@ -5427,7 +5465,7 @@ class SmartMoneyEngine:
         self.last_fast_alert_kind = alert.kind
         return True
 
-    def _withhold_ping_from_copies(self, alert: FastAlert) -> FastAlert:
+    def _guard_publication(self, alert: FastAlert) -> FastAlert:
         """No card of any kind interrupts a human on behalf of a copy (v2.47).
 
         Every lane funnels through :meth:`_publish_fast_alert`, so the rule
@@ -5443,7 +5481,44 @@ class SmartMoneyEngine:
         NO`` cards did.
         """
 
-        verdict = self._clone_verdicts.get(alert.token_mint or alert.mint)
+        mint = alert.token_mint or alert.mint
+
+        # v2.50.  Quality first, because this is the one that was being
+        # bypassed.  Every gate v2.47-2.49 added lived in ``build_early_alert``
+        # and the GMGN scan loop — and the cards the operator was actually
+        # complaining about came from ``build_promotion_alert``, published from
+        # the hot-watch timer, which touches neither.  v2.48 made that worse:
+        # every candidate past the per-scan card budget is now put on the watch
+        # list, so capping the front door widened the back one.
+        #
+        # A refused token loses the ping, loses the urgent lane, and loses the
+        # instruction in its title.  "🚨 EARLY RUNNER — LOOK NOW" printed above
+        # a body reading -63.70% over five minutes is the card telling the
+        # operator two opposite things and letting the louder one win.
+        quality = self._quality_scores.get(mint)
+        if quality is not None and quality.disqualified:
+            self.refused_publications += 1
+            alert = replace(
+                alert,
+                ping=False,
+                lane=LANE_RADAR,
+                trade_eligible=False,
+                spec=replace(
+                    alert.spec,
+                    title=strip_actionable(alert.spec.title),
+                    fields=(
+                        CardField(
+                            "⛔ NOT AN ENTRY",
+                            "\n".join(f"• {item}" for item in quality.disqualifiers[:3])
+                            + "\nShown so you can see it exists. It cannot ping you.",
+                            0,
+                        ),
+                        *alert.spec.fields,
+                    ),
+                ),
+            )
+
+        verdict = self._clone_verdicts.get(mint)
         if verdict is None or verdict.may_ping or not alert.ping:
             return alert
         return replace(alert, ping=False, lane=LANE_RADAR, symbol_collision=True)
