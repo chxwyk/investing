@@ -156,6 +156,7 @@ from .lab.fastwatch import evaluate_fast_watch, signals_from_candidate, still_cu
 from .lab.forward import EdgeInputs as ForwardEdgeInputs
 from .lab.forward import PingVerdict, forward_edge_score, should_ping
 from .lab.hardgates import (
+    UNSAFE_MOMENTUM,
     GateReport,
 )
 from .lab.latency import HISTORICAL as LAB_HISTORICAL
@@ -414,6 +415,80 @@ def _launch_failure_status(message: str) -> str:
     return "FAILED"
 
 
+#: Notifier methods that publish a card an operator is meant to act on.  These
+#: are the ones authorization applies to.  Errors, diagnostics and digests are
+#: deliberately absent: withholding an error report protects nobody.
+GUARDED_NOTIFICATIONS: frozenset[str] = frozenset(
+    {
+        "on_fast_alert",
+        "on_runner_alert",
+        "on_runner_fresh",
+        "on_coin_callout",
+        "on_coin_watch",
+        "on_fomo_watch",
+        "on_signal",
+    }
+)
+
+
+class GuardedNotifier:
+    """Every card path, wrapped, so none of them can reach Discord unchecked.
+
+    v2.51 put authorization inside ``_dispatch_card`` and the FastAlert family
+    was covered.  An audit for this release found thirteen further call sites
+    reaching the notifier directly — runner alerts, callouts, watches, signals —
+    each of which is a card an operator acts on, and none of which passed the
+    guard.  Fixing them one at a time would leave the fourteenth to be found
+    later, which is the history of this whole class of bug.
+
+    So the guard moved to the *object* rather than the call sites.  The engine
+    holds one notifier and it is this one; a builder cannot opt out of
+    authorization because there is nothing else to call.
+
+    What it does is deliberately narrow.  It refuses a card for a mint whose
+    evidence says the token is not an entry, and it leaves everything else
+    exactly as it was — including errors and digests, because withholding an
+    error report protects nobody.
+    """
+
+    def __init__(self, inner: Any, engine: Any) -> None:
+        self._inner = inner
+        self._engine = engine
+        self.refused: dict[str, int] = {}
+
+    def __getattr__(self, name: str) -> Any:
+        target = getattr(self._inner, name)
+        if name not in GUARDED_NOTIFICATIONS or not callable(target):
+            return target
+
+        async def guarded(*args: Any, **kwargs: Any) -> Any:
+            mint = _mint_of(args)
+            if mint and self._engine._refuses_publication(mint):
+                self.refused[name] = self.refused.get(name, 0) + 1
+                logger.info(
+                    "Withheld %s for %s: the evidence does not support a card", name, mint[:8]
+                )
+                return False
+            return await target(*args, **kwargs)
+
+        return guarded
+
+
+def _mint_of(args: Sequence[Any]) -> str:
+    """The exact mint a notification is about, when it is about one.
+
+    Chain plus address is identity everywhere in this codebase, so the wrapper
+    looks for the address and gives up rather than guessing from a symbol.
+    """
+
+    for item in args:
+        for attribute in ("token_mint", "mint", "address", "contract"):
+            value = getattr(item, attribute, None)
+            if isinstance(value, str) and value:
+                return value
+    return ""
+
+
 class Notifier(Protocol):
     async def on_discovery(self, refresh: DiscoveryRefresh) -> None: ...
 
@@ -549,7 +624,7 @@ class NullNotifier:
 class SmartMoneyEngine:
     def __init__(self, settings: Settings, notifier: Notifier | None = None) -> None:
         self.settings = settings
-        self.notifier: Notifier = notifier or NullNotifier()
+        self.notifier: Notifier = GuardedNotifier(notifier or NullNotifier(), self)
         self.database = Database(settings.database_path, settings.paper_starting_usd)
         self.x_budget = XBudgetManager(self.database, settings)
         self.rpc = SolanaRPC(
@@ -5519,6 +5594,21 @@ class SmartMoneyEngine:
         if guarded is not alert:
             self._fast_alerts[guarded.alert_key] = guarded
         return await self.notifier.on_fast_alert(guarded)
+
+    def _refuses_publication(self, mint: str) -> bool:
+        """Whether the evidence for this mint forbids a card at all.
+
+        The same two questions the FastAlert guard asks, in the form the
+        wrapper can use: does the hard-gate report deny it, and is the quality
+        picture disqualified.  Unknown is not a refusal — this blocks tokens we
+        looked at and rejected, never ones we simply have not measured.
+        """
+
+        report = self._gate_reports.get(mint)
+        if report is not None and report.classify() == UNSAFE_MOMENTUM:
+            return True
+        quality = self._quality_scores.get(mint)
+        return bool(quality is not None and quality.disqualified)
 
     def _guard_publication(self, alert: FastAlert) -> FastAlert:
         """No card of any kind interrupts a human on behalf of a copy (v2.47).

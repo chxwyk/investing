@@ -383,3 +383,99 @@ def test_an_invalid_answer_is_refused_at_construction() -> None:
 
     with pytest.raises(ValueError):
         GateResult(gate=SELL_ROUTE_OK, answer="PROBABLY")
+
+
+# ===========================================================================
+# 3. v2.53 — the guard moved to the object, not the call sites
+# ===========================================================================
+
+
+def test_every_card_notification_is_wrapped_rather_than_each_call_site() -> None:
+    """Specification test 37, and the reason it is structural.
+
+    v2.51 covered the FastAlert family. An audit for this release found
+    thirteen further call sites reaching the notifier directly — runner alerts,
+    callouts, watches, signals — every one a card an operator acts on. Fixing
+    them individually would leave the fourteenth to be found later, which is
+    the entire history of this bug.
+
+    So the engine holds one notifier and it is the guarded one. A builder
+    cannot opt out because there is nothing else to call.
+    """
+
+    import asyncio
+
+    from smart_money_bot.engine import GUARDED_NOTIFICATIONS, GuardedNotifier
+
+    calls: list[str] = []
+
+    class _Inner:
+        async def on_runner_alert(self, candidate):
+            calls.append("on_runner_alert")
+            return True
+
+        async def on_coin_callout(self, callout):
+            calls.append("on_coin_callout")
+            return True
+
+        async def on_error(self, context, error):
+            calls.append("on_error")
+            return True
+
+    class _Engine:
+        def __init__(self, refuse: bool) -> None:
+            self._refuse = refuse
+
+        def _refuses_publication(self, mint: str) -> bool:
+            return self._refuse
+
+    from types import SimpleNamespace
+
+    candidate = SimpleNamespace(mint=MINT)
+
+    allowed = GuardedNotifier(_Inner(), _Engine(refuse=False))
+    assert asyncio.run(allowed.on_runner_alert(candidate)) is True
+    assert calls == ["on_runner_alert"]
+
+    calls.clear()
+    refused = GuardedNotifier(_Inner(), _Engine(refuse=True))
+    assert asyncio.run(refused.on_runner_alert(candidate)) is False
+    assert asyncio.run(refused.on_coin_callout(candidate)) is False
+    assert calls == [], "a refused mint must not reach the notifier at all"
+    assert refused.refused["on_runner_alert"] == 1
+
+    # Errors are never withheld: suppressing a failure report protects nobody.
+    assert "on_error" not in GUARDED_NOTIFICATIONS
+    assert asyncio.run(refused.on_error("ctx", RuntimeError("x"))) is True
+    assert calls == ["on_error"]
+
+
+def test_the_engine_holds_the_guarded_notifier_and_not_the_raw_one() -> None:
+    import smart_money_bot.engine as engine_module
+
+    source = inspect.getsource(engine_module.SmartMoneyEngine.__init__)
+    assert "GuardedNotifier(" in source, "the engine can still hold an unguarded notifier"
+
+
+def test_the_wrapper_identifies_a_token_by_address_never_by_symbol() -> None:
+    from types import SimpleNamespace
+
+    from smart_money_bot.engine import _mint_of
+
+    assert _mint_of([SimpleNamespace(mint=MINT)]) == MINT
+    assert _mint_of([SimpleNamespace(token_mint=MINT)]) == MINT
+    # A symbol is not an identity, so an object carrying only one is not
+    # matched — the wrapper gives up rather than guessing.
+    assert _mint_of([SimpleNamespace(symbol="BONK")]) == ""
+    assert _mint_of([]) == ""
+
+
+def test_a_mint_nobody_measured_is_not_refused() -> None:
+    """This blocks tokens we looked at and rejected, never ones we have not
+    measured. Refusing the unmeasured would silence the bot on its first scan
+    after every restart."""
+
+    engine = object.__new__(engine_module.SmartMoneyEngine)
+    engine._gate_reports = {}
+    engine._quality_scores = {}
+    assert engine._refuses_publication(MINT) is False
