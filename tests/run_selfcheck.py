@@ -239,6 +239,7 @@ async def main() -> None:
     await check_production_hardening()
     await check_clone_defence()
     await check_direction_not_level()
+    await check_holder_truth()
 
     print(
         "SELF-CHECK PASSED: detector, scoring, database, discovery rotation, "
@@ -246,7 +247,7 @@ async def main() -> None:
         "SHADOW auto-trader, profit-optimization, early-alpha, Trending-first, "
         "trenches-intelligence, token-identity, promotion-intelligence, "
         "GMGN-integration, production-hardening, clone-defence and\n        "
-        "direction-not-level invariants"
+        "direction-not-level and holder-truth invariants"
     )
 
 
@@ -1585,6 +1586,179 @@ async def check_direction_not_level() -> None:
         "a budget-skipped candidate must still reach the watch list"
     )
     assert "EARLY_WHY_SCAN_BUDGET" in lane_source
+
+
+
+async def check_holder_truth() -> None:
+    """Holders reconstructed from Transfer logs, not read off a card.
+
+    The deploy gate for v2.53.  Two failures put it here: a card that said
+    nothing about holders for a token FOMO showed as "No holders yet", and a
+    board figure no independent source could confirm.  A provider's number is a
+    claim; a ledger is auditable.
+    """
+
+    import inspect
+    from decimal import Decimal as _Decimal
+
+    from smart_money_bot.config import Settings
+    from smart_money_bot.lab.holderledger import (
+        DEAD_ADDRESS,
+        EX_POOL,
+        EX_SYSTEM,
+        TAG_CREATOR,
+        ZERO_ADDRESS,
+        AddressRole,
+        HolderLedger,
+        TransferLog,
+        apply_logs,
+        compare_with_provider,
+        rollback_to,
+    )
+    from smart_money_bot.stocks.traction import (
+        STAGE_0_VERIFIED,
+        STAGE_1_SPARK,
+        STAGE_2_TRACTION,
+        STAGE_3_ENTRY,
+        HolderSnapshot,
+        climb,
+        measure,
+        traction_score,
+    )
+
+    token = "0x2e8c31162b855a2ffa90f6f8634643ad6f111e18"
+    pool, router, dev = "0xpool", "0xrouter", "0xdev"
+
+    def log(index, sender, recipient, value, **kw):
+        return TransferLog(
+            transaction_hash=f"0x{index:04x}", log_index=index, block_number=100 + index,
+            from_address=sender, to_address=recipient, value=_Decimal(value), **kw
+        )
+
+    roles = {
+        pool: AddressRole(address=pool, is_pool=True, is_contract=True),
+        router: AddressRole(address=router, is_system=True, is_contract=True),
+        dev: AddressRole(address=dev, tags=(TAG_CREATOR,)),
+        "0xw1": AddressRole(address="0xw1", cluster_id="F"),
+        "0xw2": AddressRole(address="0xw2", cluster_id="F"),
+        "0xw3": AddressRole(address="0xw3", cluster_id="F"),
+    }
+    logs = [
+        log(1, ZERO_ADDRESS, dev, "1000000"), log(2, dev, pool, "400000"),
+        log(3, pool, "0xalice", "5000"), log(4, pool, "0xbob", "3000"),
+        log(5, pool, router, "900"),
+        log(6, pool, "0xw1", "1000"), log(7, pool, "0xw2", "1000"),
+        log(8, pool, "0xw3", "1000"),
+        log(9, "0xalice", DEAD_ADDRESS, "5000"),
+    ]
+    ledger = apply_logs(HolderLedger(token=token), logs, roles=roles, observed_at=1)
+
+    # 1. Balances reconstruct exactly, and burn/zero are not holders.
+    assert ledger.balance_of(dev) == _Decimal("600000")
+    assert ledger.balance_of("0xalice") == _Decimal("0")
+    assert ledger.total_burned == _Decimal("5000")
+
+    # 2. Machinery is excluded from economic holders and KEPT in raw, so every
+    #    exclusion stays auditable rather than being a matter of trust.
+    assert pool in ledger.raw_holders and router in ledger.raw_holders
+    assert ledger.exclusion_for(pool) == EX_POOL
+    assert ledger.exclusion_for(router) == EX_SYSTEM
+    economic = ledger.economic_holders()
+    assert pool not in economic and router not in economic and "0xalice" not in economic
+
+    # 3. Three wallets on one funder are one holder.
+    assert len([item for item in economic if item.startswith("0xw")]) == 1
+
+    # 4. Excluding the pool must not erase the creator's exposure — that would
+    #    be the protection quietly undoing itself.
+    assert ledger.tagged_balance(TAG_CREATOR) == _Decimal("600000")
+
+    # 5. Replays are idempotent and reorgs roll back.
+    assert apply_logs(ledger, logs).balances == ledger.balances
+    rolled = rollback_to(ledger, block_number=104, logs=logs)
+    assert rolled.last_block == 104 and rolled.balance_of(router) == _Decimal("0")
+
+    # 6. A provider may corroborate; it may never overrule.
+    assert compare_with_provider(ledger, 265).conflict is True
+    assert compare_with_provider(ledger, len(economic) + 2).conflict is False
+
+    # 7. The ladder climbs at the moment the evidence supported it, which is
+    #    the SOL-on-INDA regression: something visible at 25 holders rather
+    #    than silence until 100.
+    launch = 1_700_000_000 - 900
+
+    def snap(at, holders, buyers, sellers, liquidity, volume="50000"):
+        return HolderSnapshot(
+            at=at, economic_holders=holders, raw_holders=holders + 4,
+            independent_buyers=buyers, independent_sellers=sellers,
+            liquidity_usd=_Decimal(liquidity), cluster_adjusted_top10=_Decimal("0.30"),
+            volume_usd=_Decimal(volume),
+        )
+
+    series = [
+        snap(launch + 60, 6, 4, 0, "3000", "2000"),
+        snap(launch + 300, 28, 12, 2, "11000", "18000"),
+        snap(launch + 600, 62, 24, 6, "17000", "40000"),
+        snap(launch + 900, 124, 41, 11, "26000", "90000"),
+    ]
+    reached = []
+    for index, age in enumerate((60, 300, 600, 900)):
+        subset = series[: index + 1]
+        reached.append(
+            climb(
+                subset[-1], measure(subset, launched_at=launch, now=subset[-1].at),
+                age_seconds=age,
+            ).stage
+        )
+    assert reached == [STAGE_0_VERIFIED, STAGE_1_SPARK, STAGE_2_TRACTION, STAGE_3_ENTRY], reached
+
+    # 7b. Each floor must bite on its own. The climb above has several rungs
+    #     failing at once, so it cannot prove any single one: these isolate the
+    #     holder floor with everything else already satisfied.
+    only_holders_short = snap(launch + 900, 6, 40, 10, "26000")
+    assert climb(
+        only_holders_short, measure(series, launched_at=launch, now=launch + 900),
+        age_seconds=900,
+    ).stage == STAGE_0_VERIFIED, "the scout holder floor is not firing"
+    only_buyers_short = snap(launch + 900, 140, 3, 10, "26000")
+    assert climb(
+        only_buyers_short, measure(series, launched_at=launch, now=launch + 900),
+        age_seconds=900,
+    ).stage == STAGE_0_VERIFIED, "the scout buyer floor is not firing"
+
+    # 8. A contested holder count supports no claim built on holders.
+    conflicted = climb(
+        series[-1], measure(series, launched_at=launch, now=launch + 900),
+        age_seconds=900, holder_conflict=True,
+    )
+    assert conflicted.stage == STAGE_0_VERIFIED
+
+    # 9. The traction score ranks verified watches; it cannot open a rung.
+    ladder_source = inspect.getsource(climb)
+    assert "traction_score" not in ladder_source
+    score, breakdown = traction_score(series[-1], measure(series, now=launch + 900), organic=True)
+    assert score > 0 and len(breakdown) == 6
+
+    # 10. Every rung is configuration, and the ladder cannot be inverted.
+    fields = set(Settings.__dataclass_fields__)
+    for name in (
+        "stonks_scout_min_economic_holders",
+        "stonks_traction_min_holder_growth_pct_15m",
+        "stonks_entry_max_cluster_top10_pct",
+    ):
+        assert name in fields
+    assert "config_from_settings" in inspect.getsource(
+        __import__("smart_money_bot.stocks.traction", fromlist=["x"])
+    )
+
+    # 11. Neither module can fetch, persist or spend.
+    import smart_money_bot.lab.holderledger as ledger_module
+    import smart_money_bot.stocks.traction as traction_module
+
+    for module in (ledger_module, traction_module):
+        source = inspect.getsource(module)
+        for forbidden in ("import aiohttp", "aiosqlite", "private_key", "send_transaction"):
+            assert forbidden not in source, module.__name__
 
 
 

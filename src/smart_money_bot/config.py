@@ -446,6 +446,29 @@ class Settings:
     #: near-tied coins do not flap the alert.
     stonks_crown_hysteresis: Decimal
 
+    # --- the holder/traction ladder (v2.53) ------------------------------
+    # Starting points to calibrate against forward outcomes, not laws.  They
+    # live here rather than inline precisely so they can be moved without
+    # editing decision code — and so an operator can see what the bot is
+    # actually asking for before it asks.
+    stonks_scout_min_economic_holders: int
+    stonks_scout_min_independent_buyers: int
+    stonks_scout_min_independent_sellers: int
+    stonks_scout_min_liquidity_usd: Decimal
+    stonks_scout_max_cluster_top10_pct: Decimal
+    stonks_traction_min_economic_holders: int
+    stonks_traction_min_independent_buyers: int
+    stonks_traction_min_independent_sellers: int
+    stonks_traction_min_holder_delta_5m: int
+    stonks_traction_min_holder_growth_pct_15m: Decimal
+    stonks_traction_min_liquidity_usd: Decimal
+    stonks_traction_max_cluster_top10_pct: Decimal
+    stonks_entry_min_economic_holders: int
+    stonks_entry_min_independent_buyers: int
+    stonks_entry_min_independent_sellers: int
+    stonks_entry_min_liquidity_usd: Decimal
+    stonks_entry_max_cluster_top10_pct: Decimal
+
     #: Only GMGN Trending may produce a card (v2.49).
     #:
     #: The operator's instruction, in their words: *"just start focusing on
@@ -982,6 +1005,43 @@ class Settings:
             stonks_long_factory=_str("STONKS_LONG_FACTORY", ""),
             stonks_long_digest=_str("STONKS_LONG_BYTECODE_SHA256", ""),
             stonks_crown_hysteresis=_decimal("STONKS_CROWN_HYSTERESIS", "1.15"),
+            stonks_scout_min_economic_holders=_int("STONKS_SCOUT_MIN_ECONOMIC_HOLDERS", 25),
+            stonks_scout_min_independent_buyers=_int("STONKS_SCOUT_MIN_INDEPENDENT_BUYERS", 10),
+            stonks_scout_min_independent_sellers=_int(
+                "STONKS_SCOUT_MIN_INDEPENDENT_SELLERS", 2
+            ),
+            stonks_scout_min_liquidity_usd=_decimal("STONKS_SCOUT_MIN_LIQUIDITY_USD", "10000"),
+            stonks_scout_max_cluster_top10_pct=_decimal(
+                "STONKS_SCOUT_MAX_CLUSTER_ADJUSTED_TOP10_PCT", "70"
+            ),
+            stonks_traction_min_economic_holders=_int(
+                "STONKS_TRACTION_MIN_ECONOMIC_HOLDERS", 50
+            ),
+            stonks_traction_min_independent_buyers=_int(
+                "STONKS_TRACTION_MIN_INDEPENDENT_BUYERS", 20
+            ),
+            stonks_traction_min_independent_sellers=_int(
+                "STONKS_TRACTION_MIN_INDEPENDENT_SELLERS", 5
+            ),
+            stonks_traction_min_holder_delta_5m=_int("STONKS_TRACTION_MIN_HOLDER_DELTA_5M", 10),
+            stonks_traction_min_holder_growth_pct_15m=_decimal(
+                "STONKS_TRACTION_MIN_HOLDER_GROWTH_PCT_15M", "25"
+            ),
+            stonks_traction_min_liquidity_usd=_decimal(
+                "STONKS_TRACTION_MIN_LIQUIDITY_USD", "15000"
+            ),
+            stonks_traction_max_cluster_top10_pct=_decimal(
+                "STONKS_TRACTION_MAX_CLUSTER_ADJUSTED_TOP10_PCT", "60"
+            ),
+            stonks_entry_min_economic_holders=_int("STONKS_ENTRY_MIN_ECONOMIC_HOLDERS", 100),
+            stonks_entry_min_independent_buyers=_int("STONKS_ENTRY_MIN_INDEPENDENT_BUYERS", 30),
+            stonks_entry_min_independent_sellers=_int(
+                "STONKS_ENTRY_MIN_INDEPENDENT_SELLERS", 8
+            ),
+            stonks_entry_min_liquidity_usd=_decimal("STONKS_ENTRY_MIN_LIQUIDITY_USD", "20000"),
+            stonks_entry_max_cluster_top10_pct=_decimal(
+                "STONKS_ENTRY_MAX_CLUSTER_ADJUSTED_TOP10_PCT", "40"
+            ),
             gmgn_trending_only=_bool("GMGN_TRENDING_ONLY", True),
             gmgn_early_lane_per_scan=_int("GMGN_EARLY_LANE_PER_SCAN", 60),
             gmgn_early_lane_concurrency=_int("GMGN_EARLY_LANE_CONCURRENCY", 8),
@@ -1467,6 +1527,46 @@ class Settings:
             raise ValueError("STONKS_CONFIRMATIONS must be between 0 and 64")
         if not 0 <= self.stonks_backfill_blocks <= 5_000_000:
             raise ValueError("STONKS_BACKFILL_BLOCKS must be between 0 and 5000000")
+        # The ladder must actually be a ladder: each rung at least as demanding
+        # as the one below it. A misconfiguration that inverted them would let
+        # a token reach Entry without passing Traction.
+        for name, rungs in (
+            ("economic holders", (
+                self.stonks_scout_min_economic_holders,
+                self.stonks_traction_min_economic_holders,
+                self.stonks_entry_min_economic_holders,
+            )),
+            ("independent buyers", (
+                self.stonks_scout_min_independent_buyers,
+                self.stonks_traction_min_independent_buyers,
+                self.stonks_entry_min_independent_buyers,
+            )),
+            ("independent sellers", (
+                self.stonks_scout_min_independent_sellers,
+                self.stonks_traction_min_independent_sellers,
+                self.stonks_entry_min_independent_sellers,
+            )),
+            ("liquidity", (
+                self.stonks_scout_min_liquidity_usd,
+                self.stonks_traction_min_liquidity_usd,
+                self.stonks_entry_min_liquidity_usd,
+            )),
+        ):
+            if not rungs[0] <= rungs[1] <= rungs[2]:
+                raise ValueError(
+                    f"STONKS {name} thresholds must not decrease from scout to entry: {rungs}"
+                )
+        for name, ceilings in (
+            ("cluster-adjusted top 10", (
+                self.stonks_scout_max_cluster_top10_pct,
+                self.stonks_traction_max_cluster_top10_pct,
+                self.stonks_entry_max_cluster_top10_pct,
+            )),
+        ):
+            if not ceilings[0] >= ceilings[1] >= ceilings[2]:
+                raise ValueError(
+                    f"STONKS {name} ceilings must not increase from scout to entry: {ceilings}"
+                )
         if self.stonks_crown_hysteresis < 1:
             raise ValueError("STONKS_CROWN_HYSTERESIS must be at least 1")
         if not self.stonks_research_only:

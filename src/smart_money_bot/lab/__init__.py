@@ -184,6 +184,16 @@ from .forward import (
     measure_families,
     should_ping,
 )
+from .holderledger import (
+    HOLDER_DATA_CONFLICT,
+    AddressRole,
+    HolderLedger,
+    LedgerConfig,
+    TransferLog,
+    apply_logs,
+    compare_with_provider,
+    rollback_to,
+)
 from .identity import NO_DESCRIPTION, TokenIdentity, build_token_identity, safe_image_url
 from .lifecycle import (
     LIFECYCLE_STATES,
@@ -540,6 +550,14 @@ __all__ = [
     "COUNTERFACTUAL_POLICIES",
     "CURATED_ACCOUNTS",
     "AMBIGUOUS",
+    "HOLDER_DATA_CONFLICT",
+    "AddressRole",
+    "HolderLedger",
+    "LedgerConfig",
+    "TransferLog",
+    "apply_logs",
+    "compare_with_provider",
+    "rollback_to",
     "CatalystAlert",
     "CloneConfig",
     "CloneVerdict",
