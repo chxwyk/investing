@@ -1272,9 +1272,40 @@ async def check_clone_defence() -> None:
 
     # 6. An unmeasured token never wins by being unknown, and is never called
     #    thin either — "we could not look" is not "there is nothing there".
-    blind = TokenFacts(mint="x", name="X", symbol="X", liquidity_usd=_Decimal("20000"))
+    #    v2.52 carves out exactly one exception: holders must be READ.
+    blind = TokenFacts(
+        mint="x", name="X", symbol="X", liquidity_usd=_Decimal("20000"), holder_count=40
+    )
     assert score_quality(blind).confident() is False
     assert score_quality(blind).weak() is False
+
+    # 6b. v2.52.  A token whose holder count was never read cannot ping.  The
+    #     refusal used to fire only on a number we had, so an empty count
+    #     skipped it entirely — which is how a card went out for a mint FOMO
+    #     was showing as "No holders yet". Unknown was authorising.
+    unread = TokenFacts(
+        mint="6z7vHjwmN92KTVzf6YKU8yDcF8Za5HCYtjbgUNypujwP",
+        name="Dr. Moonerno", symbol="Moonerno", age_seconds=120,
+        liquidity_usd=_Decimal("29330"), market_cap_usd=_Decimal("136250"),
+        buys=487, sells=513, price_change_5m_percent=_Decimal("226.00"),
+    )
+    unread_score = score_quality(unread)
+    assert unread_score.holder_count is None
+    assert unread_score.disqualified is False, "not knowing is not evidence of harm"
+    assert unread_score.weak() is True, "an unread holder count must not authorise a ping"
+    # And the count is actually fetched before scoring, from the GMGN cache
+    # that every board row populates.
+    lane_source = inspect.getsource(SmartMoneyEngine._early_lane_task)
+    assert lane_source.index("_holder_count") < lane_source.index("_quality_check")
+    assert "_token_facts" in inspect.getsource(SmartMoneyEngine._holder_count)
+
+    # 6c. Every card links to GMGN by exact mint — the operator trades there,
+    #     and a link built from a ticker would send them to whichever token
+    #     claimed the name.
+    links_source = inspect.getsource(fast_alerts_module._links)
+    assert "GMGN" in links_source
+    assert "gmgn.ai/sol/token/" in fast_alerts_module.GMGN_TOKEN_URL
+    assert "{mint}" in fast_alerts_module.GMGN_TOKEN_URL, "built from the address, not a ticker"
 
     # 7. Ranking, not feed order.  A real runner behind two hundred dead
     #    launches was the 424-second alert.
@@ -1495,11 +1526,13 @@ async def check_direction_not_level() -> None:
     # 4. A sixty-second-old token is thin because it is EARLY, which is the
     #    moment the operator asked to hear about it.  The score bar must not
     #    withhold anything from a token we could not properly see.
+    #    A real early token has holders even at sixty seconds, and v2.52 makes
+    #    the engine fetch that count before scoring, so the fixture carries one.
     grok = TokenFacts(
         mint="GROKmint", name="Grok Pocket", symbol="GROK", age_seconds=60,
         liquidity_usd=_Decimal("6900"), volume_usd=_Decimal("5200"),
         market_cap_usd=_Decimal("31180"), buys=26, sells=6,
-        price_change_5m_percent=_Decimal("14"),
+        price_change_5m_percent=_Decimal("14"), holder_count=34,
     )
     early = score_quality(grok)
     assert early.disqualified is False
