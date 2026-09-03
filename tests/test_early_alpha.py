@@ -154,6 +154,15 @@ async def engine_for(settings, tmp_path, name: str = "early.db"):
     )
     engine.notifier = _Notifier()
     await engine.database.connect()
+
+    # v2.52: a ping now requires the holder count to have been READ. In
+    # production the early lane fetches it (GMGN board row, Trending entry, or
+    # on-chain); these fixtures have no live source, so one is supplied. Tests
+    # that care about the *absence* of holders override this.
+    async def _holders(mint, *, now):
+        return 120
+
+    engine._holder_count = _holders
     return engine
 
 

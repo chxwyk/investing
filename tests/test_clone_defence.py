@@ -389,8 +389,11 @@ def test_only_a_token_we_could_see_clearly_is_ever_called_weak() -> None:
         volume_usd=Decimal("10"),
         buys=1,
         sells=0,
+        # v2.52: holders are the one field that must be READ rather than merely
+        # unobjectionable, so a fixture standing for "thin but real" has to
+        # carry one. See the dedicated test below for the unknown case.
+        holder_count=40,
     )
-    assert dex_only is not None
     assert score_quality(dex_only).weak() is False
 
     measured_and_dead = TokenFacts(
@@ -1207,6 +1210,9 @@ def test_an_early_thin_token_is_still_allowed_to_ping() -> None:
         buys=26,
         sells=6,
         price_change_5m_percent=Decimal("14"),
+        # A real early token has holders even at sixty seconds; the engine now
+        # fetches the count before scoring rather than leaving it unknown.
+        holder_count=34,
     )
     score = score_quality(grok_pocket)
     assert score.disqualified is False
@@ -1717,3 +1723,76 @@ def test_every_card_builder_is_covered_by_one_choke_point() -> None:
     # what let the promotion cards through.
     assert "_quality_scores" in guard
     assert "disqualified" in guard
+
+
+# ===========================================================================
+# 13. v2.52 — unknown holders were acting as permission
+# ===========================================================================
+
+
+def test_a_token_whose_holder_count_was_never_read_cannot_ping() -> None:
+    """Dr. Moonerno: the card pinged, FOMO showed "No holders yet".
+
+    The holder refusal only ever fired on a number we had, so a token whose
+    holder count came back empty skipped it entirely and pinged on the strength
+    of everything else. Unknown was authorising — the same mistake the gate
+    model exists to prevent, in the one place that predates it.
+    """
+
+    moonerno = TokenFacts(
+        mint="6z7vHjwmN92KTVzf6YKU8yDcF8Za5HCYtjbgUNypujwP",
+        name="Dr. Moonerno",
+        symbol="Moonerno",
+        age_seconds=120,
+        liquidity_usd=Decimal("29330"),
+        market_cap_usd=Decimal("136250"),
+        buys=487,
+        sells=513,
+        price_change_5m_percent=Decimal("226.00"),
+        holder_count=None,
+    )
+    score = score_quality(moonerno)
+
+    # Not condemned — we genuinely do not know — but it cannot interrupt.
+    assert score.disqualified is False
+    assert score.weak() is True
+    assert _card(quality=score).ping is False
+    assert any("holder count unverified" in item for item in score.concerns)
+
+
+def test_the_same_token_with_holders_read_is_judged_on_the_number() -> None:
+    base = dict(
+        mint="6z7vHjwmN92KTVzf6YKU8yDcF8Za5HCYtjbgUNypujwP",
+        name="Dr. Moonerno", symbol="Moonerno", age_seconds=120,
+        liquidity_usd=Decimal("29330"), market_cap_usd=Decimal("136250"),
+        buys=487, sells=513, price_change_5m_percent=Decimal("226.00"),
+    )
+    empty = score_quality(TokenFacts(**base, holder_count=0))
+    assert empty.disqualified is True
+    assert "0 holders" in empty.disqualifiers[0]
+
+    real = score_quality(TokenFacts(**base, holder_count=260))
+    assert real.disqualified is False
+    assert real.weak() is False
+
+
+def test_the_engine_looks_for_a_holder_count_before_scoring() -> None:
+    import smart_money_bot.engine as engine_module
+
+    lane = inspect.getsource(engine_module.SmartMoneyEngine._early_lane_task)
+    assert "_holder_count" in lane
+    assert lane.index("_holder_count") < lane.index("_quality_check")
+
+    # And the lookup consults the GMGN facts cache, which is where a
+    # GMGN-discovered token's holder count actually lives.
+    lookup = inspect.getsource(engine_module.SmartMoneyEngine._holder_count)
+    assert "_token_facts" in lookup
+
+
+def test_every_card_links_to_gmgn_by_exact_mint() -> None:
+    # The operator trades there. Built from the address, never a ticker — a
+    # link assembled from a symbol sends them to whichever token claimed it.
+    alert = _card()
+    body = alert.spec.description + "\n".join(f.value for f in alert.spec.fields)
+    assert f"https://gmgn.ai/sol/token/{REAL_MINT}" in body
+    assert "[GMGN]" in body

@@ -147,6 +147,19 @@ class QualityConfig:
     disqualify_sell_pressure: Decimal = Decimal("3")
     #: Fewer holders than this is not a market yet.
     disqualify_holders: int = 10
+    #: A ping requires the holder count to have been *read*, not merely to be
+    #: unobjectionable (v2.52).
+    #:
+    #: The refusal above only ever fired on a number we had. A token whose
+    #: holder count came back empty skipped it entirely and pinged on the
+    #: strength of everything else — which is how a card went out for a mint
+    #: that FOMO showed with "No holders yet". Unknown was acting as
+    #: permission, which is the same mistake the gate model exists to prevent,
+    #: in the one place that predates it.
+    #:
+    #: This does not hide such a token: it still publishes, and the card says
+    #: the holder count is unverified. It simply cannot interrupt anybody.
+    require_verified_holders: bool = True
     #: A collapse this steep inside the freshest window is a chart falling
     #: over, not a dip to buy.
     disqualify_momentum_percent: Decimal = Decimal("-40")
@@ -236,6 +249,11 @@ class QualityScore:
         """
 
         if self.disqualified:
+            return True
+        if config.require_verified_holders and self.holder_count is None:
+            # We never read how many people hold this. That is not evidence of
+            # anything bad, and it is not evidence of anything good either —
+            # so the card goes out and the ping does not.
             return True
         return self.confident(config=config) and self.score < config.ping_min_score
 
@@ -436,6 +454,8 @@ def score_quality(
         if value is not None and value >= bad:
             concerns.append(f"{label} at {(value * HUNDRED).quantize(CENT)}%")
 
+    if facts.holder_count is None and config.require_verified_holders:
+        concerns.append("holder count unverified — cannot confirm anyone holds this")
     if momentum is not None and momentum >= config.momentum_target_percent:
         reasons.append(f"+{momentum}% and still moving")
     elif momentum is not None and momentum < ZERO:

@@ -1979,6 +1979,15 @@ class SmartMoneyEngine:
                 now=now,
             )
         )
+        # The operator's instruction, and it is the right one: verify that
+        # somebody actually holds this before interrupting them about it.  A
+        # DEX pair cannot say, so the count is fetched from whichever source
+        # can — and when none can, the card still publishes and the ping does
+        # not.
+        if facts.holder_count is None:
+            holders = await self._holder_count(mint, now=now)
+            if holders is not None:
+                facts = self._note_token_facts(replace(facts, holder_count=holders))
         clone = await self._clone_check(facts)
         quality = self._quality_check(facts)
         if clone.suspected_clone:
@@ -2820,6 +2829,21 @@ class SmartMoneyEngine:
             entry = self.trending.entry_for(mint)
             if entry is not None:
                 count = entry.holder_count
+        if count is None:
+            # v2.52.  The GMGN board publishes a holder count on every row and
+            # this method never looked at it, so a GMGN-discovered token had no
+            # holder count anywhere in the system — and the holder refusal only
+            # fires on a number we have. That is how a card went out for a mint
+            # FOMO was showing as "No holders yet".
+            with suppress(Exception):
+                facts = self._token_facts.get(mint)
+                if facts is not None:
+                    count = facts.holder_count
+        if count is None:
+            with suppress(Exception):
+                snapshot = await self.pump_chain.holder_snapshot(mint, at=now)
+                if snapshot.holder_count:
+                    count = int(snapshot.holder_count)
         if count is None:
             return None
         series = self._holder_series.get(mint) or HolderSeries(mint=mint)

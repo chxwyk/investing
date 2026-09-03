@@ -358,9 +358,16 @@ def discovery_line(sources: Any, *, interval: str = "") -> str:
     return primary + (" • " + " • ".join(others) if others else "")
 
 
+#: The operator's own trading surfaces, keyed by exact mint.  Every one of
+#: these is built from the address and nothing else — a link assembled from a
+#: ticker would send them to whichever token happened to claim the name.
+GMGN_TOKEN_URL = "https://gmgn.ai/sol/token/{mint}"
+
+
 def _links(mint: str, fomo_url: str) -> str:
     return (
-        f"[FOMO]({fomo_url}) • [PUMP.FUN](https://pump.fun/coin/{mint}) • "
+        f"[FOMO]({fomo_url}) • [GMGN]({GMGN_TOKEN_URL.format(mint=mint)}) • "
+        f"[PUMP.FUN](https://pump.fun/coin/{mint}) • "
         f"[DEX](https://dexscreener.com/solana/{mint}) • "
         f"[SOLSCAN](https://solscan.io/token/{mint})"
     )
