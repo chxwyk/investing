@@ -161,6 +161,8 @@ def test_a_guarded_card_is_the_one_that_gets_sent() -> None:
     engine._clone_verdicts = {}
     engine._gate_reports = {}
     engine.gate_refusals = 0
+    # v2.54: the publish path re-derives every headline from the evidence.
+    engine.headline_rewrites = 0
     engine.refused_publications = 0
 
     alert = fa.FastAlert(

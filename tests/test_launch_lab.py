@@ -245,6 +245,8 @@ def _engine_for_launch(settings, *, balance=Decimal("0.03"), reserved=True):
     engine._quality_scores = {}
     engine._gate_reports = {}
     engine.gate_refusals = 0
+    # v2.54: the publish path re-derives every headline from the evidence.
+    engine.headline_rewrites = 0
     engine.clone_suppressed = 0
     engine.collision_suppressed = 0
     engine.thin_quality_suppressed = 0

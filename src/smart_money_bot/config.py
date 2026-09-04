@@ -469,6 +469,27 @@ class Settings:
     stonks_entry_min_liquidity_usd: Decimal
     stonks_entry_max_cluster_top10_pct: Decimal
 
+    # --- what a round trip may cost before it stops being an opportunity ----
+    #: v2.54.  These are the numbers the two screenshot cards failed on, and
+    #: they were failing silently: both printed the cost *and* a larger
+    #: modelled "expected net edge" beside it, so a 14.49% round trip read as a
+    #: detail underneath a +26.53% opportunity.  A cost is arithmetic on a real
+    #: quote; an edge is a model.  They are not comparable numbers and the
+    #: card no longer presents them as though they were.
+    entry_max_price_impact_pct: Decimal
+    entry_max_round_trip_cost_pct: Decimal
+    entry_min_liquidity_usd: Decimal
+    entry_quote_max_age_seconds: int
+    entry_liquidity_stability_min_seconds: int
+
+    # --- when a move stops being a move and becomes an exit -----------------
+    #: Calibrated in ``/fomo lab``; never weakened automatically in production.
+    risk_off_max_drawdown_1m_pct: Decimal
+    risk_off_max_drawdown_2m_pct: Decimal
+    risk_off_max_liquidity_drop_2m_pct: Decimal
+    risk_off_max_clustered_sell_share_pct: Decimal
+    risk_off_max_creator_cluster_sell_share_pct: Decimal
+
     #: Only GMGN Trending may produce a card (v2.49).
     #:
     #: The operator's instruction, in their words: *"just start focusing on
@@ -1042,6 +1063,24 @@ class Settings:
             stonks_entry_max_cluster_top10_pct=_decimal(
                 "STONKS_ENTRY_MAX_CLUSTER_ADJUSTED_TOP10_PCT", "40"
             ),
+            entry_max_price_impact_pct=_decimal("ENTRY_MAX_PRICE_IMPACT_PCT", "2.0"),
+            entry_max_round_trip_cost_pct=_decimal("ENTRY_MAX_ROUND_TRIP_COST_PCT", "5.0"),
+            entry_min_liquidity_usd=_decimal("ENTRY_MIN_LIQUIDITY_USD", "20000"),
+            entry_quote_max_age_seconds=_int("ENTRY_QUOTE_MAX_AGE_SECONDS", 20),
+            entry_liquidity_stability_min_seconds=_int(
+                "ENTRY_LIQUIDITY_STABILITY_MIN_SECONDS", 120
+            ),
+            risk_off_max_drawdown_1m_pct=_decimal("RISK_OFF_MAX_DRAWDOWN_1M_PCT", "15"),
+            risk_off_max_drawdown_2m_pct=_decimal("RISK_OFF_MAX_DRAWDOWN_2M_PCT", "25"),
+            risk_off_max_liquidity_drop_2m_pct=_decimal(
+                "RISK_OFF_MAX_LIQUIDITY_DROP_2M_PCT", "10"
+            ),
+            risk_off_max_clustered_sell_share_pct=_decimal(
+                "RISK_OFF_MAX_CLUSTERED_SELL_SHARE_PCT", "35"
+            ),
+            risk_off_max_creator_cluster_sell_share_pct=_decimal(
+                "RISK_OFF_MAX_CREATOR_CLUSTER_SELL_SHARE_PCT", "10"
+            ),
             gmgn_trending_only=_bool("GMGN_TRENDING_ONLY", True),
             gmgn_early_lane_per_scan=_int("GMGN_EARLY_LANE_PER_SCAN", 60),
             gmgn_early_lane_concurrency=_int("GMGN_EARLY_LANE_CONCURRENCY", 8),
@@ -1567,6 +1606,44 @@ class Settings:
                 raise ValueError(
                     f"STONKS {name} ceilings must not increase from scout to entry: {ceilings}"
                 )
+        # v2.54.  A cost ceiling of zero would refuse everything and a
+        # negative one would accept everything, and both would be discovered in
+        # production rather than here.  The liquidity floor is checked the same
+        # way: it is the number that decides whether a $16.10K pool counts as a
+        # market, and setting it to nothing quietly restores the behaviour this
+        # release exists to remove.
+        for name, value in (
+            ("ENTRY_MAX_PRICE_IMPACT_PCT", self.entry_max_price_impact_pct),
+            ("ENTRY_MAX_ROUND_TRIP_COST_PCT", self.entry_max_round_trip_cost_pct),
+            ("ENTRY_MIN_LIQUIDITY_USD", self.entry_min_liquidity_usd),
+            ("RISK_OFF_MAX_DRAWDOWN_1M_PCT", self.risk_off_max_drawdown_1m_pct),
+            ("RISK_OFF_MAX_DRAWDOWN_2M_PCT", self.risk_off_max_drawdown_2m_pct),
+            ("RISK_OFF_MAX_LIQUIDITY_DROP_2M_PCT", self.risk_off_max_liquidity_drop_2m_pct),
+            (
+                "RISK_OFF_MAX_CLUSTERED_SELL_SHARE_PCT",
+                self.risk_off_max_clustered_sell_share_pct,
+            ),
+            (
+                "RISK_OFF_MAX_CREATOR_CLUSTER_SELL_SHARE_PCT",
+                self.risk_off_max_creator_cluster_sell_share_pct,
+            ),
+        ):
+            if value <= 0:
+                raise ValueError(f"{name} must be greater than zero")
+        for name, seconds in (
+            ("ENTRY_QUOTE_MAX_AGE_SECONDS", self.entry_quote_max_age_seconds),
+            (
+                "ENTRY_LIQUIDITY_STABILITY_MIN_SECONDS",
+                self.entry_liquidity_stability_min_seconds,
+            ),
+        ):
+            if seconds <= 0:
+                raise ValueError(f"{name} must be greater than zero")
+        if self.risk_off_max_drawdown_1m_pct > self.risk_off_max_drawdown_2m_pct:
+            raise ValueError(
+                "RISK_OFF_MAX_DRAWDOWN_1M_PCT must not exceed the two-minute limit: "
+                f"{self.risk_off_max_drawdown_1m_pct} > {self.risk_off_max_drawdown_2m_pct}"
+            )
         if self.stonks_crown_hysteresis < 1:
             raise ValueError("STONKS_CROWN_HYSTERESIS must be at least 1")
         if not self.stonks_research_only:

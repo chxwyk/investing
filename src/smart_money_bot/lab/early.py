@@ -519,8 +519,8 @@ class EarlyVerdict:
         if self.late:
             return "⚠ RUNNER — EDGE CONSUMED"
         return {
-            TIER_ORGANIC_RUNNER: "🚨 ORGANIC RUNNER — LOOK NOW",
-            TIER_EARLY_RUNNER: "🚨 EARLY RUNNER — LOOK NOW",
+            TIER_ORGANIC_RUNNER: "🚨 ORGANIC RUNNER — RESEARCH",
+            TIER_EARLY_RUNNER: "🚨 EARLY MOVER — RESEARCH",
             TIER_EARLY_HEADS_UP: "👀 EARLY HEADS-UP",
         }.get(self.tier, "NOT SURFACED")
 

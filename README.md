@@ -7,6 +7,20 @@ transactions, and mirrors every newly detected hot-wallet swap in PAPER mode. PA
 as either a forced source-price observation ledger or an executable Jupiter quote-shadow
 trial; the two answer different questions and are labeled separately.
 
+Version 2.54.0 takes the headline away from the builders. A card reading **🔥 WATCH —
+HEATING UP** above its own body saying `Safety: UNKNOWN • Route: UNKNOWN • Independent
+notable wallets: 0` was telling the operator two opposite things and letting the louder one
+win, and the title was a hardcoded string that nothing about the evidence ever reached. The
+verdict is now computed from the evidence first and the title is *derived* from the verdict,
+with no argument a builder can pass to choose one. The derivation runs at the publish choke
+point for every card, every lane, pinging or not — the previous sanitiser only ran on cards
+that wanted to ping, and the card being complained about had already been demoted to
+`ping=False`, which is how it walked past three consecutive releases of guards. Both Jupiter
+swap buttons are gone: this is a research and paper-observation system, and a one-click
+route to spending real money is not a research affordance. An "expected NET edge" is no
+longer printed beside a measured round-trip cost unless every gate passed, because a model
+with no inputs borrows the authority of the arithmetic next to it.
+
 Version 2.49.0 narrows the alerting feed to **GMGN Trending only**, by instruction. The
 trenches board contributes three sections of up to sixty rows each — New, Almost bonded,
 Migrated — of tokens minutes old, and they were landing in the same candidate list as
@@ -1205,6 +1219,156 @@ The bot needs these Discord application permissions:
 - Use Application Commands
 
 No privileged Discord gateway intents are required.
+
+## The headline is the verdict (v2.54)
+
+The operator reported the same failure three times, and three releases each fixed one call
+site. This one changes where a title comes from.
+
+### What was actually wrong
+
+Two cards from production, transcribed into `tests/test_market_integrity.py` as fixtures:
+
+```text
+🔥 WATCH — HEATING UP                 🚨 EARLY RUNNER — LOOK NOW
+Safety: UNKNOWN                       Safety: UNKNOWN
+Route: UNKNOWN                        Independent notable wallets: 0
+Independent notable wallets: 0        Move since first seen: -14.59%
+Expected NET edge: +27.52%            Expected NET edge: +26.53%
+Estimated round-trip cost: 7.27%      Estimated round-trip cost: 14.49%
+RESEARCH ONLY — NOT ENTRY ELIGIBLE    RESEARCH ONLY — NOT ENTRY ELIGIBLE
+```
+
+Three separate defects:
+
+1. **The title was a literal.** `fast_alerts.py` contained `title="🔥 WATCH — HEATING UP"`
+   four lines above the field that printed `**UNKNOWN / pending**`. No evidence reached it,
+   so it could not have said anything else.
+2. **The sanitiser was conditional.** `_guard_publication` did strip actionable language —
+   but only when the gate report denied a ping *and* the card wanted one. FAST WATCH cards
+   are built with `ping=False`, so that arm never fired for them.
+3. **The edge was a model with no inputs.** `Expected NET edge` was computed and printed
+   beside a round-trip cost taken from a real quote. The cost is arithmetic; the edge is a
+   guess. Printing them together lends the second the authority of the first, and the
+   difference between them then reads as an opportunity.
+
+### What replaces it
+
+`smart_money_bot.lab.verdict` is pure logic — no provider, no database, no signer, no order
+path. It takes a `MarketEvidence` record, which is tri-state throughout (`None` means nobody
+established it, which is a different claim from a measured `False`), and returns a
+`Decision`. Fifteen verdicts, each with a derived title:
+
+```text
+⛔ DO NOT ENTER — IDENTITY UNRESOLVED        ⛔ DO NOT ENTER — EXCESSIVE COST/IMPACT
+⛔ DO NOT ENTER — VAMP/CLONE RISK            📉 DO NOT ENTER — DISTRIBUTION/LIQUIDITY DECAY
+⛔ DO NOT ENTER — SAFETY UNKNOWN             ⛔ DO NOT ENTER — LATE/EXTENDED
+⚠ DATA INTEGRITY HOLD — MARKET DATA CONFLICT ⛔ DO NOT ENTER — SAFETY/ROUTE/INDEPENDENCE
+⚠ DATA INTEGRITY HOLD — HOLDER DATA CONFLICT     UNRESOLVED
+⚠ UNSAFE MOMENTUM — WASH/CLUSTER RISK        ⛔ DO NOT ENTER — INSUFFICIENT PROOF
+⛔ DO NOT ENTER — SELL ROUTE UNPROVEN        🔎 VERIFIED WATCH — NOT ENTRY ELIGIBLE
+📉 INVALIDATED — RISK OFF                    🧪 PAPER ENTRY CANDIDATE — ALL GATES PASS
+```
+
+The default is `DO_NOT_ENTER_INSUFFICIENT`. Optimism is earned by evidence; absence of
+evidence produces refusal rather than enthusiasm. `decide()` takes no score argument and
+`MarketEvidence` has no score field, so there is nowhere for one to enter.
+
+Gates are evaluated in the order in which things stop being worth continuing — identity,
+clone family, integrity conflicts, safety, the exit, risk-off, then everything unresolved,
+then cost. Safety sits ahead of cost deliberately: a token whose safety is unknown should be
+refused for that, not for the price of a trade nobody should be making.
+
+### Enforcement at the choke point
+
+`SmartMoneyEngine._enforce_verdict_headline` runs first in `_guard_publication`, before
+anything that can be skipped, and takes no ping argument at all — there is no state in which
+it can be bypassed. It re-derives the title from that mint's hard-gate report. **A mint with
+no gate report gets the strongest refusal of the set**: nothing looked at it, so its
+builder's wording cannot be a claim about it.
+
+The builder's wording is not discarded. Whatever survives sanitising — which lane found
+this, what kind of event it was — is kept in parentheses, because that part is information:
+
+```text
+🔥 WATCH — HEATING UP    ->  ⚠ DATA INTEGRITY HOLD — DO NOT ENTER (FAST WATCH)
+🚨 EARLY RUNNER — LOOK NOW  ->  ⛔ DO NOT ENTER — INSUFFICIENT PROOF
+🐋 SMART MONEY BUY — LOOK NOW  ->  ⛔ DO NOT ENTER — SAFETY UNKNOWN (SMART MONEY BUY)
+```
+
+`engine.headline_rewrites` counts how often this fires. It is expected to be large: most
+cards are about tokens nothing has finished checking.
+
+### Cost gates
+
+Defaults, overridable but never weakened automatically in production:
+
+```text
+ENTRY_MAX_PRICE_IMPACT_PCT=2.0
+ENTRY_MAX_ROUND_TRIP_COST_PCT=5.0
+ENTRY_MIN_LIQUIDITY_USD=20000
+ENTRY_QUOTE_MAX_AGE_SECONDS=20
+ENTRY_LIQUIDITY_STABILITY_MIN_SECONDS=120
+```
+
+Both screenshot cards fail on cost alone — 7.27% and 14.49% against a 5% maximum — and the
+failing cost is reported in the reasons rather than hidden underneath a larger invented
+gain. Where an edge is not computable the field says so:
+
+```text
+Expected NET edge  **NOT COMPUTABLE — REQUIRED EVIDENCE MISSING**
+Round-trip cost `7.27%` (measured)
+```
+
+A blank field reads as zero, and zero edge is a different claim from unknowable edge.
+
+### Risk-off
+
+```text
+RISK_OFF_MAX_DRAWDOWN_1M_PCT=15
+RISK_OFF_MAX_DRAWDOWN_2M_PCT=25
+RISK_OFF_MAX_LIQUIDITY_DROP_2M_PCT=10
+RISK_OFF_MAX_CLUSTERED_SELL_SHARE_PCT=35
+RISK_OFF_MAX_CREATOR_CLUSTER_SELL_SHARE_PCT=10
+```
+
+The third fixture is the same META token two minutes later: $169.5K to $115.1K, a 32% fall
+with liquidity falling alongside it. That is `📉 DO NOT ENTER — DISTRIBUTION/LIQUIDITY
+DECAY`, and no amount of cumulative volume or holder count keeps the earlier label — none of
+those numbers is an argument to `decide()`.
+
+### No transaction controls
+
+`_token_view` no longer renders `Buy on Jupiter` or `Sell on Jupiter`. The buy button sat
+behind a `trade_eligible` flag that **every caller in the repository passed as `False`**;
+the sell button sat behind nothing and shipped on every card, including cards whose own body
+said `Safety: UNKNOWN`. Both opened a live swap screen preloaded with the mint.
+
+The parameter went with them rather than being defaulted off: a flag that is `False` at
+every call site is not a safety feature, it is a control waiting for somebody to pass
+`True`. Inspection links all remain — Fomo, GMGN, Pump.fun, DexScreener, Solscan, and the
+configured terminal — because looking at a token is how anybody decides anything.
+
+### How this is verified
+
+`tests/test_market_integrity.py` holds all three screenshots as deterministic fixtures plus
+a control case that reaches `PAPER ENTRY CANDIDATE`, so the suite cannot be satisfied by a
+function that refuses unconditionally. Every rule was mutated out and confirmed to break a
+test: `UNKNOWN` reading as `PASS`, the cost limit widened tenfold, risk-off detection
+removed, a missing decision trusting the builder's title, `edge_is_computable` always true.
+
+There is also a repository-wide sweep. Rather than grepping for phrases — which finds the
+docstrings that promise not to use them — it walks every module's AST for the shapes a
+headline is built from (`title=`/`label=` keyword arguments, assignments to `title`, `label`
+or `state`, and values in label mappings) and fails on any promotional literal. It
+deliberately does not flag `callouts.py` or `trending/thesis.py`, which hold the vocabulary
+of hype phrases the bot looks **for** in other people's posts; detecting somebody else
+saying "ape in" is the opposite of saying it, and a sweep that flagged those would push the
+next person to delete the detector to make the test pass.
+
+Three stage labels changed with the headlines: `🔥 HEATING UP` became `🔥 ACCELERATING`, and
+the early-lane tiers dropped `— LOOK NOW`. Acceleration is a fact about price and flow;
+"heating up" describes the operator's pulse.
 
 ## Direction, not level (v2.48)
 

@@ -45,6 +45,14 @@ from .discord_render import (
     CardField,
     CardSpec,
 )
+from .lab.verdict import (
+    EDGE_NOT_COMPUTABLE,
+    FORBIDDEN_PHRASES,
+    MarketEvidence,
+    decide,
+    headline,
+    sanitize,
+)
 from .trenches.publicmodel import MODEL_CAVEAT as PUBLIC_MODEL_CAVEAT
 
 logger = logging.getLogger(__name__)
@@ -272,7 +280,10 @@ def _percent_plain(value: Decimal | None) -> str:
 
 
 #: Actionable phrases a card may only use once validation has actually passed.
-_ACTIONABLE_PHRASES: tuple[str, ...] = ("LOOK NOW", "BUY NOW", "APE", "SEND IT")
+#: One list, defined with the verdicts, so that adding a phrase in one place
+#: cannot leave a builder in another still allowed to say it.  v2.54 widened it
+#: past "LOOK NOW": the card the operator complained about said HEATING UP.
+_ACTIONABLE_PHRASES: tuple[str, ...] = FORBIDDEN_PHRASES
 
 
 def strip_actionable(title: str) -> str:
@@ -283,14 +294,14 @@ def strip_actionable(title: str) -> str:
     production case: a promotion card titled **🚨 EARLY RUNNER — LOOK NOW**
     for a token its own body reported at **-63.70% over five minutes** with
     819 sells against 765 buys.
+
+    Note what this is and is not.  It removes an instruction; it does not state
+    a verdict, and it cannot, because it is handed a string rather than
+    evidence.  Stating the verdict is :func:`~smart_money_bot.lab.verdict.
+    enforce_title`, which runs at the same choke point and takes the decision.
     """
 
-    cleaned = title
-    for phrase in _ACTIONABLE_PHRASES:
-        cleaned = cleaned.replace(f" — {phrase}", "").replace(f" - {phrase}", "")
-        cleaned = cleaned.replace(phrase, "")
-    cleaned = cleaned.strip(" —-•").strip()
-    return cleaned or "RESEARCH CANDIDATE"
+    return sanitize(title) or "RESEARCH CANDIDATE"
 
 
 def _validation_pending_title(tier_label: str, *, late: bool = False) -> str:
@@ -445,15 +456,24 @@ def build_fast_watch_alert(
             )
         )
 
+    # The title is derived from the same evidence the body prints, so the two
+    # cannot disagree.  This builder's SAFETY section is the literal string
+    # "**UNKNOWN / pending**" — a card that admits that in its body may not
+    # lead with "HEATING UP", which is what it did for eleven months.
+    # Only what this builder has actually been handed.  Everything else stays
+    # ``None`` — unmeasured, which refuses, rather than an invented ``True``.
+    watch_decision = decide(
+        MarketEvidence(token_address=mint, liquidity_usd=liquidity_usd)
+    )
     spec = CardSpec(
-        title="🔥 WATCH — HEATING UP",
+        title=headline(watch_decision, context="FAST WATCH"),
         description=(
             f"**{name}** `${symbol}`\n`{mint}`\n"
             f"MC `{_money(market_cap_usd)}` • age "
             f"`{age_seconds if age_seconds is not None else '?'}s`\n{_links(mint, fomo_url)}"
         ),
         compact_description=(
-            f"🔥 WATCH **{name}** `${symbol}`\n`{mint}`\n"
+            f"{watch_decision.title()}\n**{name}** `${symbol}`\n`{mint}`\n"
             f"MC `{_money(market_cap_usd)}` • safety UNKNOWN • RESEARCH ONLY"
         ),
         fields=tuple(fields),
@@ -508,7 +528,7 @@ def build_notable_trader_alert(
     if late:
         title = "🐋 NOTABLE TRADER BUY — LATE OBSERVATION"
     elif proven:
-        title = "🐋 KNOWN TRADER BUY — LOOK NOW"
+        title = "🐋 KNOWN TRADER BUY — FORWARD-PROVEN WALLET"
     else:
         title = "🐋 NOTABLE TRADER BUY — EARLY DATA"
     delay = trade.detection_delay_seconds
@@ -1314,11 +1334,22 @@ def enrichment_from_evidence(
     expected_net_edge_percent: Decimal | None = None,
     cost_percent: Decimal | None = None,
     provider_degraded: str = "",
+    edge_computable: bool = False,
 ) -> EnrichmentUpdate:
     """Turn arriving stage-2 evidence into an in-place card update.
 
     A degraded provider becomes an explicit ``UNKNOWN — provider unavailable``,
     never a pass, and never a reason to drop the alert that already published.
+
+    ``edge_computable`` defaults to ``False`` and has to be argued for.  The
+    card in the operator's screenshot printed **Expected NET edge +27.52%**
+    beside **round-trip cost 7.27%** for a token whose route it could not
+    confirm existed.  The cost was arithmetic on a real quote; the edge was a
+    model with no inputs.  Printing them side by side lends the second the
+    authority of the first, and the difference between them then reads as an
+    opportunity.  So the edge is shown only where every gate passed, and where
+    it is not, the field says *why* rather than going blank — a blank field
+    reads as zero, and zero edge is a different claim from unknowable edge.
     """
 
     fields: list[CardField] = []
@@ -1346,13 +1377,16 @@ def enrichment_from_evidence(
     if catalyst:
         fields.append(CardField("CATALYST", catalyst, P_WHY_SURFACED))
     if expected_net_edge_percent is not None or cost_percent is not None:
+        edge = (
+            f"`{_percent(expected_net_edge_percent)}`"
+            if edge_computable and expected_net_edge_percent is not None
+            else f"**{EDGE_NOT_COMPUTABLE}**"
+        )
+        cost = f"{cost_percent}%" if cost_percent is not None else "unknown"
         fields.append(
             CardField(
                 "ECONOMICS",
-                (
-                    f"Expected NET edge `{_percent(expected_net_edge_percent)}` • "
-                    f"round-trip cost `{cost_percent if cost_percent is not None else '?'}%`"
-                ),
+                f"Expected NET edge {edge}\nRound-trip cost `{cost}` (measured)",
                 P_EDGE,
             )
         )
@@ -1404,8 +1438,9 @@ def build_trending_alert(
 
     Every claim on it is separated from its corroboration: the About text is a
     claim, external verification is a fact, a thesis is an opinion, and the
-    Fomo verification badge is a badge.  The card is allowed to say LOOK NOW.
-    It is never allowed to say safe, guaranteed or free money (section 61).
+    Fomo verification badge is a badge.  The card is never allowed to say
+    safe, guaranteed, free money (section 61) or anything else that reads as
+    an instruction (v2.54) — its headline states a verdict or a lane.
     """
 
     velocity = getattr(event, "rank_velocity", None)
@@ -1549,11 +1584,11 @@ def build_trending_alert(
     fields.append(CardField("LINKS", _links(mint, fomo_url), P_LINKS))
 
     headline = {
-        TRENDING_ALPHA: "🔥 FOMO TRENDING — LOOK NOW",
-        TRENDING_CONTINUATION_ALERT: "🚀 TRENDING CONTINUATION — LOOK NOW",
-        TRENDING_ACCELERATION_ALERT: "🔥 TRENDING ACCELERATION — LOOK NOW",
-        OFF_TRENDING_EXCEPTION: "⚡ OFF-TRENDING EXCEPTION — LOOK NOW",
-    }.get(kind, "🔥 FOMO TRENDING — LOOK NOW")
+        TRENDING_ALPHA: "🔥 FOMO TRENDING — RESEARCH",
+        TRENDING_CONTINUATION_ALERT: "🚀 TRENDING CONTINUATION — RESEARCH",
+        TRENDING_ACCELERATION_ALERT: "🔥 TRENDING ACCELERATION — RESEARCH",
+        OFF_TRENDING_EXCEPTION: "⚡ OFF-TRENDING EXCEPTION — RESEARCH",
+    }.get(kind, "🔥 FOMO TRENDING — RESEARCH")
 
     display = f"${symbol}" if symbol else (name or "Unknown token")
     spec = CardSpec(
@@ -1693,8 +1728,8 @@ def build_trench_runner_alert(
     """The PUMP TRENCH RUNNER card (section 47).
 
     Everything on it is public or on-chain, and every uncertain field says
-    UNKNOWN rather than guessing.  It is allowed to say LOOK NOW; it is never
-    allowed to say buy, safe or guaranteed.
+    UNKNOWN rather than guessing.  It is never allowed to say buy, safe,
+    guaranteed, or anything else shaped like an instruction (v2.54).
     """
 
     lifecycle = candidate.lifecycle
@@ -1841,11 +1876,11 @@ def build_trench_runner_alert(
     fields.append(CardField("LINKS", _trench_links(mint, fomo_url), P_LINKS))
 
     headline = {
-        TRENCH_RUNNER_ALERT: "🚨 PUMP TRENCH RUNNER — LOOK NOW",
+        TRENCH_RUNNER_ALERT: "🚨 PUMP TRENCH RUNNER — RESEARCH",
         ALMOST_BONDED_ALERT: "⚡ ALMOST BONDED — MOMENTUM",
-        PUBLIC_TRENDING_ALERT: "🔥 PUBLIC TRENDING — LOOK NOW",
+        PUBLIC_TRENDING_ALERT: "🔥 PUBLIC TRENDING — RESEARCH",
         TRENCH_HEADS_UP_ALERT: "👀 TRENCH HEADS-UP",
-    }.get(kind, "🚨 PUMP TRENCH RUNNER — LOOK NOW")
+    }.get(kind, "🚨 PUMP TRENCH RUNNER — RESEARCH")
 
     display = f"${symbol}" if symbol else (name or "Unknown token")
     spec = CardSpec(
@@ -1989,7 +2024,7 @@ def build_public_trending_alert(
 
     display = f"${symbol}" if symbol else (name or "Unknown token")
     spec = CardSpec(
-        title=f"🔥 PUBLIC TRENDING — LOOK NOW • {display}",
+        title=f"🔥 PUBLIC TRENDING — RESEARCH • {display}",
         description=(
             f"`{mint}`\n"
             "**RESEARCH ONLY. MANUAL DECISION.** Nothing was bought and nothing can be."
@@ -2102,8 +2137,13 @@ def build_promotion_alert(
     families = tuple(getattr(decision, "families", ()) or ())
     reasons = tuple(getattr(decision, "reasons", ()) or ())
     trustworthy = identity_verified
+    # v2.54.  A verified identity answers one question out of thirteen.  This
+    # card used to read "🚨 EARLY RUNNER — LOOK NOW" on the strength of that
+    # single answer, above a body that went on to admit unknown safety; it is
+    # the exact headline in the operator's screenshot.  Identity now buys the
+    # right to be *named*, not the right to instruct.
     title = (
-        "🚨 EARLY RUNNER — LOOK NOW"
+        "🚨 EARLY MOVER — RESEARCH ONLY"
         if trustworthy
         else "🔬 RESEARCH CANDIDATE — IDENTITY UNVERIFIED"
     )
@@ -2346,9 +2386,9 @@ def build_gmgn_participant_alert(
             else "⚠ SMART MONEY BUY — EDGE CONSUMED"
         )
     elif is_kol:
-        title = "📣 KOL ACTIVITY — LOOK NOW"
+        title = "📣 KOL ACTIVITY — RESEARCH ONLY"
     else:
-        title = "🐋 SMART MONEY BUY — LOOK NOW"
+        title = "🐋 SMART MONEY BUY — RESEARCH ONLY"
 
     display = wallet_label or f"{wallet[:6]}…{wallet[-4:] if len(wallet) > 10 else ''}"
     current_mc = current_market_cap_usd

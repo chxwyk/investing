@@ -17,6 +17,7 @@ from smart_money_bot.config import Settings
 from smart_money_bot.constants import WRAPPED_SOL_MINT
 from smart_money_bot.database import Database
 from smart_money_bot.detector import SwapDetector
+from smart_money_bot.lab import verdict as verdict_module
 from smart_money_bot.models import (
     DetectedSwap,
     DiscoveryCandidate,
@@ -432,27 +433,31 @@ async def check_token_identity() -> None:
         sells=6,
         safety_status="UNKNOWN",
     )
-    for phrase in ("LOOK NOW", "BUY NOW", "APE", "SEND IT"):
-        assert phrase not in alert.spec.title, (
-            "an unvalidated card may not lead with actionable language"
-        )
+    assert verdict_module.contains_forbidden(alert.spec.title) == (), (
+        "an unvalidated card may not lead with actionable language"
+    )
     state = {field.name: field.value for field in alert.spec.fields}["STATE"]
     assert "Entry eligible: **NO**" in state and "Trade CTA: **DISABLED**" in state
     assert alert.trade_eligible is False
     assert watched in alert.spec.description, "the exact mint must be on the card"
 
-    view_source = inspect.getsource(bot_module._token_view)
-    assert "if trade_eligible:" in view_source, "the buy control must be gated"
-    buttons = {item.label for item in bot_module._token_view(watched).children}
-    assert "Buy on Jupiter" not in buttons
-    assert {"Open in Fomo", "Chart", "Solscan"} <= buttons, "research links always render"
-    eligible = {
-        item.label for item in bot_module._token_view(watched, trade_eligible=True).children
-    }
-    assert "Buy on Jupiter" in eligible
-    assert "trade_eligible=alert.trade_eligible" in inspect.getsource(
-        bot_module.SmartMoneyBot.on_fast_alert
-    ), "the renderer must read the gate the lane set"
+    # v2.54.  There is no buy control to gate any more.  Both Jupiter buttons
+    # are gone: the buy one sat behind a flag every caller passed as False, and
+    # the sell one sat behind nothing at all and rendered on every card,
+    # including cards whose own body said Safety: UNKNOWN.  Both opened a live
+    # swap screen preloaded with the mint, which is not a research affordance.
+    view = bot_module._token_view(watched)
+    buttons = {item.label for item in view.children}
+    urls = {item.url for item in view.children}
+    assert "trade_eligible" not in inspect.signature(bot_module._token_view).parameters, (
+        "a flag with nothing to gate is a control waiting to be re-enabled"
+    )
+    assert not any("jup.ag" in url for url in urls), "no research card may open a swap screen"
+    assert {"Buy on Jupiter", "Sell on Jupiter"}.isdisjoint(buttons)
+    assert {"Open in Fomo", "Open in GMGN", "Chart", "Solscan"} <= buttons, (
+        "research links always render"
+    )
+    assert all(watched in url for url in urls), "every link is built from the exact mint"
 
     # 5. "Organic" is a claim about who is buying, not how many trades printed.
     loud = evaluate_early_signal(
@@ -1365,6 +1370,20 @@ async def check_clone_defence() -> None:
     assert "_quality_scores" in guard_source
     assert "disqualified" in guard_source
     assert "strip_actionable" in guard_source
+    # v2.51-2.53 each guarded one more path and the promotional headline still
+    # arrived, because every arm of this guard was conditional — on a gate
+    # report existing, on the card wanting to ping.  The FAST WATCH card is
+    # built with ping=False already, so "🔥 WATCH — HEATING UP" walked past all
+    # of them.  v2.54 re-derives the title from the evidence unconditionally.
+    assert "_enforce_verdict_headline" in guard_source
+    headline_source = inspect.getsource(SmartMoneyEngine._enforce_verdict_headline)
+    assert "enforce_title" in headline_source
+    assert "ping" not in headline_source.split('"""')[2], (
+        "headline enforcement must not depend on whether the card pings"
+    )
+    assert guard_source.index("_enforce_verdict_headline") < guard_source.index(
+        "_quality_scores"
+    ), "the headline is re-derived before anything that can be skipped"
     promotion_source = inspect.getsource(SmartMoneyEngine._publish_promotion)
     assert "_quality_check" in promotion_source, (
         "the promotion path still never asks whether this is an entry"

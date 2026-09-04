@@ -527,7 +527,10 @@ def test_fast_watch_now_has_a_publishable_card() -> None:
     alert = _watch_alert()
     assert alert.kind == fa.FAST_WATCH
     embeds, _ = render_message([alert.spec])
-    assert embeds and embeds[0].title.startswith("🔥 WATCH")
+    # v2.54.  This card's own SAFETY section reads "UNKNOWN / pending", so its
+    # headline says the same thing.  It used to say "🔥 WATCH — HEATING UP".
+    assert embeds and embeds[0].title == "⚠ DATA INTEGRITY HOLD — DO NOT ENTER (FAST WATCH)"
+    assert "HEATING UP" not in embeds[0].title
 
 
 def test_a_published_fast_watch_is_never_entry_eligible() -> None:
@@ -910,6 +913,9 @@ def _engine(database, notifier, **settings):
     engine._quality_scores = {}
     engine._gate_reports = {}
     engine.gate_refusals = 0
+    # v2.54: every publish re-derives the headline from the evidence, and
+    # counts how often the builder's own wording had to be replaced.
+    engine.headline_rewrites = 0
     engine.clone_suppressed = 0
     engine.collision_suppressed = 0
     engine.thin_quality_suppressed = 0

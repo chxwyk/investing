@@ -268,7 +268,11 @@ def test_accelerating_fresh_candidate_becomes_a_watch() -> None:
     verdict = evaluate_fast_watch(_hot_signals())
     assert verdict.watch
     assert verdict.reasons
-    assert "HEATING UP" in verdict.label
+    # v2.54.  "HEATING UP" describes the operator's pulse; what this verdict
+    # established is that price and flow are accelerating, which says nothing
+    # about safety, route, or whether anybody independent is buying.
+    assert verdict.label == "WATCH — ACCELERATING"
+    assert "HEATING UP" not in verdict.label
 
 
 def test_fast_watch_is_never_entry_eligible() -> None:

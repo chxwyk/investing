@@ -55,6 +55,8 @@ async def test_no_x_candidate_alert_never_auto_launches() -> None:
     engine._quality_scores = {}
     engine._gate_reports = {}
     engine.gate_refusals = 0
+    # v2.54: the publish path re-derives every headline from the evidence.
+    engine.headline_rewrites = 0
     engine.clone_suppressed = 0
     engine.collision_suppressed = 0
     engine.thin_quality_suppressed = 0

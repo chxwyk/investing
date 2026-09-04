@@ -38,24 +38,42 @@ async def test_token_view_builds_exact_solana_coin_links() -> None:
     }
 
     assert buttons["Open in Pump.fun"].url == f"https://pump.fun/coin/{mint}"
-    # The buy CTA is gated (section 6): research links always render, the buy
-    # button only once the caller has confirmed the token is trade eligible.
-    assert "Buy on Jupiter" not in buttons
-    assert buttons["Sell on Jupiter"].url == f"https://jup.ag/swap/{mint}-SOL"
+    assert buttons["Open in GMGN"].url == f"https://gmgn.ai/sol/token/{mint}"
     assert buttons["Chart"].url == f"https://dexscreener.com/solana/{mint}"
     assert buttons["Solscan"].url == f"https://solscan.io/token/{mint}"
     assert buttons["Open in Fomo"].row == 0
     assert buttons["Open in Pump.fun"].row == 0
-    assert buttons["Sell on Jupiter"].row == 0
+    assert buttons["Open in GMGN"].row == 0
     assert buttons["Chart"].row == 1
     assert buttons["Solscan"].row == 1
 
-    eligible = {
-        item.label: item
-        for item in _token_view(mint, "WetOuterLemur", trade_eligible=True).children
-    }
-    assert eligible["Buy on Jupiter"].url == f"https://jup.ag/swap/SOL-{mint}"
-    assert eligible["Buy on Jupiter"].row == 0
+
+def test_no_research_card_carries_a_transaction_control() -> None:
+    """v2.54.  Every button opens a page that shows the operator something.
+
+    The two Jupiter buttons are gone.  ``Buy on Jupiter`` was gated behind a
+    ``trade_eligible`` flag that every caller in the repository passed as
+    ``False``, and ``Sell on Jupiter`` was gated behind nothing and shipped on
+    every card — including cards whose own body said ``Safety: UNKNOWN``.
+    Both opened a live swap screen preloaded with the mint.
+
+    The parameter went with them.  A flag that is ``False`` at every call site
+    is not a safety feature; it is a control waiting for somebody to pass
+    ``True``, which is why this test asserts against the signature and not
+    only against the rendered buttons.
+    """
+
+    import inspect
+
+    mint = "CBRRJc94xJpVnNWiMX2JemVQh7CxY2E27UnYL5tqpump"
+    labels = {item.label for item in _token_view(mint).children}
+    urls = {item.url for item in _token_view(mint).children}
+
+    assert not any("jup.ag" in url for url in urls)
+    assert not any("swap" in url.lower() for url in urls)
+    for banned in ("Buy on Jupiter", "Sell on Jupiter", "Jupiter", "Buy", "Sell"):
+        assert banned not in labels
+    assert "trade_eligible" not in inspect.signature(_token_view).parameters
 
 
 def test_news_without_contract_has_search_and_creation_links() -> None:

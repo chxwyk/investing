@@ -103,7 +103,11 @@ class FastWatchVerdict:
 
     @property
     def label(self) -> str:
-        return "WATCH — HEATING UP" if self.watch else "NOT WATCHED"
+        # v2.54.  "HEATING UP" describes the operator's pulse, not the
+        # token.  What this verdict actually established is that price and
+        # flow are accelerating, which is a fact and says nothing about
+        # safety, route or whether anybody independent is buying.
+        return "WATCH — ACCELERATING" if self.watch else "NOT WATCHED"
 
 
 def evaluate_fast_watch(

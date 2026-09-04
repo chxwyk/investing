@@ -231,6 +231,13 @@ from .lab.toptraders import (
     known_money_flow,
 )
 from .lab.venues import classify_graduation
+from .lab.verdict import (
+    cost_config_from_settings,
+    decide,
+    enforce_title,
+    evidence_from_gates,
+    risk_off_config_from_settings,
+)
 from .lab_runtime import QUALIFIED_STAGES as LAB_QUALIFIED_STAGES
 from .lab_runtime import LabEvaluation, LabRuntime
 from .lab_store import LabStore
@@ -820,6 +827,15 @@ class SmartMoneyEngine:
         # One record, one decision, every card path.
         self._gate_reports: dict[str, GateReport] = {}
         self.gate_refusals = 0
+        #: Cards whose builder-chosen headline was replaced by the verdict
+        #: derived from that mint's evidence (v2.54).  Expected to be large:
+        #: most cards are about tokens nothing has finished checking.
+        self.headline_rewrites = 0
+        # Read once at construction: the ceilings are operator configuration,
+        # and re-reading them per card would let a mid-run change apply to
+        # half a scan's decisions and not the other half.
+        self._cost_config = cost_config_from_settings(settings)
+        self._risk_off_config = risk_off_config_from_settings(settings)
         self.clone_suppressed = 0
         self.collision_suppressed = 0
         self.thin_quality_suppressed = 0
@@ -5628,6 +5644,23 @@ class SmartMoneyEngine:
 
         mint = alert.token_mint or alert.mint
 
+        # v2.54, and it runs first because it runs *unconditionally*.
+        #
+        # Everything below this is conditional — on the gate report existing,
+        # on the card wanting to ping, on the quality score being disqualified.
+        # That is exactly how "🔥 WATCH — HEATING UP" survived three releases
+        # of guards: the FAST WATCH card is built with ``ping=False`` already,
+        # so the ``not report.may_ping and alert.ping`` arm below never fired
+        # for it, and its headline reached the channel untouched above a body
+        # reading ``Safety: UNKNOWN``.  A headline is read whether or not it
+        # made a phone buzz.
+        #
+        # So the title is re-derived from the evidence here, for every card,
+        # every lane, every builder, pinging or not.  A mint with no gate
+        # report at all gets the strongest refusal of the set: nothing looked
+        # at it, so its builder's wording cannot be a claim about it.
+        alert = self._enforce_verdict_headline(alert, mint)
+
         # v2.50.  Quality first, because this is the one that was being
         # bypassed.  Every gate v2.47-2.49 added lived in ``build_early_alert``
         # and the GMGN scan loop — and the cards the operator was actually
@@ -5696,6 +5729,35 @@ class SmartMoneyEngine:
         if verdict is None or verdict.may_ping or not alert.ping:
             return alert
         return replace(alert, ping=False, lane=LANE_RADAR, symbol_collision=True)
+
+    def _enforce_verdict_headline(self, alert: FastAlert, mint: str) -> FastAlert:
+        """Re-derive the card title from the evidence, whatever the builder said.
+
+        The decision is computed from the hard-gate report for this mint, which
+        is the only record in the system that asked whether the token can
+        actually be sold.  No report means no decision, which means
+        ``DO NOT ENTER — INSUFFICIENT PROOF`` rather than the builder's opinion.
+
+        The builder's wording is not discarded: whatever survives sanitising —
+        which lane found this, what kind of event it was — is kept in
+        parentheses, because that part is information the operator uses.  Only
+        the instruction goes.
+        """
+
+        report = self._gate_reports.get(mint)
+        decision = None
+        if report is not None:
+            decision = decide(
+                evidence_from_gates(report),
+                gates=report,
+                cost=self._cost_config,
+                risk_off=self._risk_off_config,
+            )
+        title = enforce_title(alert.spec.title, decision)
+        if title == alert.spec.title:
+            return alert
+        self.headline_rewrites += 1
+        return replace(alert, spec=replace(alert.spec, title=title))
 
     def _fast_watch_rate_limited(self, now: int) -> bool:
         while self._fast_watch_times and now - self._fast_watch_times[0] >= 3600:

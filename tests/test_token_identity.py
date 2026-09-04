@@ -24,12 +24,12 @@ substitution.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import inspect
 from decimal import Decimal
 
 import pytest
 
-import smart_money_bot.bot as bot_module
 import smart_money_bot.engine as engine_module
 from smart_money_bot.bot import _token_view
 from smart_money_bot.fast_alerts import build_early_alert
@@ -158,10 +158,7 @@ def test_an_unresolved_candidate_is_not_promotable_and_gets_no_buy_control() -> 
     provenance = unresolved(WATCHED, source="fomo_trending")
 
     assert provenance.identity_verified is False
-    buttons = {
-        item.label: item
-        for item in _token_view(WATCHED, trade_eligible=provenance.identity_verified).children
-    }
+    buttons = {item.label: item for item in _token_view(WATCHED).children}
     assert "Buy on Jupiter" not in buttons
     # Research links survive: the operator still has to be able to go look.
     assert "Open in Fomo" in buttons
@@ -379,25 +376,41 @@ def test_the_card_states_what_it_does_not_know_about_identity_and_safety() -> No
     assert "⚠ SYMBOL COLLISION" in fields
 
 
-def test_the_buy_control_is_gated_and_the_research_links_are_not() -> None:
-    """Section 6: no buy button without eligibility; research links always."""
+def test_there_is_no_buy_control_left_to_gate() -> None:
+    """Section 6, hardened in v2.54: research links always, transactions never.
+
+    The old version of this test asserted that ``Buy on Jupiter`` appeared
+    once a caller passed ``trade_eligible=True``.  No caller in the repository
+    ever did, and the sibling ``Sell on Jupiter`` button was not gated at all
+    — it rendered on every card, including cards for tokens whose safety was
+    UNKNOWN, and it opened a live swap screen preloaded with the mint.  This
+    is a research and paper-observation system; the honest state is that no
+    such control exists, and no flag re-enables one.
+    """
 
     blocked = {item.label: item for item in _token_view(WATCHED).children}
-    assert "Buy on Jupiter" not in blocked
-    for label in ("Open in Fomo", "Open in Pump.fun", "Chart", "Solscan"):
+
+    for label in ("Open in Fomo", "Open in Pump.fun", "Open in GMGN", "Chart", "Solscan"):
         assert label in blocked
-    # An operator already holding the token must always be able to exit.
-    assert "Sell on Jupiter" in blocked
+    assert "Buy on Jupiter" not in blocked
+    assert "Sell on Jupiter" not in blocked
+    assert not any("jup.ag" in item.url for item in blocked.values())
+    assert "trade_eligible" not in inspect.signature(_token_view).parameters
 
-    allowed = {item.label: item for item in _token_view(WATCHED, trade_eligible=True).children}
-    assert allowed["Buy on Jupiter"].url == f"https://jup.ag/swap/SOL-{WATCHED}"
 
+def test_the_early_lane_still_carries_its_gate_state(settings) -> None:
+    """The eligibility flag survives on the alert even with no control to gate.
 
-def test_the_early_lane_hands_its_gate_state_to_the_discord_view() -> None:
-    """The gate is only worth anything if the renderer actually reads it."""
+    ``trade_eligible`` remains on :class:`FastAlert` because other things read
+    it — the card prints ``Trade CTA: DISABLED`` from it, and the publication
+    guard clears it on refusal.  What it no longer does is decide whether a
+    button that spends money appears, because that button is gone.
+    """
 
-    source = inspect.getsource(bot_module.SmartMoneyBot.on_fast_alert)
-    assert "trade_eligible=alert.trade_eligible" in source
+    from smart_money_bot.fast_alerts import FastAlert
+
+    assert "trade_eligible" in {f.name for f in dataclasses.fields(FastAlert)}
+    assert _early_alert().trade_eligible is False
 
 
 # ===========================================================================

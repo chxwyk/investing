@@ -923,7 +923,7 @@ def score_runner_candidate(
     elif score >= Decimal("70") and safety.status == "PASS":
         state = "✅ ENTRY CANDIDATE"
     elif score >= Decimal("55"):
-        state = "🔥 HEATING UP"
+        state = "🔥 ACCELERATING"
     elif score >= Decimal("35"):
         state = "🟡 WATCH"
     elif age_seconds is not None and age_seconds <= 300:

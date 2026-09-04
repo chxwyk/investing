@@ -46,7 +46,7 @@ from .discord_render import (
 )
 from .engine import SmartMoneyEngine
 from .errors import DiscoveryError, JupiterError, PumpLaunchError, describe_exception
-from .fast_alerts import LANE_URGENT, EnrichmentUpdate, FastAlert
+from .fast_alerts import GMGN_TOKEN_URL, LANE_URGENT, EnrichmentUpdate, FastAlert
 from .lab.decision import Decision
 from .lab.evidence import buyer_evidence, organic_demand_text
 from .lab.exit_regret import ExitQualityReport
@@ -183,21 +183,27 @@ def _token_view(
     mint: str,
     fomo_referral_code: str | None = None,
     *,
-    trade_eligible: bool = False,
     terminal_url: str = "",
 ) -> discord.ui.View:
-    """Link buttons for one exact mint.
+    """Inspection links for one exact mint.  No transaction control, ever.
 
-    ``trade_eligible`` gates the **buy** control only.  Inspection links — Fomo,
-    Pump.fun, DEX, Solscan — always remain, because looking at a token is how an
-    operator decides anything and withholding them helps nobody.
+    Every button here opens a page that *shows* the operator something — Fomo,
+    GMGN, Pump.fun, DexScreener, Solscan, and the configured terminal.  Looking
+    at a token is how anybody decides anything, so none of these are withheld.
 
-    A buy button is different in kind: it is a call to action, and attaching one
-    to a candidate whose safety is UNKNOWN, whose validation is still running, or
-    whose identity could not be verified presents a guess as an opportunity.
-    That is what put a same-symbol clone in front of the operator with a
-    one-click buy, so the default here is ``False`` — a caller has to prove
-    eligibility to get the control.
+    What is gone as of v2.54 is the pair of Jupiter swap buttons.  ``Buy on
+    Jupiter`` sat behind a ``trade_eligible`` flag that every caller in this
+    repository passed as ``False``; ``Sell on Jupiter`` sat behind nothing at
+    all and appeared on every card, including research cards for tokens whose
+    safety was UNKNOWN.  Both opened a live swap screen preloaded with the
+    mint.  This is a research and paper-observation system, and a one-click
+    route to spending real money is not a research affordance no matter which
+    flag guards it — a flag that is ``False`` at every call site is a control
+    waiting for someone to pass ``True``.
+
+    The parameter is gone rather than defaulted off for that reason: there is
+    no transaction control left for it to gate, so keeping it would describe a
+    capability the function does not have.
     """
 
     view = discord.ui.View(timeout=None)
@@ -217,20 +223,11 @@ def _token_view(
             row=0,
         )
     )
-    if trade_eligible:
-        view.add_item(
-            discord.ui.Button(
-                label="Buy on Jupiter",
-                style=discord.ButtonStyle.link,
-                url=f"https://jup.ag/swap/SOL-{mint}",
-                row=0,
-            )
-        )
     view.add_item(
         discord.ui.Button(
-            label="Sell on Jupiter",
+            label="Open in GMGN",
             style=discord.ButtonStyle.link,
-            url=f"https://jup.ag/swap/{mint}-SOL",
+            url=GMGN_TOKEN_URL.format(mint=mint),
             row=0,
         )
     )
@@ -2750,9 +2747,9 @@ class PaperPositionsView(discord.ui.View):
                 row=1,
             ),
             discord.ui.Button(
-                label="Jupiter",
+                label="GMGN",
                 style=discord.ButtonStyle.link,
-                url=f"https://jup.ag/swap/SOL-{mint}",
+                url=GMGN_TOKEN_URL.format(mint=mint),
                 row=1,
             ),
             discord.ui.Button(
@@ -3224,7 +3221,6 @@ class SmartMoneyBot(commands.Bot):
                     # The buy control is gated on the alert's own declaration.
                     # Research links stay either way; only the call to action
                     # requires eligibility.
-                    trade_eligible=alert.trade_eligible,
                     terminal_url=_terminal_token_url(
                         getattr(self.settings, "terminal_token_url_template", ""),
                         alert.token_mint,
@@ -5471,7 +5467,7 @@ def _early_runners_embed(rows: list[dict[str, object]]) -> discord.Embed:
     """`/fomo runners` — how early we actually were, per token (section 75)."""
 
     embed = discord.Embed(
-        title="🚨 EARLY RUNNERS",
+        title="🚨 EARLY MOVERS — RESEARCH",
         description=(
             f"`{len(rows)}` token(s) the operator lane surfaced recently, each with "
             "the market cap it was first seen at and the market cap the alert "

@@ -898,12 +898,22 @@ def test_a_promotion_never_hands_out_a_buy_control() -> None:
 
 
 def test_a_promotion_on_an_unverified_mint_loses_its_actionable_language() -> None:
-    """Identity outranks evidence: no market case makes an unknown token a buy."""
+    """Identity outranks evidence: no market case makes an unknown token a buy.
+
+    v2.54 tightened both sides of this.  A verified identity used to buy the
+    headline ``🚨 EARLY RUNNER — LOOK NOW`` — one answered question out of
+    thirteen, printed as an instruction above a body that went on to admit
+    unknown safety.  It is the exact headline in the operator's screenshot, so
+    the verified card no longer instructs either; it names what it found.
+    """
 
     verified = _promotion_alert()
     unverified = _promotion_alert(identity_verified=False)
 
-    assert "LOOK NOW" in verified.spec.title
+    assert verified.spec.title == "🚨 EARLY MOVER — RESEARCH ONLY"
+    assert "LOOK NOW" not in verified.spec.title
+    assert "EARLY RUNNER" not in verified.spec.title
+    assert "IDENTITY UNVERIFIED" in unverified.spec.title
     assert "LOOK NOW" not in unverified.spec.title
     assert unverified.ping is False
     assert unverified.lane == fa.LANE_RADAR
