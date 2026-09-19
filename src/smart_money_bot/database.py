@@ -1734,6 +1734,357 @@ class Database:
                 updated_at INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (provider, endpoint)
             );
+
+            -- ================================================================
+            -- FOMO PRE-TREND INTELLIGENCE (v2.55).
+            --
+            -- Additive and IF NOT EXISTS throughout.  No existing table is
+            -- altered and no production row is touched, so a redeploy re-runs
+            -- this block harmlessly and a rollback loses only the new lane.
+            --
+            -- The write-once discipline used by the Trending ledger applies
+            -- here too, and for the same reason: if the entry numbers could be
+            -- rewritten during enrichment, "was the alert early?" would become
+            -- unanswerable because every late alert would look early in
+            -- hindsight.
+            -- ================================================================
+
+            -- Every attempt to read the Trending board, successful or not.
+            -- Failures are stored as rows WITH an error rather than discarded,
+            -- because "the provider was down for six minutes" is the context
+            -- that explains a gap in the ground truth.
+            CREATE TABLE IF NOT EXISTS pretrend_board_snapshots (
+                observed_at INTEGER PRIMARY KEY,
+                provider TEXT NOT NULL DEFAULT '',
+                source_kind TEXT NOT NULL DEFAULT '',
+                valid INTEGER NOT NULL DEFAULT 0,
+                invalid_reason TEXT NOT NULL DEFAULT '',
+                invalid_detail TEXT NOT NULL DEFAULT '',
+                row_count INTEGER NOT NULL DEFAULT 0,
+                error TEXT NOT NULL DEFAULT '',
+                source_at INTEGER,
+                collector_version TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_pretrend_board_snapshots_valid
+                ON pretrend_board_snapshots(valid, observed_at DESC);
+
+            -- One row per mint per valid snapshot: the board membership tape.
+            CREATE TABLE IF NOT EXISTS pretrend_board_rows (
+                observed_at INTEGER NOT NULL,
+                mint TEXT NOT NULL,
+                rank INTEGER,
+                symbol TEXT NOT NULL DEFAULT '',
+                name TEXT NOT NULL DEFAULT '',
+                tier TEXT NOT NULL DEFAULT '',
+                market_cap_usd REAL,
+                price_usd REAL,
+                liquidity_usd REAL,
+                volume_usd REAL,
+                holders INTEGER,
+                token_age_seconds INTEGER,
+                pair_age_seconds INTEGER,
+                source_at INTEGER,
+                PRIMARY KEY (observed_at, mint)
+            );
+            CREATE INDEX IF NOT EXISTS idx_pretrend_board_rows_mint
+                ON pretrend_board_rows(mint, observed_at DESC);
+
+            -- CANONICAL GROUND TRUTH.  first_trending_at is set by the initial
+            -- INSERT OR IGNORE and appears in no UPDATE SET clause anywhere in
+            -- this codebase, so no code path -- including a bug -- can move it.
+            CREATE TABLE IF NOT EXISTS pretrend_membership (
+                mint TEXT PRIMARY KEY,
+                first_trending_at INTEGER NOT NULL,
+                first_rank INTEGER,
+                first_market_cap_usd REAL,
+                state TEXT NOT NULL DEFAULT 'ENTERED',
+                last_seen_on_board_at INTEGER NOT NULL DEFAULT 0,
+                left_at INTEGER,
+                entries INTEGER NOT NULL DEFAULT 1,
+                stints_json TEXT NOT NULL DEFAULT '[]',
+                updated_at INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_pretrend_membership_first
+                ON pretrend_membership(first_trending_at DESC);
+
+            -- FOMO_TREND_ENTER / FOMO_TREND_REENTER / FOMO_TREND_LEAVE, with
+            -- the provider's raw evidence kept next to our normalised values so
+            -- "why did the bot think this?" is answerable a month later.
+            CREATE TABLE IF NOT EXISTS pretrend_trend_events (
+                mint TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                occurred_at INTEGER NOT NULL,
+                symbol TEXT NOT NULL DEFAULT '',
+                name TEXT NOT NULL DEFAULT '',
+                initial_rank INTEGER,
+                tier TEXT NOT NULL DEFAULT '',
+                market_cap_usd REAL,
+                price_usd REAL,
+                liquidity_usd REAL,
+                volume_usd REAL,
+                holders INTEGER,
+                token_age_seconds INTEGER,
+                pair_age_seconds INTEGER,
+                provider TEXT NOT NULL DEFAULT '',
+                source_kind TEXT NOT NULL DEFAULT '',
+                source_at INTEGER,
+                collector_at INTEGER NOT NULL DEFAULT 0,
+                collector_version TEXT NOT NULL DEFAULT '',
+                raw_json TEXT NOT NULL DEFAULT '{}',
+                PRIMARY KEY (mint, kind, occurred_at)
+            );
+            CREATE INDEX IF NOT EXISTS idx_pretrend_trend_events_time
+                ON pretrend_trend_events(occurred_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_pretrend_trend_events_kind
+                ON pretrend_trend_events(kind, occurred_at DESC);
+
+            -- APPEND-ONLY point-in-time observations for CANDIDATE (not yet
+            -- trending) mints.  This is the table the whole research programme
+            -- depends on: without it there is no history to reconstruct a
+            -- pre-entry state from, and prediction is not possible at all.
+            -- Rows are keyed by (mint, observed_at) and are never updated.
+            CREATE TABLE IF NOT EXISTS pretrend_observations (
+                mint TEXT NOT NULL,
+                observed_at INTEGER NOT NULL,
+                source_at INTEGER,
+                received_at INTEGER NOT NULL DEFAULT 0,
+                provider TEXT NOT NULL DEFAULT '',
+                collector_version TEXT NOT NULL DEFAULT '',
+                price_usd REAL,
+                market_cap_usd REAL,
+                liquidity_usd REAL,
+                volume_usd REAL,
+                buys INTEGER,
+                sells INTEGER,
+                unique_buyers INTEGER,
+                holders INTEGER,
+                net_flow_usd REAL,
+                social_engagement REAL,
+                token_age_seconds INTEGER,
+                pair_age_seconds INTEGER,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                PRIMARY KEY (mint, observed_at)
+            );
+            CREATE INDEX IF NOT EXISTS idx_pretrend_observations_time
+                ON pretrend_observations(observed_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_pretrend_observations_mint
+                ON pretrend_observations(mint, observed_at DESC);
+
+            -- The FOMO-native tape.  event_id is the primary key so a provider
+            -- retry or an overlapping poll replays without double-counting a
+            -- buy -- a duplicate would inflate every velocity and percentile
+            -- that reads it.
+            CREATE TABLE IF NOT EXISTS pretrend_activity_events (
+                event_id TEXT PRIMARY KEY,
+                mint TEXT NOT NULL,
+                occurred_at INTEGER NOT NULL,
+                received_at INTEGER,
+                event_type TEXT NOT NULL DEFAULT 'OTHER',
+                trader_id TEXT NOT NULL DEFAULT '',
+                handle TEXT NOT NULL DEFAULT '',
+                profile_url TEXT NOT NULL DEFAULT '',
+                amount_usd REAL,
+                token_amount REAL,
+                market_cap_usd REAL,
+                price_usd REAL,
+                thesis_text TEXT NOT NULL DEFAULT '',
+                token_name TEXT NOT NULL DEFAULT '',
+                token_symbol TEXT NOT NULL DEFAULT '',
+                chain TEXT NOT NULL DEFAULT 'solana',
+                provider TEXT NOT NULL DEFAULT '',
+                raw_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_pretrend_activity_mint
+                ON pretrend_activity_events(mint, occurred_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_pretrend_activity_trader
+                ON pretrend_activity_events(trader_id, occurred_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_pretrend_activity_time
+                ON pretrend_activity_events(occurred_at DESC);
+
+            -- One row per (actor, mint) the first time that actor acted on it.
+            -- This is the join that makes pre-trend affinity computable, and it
+            -- is write-once: a later action must not move the first-action
+            -- timestamp, or every measured lead time would shrink over time.
+            CREATE TABLE IF NOT EXISTS pretrend_actor_observations (
+                actor_id TEXT NOT NULL,
+                mint TEXT NOT NULL,
+                surface TEXT NOT NULL DEFAULT 'fomo_activity',
+                observed_at INTEGER NOT NULL,
+                market_cap_at_observation_usd REAL,
+                token_age_seconds INTEGER,
+                handle TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (actor_id, mint, surface)
+            );
+            CREATE INDEX IF NOT EXISTS idx_pretrend_actor_obs_mint
+                ON pretrend_actor_observations(mint, observed_at);
+            CREATE INDEX IF NOT EXISTS idx_pretrend_actor_obs_actor
+                ON pretrend_actor_observations(actor_id, observed_at DESC);
+
+            -- Computed affinity records.  Cached rather than authoritative: the
+            -- observations above are the record, and this table is rebuilt from
+            -- them, so a change to the shrinkage prior cannot corrupt history.
+            CREATE TABLE IF NOT EXISTS pretrend_affinity (
+                actor_id TEXT NOT NULL,
+                surface TEXT NOT NULL DEFAULT 'fomo_activity',
+                handle TEXT NOT NULL DEFAULT '',
+                observations INTEGER NOT NULL DEFAULT 0,
+                recent_observations INTEGER NOT NULL DEFAULT 0,
+                median_lead_seconds INTEGER,
+                median_entry_market_cap_usd REAL,
+                statistically_meaningful INTEGER NOT NULL DEFAULT 0,
+                horizons_json TEXT NOT NULL DEFAULT '{}',
+                computed_at INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (actor_id, surface)
+            );
+            CREATE INDEX IF NOT EXISTS idx_pretrend_affinity_rank
+                ON pretrend_affinity(statistically_meaningful DESC, observations DESC);
+
+            -- Every prediction ever made, production or challenger, whether or
+            -- not it produced an alert.  Storing the silent ones is the point:
+            -- a scoreboard built only from the predictions we chose to publish
+            -- measures our publishing rule, not our model.
+            CREATE TABLE IF NOT EXISTS pretrend_predictions (
+                prediction_id TEXT PRIMARY KEY,
+                mint TEXT NOT NULL,
+                predicted_at INTEGER NOT NULL,
+                model_version TEXT NOT NULL DEFAULT '',
+                feature_version TEXT NOT NULL DEFAULT '',
+                lane TEXT NOT NULL DEFAULT 'production',
+                horizon_seconds INTEGER NOT NULL DEFAULT 300,
+                probability REAL NOT NULL DEFAULT 0,
+                calibration_bucket TEXT NOT NULL DEFAULT '',
+                sample_support INTEGER NOT NULL DEFAULT 0,
+                missing_features INTEGER NOT NULL DEFAULT 0,
+                market_cap_usd REAL,
+                state TEXT NOT NULL DEFAULT '',
+                alerted INTEGER NOT NULL DEFAULT 0,
+                reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                -- Resolved later from ground truth; never an input to anything.
+                outcome TEXT NOT NULL DEFAULT 'PENDING',
+                resolved_at INTEGER,
+                trend_entered_at INTEGER,
+                lead_seconds INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_pretrend_predictions_mint
+                ON pretrend_predictions(mint, predicted_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_pretrend_predictions_pending
+                ON pretrend_predictions(outcome, predicted_at);
+            CREATE INDEX IF NOT EXISTS idx_pretrend_predictions_lane
+                ON pretrend_predictions(lane, predicted_at DESC);
+
+            -- The feature vector behind each prediction, so a decision can be
+            -- re-derived byte for byte rather than re-approximated.
+            CREATE TABLE IF NOT EXISTS pretrend_prediction_features (
+                prediction_id TEXT PRIMARY KEY,
+                mint TEXT NOT NULL,
+                observed_at INTEGER NOT NULL,
+                feature_version TEXT NOT NULL DEFAULT '',
+                mc_cohort TEXT NOT NULL DEFAULT '',
+                age_cohort TEXT NOT NULL DEFAULT '',
+                completeness REAL NOT NULL DEFAULT 0,
+                missing_json TEXT NOT NULL DEFAULT '[]',
+                values_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_pretrend_prediction_features_mint
+                ON pretrend_prediction_features(mint, observed_at DESC);
+
+            -- The token state machine, persisted so cooldowns survive a
+            -- redeploy.  An in-memory cooldown resets on every Railway deploy,
+            -- which is how one token gets alerted five times by a system that
+            -- believes it alerted once.
+            CREATE TABLE IF NOT EXISTS pretrend_token_state (
+                mint TEXT PRIMARY KEY,
+                state TEXT NOT NULL DEFAULT 'DISCOVERED',
+                entered_state_at INTEGER NOT NULL DEFAULT 0,
+                first_seen_at INTEGER NOT NULL DEFAULT 0,
+                last_evaluated_at INTEGER NOT NULL DEFAULT 0,
+                best_probability REAL NOT NULL DEFAULT 0,
+                last_probability REAL NOT NULL DEFAULT 0,
+                last_band INTEGER NOT NULL DEFAULT 0,
+                last_alert_at INTEGER,
+                alerts_sent INTEGER NOT NULL DEFAULT 0,
+                suppressed INTEGER NOT NULL DEFAULT 0,
+                alerted_quality_traders INTEGER NOT NULL DEFAULT 0,
+                cooldown_until INTEGER NOT NULL DEFAULT 0,
+                trend_confirmed_at INTEGER,
+                first_pretrend_alert_at INTEGER,
+                first_pretrend_probability REAL,
+                first_pretrend_market_cap_usd REAL,
+                history_json TEXT NOT NULL DEFAULT '[]',
+                updated_at INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_pretrend_token_state_state
+                ON pretrend_token_state(state, last_evaluated_at DESC);
+
+            -- Alert deliveries, for the hourly budget and the alert-rate KPI.
+            CREATE TABLE IF NOT EXISTS pretrend_alert_events (
+                alert_id TEXT PRIMARY KEY,
+                mint TEXT NOT NULL,
+                sent_at INTEGER NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'PRE_TREND',
+                reason TEXT NOT NULL DEFAULT '',
+                probability REAL,
+                market_cap_usd REAL,
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_pretrend_alert_events_time
+                ON pretrend_alert_events(sent_at DESC);
+
+            -- Cross-source first-seen times per exact mint.  Write-once per
+            -- (mint, source): the whole value of this table is that it records
+            -- when we FIRST saw a mint somewhere, not when we last did.
+            CREATE TABLE IF NOT EXISTS pretrend_source_first_seen (
+                mint TEXT NOT NULL,
+                source TEXT NOT NULL,
+                first_seen_at INTEGER NOT NULL,
+                market_cap_at_first_seen_usd REAL,
+                PRIMARY KEY (mint, source)
+            );
+            CREATE INDEX IF NOT EXISTS idx_pretrend_source_first_seen_mint
+                ON pretrend_source_first_seen(mint, first_seen_at);
+
+            -- Trained models and their walk-forward metrics.  A model without
+            -- its metrics is not deployable, so they live in one row.
+            CREATE TABLE IF NOT EXISTS pretrend_models (
+                model_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL DEFAULT '',
+                lane TEXT NOT NULL DEFAULT 'production',
+                horizon_seconds INTEGER NOT NULL DEFAULT 300,
+                feature_version TEXT NOT NULL DEFAULT '',
+                trained_at INTEGER NOT NULL DEFAULT 0,
+                training_cutoff_at INTEGER NOT NULL DEFAULT 0,
+                trained_rows INTEGER NOT NULL DEFAULT 0,
+                trained_positives INTEGER NOT NULL DEFAULT 0,
+                threshold REAL NOT NULL DEFAULT 1,
+                active INTEGER NOT NULL DEFAULT 0,
+                metrics_json TEXT NOT NULL DEFAULT '{}',
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_pretrend_models_active
+                ON pretrend_models(lane, active DESC, trained_at DESC);
+
+            -- Paper/shadow record for every PRE_TREND signal.  Losing signals
+            -- are kept forever; a scoreboard you can delete from is not one.
+            CREATE TABLE IF NOT EXISTS pretrend_paper_observations (
+                observation_id TEXT PRIMARY KEY,
+                mint TEXT NOT NULL,
+                signalled_at INTEGER NOT NULL,
+                entry_price_usd REAL,
+                entry_market_cap_usd REAL,
+                entry_liquidity_usd REAL,
+                probability REAL,
+                trend_entered_at INTEGER,
+                seconds_to_trend INTEGER,
+                market_cap_at_trend_usd REAL,
+                max_favourable_market_cap_usd REAL,
+                max_adverse_market_cap_usd REAL,
+                outcome TEXT NOT NULL DEFAULT 'OPEN',
+                resolved_at INTEGER,
+                updated_at INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_pretrend_paper_open
+                ON pretrend_paper_observations(outcome, signalled_at DESC);
             """
         )
         await self._migrate_pump_launch_status_constraint()

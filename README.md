@@ -7,6 +7,42 @@ transactions, and mirrors every newly detected hot-wallet swap in PAPER mode. PA
 as either a forced source-price observation ledger or an executable Jupiter quote-shadow
 trial; the two answer different questions and are labeled separately.
 
+Version 2.55.0 adds **FOMO PRE-TREND INTELLIGENCE**: a research lane that asks the opposite
+question to every other lane in this bot. The rest of the system looks at what is already on
+the FOMO Trending board and asks whether it is still tradeable. This one asks what measurably
+happens *before* an exact Solana mint first appears there, and whether that state can be
+detected early enough, and quietly enough, to be worth acting on.
+
+The honest reason it exists is that the previous alerting could not be tuned. Its decision
+variable was a hand-weighted 0-100 score compared against a threshold, and **no weight in it
+was ever fitted to an outcome** — because the repository had no label for "entered FOMO
+Trending" at all. With no label there is no precision, with no precision there is no way to
+choose a threshold, and so the threshold was chosen by feel and the alert volume was capped
+by a rate limit instead. A rate limit trades recall for quiet; it cannot make a signal better.
+
+So v2.55 starts at the bottom. It defines one canonical event (`FOMO_TREND_ENTER`: an exact
+mint absent from the previous *valid* board snapshot and present in the next), records it
+write-once, collects append-only point-in-time observations of tokens that have **not** yet
+trended, labels them at 2/5/10/20-minute horizons, matches every winner against look-alikes
+that never trended, and only then fits anything. The model layer is a transparent heuristic, a
+regularized logistic regression and boosted trees — tried in that order, validated with
+chronological walk-forward folds only, and **refused** unless it beats the heuristic, clears a
+lift floor over the measured base rate, and rests on at least thirty distinct positive mints.
+
+**The lane ships collecting and silent.** `PRETREND_INFERENCE_ENABLED` and
+`PRETREND_ALERTING_ENABLED` both default to `false`, because no model has earned the right to
+interrupt anybody yet. Collection defaults to `true` because it is the only part that cannot be
+deferred: a model trained next month can only learn from observations recorded today. When a
+model is eventually promoted, its own budget is four alerts an hour with per-mint cooldowns and
+a material-change rule, so 41% → 42% → 43% is one message rather than four.
+
+This deployment has **no authorised FOMO-native activity feed**, and this release does not
+invent one — it will not scrape, reuse a browser session, replay a cookie or reverse a private
+endpoint. The interfaces, schema, mocks, rolling-window features and tests for that lane are
+all built and exercised; without `PRETREND_ACTIVITY_API_URL` every FOMO-native feature reports
+`UNKNOWN` rather than `0`, and the cards say so. That is a real limit on what can currently be
+measured, and it is recorded as a blocker rather than papered over.
+
 Version 2.54.0 takes the headline away from the builders. A card reading **🔥 WATCH —
 HEATING UP** above its own body saying `Safety: UNKNOWN • Route: UNKNOWN • Independent
 notable wallets: 0` was telling the operator two opposite things and letting the louder one
@@ -1219,6 +1255,181 @@ The bot needs these Discord application permissions:
 - Use Application Commands
 
 No privileged Discord gateway intents are required.
+
+## FOMO pre-trend intelligence (v2.55)
+
+### The question, stated so it can fail
+
+> Using only information available at moment `T`, can we identify a repeatable behavioural
+> state that occurs **before** an exact Solana mint enters FOMO Trending — early enough to
+> matter, and with few enough false alerts to be useful?
+
+Every layer below is built so the answer is allowed to be *no*, and so that a *yes* would be
+hard to fake. The `/pretrend` commands will say "not enough data to quote a number" for as
+long as that is true, and `/pretrend modelhealth` will name the specific reason the lane is
+still silent.
+
+### Ground truth: one event, written once
+
+`FOMO_TREND_ENTER` is defined as: an exact mint was **absent** from the previous **valid**
+Trending snapshot and **present** in the next one. Three words carry the definition.
+
+*Exact mint.* A board row whose mint cannot be resolved is dropped, not keyed by ticker. Two
+tokens called `$CAT` are two tokens.
+
+*Valid.* A snapshot is valid only when the provider actually answered. An empty payload, a
+timeout, an HTTP error, a board below the row floor, or a board that shrank by more than 60%
+in one step is an **unknown**, not "Trending is now empty". This is not a nicety: one network
+blip read as an empty board would emit a LEFT event for every mint and an ENTER for all of
+them on the next success — hundreds of fabricated ground-truth events from one hiccup,
+permanently in the training labels. Invalid snapshots are still *stored*, with their reason,
+because a gap in the record is only interpretable if the failures that caused it are on it.
+
+*First.* `first_trending_at` is written by an `INSERT OR IGNORE` and appears in **no**
+`UPDATE SET` clause anywhere in the codebase; an architecture test asserts this. A re-entry
+produces `FOMO_TREND_REENTER` with its own timestamp and leaves the first entry frozen.
+Without that rule, "was the alert early?" becomes unanswerable, because a re-entry two hours
+later would silently redefine the target and make every late alert look prescient.
+
+### Labels, controls and the things that fake an edge
+
+At observation time `T`, `TREND_H` is true when the mint's `first_trending_at` lands in
+`(T, T+H]` for H in 2m / 5m / 10m / 20m.
+
+* A mint **already on the board at `T`** is not a prediction opportunity and is refused
+  outright. Labelling those positive is the single easiest way to report 95% precision: the
+  model simply learns to recognise "already trending".
+* A horizon that extends past the end of our record is **censored**, not negative. Calling it
+  negative would teach the model that the most recent — and most relevant — rows never trend.
+* Every positive is matched against controls from the same market-cap cohort, age cohort and
+  **time window**, because market regime is shared by every token alive at once. A positive
+  from a hot Tuesday compared against a dead Sunday would "discover" that activity predicts
+  trending.
+* A mint that ever trended is never used as a control, at any timestamp.
+
+### Leakage is checked mechanically, not carefully
+
+`smart_money_bot.pretrend.leakage` exists to prove the rest of the package is cheating, and it
+runs as tests. It catches future source timestamps, future samples inside an input series,
+feature *names* that could only be known after the event (`trending_rank`, `peak_market_cap`,
+`future_*`), duplicate `(mint, timestamp)` rows, the same mint on both sides of a split, a test
+fold that predates its training fold, and a stored value that changed for one observation
+instant — which would prove the store is being rewritten rather than appended to.
+
+One leak was found this way during development and is worth naming, because it is the kind
+that survives review. The `quality_fomo_buyers` family depends on each account's pre-trend
+affinity, and affinity is computed from **outcomes**. Building one affinity table from the
+whole dataset and using it to generate features for every training row would feed the labels
+back into the inputs — the model would learn to recognise accounts it had already been told
+were winners, and the backtest would report that circularity as skill. Affinity is therefore
+bucketed and strictly backward-looking: a row in bucket *N* sees only actor observations whose
+outcome had already resolved before bucket *N* began.
+
+### Affinity: measured, shrunk, and never called an insider score
+
+For each public account: of the tokens they were observed entering, what fraction subsequently
+reached Trending? That is all it is. Everything measured is public behaviour, and being
+repeatedly early is evidence of taste, speed or a shared information source — the code does not
+claim to distinguish those and does not allege access to anything non-public.
+
+Three of three is **not** a 100% hit rate; it is three observations. With a 1% base rate, a
+population of 50,000 accounts produces 3/3 accounts by the dozen daily, and ranking on raw
+precision surfaces exactly those. The headline figure is a Beta-Binomial posterior shrunk
+toward the population base rate, so 3/3 lands near 8% while 80/120 lands near 50%. Every record
+carries its raw rate, its shrunk rate, the baseline, the lift, a Wilson interval and `n`.
+
+### Independence: ten buyers, or one buyer and nine followers?
+
+Ten independent accounts reaching a token separately is ten pieces of evidence. One account
+buying and nine copy-trading it six seconds later is one piece and nine echoes. Arrival timing
+cannot *prove* independence, so the engine measures the pattern — burst detection, arrival
+entropy, concentration, median inter-arrival gap — and reports a *suspected*
+`possible_follow_cluster_count` alongside the raw count. On-chain wallets get the stronger
+signal already in this repository: a shared funding source collapses five wallets into one
+actor regardless of how their arrivals looked.
+
+### Which signal moves first is measured, not assumed
+
+The tempting story — sharp trader buys, thesis appears, independent buyers follow, volume
+lifts, holders grow, social amplifies, price runs, Trending notices — is plausible and is
+**not hardcoded anywhere**. `smart_money_bot.pretrend.cascade` records the first measurable
+acceleration per signal family and reports each family's lead over the board entry as a
+distribution. If FOMO-native attention turns out to arrive *after* the move, `summarise_leads`
+returns `LAGS` for it and the honest conclusion is that it is a confirmation signal, not a
+prediction signal.
+
+### Validation has no random-split option
+
+There is no random split in the validation module and no way to request one; a test asserts
+the module contains no shuffling primitive. Folds are chronological, with an embargo equal to
+the label horizon (a training row five minutes before the boundary has an outcome that
+resolves *inside* the test window), and any mint straddling a boundary is dropped from the test
+side. Metrics are PR-AUC rather than ROC-AUC — at a 1% base rate a useless model still scores
+a respectable ROC — plus Brier score, reliability buckets, precision@K, alerts/hour, and the
+base rate beside every precision figure.
+
+A model is promoted only if the dataset is leakage-clean, there are ≥30 **distinct positive
+mints** (not rows: one token producing forty rows is one token), there are ≥3 walk-forward
+folds, pooled lift clears 3x, the chosen threshold can actually hold the alert budget, **and**
+the learned model beat the transparent heuristic baseline. A learned model that cannot beat a
+five-rule heuristic has not found anything; it has fitted the same signal less legibly.
+
+### Replay is a clock, not a dataframe
+
+`smart_money_bot.pretrend.replay` advances in fixed ticks and, at each one, truncates every
+input to that instant and calls the same feature builder, the same model and the same alert
+gate production uses — including the hourly budget, the cooldowns and the material-change rule,
+because those change *which* alerts happen and therefore the measured precision. It audits its
+own inputs for leakage as it goes, and an alert on a token that never trended counts against
+precision rather than being quietly excluded.
+
+### Sample output
+
+```text
+**FOMO TREND FORENSICS — `WWWW…WWWW`**
+
+**FIRST FOMO TRENDING**
+  when: 2024-… (epoch 1729200)
+  initial rank: 1
+  tier (raw, uninterpreted): $$
+  MC: $126.0K • LIQ: unknown
+  provider: operator_feed (FOMO_TRENDING)
+
+**PRE-ENTRY TIMELINE** (reconstructed with the live feature code; nothing below reads past its own offset)
+offset          MC  fomoBuy1m  qual  indep  thesis  onchain  holders  complete
+T-20m       $38.0K          0     0      0       0       18      180    0.5291
+T-10m       $62.0K          0     0      0       0       48      290    0.6502
+T-5m        $74.0K          5     0      0       1       63      345    0.7489
+T-1m        $83.6K          5     0      0       0       75      389    0.7489
+T0          $83.6K          4     0      0       0       75      389    0.6996
+
+**EARLIEST NOTABLE FOMO ACCOUNTS** (public activity; not insiders)
+  • @early0 — BUY 8m before entry at MC $66.8K; record n=1, adj rate 0.000000 [sample too thin to rank]
+
+**WHAT CHANGED BEFORE TRENDING** (T-10m → T0)
+  • unique_buyers_level_1m: 48 → 75 (1.56x)
+  • volume_usd_level_5m: 92000 → 142000 (1.54x)
+  • market_cap_usd: 62000 → 83600 (1.35x)
+  • holders_level_1m: 290 → 389 (1.34x)
+
+**OUR CALL:** alerted 7m early at MC $69.2K with P=61.0%
+```
+
+Note what that output does *not* do. The accounts are marked `[sample too thin to rank]`
+because they have one observation each. `adj rate` is `0.000000` because those buys landed
+eight minutes out, outside the 5-minute horizon being measured — the number is small because
+the behaviour did not qualify, not because something failed. `LIQ: unknown` is printed rather
+than `$0`.
+
+### What this release does not claim
+
+* **No edge has been demonstrated.** No model is promoted, because no data has been collected
+  yet. Everything above is machinery for answering the question, not an answer.
+* **The FOMO-native lane is unconfigured** in this deployment and every feature it would
+  produce currently reports `UNKNOWN`.
+* **Prediction is decoupled from execution by construction.** The lane has no reference to the
+  executor, the paper engine or any trading surface, and an architecture test parses the source
+  to keep it that way.
 
 ## The headline is the verdict (v2.54)
 
@@ -2733,6 +2944,89 @@ module's AST and assert it.
 
 ## Railway deployment
 
+### v2.55.0 Railway changes
+
+Every new setting has a safe code default, so **no Railway variable has to be added**. The
+release is deliberately safe to deploy untouched: the pre-trend lane starts **collecting** and
+stays **silent**. Nothing here enables live trading, no forward history is reset, and the
+schema block is additive `CREATE TABLE IF NOT EXISTS` throughout — no existing table is altered
+and no production row is touched, so a rollback loses only the new lane.
+
+**ADD:** none required.  **CHANGE:** none required.
+
+**OPTIONAL:**
+
+```text
+PRETREND_ENABLED=true                     # the research lane as a whole
+PRETREND_COLLECTION_ENABLED=true          # board snapshots + point-in-time observations
+PRETREND_INFERENCE_ENABLED=false          # scoring; stays off until a model is validated
+PRETREND_ALERTING_ENABLED=false           # pinging; stays off even when inference is on
+PRETREND_BOARD_POLL_SECONDS=30            # ground-truth sampling cadence
+PRETREND_OBSERVATION_SECONDS=60           # candidate observation cadence
+PRETREND_HORIZON_SECONDS=300              # the horizon the production model predicts
+PRETREND_UNIVERSE_MIN_MC_USD=20000        # research universe floor
+PRETREND_UNIVERSE_MAX_MC_USD=1000000      # research universe ceiling
+PRETREND_ALERT_THRESHOLD=0.20             # calibrated probability required to enter PRE_TREND
+PRETREND_WATCH_THRESHOLD=0.05             # the silent WATCH tier
+PRETREND_MAX_ALERTS_PER_HOUR=4            # hourly ceiling; three good beats eighty mediocre
+PRETREND_COOLDOWN_SECONDS=1800            # per-mint cooldown between pre-trend pings
+PRETREND_NEW_QUALITY_TRADERS_FOR_REALERT=2
+PRETREND_MIN_BOARD_ROWS=5                 # below this, a snapshot is a partial response
+PRETREND_MAX_BOARD_SHRINK_RATIO=0.6       # a bigger one-step shrink is refused
+PRETREND_MIN_POSITIVES_TO_ALERT=30        # board entries required before any ping
+PRETREND_TRAINING_ENABLED=true            # periodic retrain; promotion is separately gated
+PRETREND_TRAINING_INTERVAL_SECONDS=21600
+PRETREND_FOLD_SECONDS=86400               # walk-forward fold width
+PRETREND_MAX_CANDIDATES_PER_CYCLE=60
+PRETREND_AFFINITY_REFRESH_SECONDS=900
+PRETREND_ACTIVITY_API_URL=                # authorised FOMO-native feed; no default, ever
+PRETREND_ACTIVITY_API_KEY=
+PRETREND_ACTIVITY_POLL_SECONDS=20
+```
+
+**Deployment steps**
+
+1. Deploy as normal. No variable changes are required.
+2. Confirm the lane started: `/pretrend modelhealth` should report
+   `collection: on • training: on • inference: off • alerting: off` and `NO ACTIVE MODEL`.
+   That is the correct state on day one, not a failure.
+3. After a few hours, `/pretrend stats` should show a rising **board entries observed** count
+   and a board-snapshot acceptance rate near 1.0. A low acceptance rate names its reason
+   (`PROVIDER_ERROR`, `TOO_SHORT`, `STALE`) — that is the number to watch, because ground truth
+   is what everything else is measured against.
+4. Leave it collecting. Nothing will ping. `/pretrend modelhealth` will keep naming the reason
+   promotion was refused — most often "only N distinct positive mints; 30 required".
+5. Once `/pretrend stats` reports `sufficient: yes` and `/pretrend modelhealth` shows a
+   promoted model, set `PRETREND_INFERENCE_ENABLED=true` to begin shadow scoring. Predictions
+   are recorded silently. Review `/pretrend stats` and `/pretrend falsepositives` for a few
+   days.
+6. Only then consider `PRETREND_ALERTING_ENABLED=true`.
+
+**Verification procedure**
+
+* `/pretrend stats` — sample counts first, precision only if the sample supports it.
+* `/pretrend modelhealth` — training cutoff, rows, positives, threshold, and the refusal reason
+  for recent non-promoted runs.
+* `/pretrend patterns` — winners versus matched look-alikes, per feature, with effect sizes. If
+  no feature separates the two groups once the sample has grown, the honest conclusion is that
+  the hypothesis is not supported.
+* `/pretrend trendforensics <exact mint>` — after any token you saw reach Trending, reconstruct
+  what was knowable beforehand.
+* `/pretrend missed` and `/pretrend falsepositives` — the two failure lists, unfiltered.
+
+**Worth knowing without changing anything:**
+
+* **Collection is the part that cannot be deferred.** A model trained next month can only learn
+  from observations recorded today. `PRETREND_COLLECTION_ENABLED=false` does not just pause the
+  lane, it means the research cannot start.
+* **The FOMO-native lane is off unless you supply an endpoint.** There is no default URL and no
+  discovery path. Without `PRETREND_ACTIVITY_API_URL` every FOMO-native feature is `UNKNOWN`,
+  the boot log says so once, and the cards say so too.
+* **Storage cost is bounded by the observation cadence.** Roughly one row per tracked mint per
+  `PRETREND_OBSERVATION_SECONDS`, plus one board snapshot per `PRETREND_BOARD_POLL_SECONDS`.
+* **Provider cost is zero above what the Trending lane already spends.** The board observer
+  wraps the *existing* Trending client rather than opening a second feed.
+
 ### v2.43.0 Railway changes
 
 Every new setting has a safe code default, so **no Railway variable has to be added**. Nothing
@@ -3273,6 +3567,13 @@ in that URL private. Helius documents the endpoint format as
 | `/smartmoney kill-switch` | Immediately pause discovery, scanning, and new paper actions. |
 | `/smartmoney launch-check` | Read-only J7/IPFS/public-wallet/limit/reservation readiness check. |
 | `/smartmoney launch-lab mode:production` | Browse, edit, re-art, and deliberately confirm a qualifying recent J7-only candidate. |
+| `/pretrend stats` | Pre-trend sample count, base rate, out-of-sample precision, lead time and alert rate. Refuses to quote precision on a thin sample. |
+| `/pretrend forensics` | Reconstruct what was knowable before an exact mint entered Trending, using the live feature code. |
+| `/pretrend patterns` | Future trenders versus matched look-alikes that never trended, per feature, with effect sizes. |
+| `/pretrend missed` | Board entries the model did not alert on — the false negatives, unfiltered. |
+| `/pretrend falsepositives` | PRE_TREND alerts whose token never entered Trending. Losing signals are retained permanently. |
+| `/pretrend modelhealth` | Training cutoff, sample, threshold, and the named reason recent runs were not promoted. |
+| `/pretrend traders` | Public FOMO accounts with a statistically meaningful early record — shrunk rate, baseline, lift, interval and `n`. |
 | `/smartmoney launch-lab mode:test` | Immediately inspect real recent RSS evidence and test art/X without bypassing live J7 eligibility. |
 | `/smartmoney status` | Check RPC and scanner health. |
 | `/smartmoney limits` | Show active risk limits. |

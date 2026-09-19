@@ -98,6 +98,7 @@ from .models import (
     TokenInfo,
     TrackedTrader,
 )
+from .pretrend_cards import render_forensics as render_pretrend_forensics
 from .quality import STAGE_LABELS, why_surfaced
 from .trenches.publicmodel import MODEL_CAVEAT as PUBLIC_MODEL_CAVEAT
 from .trending import describe_change
@@ -2935,6 +2936,7 @@ class SmartMoneyBot(commands.Bot):
         await self.engine.initialize()
         await self.add_cog(SmartMoneyCommands(self))
         await self.add_cog(FomoCommands(self))
+        await self.add_cog(PretrendCommands(self))
         if self.settings.discord_guild_id:
             guild = discord.Object(id=self.settings.discord_guild_id)
             # Testing uses guild-scoped commands so updates appear immediately. Clear the
@@ -8969,6 +8971,491 @@ class FomoCommands(
         )
         await self._resolve_lab(interaction, embed=_clamp_embed(embed))
 
+class PretrendCommands(
+    commands.GroupCog,
+    group_name="pretrend",
+    group_description="FOMO pre-trend research: is there a measurable edge before Trending?",
+):
+    """Its own cog because ``/fomo`` is full.
+
+    Discord caps a command group at 25 children and ``/fomo`` is already at the
+    ceiling, so these seven research surfaces get their own group rather than
+    displacing product commands -- the same split that separated ``/fomo`` from
+    ``/smartmoney`` in the first place.
+
+    Everything here is a research surface, not a trading surface.  Every one of
+    these commands is allowed to answer "we do not have enough data to say", and
+    several of them usually will.  That is the intended behaviour, not a gap to
+    be smoothed over with a plausible-looking number.
+    """
+
+    def __init__(self, bot: SmartMoneyBot) -> None:
+        self.bot = bot
+
+    async def _require_admin(self, interaction: discord.Interaction) -> bool:
+        if _member_is_admin(interaction.user, self.bot.settings):
+            return True
+        await interaction.response.send_message(
+            "You need Administrator or a configured bot-admin role for pre-trend research.",
+            ephemeral=True,
+        )
+        return False
+
+    async def _resolve(
+        self,
+        interaction: discord.Interaction,
+        *,
+        content: str | None = None,
+        embed: discord.Embed | None = None,
+    ) -> None:
+        """Replace the deferred response, degrading to text if the card is refused.
+
+        Same reasoning as the Fomo cog's version: letting an HTTP 400 propagate
+        strands the spinner, which looks identical to a hung bot.
+        """
+
+        try:
+            await interaction.edit_original_response(content=content, embed=embed)
+        except discord.HTTPException:
+            await interaction.edit_original_response(
+                content=(content or "The research card could not be rendered.")[:1900],
+                embed=None,
+            )
+
+    @app_commands.command(
+        name="stats",
+        description="Pre-trend sample count, base rate, precision, lead time and alert rate.",
+    )
+    @app_commands.describe(days="How many days of predictions to summarise")
+    async def stats(
+        self, interaction: discord.Interaction, days: int = 7
+    ) -> None:
+        if not await self._require_admin(interaction):
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        stats = await self.bot.engine.pretrend_stats(days=max(1, min(days, 30)))
+        metrics = stats["metrics"]
+        embed = discord.Embed(
+            title="FOMO PRE-TREND — out-of-sample record",
+            colour=0xE67E22,
+            description=(
+                f"Window: last {stats['days']}d • features `{stats['feature_version']}`"
+            ),
+        )
+        # The counts come first, deliberately.  A precision figure read without
+        # its sample size is the thing this whole lane exists to stop.
+        embed.add_field(
+            name="SAMPLE",
+            value=(
+                f"resolved predictions: **{metrics['resolved']}**\n"
+                f"board entries observed: **{stats['trend_entries']}**\n"
+                f"positives: **{metrics['positives']}**\n"
+                f"sufficient to quote a number: "
+                f"**{'yes' if metrics['sufficient'] else 'NO'}**"
+            ),
+            inline=False,
+        )
+        if metrics["sufficient"]:
+            embed.add_field(
+                name="PRECISION",
+                value=(
+                    f"base rate: **{_pct(metrics['base_rate'])}**\n"
+                    f"alert precision: **{_pct(metrics['precision'])}** "
+                    f"({metrics['alert_hits']}/{metrics['alerts']})\n"
+                    f"lift over base rate: **{metrics['lift']}x**\n"
+                    f"median lead: **{_secs(metrics['median_lead_seconds'])}**"
+                ),
+                inline=False,
+            )
+        else:
+            embed.add_field(
+                name="PRECISION",
+                value=(
+                    "Not enough resolved predictions to quote precision "
+                    "(30 positives and 500 resolved required). "
+                    "Quoting one now would be a number with no sample behind it."
+                ),
+                inline=False,
+            )
+        rates = stats["alert_rate"].get("by_kind", {})
+        embed.add_field(
+            name="ALERT RATE",
+            value=(
+                "\n".join(
+                    f"{kind}: {row['count']} ({row['per_hour'] or '?'}/h)"
+                    for kind, row in sorted(rates.items())
+                )
+                or "no alerts in this window"
+            ),
+            inline=False,
+        )
+        health = stats["snapshot_health"]
+        embed.add_field(
+            name="GROUND-TRUTH HEALTH",
+            value=(
+                f"board snapshots accepted: {health['accepted']} • "
+                f"rejected: {health['rejected']}\n"
+                f"acceptance rate: {health['acceptance_rate']}\n"
+                f"rejections: {health['rejections'] or 'none'}"
+            ),
+            inline=False,
+        )
+        if not stats["activity_lane"]["configured"]:
+            embed.add_field(
+                name="⚠️ FOMO-NATIVE LANE UNCONFIGURED",
+                value=stats["activity_lane"]["detail"][:1000],
+                inline=False,
+            )
+        await self._resolve(interaction, embed=_clamp_embed(embed))
+
+    @app_commands.command(
+        name="forensics",
+        description="Reconstruct what was knowable before an exact mint entered Trending.",
+    )
+    @app_commands.describe(mint="Exact Solana token mint; ticker searches are not accepted")
+    async def forensics(
+        self, interaction: discord.Interaction, mint: str
+    ) -> None:
+        if not await self._require_admin(interaction):
+            return
+        try:
+            exact_mint = str(Pubkey.from_string(mint.strip()))
+        except ValueError:
+            await interaction.response.send_message(
+                "Enter an exact valid Solana mint. Ticker searches are not accepted: "
+                "two tokens with one ticker are two tokens.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        result = await self.bot.engine.pretrend_forensics(exact_mint)
+        if result.get("report") is None:
+            await self._resolve_lab(
+                interaction,
+                content=(
+                    f"No FOMO_TREND_ENTER event is recorded for `{exact_mint}`. "
+                    "Either it never entered the board while the collector was "
+                    "running, or the mint is wrong. Nothing is inferred from a name."
+                ),
+            )
+            return
+        body = render_pretrend_forensics(result["report"])
+        await self._resolve(interaction, content=body[:1900])
+
+    @app_commands.command(
+        name="missed",
+        description="Board entries the model did not alert on — the false negatives.",
+    )
+    @app_commands.describe(count="How many misses to show")
+    async def missed(
+        self, interaction: discord.Interaction, count: int = 10
+    ) -> None:
+        if not await self._require_admin(interaction):
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        rows = await self.bot.engine.pretrend_missed(limit=max(1, min(count, 25)))
+        embed = discord.Embed(
+            title="MISSED BOARD ENTRIES (false negatives)",
+            colour=0x95A5A6,
+            description=(
+                "Tokens that entered FOMO Trending with no preceding PRE_TREND "
+                "alert. Kept in full; this list is never filtered down."
+            ),
+        )
+        if not rows:
+            embed.add_field(
+                name="No misses recorded",
+                value=(
+                    "Either no board entries have been observed yet, or every "
+                    "one was alerted. Check /fomo pretrendstats for the sample."
+                ),
+                inline=False,
+            )
+        for row in rows[:10]:
+            embed.add_field(
+                name=f"${row.get('symbol') or '?'} — rank {row.get('initial_rank') or '?'}",
+                value=(
+                    f"`{row['mint']}`\n"
+                    f"entered <t:{int(row['occurred_at'])}:R> at "
+                    f"MC {_usd(row.get('market_cap_usd'))}"
+                ),
+                inline=False,
+            )
+        await self._resolve(interaction, embed=_clamp_embed(embed))
+
+    @app_commands.command(
+        name="falsepositives",
+        description="PRE_TREND alerts whose token never entered Trending.",
+    )
+    @app_commands.describe(count="How many failed alerts to show")
+    async def falsepositives(
+        self, interaction: discord.Interaction, count: int = 10
+    ) -> None:
+        if not await self._require_admin(interaction):
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        rows = await self.bot.engine.pretrend_false_positives(
+            limit=max(1, min(count, 25))
+        )
+        embed = discord.Embed(
+            title="FAILED PRE_TREND ALERTS (false positives)",
+            colour=0xC0392B,
+            description=(
+                "Every alert that did not resolve into a board entry. Losing "
+                "signals are retained permanently — a scoreboard you can delete "
+                "from is not one."
+            ),
+        )
+        if not rows:
+            embed.add_field(
+                name="No failed alerts recorded",
+                value="No PRE_TREND alert has been published and resolved yet.",
+                inline=False,
+            )
+        for row in rows[:10]:
+            embed.add_field(
+                name=f"P={_pct(row.get('probability'))} — {row.get('model_version') or '?'}",
+                value=(
+                    f"`{row['mint']}`\n"
+                    f"predicted <t:{int(row['predicted_at'])}:R> at "
+                    f"MC {_usd(row.get('market_cap_usd'))}"
+                ),
+                inline=False,
+            )
+        await self._resolve(interaction, embed=_clamp_embed(embed))
+
+    @app_commands.command(
+        name="modelhealth",
+        description="Training cutoff, sample, calibration, rolling precision and drift.",
+    )
+    async def modelhealth(self, interaction: discord.Interaction) -> None:
+        if not await self._require_admin(interaction):
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        health = await self.bot.engine.pretrend_model_health()
+        active = health["active"]
+        embed = discord.Embed(
+            title="PRE-TREND MODEL HEALTH",
+            colour=0x3498DB,
+            description=f"Feature version `{health['feature_version']}`",
+        )
+        embed.add_field(
+            name="LANE",
+            value=(
+                f"collection: on\n"
+                f"training: {'on' if health['training_enabled'] else 'off'}\n"
+                f"inference: {'on' if health['inference_enabled'] else 'off'}\n"
+                f"alerting: {'on' if health['alerting_enabled'] else 'off'}"
+            ),
+            inline=False,
+        )
+        if active is None:
+            embed.add_field(
+                name="NO ACTIVE MODEL",
+                value=(
+                    "No model has been promoted. This is the expected state "
+                    "until enough board entries have been observed to validate "
+                    "one walk-forward. The lane stays silent until then."
+                ),
+                inline=False,
+            )
+        else:
+            embed.add_field(
+                name="ACTIVE MODEL",
+                value=(
+                    f"`{active['name']}` • horizon {active['horizon_seconds']}s\n"
+                    f"trained <t:{int(active['trained_at'])}:R>\n"
+                    f"training cutoff <t:{int(active['training_cutoff_at'])}:f>\n"
+                    f"rows {active['trained_rows']} • "
+                    f"positives {active['trained_positives']}\n"
+                    f"threshold {active['threshold']}"
+                ),
+                inline=False,
+            )
+        refusals = [
+            row
+            for row in health["history"]
+            if not row["active"]
+        ][:3]
+        if refusals:
+            lines = []
+            for row in refusals:
+                try:
+                    metrics = json.loads(row["metrics_json"])
+                except (ValueError, TypeError):
+                    metrics = {}
+                reason = metrics.get("refusal_reason") or "no reason recorded"
+                lines.append(f"• <t:{int(row['trained_at'])}:R> — {reason}")
+            embed.add_field(
+                name="RECENT TRAINING RUNS NOT PROMOTED",
+                value="\n".join(lines)[:1000],
+                inline=False,
+            )
+        await self._resolve(interaction, embed=_clamp_embed(embed))
+
+    @app_commands.command(
+        name="traders",
+        description="Public FOMO accounts with a statistically meaningful early record.",
+    )
+    @app_commands.describe(count="How many accounts to show")
+    async def traders(
+        self, interaction: discord.Interaction, count: int = 10
+    ) -> None:
+        if not await self._require_admin(interaction):
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        result = await self.bot.engine.pretrend_traders(limit=max(1, min(count, 25)))
+        embed = discord.Embed(
+            title="FOMO PRE-TREND AFFINITY",
+            colour=0x9B59B6,
+            description=(
+                "Public accounts measured on how often the tokens they entered "
+                "subsequently reached Trending. This is a measured record of "
+                "being early. It is **not** an insider score and nothing here "
+                "alleges access to non-public information."
+            ),
+        )
+        if not result["records"]:
+            embed.add_field(
+                name="No accounts with a meaningful record",
+                value=(
+                    f"Population: {result['population']} accounts observed.\n"
+                    + (
+                        result["activity_lane"]["detail"]
+                        if not result["activity_lane"]["configured"]
+                        else "No account has reached the minimum sample yet."
+                    )
+                )[:1000],
+                inline=False,
+            )
+        for record in result["records"][:10]:
+            horizon = record["horizons"].get("5m", {})
+            embed.add_field(
+                name=(record["handle"] or record["actor_id"][:16]),
+                value=(
+                    f"adjusted rate **{_pct(horizon.get('adjusted_rate'))}** "
+                    f"(raw {_pct(horizon.get('raw_rate'))})\n"
+                    f"n={horizon.get('observations')} • "
+                    f"baseline {_pct(horizon.get('baseline'))} • "
+                    f"lift {horizon.get('lift') or '?'}x\n"
+                    f"95% CI [{_pct(horizon.get('ci_low'))}, "
+                    f"{_pct(horizon.get('ci_high'))}] • "
+                    f"median lead {_secs(record.get('median_lead_seconds'))}"
+                ),
+                inline=False,
+            )
+        await self._resolve(interaction, embed=_clamp_embed(embed))
+
+    @app_commands.command(
+        name="patterns",
+        description="Future trenders versus matched look-alikes that never trended.",
+    )
+    @app_commands.describe(days="How many days of observations to compare")
+    async def patterns(
+        self, interaction: discord.Interaction, days: int = 7
+    ) -> None:
+        if not await self._require_admin(interaction):
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        result = await self.bot.engine.pretrend_patterns(days=max(1, min(days, 30)))
+        if not result.get("available"):
+            await self._resolve_lab(
+                interaction,
+                content=(
+                    "No pre-trend observations have been collected yet, so "
+                    f"there is nothing to compare. ({result.get('reason', '')})"
+                ),
+            )
+            return
+        matched = result["matched"]
+        embed = discord.Embed(
+            title="WINNERS vs MATCHED LOOK-ALIKES",
+            colour=0x1ABC9C,
+            description=(
+                "Tokens that reached Trending compared against tokens in the "
+                "same market-cap cohort, age cohort and time window that did "
+                "not. Effect size is rank-biserial: 0 means the two groups are "
+                "indistinguishable on that feature."
+            ),
+        )
+        embed.add_field(
+            name="SAMPLE",
+            value=(
+                f"rows {matched['rows']} • positives {matched['positives']} "
+                f"(from {matched['distinct_positive_mints']} distinct mints)\n"
+                f"base rate {matched['base_rate']}\n"
+                f"leakage-clean: {'yes' if matched['clean'] else 'NO'}\n"
+                f"sufficient to quote: "
+                f"{'yes' if matched['sufficient'] else 'NO — treat as indicative'}"
+            ),
+            inline=False,
+        )
+        rows = [
+            comparison
+            for comparison in result["comparisons"]
+            if comparison["meaningful"]
+        ][:8]
+        if rows:
+            embed.add_field(
+                name="STRONGEST SEPARATORS",
+                value="\n".join(
+                    f"`{row['feature']}` effect {row['effect_size']} • "
+                    f"median {row['positive_median']} vs {row['negative_median']} "
+                    f"(n={row['positive_n']}/{row['negative_n']})"
+                    for row in rows
+                )[:1000],
+                inline=False,
+            )
+        else:
+            embed.add_field(
+                name="NO FEATURE SEPARATES THE GROUPS",
+                value=(
+                    "No feature reached the minimum sample on both sides. "
+                    "If this persists once the sample grows, the honest "
+                    "conclusion is that the hypothesis is not supported."
+                ),
+                inline=False,
+            )
+        await self._resolve(interaction, embed=_clamp_embed(embed))
+
+
+
+def _pct(value: object) -> str:
+    """Render a 0-1 rate as a percentage, or ``unknown``.  Never renders 0 for None."""
+
+    if value is None or value == "":
+        return "unknown"
+    try:
+        return f"{float(value) * 100:.2f}%"
+    except (TypeError, ValueError):
+        return "unknown"
+
+
+def _usd(value: object) -> str:
+    if value is None or value == "":
+        return "unknown"
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return "unknown"
+    if abs(amount) >= 1_000_000:
+        return f"${amount / 1_000_000:.2f}M"
+    if abs(amount) >= 1_000:
+        return f"${amount / 1_000:.1f}K"
+    return f"${amount:.2f}"
+
+
+def _secs(value: object) -> str:
+    if value is None:
+        return "unknown"
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        return "unknown"
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, remainder = divmod(seconds, 60)
+    return f"{minutes}m {remainder}s" if remainder else f"{minutes}m"
 
 
 def run_bot(settings: Settings) -> None:
