@@ -9239,14 +9239,49 @@ class PretrendCommands(
             colour=0x3498DB,
             description=f"Feature version `{health['feature_version']}`",
         )
+        def _switch(name: str, running: str | None = None) -> str:
+            state = "on" if health.get(name) else "off"
+            if running is None:
+                return state
+            # A switch that is on with a dead loop is the failure this command
+            # exists to surface, so the two facts are printed together rather
+            # than the configured value standing in for the running one.
+            if health.get(name) and not health.get(running):
+                return "on (LOOP NOT RUNNING)"
+            return state
+
         embed.add_field(
             name="LANE",
             value=(
-                f"collection: on\n"
-                f"training: {'on' if health['training_enabled'] else 'off'}\n"
-                f"inference: {'on' if health['inference_enabled'] else 'off'}\n"
-                f"alerting: {'on' if health['alerting_enabled'] else 'off'}"
+                f"lane: {_switch('enabled')}\n"
+                f"collection: {_switch('collection_enabled', 'board_loop_running')}\n"
+                f"training: {_switch('training_enabled', 'training_loop_running')}\n"
+                f"inference: {_switch('inference_enabled')}\n"
+                f"alerting: {_switch('alerting_enabled')} "
+                f"(may_send={health.get('may_send')})\n"
+                f"board cycles: {health.get('cycles', 0)}"
             ),
+            inline=False,
+        )
+        source = health.get("label_source") or {}
+        snapshots = health.get("snapshot_health") or {}
+        labels = health.get("labels") or {}
+        embed.add_field(
+            name=(
+                "LABEL SOURCE — AUTHORISED"
+                if source.get("authorised_for_fomo_labels")
+                else "⚠️ LABEL SOURCE — NOT AUTHORISED FOR FOMO LABELS"
+            ),
+            value=(
+                f"`{source.get('source_kind', 'UNKNOWN')}`\n"
+                f"{source.get('detail', '')}\n"
+                f"usable labels (witnessed FOMO entries): "
+                f"**{labels.get('usable_labels', 0)}**\n"
+                f"entry unproven (seen on a board, arrival not witnessed): "
+                f"{labels.get('entry_unproven', 0)}\n"
+                f"snapshots accepted/rejected: "
+                f"{snapshots.get('accepted', 0)}/{snapshots.get('rejected', 0)}"
+            )[:1024],
             inline=False,
         )
         if active is None:

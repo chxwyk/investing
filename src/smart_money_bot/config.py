@@ -320,6 +320,14 @@ class Settings:
     fomo_trending_off_board_exception_enabled: bool
     fomo_trending_stale_snapshot_seconds: int
 
+    # --- alert policy (v2.55) ----------------------------------------------
+    #: Which lanes may interrupt a human.  One table, applied at the single
+    #: publication choke point, because per-lane caps cannot bound the total
+    #: rate an operator actually experiences.  Defaults to LEGACY so this
+    #: release changes no existing lane's behaviour until opted into.
+    #: SILENT | GROUND_TRUTH | CURATED | LEGACY
+    alert_policy_mode: str
+
     # --- FOMO PRE-TREND INTELLIGENCE (v2.55) -------------------------------
     # The research lane.  Its defaults are chosen so that enabling the release
     # changes nothing an operator can hear: collection is ON (it is the only
@@ -353,6 +361,9 @@ class Settings:
     #: partial response rather than as a real market event.
     pretrend_min_board_rows: int
     pretrend_max_board_shrink_ratio: Decimal
+    #: A gap longer than this between accepted snapshots means we cannot claim
+    #: to have witnessed anything that appeared during it.
+    pretrend_max_coverage_gap_seconds: int
     #: The authorised FOMO activity feed.  There is no default endpoint and no
     #: discovery path: without this the FOMO-native lane reports itself
     #: unconfigured and every FOMO feature is UNKNOWN rather than zero.
@@ -973,6 +984,7 @@ class Settings:
             fomo_trending_stale_snapshot_seconds=_int(
                 "FOMO_TRENDING_STALE_SNAPSHOT_SECONDS", 600
             ),
+            alert_policy_mode=os.getenv("ALERT_POLICY_MODE", "LEGACY").strip(),
             pretrend_enabled=_bool("PRETREND_ENABLED", True),
             pretrend_collection_enabled=_bool("PRETREND_COLLECTION_ENABLED", True),
             pretrend_inference_enabled=_bool("PRETREND_INFERENCE_ENABLED", False),
@@ -994,6 +1006,9 @@ class Settings:
             pretrend_min_board_rows=_int("PRETREND_MIN_BOARD_ROWS", 5),
             pretrend_max_board_shrink_ratio=_decimal(
                 "PRETREND_MAX_BOARD_SHRINK_RATIO", "0.6"
+            ),
+            pretrend_max_coverage_gap_seconds=_int(
+                "PRETREND_MAX_COVERAGE_GAP_SECONDS", 180
             ),
             pretrend_activity_api_url=(
                 os.getenv("PRETREND_ACTIVITY_API_URL", "").strip() or None

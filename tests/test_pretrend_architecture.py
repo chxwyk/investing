@@ -118,24 +118,25 @@ def test_every_ping_passes_through_the_single_publication_choke_point() -> None:
         assert "_dispatch_card(" in body, f"{name} must publish via _dispatch_card"
 
 
-def test_first_observation_columns_appear_in_no_update_clause() -> None:
+def test_first_observation_columns_appear_in_no_unguarded_update_clause() -> None:
     """Write-once is enforced by the SQL, not by callers remembering.
 
     ``first_trending_at`` is the timestamp every lead-time claim is measured
-    against.  If any UPDATE could move it, a re-entry would silently redefine
-    the target and every late alert would look early in hindsight.
+    against. Exactly one UPDATE in the codebase may set it -- the guarded
+    promotion in :meth:`promote_membership_entry`, which fires only while the
+    column is still NULL, so a witnessed entry can be recorded once and can
+    never overwrite one that was already proven.
     """
 
     sql = Path(inspect.getfile(store)).read_text()
-    schema = (SOURCE_ROOT.parent / "database.py").read_text()
 
     protected = (
         "first_trending_at",
+        "first_observed_on_board_at",
         "first_rank",
         "first_market_cap_usd",
         "first_seen_at",
     )
-    # Collect the text of every UPDATE SET clause in the pre-trend store.
     lowered = sql.lower()
     cursor = 0
     while True:
@@ -147,12 +148,64 @@ def test_first_observation_columns_appear_in_no_update_clause() -> None:
         clause = clause[: end if end != -1 else len(clause)]
         for column in protected:
             assert column not in clause, (
-                f"{column} appears in an UPDATE SET clause; it must be write-once"
+                f"{column} appears in an upsert's UPDATE SET clause; it must be write-once"
             )
         cursor = index + 1
 
-    # And the schema declares them, so the test is checking something real.
-    assert "first_trending_at INTEGER NOT NULL" in schema
+    # The strictest form of the rule: NOTHING updates the entry timestamp.
+    # It is set once by an INSERT or it stays NULL forever.  A mint we found
+    # already on the board entered before we were watching, so a later
+    # witnessed arrival is a re-entry and must not be back-filled as the first.
+    assert "SET first_trending_at" not in sql, (
+        "no UPDATE may set first_trending_at; it is INSERT-only"
+    )
+
+
+def test_a_presence_we_never_witnessed_cannot_be_stored_as_an_entry() -> None:
+    """The column is nullable on purpose, and the schema says why."""
+
+    schema = (SOURCE_ROOT.parent / "database.py").read_text()
+    block = schema[schema.index("CREATE TABLE IF NOT EXISTS pretrend_membership") :]
+    block = block[: block.index(");")]
+
+    assert "first_observed_on_board_at INTEGER NOT NULL" in block
+    # NOT nullable would force a fabricated entry time for every token that was
+    # already on the board when collection started.
+    assert "first_trending_at INTEGER," in block
+    assert "first_trending_at INTEGER NOT NULL" not in block
+    assert "PRIMARY KEY (mint, grade)" in block, (
+        "membership must be keyed by grade so a proxy board cannot occupy the "
+        "FOMO row for a mint"
+    )
+
+
+def test_only_an_authorised_source_can_establish_a_label() -> None:
+    """Provenance is a membership test against a frozen set, not a heuristic."""
+
+    from smart_money_bot.pretrend.groundtruth import (
+        AUTHORISED_SOURCE_KINDS,
+        GRADE_FOMO,
+        GRADE_PROXY,
+        grade_for_source,
+    )
+
+    assert frozenset({"FOMO_TRENDING"}) == AUTHORISED_SOURCE_KINDS
+    assert grade_for_source("FOMO_TRENDING") == GRADE_FOMO
+    for unauthorised in (
+        "TRENDING_PROXY",
+        "NO_SOURCE_CONFIGURED",
+        "",
+        "fomo_trending",
+        "FOMO_TRENDING_V2",
+    ):
+        assert grade_for_source(unauthorised) == GRADE_PROXY, unauthorised
+
+    # The label-grade queries live in SQL so a new caller inherits them.
+    sql = Path(inspect.getfile(store)).read_text()
+    label_map = sql[sql.index("async def first_trending_map(") :]
+    label_map = label_map[: label_map.index("\n    async def ")]
+    assert "grade = 'FOMO'" in label_map
+    assert "first_trending_at IS NOT NULL" in label_map
 
 
 def test_the_pretrend_observation_insert_is_append_only() -> None:

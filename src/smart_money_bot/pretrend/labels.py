@@ -48,6 +48,10 @@ LABEL_NAMES: dict[int, str] = {
 
 #: Why a row is not usable as a training example.
 INELIGIBLE_ALREADY_TRENDING = "ALREADY_TRENDING"
+#: The mint was seen on a board but its arrival was never witnessed, so there is
+#: no entry time to predict -- and it cannot serve as a negative either, because
+#: it demonstrably WAS on the board.  Excluded in both directions.
+INELIGIBLE_ENTRY_UNPROVEN = "ENTRY_UNPROVEN"
 INELIGIBLE_OUT_OF_UNIVERSE = "OUT_OF_UNIVERSE"
 INELIGIBLE_NO_MARKET_CAP = "NO_MARKET_CAP"
 INELIGIBLE_CENSORED = "CENSORED"
@@ -125,13 +129,23 @@ def eligible_at(
     market_cap_usd: Decimal | None,
     universe_min_usd: Decimal,
     universe_max_usd: Decimal,
+    entry_unproven: bool = False,
 ) -> tuple[bool, str]:
     """Is this observation a genuine prediction opportunity?
 
     Returns ``(eligible, reason)``.  A mint already on the board at ``T`` is
     ineligible even if it later re-enters: there is nothing left to predict.
+
+    ``entry_unproven`` marks a mint we found on a board without witnessing its
+    arrival -- present when collection started, or appearing across a coverage
+    gap.  Such a mint is refused outright rather than treated as a negative.
+    Treating it as a negative would be the more damaging error of the two: it
+    was on the board, so the model would be trained to call a genuine trender a
+    non-event.
     """
 
+    if entry_unproven:
+        return (False, INELIGIBLE_ENTRY_UNPROVEN)
     if first_trending_at is not None and first_trending_at <= observed_at:
         return (False, INELIGIBLE_ALREADY_TRENDING)
     if market_cap_usd is None:
@@ -153,6 +167,7 @@ def label_observation(
     #: unobserved, so horizons extending past it are censored.
     data_complete_until: int,
     horizons: Sequence[int] = LABEL_HORIZONS_SECONDS,
+    entry_unproven: bool = False,
 ) -> LabelSet:
     """Label one point-in-time observation at every horizon."""
 
@@ -162,6 +177,7 @@ def label_observation(
         market_cap_usd=market_cap_usd,
         universe_min_usd=universe_min_usd,
         universe_max_usd=universe_max_usd,
+        entry_unproven=entry_unproven,
     )
     if not eligible:
         return LabelSet(

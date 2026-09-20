@@ -159,8 +159,8 @@ class PretrendStore:
                 mint, kind, occurred_at, symbol, name, initial_rank, tier,
                 market_cap_usd, price_usd, liquidity_usd, volume_usd, holders,
                 token_age_seconds, pair_age_seconds, provider, source_kind,
-                source_at, collector_at, collector_version, raw_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                grade, source_at, collector_at, collector_version, raw_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -180,6 +180,7 @@ class PretrendStore:
                     event.pair_age_seconds,
                     event.provider,
                     event.source_kind,
+                    event.grade,
                     event.source_at,
                     event.collector_at,
                     event.collector_version,
@@ -191,11 +192,20 @@ class PretrendStore:
         await self._db.commit()
 
     async def upsert_membership(self, records: Sequence[MembershipRecord]) -> None:
-        """Write membership state.
+        """Write membership state, keyed by (mint, grade).
 
-        ``first_trending_at``, ``first_rank`` and ``first_market_cap_usd`` are
-        set by the INSERT and are deliberately absent from the UPDATE clause, so
-        a re-entry — or a bug — cannot rewrite what the entry numbers were.
+        ``first_observed_on_board_at``, ``first_trending_at``, ``first_rank``
+        and ``first_market_cap_usd`` are set by the INSERT and are deliberately
+        absent from the UPDATE clause, so a re-entry -- or a bug -- cannot
+        rewrite what the entry numbers were.
+
+        ``first_trending_at`` stays NULL for a mint whose arrival we never
+        witnessed, and **no** code path can fill it in later -- there is no
+        UPDATE anywhere that sets it.  That is not an oversight: a mint we
+        found already on the board had its first entry before we were watching,
+        so a later witnessed arrival is a RE-entry, not a first one.  Recording
+        that later timestamp as the first entry would understate the token's
+        age on the board and flatter every lead time measured against it.
         """
 
         if not records:
@@ -205,12 +215,14 @@ class PretrendStore:
             await self._db.execute(
                 """
                 INSERT INTO pretrend_membership (
-                    mint, first_trending_at, first_rank, first_market_cap_usd,
-                    state, last_seen_on_board_at, left_at, entries, stints_json,
+                    mint, grade, first_observed_on_board_at, first_trending_at,
+                    first_rank, first_market_cap_usd, state, unproven_reason,
+                    last_seen_on_board_at, left_at, entries, stints_json,
                     updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(mint) DO UPDATE SET
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(mint, grade) DO UPDATE SET
                     state = excluded.state,
+                    unproven_reason = excluded.unproven_reason,
                     last_seen_on_board_at = excluded.last_seen_on_board_at,
                     left_at = excluded.left_at,
                     entries = excluded.entries,
@@ -219,10 +231,13 @@ class PretrendStore:
                 """,
                 (
                     record.mint,
+                    record.grade,
+                    record.first_observed_on_board_at,
                     record.first_trending_at,
                     record.first_rank,
                     _f(record.first_market_cap_usd),
                     record.state,
+                    record.unproven_reason,
                     record.last_seen_on_board_at,
                     record.left_at,
                     record.entries,
@@ -234,16 +249,19 @@ class PretrendStore:
 
     async def load_membership(self) -> tuple[MembershipRecord, ...]:
         cursor = await self._db.execute(
-            "SELECT * FROM pretrend_membership ORDER BY first_trending_at"
+            "SELECT * FROM pretrend_membership ORDER BY first_observed_on_board_at"
         )
         rows = await cursor.fetchall()
         return tuple(
             MembershipRecord(
                 mint=row["mint"],
-                first_trending_at=int(row["first_trending_at"]),
+                grade=row["grade"],
+                first_observed_on_board_at=int(row["first_observed_on_board_at"] or 0),
+                first_trending_at=row["first_trending_at"],
                 first_rank=row["first_rank"],
                 first_market_cap_usd=_d(row["first_market_cap_usd"]),
                 state=row["state"],
+                unproven_reason=row["unproven_reason"] or "",
                 last_seen_on_board_at=int(row["last_seen_on_board_at"] or 0),
                 left_at=row["left_at"],
                 entries=int(row["entries"] or 1),
@@ -257,13 +275,82 @@ class PretrendStore:
         )
 
     async def first_trending_map(self) -> dict[str, int]:
-        """``mint -> first_trending_at`` for labelling.  The ground-truth index."""
+        """``mint -> first_trending_at`` for labelling.  The ground-truth index.
+
+        Restricted in SQL to FOMO-grade rows with a WITNESSED entry.  A proxy
+        sighting and an unwitnessed presence are both excluded, because neither
+        is the event this engine claims to predict.  Putting the restriction in
+        the query rather than in the callers means a new caller inherits it.
+        """
 
         cursor = await self._db.execute(
-            "SELECT mint, first_trending_at FROM pretrend_membership"
+            """
+            SELECT mint, first_trending_at FROM pretrend_membership
+            WHERE grade = 'FOMO' AND first_trending_at IS NOT NULL
+            """
         )
         rows = await cursor.fetchall()
         return {row["mint"]: int(row["first_trending_at"]) for row in rows}
+
+    async def entry_unproven_mints(self) -> frozenset[str]:
+        """Mints seen on some board whose arrival we never witnessed.
+
+        Excluded from labels in BOTH directions: they cannot be positives
+        because the entry time is unknown, and they must not serve as controls
+        either, because they were demonstrably on a board -- calling them
+        "tokens that did not trend" would be exactly backwards.
+        """
+
+        cursor = await self._db.execute(
+            "SELECT DISTINCT mint FROM pretrend_membership WHERE first_trending_at IS NULL"
+        )
+        rows = await cursor.fetchall()
+        return frozenset(row["mint"] for row in rows)
+
+    async def proxy_only_mints(self) -> frozenset[str]:
+        """Mints known to a proxy board but never witnessed entering FOMO."""
+
+        cursor = await self._db.execute(
+            """
+            SELECT DISTINCT p.mint FROM pretrend_membership p
+            WHERE p.grade = 'PROXY' AND NOT EXISTS (
+                SELECT 1 FROM pretrend_membership f
+                WHERE f.mint = p.mint AND f.grade = 'FOMO'
+                  AND f.first_trending_at IS NOT NULL
+            )
+            """
+        )
+        rows = await cursor.fetchall()
+        return frozenset(row["mint"] for row in rows)
+
+    async def label_health(self) -> dict[str, Any]:
+        """How many supervised targets actually exist, and why others do not."""
+
+        cursor = await self._db.execute(
+            """
+            SELECT grade,
+                   SUM(CASE WHEN first_trending_at IS NOT NULL THEN 1 ELSE 0 END) AS proven,
+                   SUM(CASE WHEN first_trending_at IS NULL THEN 1 ELSE 0 END) AS unproven,
+                   COUNT(*) AS total
+            FROM pretrend_membership GROUP BY grade
+            """
+        )
+        rows = await cursor.fetchall()
+        by_grade = {
+            row["grade"]: {
+                "proven": int(row["proven"] or 0),
+                "unproven": int(row["unproven"] or 0),
+                "total": int(row["total"] or 0),
+            }
+            for row in rows
+        }
+        fomo = by_grade.get("FOMO", {"proven": 0, "unproven": 0, "total": 0})
+        return {
+            "by_grade": by_grade,
+            "usable_labels": fomo["proven"],
+            "entry_unproven": sum(block["unproven"] for block in by_grade.values()),
+            "proxy_only": by_grade.get("PROXY", {}).get("total", 0),
+        }
 
     async def trend_entries(
         self, *, since: int = 0, limit: int = 200
@@ -271,7 +358,7 @@ class PretrendStore:
         cursor = await self._db.execute(
             """
             SELECT * FROM pretrend_trend_events
-            WHERE kind = 'FOMO_TREND_ENTER' AND occurred_at >= ?
+            WHERE kind = 'FOMO_TREND_ENTER' AND grade = 'FOMO' AND occurred_at >= ?
             ORDER BY occurred_at DESC LIMIT ?
             """,
             (since, limit),
@@ -283,7 +370,7 @@ class PretrendStore:
         cursor = await self._db.execute(
             """
             SELECT * FROM pretrend_trend_events
-            WHERE mint = ? AND kind = 'FOMO_TREND_ENTER'
+            WHERE mint = ? AND kind = 'FOMO_TREND_ENTER' AND grade = 'FOMO'
             ORDER BY occurred_at LIMIT 1
             """,
             (mint,),
@@ -308,6 +395,7 @@ class PretrendStore:
             pair_age_seconds=row["pair_age_seconds"],
             provider=row["provider"],
             source_kind=row["source_kind"],
+            grade=row["grade"],
             source_at=row["source_at"],
             collector_at=int(row["collector_at"] or 0),
             collector_version=row["collector_version"],
@@ -341,6 +429,31 @@ class PretrendStore:
             )
             for row in rows
         )
+
+    async def last_accepted_snapshot_at(self, *, grade: str = "FOMO") -> int | None:
+        """When coverage was last known good, so a restart is not read as a gap.
+
+        A restart shorter than the coverage-gap bound must not void a real
+        entry; a restart longer than it must. Comparing against the genuine
+        last-accepted timestamp gets both cases right, where resetting the
+        clock to process-start time would silently get the second one wrong.
+        """
+
+        kinds = (
+            ("FOMO_TRENDING",)
+            if grade == "FOMO"
+            else ("TRENDING_PROXY", "NO_SOURCE_CONFIGURED", "")
+        )
+        placeholders = ",".join("?" for _ in kinds)
+        cursor = await self._db.execute(
+            f"""
+            SELECT MAX(observed_at) AS last_at FROM pretrend_board_snapshots
+            WHERE valid = 1 AND source_kind IN ({placeholders})
+            """,
+            kinds,
+        )
+        row = await cursor.fetchone()
+        return None if row is None or row["last_at"] is None else int(row["last_at"])
 
     async def snapshot_health(self, *, since: int = 0) -> dict[str, Any]:
         cursor = await self._db.execute(
@@ -980,8 +1093,13 @@ class PretrendStore:
             SELECT e.mint, e.occurred_at, e.symbol, e.name, e.initial_rank,
                    e.market_cap_usd, m.first_trending_at
             FROM pretrend_trend_events e
-            JOIN pretrend_membership m ON m.mint = e.mint
-            WHERE e.kind = 'FOMO_TREND_ENTER'
+            JOIN pretrend_membership m
+              ON m.mint = e.mint AND m.grade = 'FOMO'
+            WHERE e.kind = 'FOMO_TREND_ENTER' AND e.grade = 'FOMO'
+              -- Only a WITNESSED entry can be "missed": a presence we never saw
+              -- arrive was never predictable, so counting it as a false
+              -- negative would blame the model for our own coverage gap.
+              AND m.first_trending_at IS NOT NULL
               AND NOT EXISTS (
                 SELECT 1 FROM pretrend_alert_events a
                 WHERE a.mint = e.mint AND a.sent_at < m.first_trending_at

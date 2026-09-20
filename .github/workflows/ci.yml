@@ -1,0 +1,104 @@
+# CI for smart-money-copy-bot.
+#
+# Everything here runs against public code only.  The suite must pass with no
+# Discord token, no RPC endpoint, no provider API key and no database volume,
+# and it must never reach a live trading service -- so this workflow supplies
+# no secrets at all.  If a test ever needs one, that test is talking to
+# something it should be faking.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # A new push supersedes an in-flight run for the same ref.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    # No `env:` block and no `secrets` are referenced anywhere in this job.
+    # That is deliberate and is asserted by the guard step below.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          # Matches requires-python = ">=3.12" in pyproject.toml.
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install the project and its dev extras
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Lint
+        run: ruff check src tests
+
+      - name: Verify no production credentials are present
+        # The suite is supposed to run on public code with nothing configured.
+        # If any of these are somehow set, the run is not proving what it claims.
+        run: |
+          for name in DISCORD_TOKEN SOLANA_RPC_URL J7_API_KEY PINATA_JWT \
+                      LAUNCH_WALLET_SECRET_KEY FOMO_TRENDING_API_KEY \
+                      PRETREND_ACTIVITY_API_KEY X_BEARER_TOKEN; do
+            if [ -n "${!name:-}" ]; then
+              echo "::error::$name is set in CI; tests must not require credentials"
+              exit 1
+            fi
+          done
+          echo "No production credentials present, as required."
+
+      - name: Tests
+        run: pytest -q
+
+      - name: Dependency-light self-check
+        # Exercises the restricted-runtime path that Railway's slim image uses.
+        run: python tests/run_selfcheck.py
+
+      - name: Wheel build and installed-package import check
+        # Catches a new subpackage that setuptools does not actually ship --
+        # the failure mode where every test passes and the deployed image is
+        # missing a module.
+        run: |
+          python -m pip install --upgrade build
+          python -m build --wheel --outdir dist
+          python -m venv /tmp/wheelcheck
+          /tmp/wheelcheck/bin/pip install --quiet dist/*.whl
+          /tmp/wheelcheck/bin/python - <<'PY'
+          import importlib, pkgutil
+          import smart_money_bot
+          import smart_money_bot.pretrend as pretrend
+
+          # Import every shipped module, so a missing file fails here rather
+          # than at 3am on a Railway boot.
+          missing = []
+          for package in (smart_money_bot, pretrend):
+              for info in pkgutil.walk_packages(package.__path__, package.__name__ + "."):
+                  try:
+                      importlib.import_module(info.name)
+                  except Exception as exc:  # noqa: BLE001 - report, do not mask
+                      missing.append(f"{info.name}: {exc}")
+          if missing:
+              raise SystemExit("modules failed to import from the wheel:\n" + "\n".join(missing))
+
+          from smart_money_bot.config import Settings
+
+          settings = Settings.from_env(require_discord_token=False)
+          assert settings.pretrend_collection_enabled is True
+          assert settings.pretrend_inference_enabled is False
+          assert settings.pretrend_alerting_enabled is False
+          assert settings.alert_policy_mode == "LEGACY"
+          print("wheel imports cleanly and ships the documented defaults")
+          PY

@@ -36,6 +36,24 @@ deferred: a model trained next month can only learn from observations recorded t
 model is eventually promoted, its own budget is four alerts an hour with per-mint cooldowns and
 a material-change rule, so 41% → 42% → 43% is one message rather than four.
 
+**The default Trending source cannot produce labels at all, and the system says so.** With no
+`FOMO_TRENDING_API_URL` configured, this bot's Trending source is a DexScreener paid-boost
+ordering stamped `TRENDING_PROXY` — a legitimate attention approximation, and emphatically not
+the FOMO Trending board. Proxy rows are collected and stored, but they emit `PROXY_BOARD_*`
+events, never `FOMO_TREND_ENTER`, and `/pretrend modelhealth` reports
+`usable labels: 0` with the reason. Labelling proxy data as FOMO entries would have meant every
+downstream number — lead time, affinity, precision, base rate — described a different event
+from the one it was named after. **A deployment without an authorised feed collects usefully
+and can never train.** That is the honest state, not a bug.
+
+**Presence is not entry.** A token already on the board when collection starts did not just
+arrive; we started watching. Such mints get a `first_observed_on_board_at` and **no**
+`first_trending_at`, and are excluded from the dataset in both directions — they cannot be
+positives (the entry time is unknown) and must not be controls (they demonstrably *were*
+trending). The same rule applies after any coverage gap longer than
+`PRETREND_MAX_COVERAGE_GAP_SECONDS`. A first entry we missed stays missed permanently: a later
+witnessed return is recorded as a re-entry and is never back-filled as the first.
+
 This deployment has **no authorised FOMO-native activity feed**, and this release does not
 invent one — it will not scrape, reuse a browser session, replay a cookie or reverse a private
 endpoint. The interfaces, schema, mocks, rolling-window features and tests for that lane are
@@ -1255,6 +1273,46 @@ The bot needs these Discord application permissions:
 - Use Application Commands
 
 No privileged Discord gateway intents are required.
+
+## Alert policy: which lanes may interrupt you (v2.55)
+
+Adding a quiet new lane does not fix over-alerting, because the volume never came from one
+place. This bot has several independent publishers — the early lane, fast alerts, the runner
+lanes, the trenches lanes, GMGN participants, Trending, and now pre-trend — and each enforced
+its own threshold and its own hourly cap. **The rate a human experiences is the sum of those
+caps, and no single lane could see that total.**
+
+So the decision moved to one table in `alert_policy.py`, consulted at the single publication
+choke point (`_dispatch_card`) that every card already passes through. Each alert class maps to
+one of three dispositions per mode:
+
+| | Meaning |
+|---|---|
+| `PING` | Publishes and may interrupt (role mention, push). |
+| `RADAR` | Publishes to the channel with the interruption removed. Still scrollable, no longer claiming urgency. |
+| `SUPPRESS` | Not published. Collection, persistence, scoring and the forward record are untouched. |
+
+That last row is what makes the quiet modes safe: **suppressing a card never suppresses the
+observation behind it.** A mode change costs visibility and never costs research.
+
+### Modes
+
+| Mode | Classes that may ping | What it is for |
+|---|---|---|
+| `SILENT` | none | Run the bot as a pure data collector. |
+| `GROUND_TRUTH` | `TRENDING_CONFIRMED` only | See what actually reached the board and nothing predictive. The mode to evaluate the pre-trend research in. |
+| `CURATED` | `PRE_TREND_SIGNAL`, `TRENDING_CONFIRMED` | The one that actually implements "three exceptional alerts beat eighty mediocre ones": exactly one lane may interrupt, and its own budget is 4/hour with cooldowns. Every legacy lane is demoted to radar — still visible, never interrupting. |
+| `LEGACY` **(default)** | all 15 previously-pinging classes | Pre-release behaviour, unchanged. |
+
+`LEGACY` is the default deliberately. Defaulting to `CURATED` would have been a silent change
+to the behaviour of lanes this work did not otherwise touch, which is the kind of surprise that
+makes a release untrustworthy even when the new behaviour is better. Set
+`ALERT_POLICY_MODE=CURATED` to opt in. An unrecognised value falls back to `LEGACY` rather than
+to silence — a typo must not quietly switch alerting off.
+
+**WATCH** is absent from the table because WATCH never produces a card in any mode. It is a
+state in the pre-trend state machine with no publisher at all, which is what "silent WATCH"
+means: interesting enough to keep watching, not interesting enough to say anything about.
 
 ## FOMO pre-trend intelligence (v2.55)
 
@@ -2982,6 +3040,8 @@ PRETREND_AFFINITY_REFRESH_SECONDS=900
 PRETREND_ACTIVITY_API_URL=                # authorised FOMO-native feed; no default, ever
 PRETREND_ACTIVITY_API_KEY=
 PRETREND_ACTIVITY_POLL_SECONDS=20
+PRETREND_MAX_COVERAGE_GAP_SECONDS=180     # longer gap => arrivals are unprovable
+ALERT_POLICY_MODE=LEGACY                  # SILENT | GROUND_TRUTH | CURATED | LEGACY
 ```
 
 **Deployment steps**
@@ -2990,17 +3050,23 @@ PRETREND_ACTIVITY_POLL_SECONDS=20
 2. Confirm the lane started: `/pretrend modelhealth` should report
    `collection: on • training: on • inference: off • alerting: off` and `NO ACTIVE MODEL`.
    That is the correct state on day one, not a failure.
-3. After a few hours, `/pretrend stats` should show a rising **board entries observed** count
-   and a board-snapshot acceptance rate near 1.0. A low acceptance rate names its reason
-   (`PROVIDER_ERROR`, `TOO_SHORT`, `STALE`) — that is the number to watch, because ground truth
-   is what everything else is measured against.
-4. Leave it collecting. Nothing will ping. `/pretrend modelhealth` will keep naming the reason
+3. Check `/pretrend modelhealth` for the **LABEL SOURCE** block. Without an authorised feed it
+   reads `⚠️ LABEL SOURCE — NOT AUTHORISED FOR FOMO LABELS` and `usable labels: 0`, and it will
+   keep reading that no matter how long it collects. Proxy rows accumulate as evidence; they
+   cannot become training targets. If you want this lane to ever produce a model, an authorised
+   `FOMO_TRENDING_API_URL` is a hard prerequisite, not an optimisation.
+4. With an authorised feed, `/pretrend stats` should show a rising **board entries observed**
+   count and a snapshot acceptance rate near 1.0. A low acceptance rate names its reason
+   (`PROVIDER_ERROR`, `TOO_SHORT`, `STALE`). Expect `entry unproven` to be non-zero right after
+   startup — that is the collector correctly declining to date entries it did not witness.
+5. Leave it collecting. Nothing will ping. `/pretrend modelhealth` will keep naming the reason
    promotion was refused — most often "only N distinct positive mints; 30 required".
-5. Once `/pretrend stats` reports `sufficient: yes` and `/pretrend modelhealth` shows a
+6. Once `/pretrend stats` reports `sufficient: yes` and `/pretrend modelhealth` shows a
    promoted model, set `PRETREND_INFERENCE_ENABLED=true` to begin shadow scoring. Predictions
    are recorded silently. Review `/pretrend stats` and `/pretrend falsepositives` for a few
    days.
-6. Only then consider `PRETREND_ALERTING_ENABLED=true`.
+7. Only then consider `PRETREND_ALERTING_ENABLED=true`, and consider
+   `ALERT_POLICY_MODE=CURATED` if you want the legacy lanes to stop interrupting.
 
 **Verification procedure**
 

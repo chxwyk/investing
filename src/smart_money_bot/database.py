@@ -1793,20 +1793,43 @@ class Database:
             -- CANONICAL GROUND TRUTH.  first_trending_at is set by the initial
             -- INSERT OR IGNORE and appears in no UPDATE SET clause anywhere in
             -- this codebase, so no code path -- including a bug -- can move it.
+            -- CANONICAL GROUND TRUTH.  Keyed by (mint, grade) because a proxy
+            -- board and the FOMO board are different boards: a mint can be on
+            -- one, the other, or both, and conflating them would let DexScreener
+            -- boost ordering supply FOMO labels.
+            --
+            -- first_trending_at is NULLABLE on purpose.  It is set only when the
+            -- absent-to-present transition was actually WITNESSED.  A mint that
+            -- was already on the board when collection started, or that appeared
+            -- across a coverage gap, has a first_observed_on_board_at and a NULL
+            -- first_trending_at -- because "we started watching" is not "it just
+            -- entered", and recording the collector's start time as an entry
+            -- would fabricate a cohort of entries dated to the exact moment no
+            -- model could have predicted them.
+            --
+            -- Both first_* columns are set by the initial INSERT OR IGNORE and
+            -- appear in no UPDATE SET clause anywhere in this codebase.
             CREATE TABLE IF NOT EXISTS pretrend_membership (
-                mint TEXT PRIMARY KEY,
-                first_trending_at INTEGER NOT NULL,
+                mint TEXT NOT NULL,
+                grade TEXT NOT NULL DEFAULT 'FOMO',
+                first_observed_on_board_at INTEGER NOT NULL,
+                first_trending_at INTEGER,
                 first_rank INTEGER,
                 first_market_cap_usd REAL,
                 state TEXT NOT NULL DEFAULT 'ENTERED',
+                unproven_reason TEXT NOT NULL DEFAULT '',
                 last_seen_on_board_at INTEGER NOT NULL DEFAULT 0,
                 left_at INTEGER,
                 entries INTEGER NOT NULL DEFAULT 1,
                 stints_json TEXT NOT NULL DEFAULT '[]',
-                updated_at INTEGER NOT NULL DEFAULT 0
+                updated_at INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (mint, grade)
             );
             CREATE INDEX IF NOT EXISTS idx_pretrend_membership_first
-                ON pretrend_membership(first_trending_at DESC);
+                ON pretrend_membership(grade, first_trending_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_pretrend_membership_proven
+                ON pretrend_membership(grade, first_trending_at)
+                WHERE first_trending_at IS NOT NULL;
 
             -- FOMO_TREND_ENTER / FOMO_TREND_REENTER / FOMO_TREND_LEAVE, with
             -- the provider's raw evidence kept next to our normalised values so
@@ -1828,12 +1851,18 @@ class Database:
                 pair_age_seconds INTEGER,
                 provider TEXT NOT NULL DEFAULT '',
                 source_kind TEXT NOT NULL DEFAULT '',
+                -- 'FOMO' or 'PROXY'.  Only FOMO rows may establish a label, and
+                -- the PROXY_BOARD_* kinds are deliberately different strings so
+                -- no query written for the FOMO kinds can match one by accident.
+                grade TEXT NOT NULL DEFAULT 'PROXY',
                 source_at INTEGER,
                 collector_at INTEGER NOT NULL DEFAULT 0,
                 collector_version TEXT NOT NULL DEFAULT '',
                 raw_json TEXT NOT NULL DEFAULT '{}',
                 PRIMARY KEY (mint, kind, occurred_at)
             );
+            CREATE INDEX IF NOT EXISTS idx_pretrend_trend_events_grade
+                ON pretrend_trend_events(grade, kind, occurred_at DESC);
             CREATE INDEX IF NOT EXISTS idx_pretrend_trend_events_time
                 ON pretrend_trend_events(occurred_at DESC);
             CREATE INDEX IF NOT EXISTS idx_pretrend_trend_events_kind
@@ -2088,6 +2117,20 @@ class Database:
             """
         )
         await self._migrate_pump_launch_status_constraint()
+        # v2.55 review fixes.  Harmless on a fresh database; they migrate a
+        # checkout that ran an earlier build of this branch.
+        await self._ensure_column(
+            "pretrend_membership", "grade", "TEXT NOT NULL DEFAULT 'FOMO'"
+        )
+        await self._ensure_column(
+            "pretrend_membership", "first_observed_on_board_at", "INTEGER NOT NULL DEFAULT 0"
+        )
+        await self._ensure_column(
+            "pretrend_membership", "unproven_reason", "TEXT NOT NULL DEFAULT ''"
+        )
+        await self._ensure_column(
+            "pretrend_trend_events", "grade", "TEXT NOT NULL DEFAULT 'PROXY'"
+        )
         await self._ensure_column(
             "provider_call_usage", "calls_skipped", "INTEGER NOT NULL DEFAULT 0"
         )

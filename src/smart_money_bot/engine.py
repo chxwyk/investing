@@ -15,6 +15,9 @@ from decimal import Decimal
 from typing import Any, Protocol, cast
 from zoneinfo import ZoneInfo
 
+from .alert_policy import decide as alert_policy_decide
+from .alert_policy import describe_policy as alert_policy_describe
+from .alert_policy import normalise_mode as alert_policy_mode
 from .callouts import (
     CoinCalloutAnalyzer,
     DexScreenerClient,
@@ -850,6 +853,9 @@ class SmartMoneyEngine:
                 ground_truth=GroundTruthConfig(
                     min_rows=settings.pretrend_min_board_rows,
                     max_shrink_ratio=settings.pretrend_max_board_shrink_ratio,
+                    max_coverage_gap_seconds=(
+                        settings.pretrend_max_coverage_gap_seconds
+                    ),
                 ),
                 affinity_refresh_seconds=settings.pretrend_affinity_refresh_seconds,
                 min_positives_to_alert=settings.pretrend_min_positives_to_alert,
@@ -857,6 +863,9 @@ class SmartMoneyEngine:
             publish=self._publish_pretrend,
             confirm=self._publish_trend_confirmation,
         )
+        self._alert_mode = alert_policy_mode(settings.alert_policy_mode)
+        self.alerts_policy_suppressed = 0
+        self.alerts_policy_demoted = 0
         self._pretrend_board_task: asyncio.Task[None] | None = None
         self._pretrend_activity_task: asyncio.Task[None] | None = None
         self._pretrend_training_task: asyncio.Task[None] | None = None
@@ -5752,9 +5761,44 @@ class SmartMoneyEngine:
         """
 
         guarded = self._guard_publication(alert)
+
+        # v2.55: the alert POLICY is applied here, at the same choke point and
+        # for the same reason.  Per-lane thresholds cannot bound the rate a
+        # human experiences, because that rate is the sum across lanes and no
+        # lane can see it.  One table, one place, every card.
+        decision = alert_policy_decide(guarded.kind, mode=self._resolve_alert_mode())
+        if not decision.publish:
+            self.alerts_policy_suppressed = getattr(self, "alerts_policy_suppressed", 0) + 1
+            logger.debug("Alert policy suppressed a card: %s", decision.reason)
+            return False
+        if not decision.may_ping and guarded.ping:
+            # Demoted, not dropped: the card still reaches the channel, it just
+            # stops claiming urgency.
+            self.alerts_policy_demoted = getattr(self, "alerts_policy_demoted", 0) + 1
+            guarded = replace(
+                guarded, ping=False, ping_reason="", lane=LANE_RADAR
+            )
+
         if guarded is not alert:
             self._fast_alerts[guarded.alert_key] = guarded
         return await self.notifier.on_fast_alert(guarded)
+
+    def _resolve_alert_mode(self) -> str:
+        """The active alert mode, resolved defensively.
+
+        Falls back through the cached value, then settings, then ``LEGACY``.
+        A partially-constructed engine -- which the test suite builds routinely
+        -- must not silently land in a mode that suppresses cards: failing open
+        to prior behaviour is the safe direction for a policy that governs
+        whether a human hears anything at all.
+        """
+
+        cached = getattr(self, "_alert_mode", None)
+        if cached:
+            return cached
+        return alert_policy_mode(
+            getattr(getattr(self, "settings", None), "alert_policy_mode", None)
+        )
 
     def _refuses_publication(self, mint: str) -> bool:
         """Whether the evidence for this mint forbids a card at all.
@@ -7677,6 +7721,14 @@ class SmartMoneyEngine:
             logger.debug("Pre-trend observation failed for %s", mint, exc_info=True)
             return False
 
+    def alert_policy(self) -> dict[str, Any]:
+        """The active alert policy, generated from the table that enforces it."""
+
+        payload = alert_policy_describe(self._alert_mode)
+        payload["suppressed_cards"] = self.alerts_policy_suppressed
+        payload["demoted_cards"] = self.alerts_policy_demoted
+        return payload
+
     async def pretrend_status(self) -> dict[str, Any]:
         status = await self.pretrend.status()
         status["activity_lane_detail"] = self.pretrend_activity_status.to_json()
@@ -7776,16 +7828,53 @@ class SmartMoneyEngine:
         )
 
     async def pretrend_model_health(self) -> dict[str, Any]:
+        """Model state plus the ACTUAL lane settings and collector health.
+
+        Every switch here is read from the live runtime and the database rather
+        than asserted.  The first version of the command printed
+        ``collection: on`` as a hardcoded string, which would have reported a
+        healthy collector on a deployment where collection was switched off or
+        the loop had never started -- the one failure the command exists to
+        surface.
+        """
+
         rows = await self.pretrend_store.model_health()
         active = await self.pretrend_store.active_model(lane="production")
+        status = await self.pretrend.status()
         return {
             "feature_version": PRETREND_FEATURE_VERSION,
             "active": active,
             "history": rows,
             "last_trained_at": self._pretrend_last_trained_at,
+            # --- configured switches, read from settings ----------------------
+            "enabled": self.settings.pretrend_enabled,
+            "collection_enabled": self.settings.pretrend_collection_enabled,
             "training_enabled": self.settings.pretrend_training_enabled,
             "inference_enabled": self.settings.pretrend_inference_enabled,
             "alerting_enabled": self.settings.pretrend_alerting_enabled,
+            # --- whether the loop is actually running -------------------------
+            "board_loop_running": bool(
+                self._pretrend_board_task is not None
+                and not self._pretrend_board_task.done()
+            ),
+            "activity_loop_running": bool(
+                self._pretrend_activity_task is not None
+                and not self._pretrend_activity_task.done()
+            ),
+            "training_loop_running": bool(
+                self._pretrend_training_task is not None
+                and not self._pretrend_training_task.done()
+            ),
+            "cycles": status["cycles"],
+            "last_cycle_at": status["last_cycle_at"],
+            "board": status["board"],
+            "snapshot_health": status["snapshot_health"],
+            # --- can this source produce labels at all? -----------------------
+            "label_source": status["label_source"],
+            "labels": status["labels"],
+            "may_send": status["may_send"],
+            "suppressed": status["suppressed"],
+            "activity_lane": status["activity_lane"],
         }
 
     async def pretrend_traders(self, *, limit: int = 15) -> dict[str, Any]:
@@ -7812,6 +7901,7 @@ class SmartMoneyEngine:
         dataset = build_pretrend_dataset(
             vectors,
             first_trending_at=await self.pretrend_store.first_trending_map(),
+            entry_unproven_mints=await self.pretrend_store.entry_unproven_mints(),
             horizon_seconds=self.settings.pretrend_horizon_seconds,
             data_complete_until=cutoff,
             universe_min_usd=self.settings.pretrend_universe_min_mc_usd,

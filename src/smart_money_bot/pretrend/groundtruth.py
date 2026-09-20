@@ -27,9 +27,34 @@ with its own timestamp while the first entry stays frozen.  Without this rule
 "was the alert early?" becomes unanswerable: a re-entry two hours later would
 silently redefine the target and make every late alert look prescient.
 
+Two further rules exist because the first version of this module got them wrong.
+
+**Only an authorised FOMO source may establish a FOMO label.**  This deployment's
+default Trending source is not FOMO at all — with no ``FOMO_TRENDING_API_URL``
+configured it is a DexScreener paid-boost ordering stamped ``TRENDING_PROXY``.
+That is a legitimate *observation* and it is still collected, but labelling it
+``FOMO_TREND_ENTER`` would mean every downstream claim — lead time, affinity,
+precision, base rate — described a different event from the one named.  Proxy
+membership is therefore tracked in a completely separate namespace, emits its own
+``PROXY_BOARD_*`` event kinds, and can never reach a FOMO label, a confirmation
+card or a training target.  :meth:`TrendingGroundTruth.first_trending_at` returns
+``None`` for a mint known only to the proxy.
+
+**Presence is not entry.**  A mint that is already on the board when collection
+starts did not just enter it; we simply began watching.  Recording the collector's
+start time as its ``first_trending_at`` would invent an entry that never happened
+and, worse, would date it to the moment we were least able to have predicted it —
+manufacturing a cohort of "entries" no model could ever have called.  The same
+applies after a coverage gap: if the collector was down for ten minutes, a mint
+that appears on the next snapshot may have entered at any point in between.  Such
+mints are recorded as ``PRESENT_UNPROVEN`` with a ``first_observed_on_board_at``
+and **no** ``first_trending_at``, and they are excluded from labels in both
+directions — they cannot be positives, and they must not be used as controls
+either, because they *were* trending.
+
 Membership states are explicit (``ABSENT`` → ``ENTERED`` → ``ACTIVE`` → ``LEFT``
-→ ``REENTERED``) so a consumer never has to infer a transition from two
-snapshots it may not both have seen.
+→ ``REENTERED``, plus ``PRESENT_UNPROVEN``) so a consumer never has to infer a
+transition from two snapshots it may not both have seen.
 """
 
 from __future__ import annotations
@@ -53,6 +78,9 @@ MEMBERSHIP_ACTIVE = "ACTIVE"
 MEMBERSHIP_LEFT = "LEFT"
 #: Absent on the previous valid snapshot, present now, and present before that.
 MEMBERSHIP_REENTERED = "REENTERED"
+#: On the board the first time we looked, or the first time we looked after a
+#: coverage gap.  We know it is there; we do not know when it arrived.
+MEMBERSHIP_PRESENT_UNPROVEN = "PRESENT_UNPROVEN"
 
 MEMBERSHIP_STATES: tuple[str, ...] = (
     MEMBERSHIP_ABSENT,
@@ -60,6 +88,17 @@ MEMBERSHIP_STATES: tuple[str, ...] = (
     MEMBERSHIP_ACTIVE,
     MEMBERSHIP_LEFT,
     MEMBERSHIP_REENTERED,
+    MEMBERSHIP_PRESENT_UNPROVEN,
+)
+
+#: States that mean "currently on the board", whatever we know about arrival.
+ON_BOARD_STATES: frozenset[str] = frozenset(
+    {
+        MEMBERSHIP_ENTERED,
+        MEMBERSHIP_ACTIVE,
+        MEMBERSHIP_REENTERED,
+        MEMBERSHIP_PRESENT_UNPROVEN,
+    }
 )
 
 # --- ground-truth event kinds ------------------------------------------------
@@ -69,12 +108,65 @@ FOMO_TREND_ENTER = "FOMO_TREND_ENTER"
 FOMO_TREND_REENTER = "FOMO_TREND_REENTER"
 #: The mint dropped off the board.
 FOMO_TREND_LEAVE = "FOMO_TREND_LEAVE"
+#: Seen on the board without witnessing the arrival.  Evidence, never a label.
+FOMO_BOARD_PRESENT_UNPROVEN = "FOMO_BOARD_PRESENT_UNPROVEN"
+
+#: Proxy-source equivalents.  Deliberately different strings so that no filter,
+#: query or card written for the FOMO kinds can ever match a proxy row by
+#: accident -- the two describe different events on different boards.
+PROXY_BOARD_ENTER = "PROXY_BOARD_ENTER"
+PROXY_BOARD_REENTER = "PROXY_BOARD_REENTER"
+PROXY_BOARD_LEAVE = "PROXY_BOARD_LEAVE"
+PROXY_BOARD_PRESENT_UNPROVEN = "PROXY_BOARD_PRESENT_UNPROVEN"
 
 TREND_EVENT_KINDS: tuple[str, ...] = (
     FOMO_TREND_ENTER,
     FOMO_TREND_REENTER,
     FOMO_TREND_LEAVE,
+    FOMO_BOARD_PRESENT_UNPROVEN,
+    PROXY_BOARD_ENTER,
+    PROXY_BOARD_REENTER,
+    PROXY_BOARD_LEAVE,
+    PROXY_BOARD_PRESENT_UNPROVEN,
 )
+
+#: The only event kind that may establish a FOMO training label.
+LABEL_EVENT_KINDS: frozenset[str] = frozenset({FOMO_TREND_ENTER})
+
+# --- label grade -------------------------------------------------------------
+#: An authorised FOMO Trending feed.  May establish labels.
+GRADE_FOMO = "FOMO"
+#: A public approximation.  Observed and stored; never a label.
+GRADE_PROXY = "PROXY"
+
+#: Provenance kinds (from :mod:`smart_money_bot.trending.source`) that are
+#: authorised to establish FOMO labels.  Membership of this set is the single
+#: gate; there is no heuristic, hostname check or response-shape check that can
+#: promote a source into it.
+AUTHORISED_SOURCE_KINDS: frozenset[str] = frozenset({"FOMO_TRENDING"})
+
+
+def grade_for_source(source_kind: str) -> str:
+    """Whether a source may establish FOMO labels.  Unknown means proxy."""
+
+    return GRADE_FOMO if source_kind in AUTHORISED_SOURCE_KINDS else GRADE_PROXY
+
+
+#: ``grade -> (enter, reenter, leave, unproven)`` event kinds.
+_EVENT_KINDS_BY_GRADE: dict[str, tuple[str, str, str, str]] = {
+    GRADE_FOMO: (
+        FOMO_TREND_ENTER,
+        FOMO_TREND_REENTER,
+        FOMO_TREND_LEAVE,
+        FOMO_BOARD_PRESENT_UNPROVEN,
+    ),
+    GRADE_PROXY: (
+        PROXY_BOARD_ENTER,
+        PROXY_BOARD_REENTER,
+        PROXY_BOARD_LEAVE,
+        PROXY_BOARD_PRESENT_UNPROVEN,
+    ),
+}
 
 # --- why a snapshot was rejected ---------------------------------------------
 SNAPSHOT_VALID = "VALID"
@@ -259,11 +351,19 @@ class TrendEntryEvent:
     pair_age_seconds: int | None = None
     provider: str = ""
     source_kind: str = ""
+    #: ``FOMO`` or ``PROXY``.  Only ``FOMO`` may establish a training label.
+    grade: str = GRADE_PROXY
     source_at: int | None = None
     collector_at: int = 0
     collector_version: str = ""
     #: The board row exactly as the provider sent it.
     raw: Mapping[str, Any] = field(default_factory=dict)
+
+    @property
+    def establishes_label(self) -> bool:
+        """Whether this event may be used as a supervised target."""
+
+        return self.grade == GRADE_FOMO and self.kind in LABEL_EVENT_KINDS
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -283,6 +383,8 @@ class TrendEntryEvent:
             "pair_age_seconds": self.pair_age_seconds,
             "provider": self.provider,
             "source_kind": self.source_kind,
+            "grade": self.grade,
+            "establishes_label": self.establishes_label,
             "source_at": self.source_at,
             "collector_at": self.collector_at,
             "collector_version": self.collector_version,
@@ -291,23 +393,55 @@ class TrendEntryEvent:
 
 @dataclass(frozen=True, slots=True)
 class MembershipRecord:
-    """Per-mint board history.  ``first_trending_at`` is write-once."""
+    """Per-mint board history.  Observation and proven entry are separate facts.
+
+    ``first_observed_on_board_at`` is when we first *saw* it there and is always
+    known.  ``first_trending_at`` is when we *witnessed it arrive* and is
+    ``None`` unless we actually observed the absent-to-present transition.
+    Conflating the two is what turns "we started watching" into "it just
+    entered", and dates a fabricated entry to the one moment no model could
+    have predicted it.
+    """
 
     mint: str
-    first_trending_at: int
+    #: Always set: when this mint was first seen on the board.
+    first_observed_on_board_at: int
+    #: Set only when the ABSENT -> PRESENT transition was actually witnessed.
+    first_trending_at: int | None = None
     first_rank: int | None = None
     first_market_cap_usd: Decimal | None = None
     state: str = MEMBERSHIP_ENTERED
+    #: ``FOMO`` or ``PROXY``.  Proxy records live in their own namespace.
+    grade: str = GRADE_FOMO
     last_seen_on_board_at: int = 0
     left_at: int | None = None
     entries: int = 1
     #: Every stint, oldest first, as ``(entered_at, left_at_or_None)``.
     stints: tuple[tuple[int, int | None], ...] = ()
+    #: Why the entry is unproven, when it is.
+    unproven_reason: str = ""
+
+    @property
+    def entry_proven(self) -> bool:
+        """Whether we witnessed this mint arrive, as opposed to finding it there."""
+
+        return self.first_trending_at is not None
+
+    @property
+    def usable_as_label(self) -> bool:
+        """Whether this record may supply a supervised target."""
+
+        return self.entry_proven and self.grade == GRADE_FOMO
 
     def to_json(self) -> dict[str, Any]:
         return {
             "mint": self.mint,
+            "first_observed_on_board_at": self.first_observed_on_board_at,
             "first_trending_at": self.first_trending_at,
+            "entry_proven": self.entry_proven,
+            "usable_as_label": self.usable_as_label,
+            "grade": self.grade,
+            "unproven_reason": self.unproven_reason,
             "first_rank": self.first_rank,
             "first_market_cap_usd": (
                 None if self.first_market_cap_usd is None else str(self.first_market_cap_usd)
@@ -330,10 +464,28 @@ class SnapshotOutcome:
     reentered: tuple[str, ...] = ()
     left: tuple[str, ...] = ()
     active: tuple[str, ...] = ()
+    #: Mints found on the board without witnessing their arrival.
+    present_unproven: tuple[str, ...] = ()
+    #: ``FOMO`` or ``PROXY`` -- which namespace this snapshot advanced.
+    grade: str = GRADE_PROXY
+    #: True when a coverage gap made this snapshot's arrivals unprovable.
+    after_coverage_gap: bool = False
 
     @property
     def accepted(self) -> bool:
         return self.validity.valid
+
+    @property
+    def establishes_labels(self) -> bool:
+        """Whether anything here may become a supervised target."""
+
+        return self.grade == GRADE_FOMO
+
+    @property
+    def label_events(self) -> tuple[TrendEntryEvent, ...]:
+        """Only the events that may be used as training targets."""
+
+        return tuple(event for event in self.events if event.establishes_label)
 
 
 @dataclass(frozen=True, slots=True)
@@ -353,6 +505,12 @@ class GroundTruthConfig:
     #: If the board shrinks by more than this fraction in one step, the snapshot
     #: is refused as a suspected partial response.
     max_shrink_ratio: Decimal = Decimal("0.6")
+    #: A gap longer than this between accepted snapshots means we cannot claim to
+    #: have witnessed anything that appeared during it.  Set a little above the
+    #: poll interval so an ordinary missed beat does not void a real entry, but
+    #: far below the shortest label horizon so a voided entry is never one the
+    #: model could have been scored on.
+    max_coverage_gap_seconds: int = 180
 
 
 DEFAULT_GROUND_TRUTH_CONFIG = GroundTruthConfig()
@@ -414,8 +572,13 @@ class TrendingGroundTruth:
     """Turns a stream of board readings into immutable first-entry events.
 
     The class holds only membership bookkeeping.  It does no I/O, so it can be
-    driven identically by the live collector and by a historical replay — which
+    driven identically by the live collector and by a historical replay -- which
     is what makes a replayed label provably the same label the live system saw.
+
+    FOMO and proxy membership are tracked in two entirely separate namespaces.
+    A proxy snapshot can never advance FOMO membership, and switching a
+    deployment from proxy to an authorised feed starts the FOMO namespace clean
+    rather than inheriting whatever the proxy happened to be showing.
     """
 
     def __init__(
@@ -427,80 +590,248 @@ class TrendingGroundTruth:
     ) -> None:
         self.config = config
         self.collector_version = collector_version
-        self._records: dict[str, MembershipRecord] = {
-            record.mint: record for record in records
+        self._records: dict[str, dict[str, MembershipRecord]] = {
+            GRADE_FOMO: {},
+            GRADE_PROXY: {},
         }
-        self._on_board: set[str] = {
-            mint
-            for mint, record in self._records.items()
-            if record.state in {MEMBERSHIP_ENTERED, MEMBERSHIP_ACTIVE, MEMBERSHIP_REENTERED}
+        self._on_board: dict[str, set[str]] = {GRADE_FOMO: set(), GRADE_PROXY: set()}
+        self._last_observed_at: dict[str, int | None] = {
+            GRADE_FOMO: None,
+            GRADE_PROXY: None,
         }
-        self._last_observed_at: int | None = None
-        self._last_size: int | None = None
+        self._last_size: dict[str, int | None] = {GRADE_FOMO: None, GRADE_PROXY: None}
+
+        for record in records:
+            grade = record.grade if record.grade in self._records else GRADE_FOMO
+            self._records[grade][record.mint] = record
+            if record.state in ON_BOARD_STATES:
+                self._on_board[grade].add(record.mint)
+                # Restoring membership also restores coverage: a restart is not
+                # a coverage gap if the board has not moved on without us.  The
+                # runtime supplies the real last-accepted time via restore().
+                last = self._last_observed_at[grade]
+                seen = record.last_seen_on_board_at
+                if seen and (last is None or seen > last):
+                    self._last_observed_at[grade] = seen
+
         self.accepted_snapshots = 0
         self.rejected_snapshots = 0
         self.rejections: dict[str, int] = {}
+        self.coverage_gaps = 0
 
     # ------------------------------------------------------------------
     @property
     def records(self) -> dict[str, MembershipRecord]:
-        return dict(self._records)
+        """FOMO-grade records.  Proxy records are reached through :meth:`proxy_records`."""
 
-    def record(self, mint: str) -> MembershipRecord | None:
-        return self._records.get(mint)
+        return dict(self._records[GRADE_FOMO])
+
+    def proxy_records(self) -> dict[str, MembershipRecord]:
+        return dict(self._records[GRADE_PROXY])
+
+    def all_records(self) -> tuple[MembershipRecord, ...]:
+        return tuple(self._records[GRADE_FOMO].values()) + tuple(
+            self._records[GRADE_PROXY].values()
+        )
+
+    def record(self, mint: str, *, grade: str = GRADE_FOMO) -> MembershipRecord | None:
+        return self._records.get(grade, {}).get(mint)
 
     def first_trending_at(self, mint: str) -> int | None:
-        record = self._records.get(mint)
-        return None if record is None else record.first_trending_at
+        """The witnessed FOMO entry time, or ``None``.
 
-    def on_board(self) -> frozenset[str]:
-        return frozenset(self._on_board)
+        ``None`` covers three genuinely different situations -- never on the
+        board, on the board but we never saw it arrive, and on a proxy board
+        only -- and none of them may become a label, which is why they share a
+        return value.  :meth:`describe` distinguishes them for a human.
+        """
+
+        record = self._records[GRADE_FOMO].get(mint)
+        if record is None or not record.usable_as_label:
+            return None
+        return record.first_trending_at
+
+    def label_map(self) -> dict[str, int]:
+        """Every mint whose FOMO entry we actually witnessed."""
+
+        return {
+            mint: record.first_trending_at
+            for mint, record in self._records[GRADE_FOMO].items()
+            if record.usable_as_label and record.first_trending_at is not None
+        }
+
+    def entry_unproven_mints(self) -> frozenset[str]:
+        """Mints seen on a board whose arrival we never witnessed.
+
+        These are excluded from labels in **both** directions.  They cannot be
+        positives because we do not know when they entered, and they must not be
+        used as controls either, because they were demonstrably on the board --
+        using them as "tokens that did not trend" would be exactly backwards.
+        """
+
+        return frozenset(
+            mint
+            for grade in (GRADE_FOMO, GRADE_PROXY)
+            for mint, record in self._records[grade].items()
+            if not record.entry_proven
+        )
+
+    def proxy_only_mints(self) -> frozenset[str]:
+        """Mints known to the proxy board but never witnessed entering FOMO."""
+
+        fomo = self._records[GRADE_FOMO]
+        return frozenset(
+            mint
+            for mint in self._records[GRADE_PROXY]
+            if mint not in fomo or not fomo[mint].usable_as_label
+        )
+
+    def on_board(self, *, grade: str = GRADE_FOMO) -> frozenset[str]:
+        return frozenset(self._on_board.get(grade, set()))
+
+    def describe(self, mint: str) -> str:
+        """A human-readable membership verdict for one mint."""
+
+        fomo = self._records[GRADE_FOMO].get(mint)
+        if fomo is not None and fomo.usable_as_label:
+            return f"FOMO entry witnessed at {fomo.first_trending_at}"
+        if fomo is not None:
+            return f"on the FOMO board but arrival not witnessed ({fomo.unproven_reason})"
+        proxy = self._records[GRADE_PROXY].get(mint)
+        if proxy is not None:
+            return "seen on the PROXY board only; not a FOMO fact"
+        return "never observed on any board"
+
+    # ------------------------------------------------------------------
+    def note_coverage(self, *, grade: str, at: int) -> None:
+        """Tell the tracker when coverage was last known good, after a restart."""
+
+        if grade in self._last_observed_at:
+            current = self._last_observed_at[grade]
+            if current is None or at > current:
+                self._last_observed_at[grade] = at
 
     # ------------------------------------------------------------------
     def ingest(self, snapshot: TrendingSnapshot) -> SnapshotOutcome:
         """Apply one reading.  An invalid reading changes nothing at all."""
 
+        grade = grade_for_source(snapshot.source_kind)
         validity = assess_snapshot(
             snapshot,
-            previous_size=self._last_size,
-            previous_observed_at=self._last_observed_at,
+            previous_size=self._last_size[grade],
+            previous_observed_at=self._last_observed_at[grade],
             config=self.config,
         )
         if not validity.valid:
             self.rejected_snapshots += 1
             self.rejections[validity.reason] = self.rejections.get(validity.reason, 0) + 1
-            return SnapshotOutcome(validity)
+            return SnapshotOutcome(validity, grade=grade)
 
         self.accepted_snapshots += 1
+        enter_kind, reenter_kind, leave_kind, unproven_kind = _EVENT_KINDS_BY_GRADE[grade]
+        records = self._records[grade]
         rows = snapshot.by_mint()
         current = frozenset(rows)
-        previous = frozenset(self._on_board)
+        previous = frozenset(self._on_board[grade])
+
+        # Can we claim to have witnessed an arrival on this snapshot at all?
+        last_at = self._last_observed_at[grade]
+        if last_at is None:
+            witnessed = False
+            gap_reason = "first snapshot of this collection run"
+        else:
+            gap = snapshot.observed_at - last_at
+            witnessed = gap <= self.config.max_coverage_gap_seconds
+            gap_reason = "" if witnessed else f"{gap}s coverage gap before this snapshot"
+        if not witnessed:
+            self.coverage_gaps += 1
 
         entered: list[str] = []
         reentered: list[str] = []
+        unproven: list[str] = []
         events: list[TrendEntryEvent] = []
 
         for mint in sorted(current - previous):
             row = rows[mint]
-            existing = self._records.get(mint)
+            existing = records.get(mint)
+
+            if not witnessed:
+                # We found it there.  We did not see it arrive, and saying
+                # otherwise would date a fabricated entry to this instant.
+                if existing is None:
+                    records[mint] = MembershipRecord(
+                        mint=mint,
+                        first_observed_on_board_at=snapshot.observed_at,
+                        first_trending_at=None,
+                        first_rank=row.rank,
+                        first_market_cap_usd=row.market_cap_usd,
+                        state=MEMBERSHIP_PRESENT_UNPROVEN,
+                        grade=grade,
+                        last_seen_on_board_at=snapshot.observed_at,
+                        entries=1,
+                        stints=((snapshot.observed_at, None),),
+                        unproven_reason=gap_reason,
+                    )
+                    unproven.append(mint)
+                    events.append(
+                        self._event(unproven_kind, row, snapshot, grade=grade)
+                    )
+                else:
+                    # A known mint reappearing across a gap: the stint is real,
+                    # the first entry (proven or not) is untouched.
+                    records[mint] = replace(
+                        existing,
+                        state=(
+                            MEMBERSHIP_REENTERED
+                            if existing.entry_proven
+                            else MEMBERSHIP_PRESENT_UNPROVEN
+                        ),
+                        last_seen_on_board_at=snapshot.observed_at,
+                        left_at=None,
+                        entries=existing.entries + 1,
+                        stints=existing.stints + ((snapshot.observed_at, None),),
+                    )
+                    if existing.entry_proven:
+                        reentered.append(mint)
+                        events.append(
+                            self._event(reenter_kind, row, snapshot, grade=grade)
+                        )
+                    else:
+                        unproven.append(mint)
+                        events.append(
+                            self._event(unproven_kind, row, snapshot, grade=grade)
+                        )
+                continue
+
             if existing is None:
-                # FIRST entry, ever.  This timestamp is now frozen for all time.
-                self._records[mint] = MembershipRecord(
+                # A genuine, witnessed first arrival.  This timestamp is now
+                # frozen for all time.
+                records[mint] = MembershipRecord(
                     mint=mint,
+                    first_observed_on_board_at=snapshot.observed_at,
                     first_trending_at=snapshot.observed_at,
                     first_rank=row.rank,
                     first_market_cap_usd=row.market_cap_usd,
                     state=MEMBERSHIP_ENTERED,
+                    grade=grade,
                     last_seen_on_board_at=snapshot.observed_at,
                     entries=1,
                     stints=((snapshot.observed_at, None),),
                 )
                 entered.append(mint)
-                events.append(self._event(FOMO_TREND_ENTER, row, snapshot))
-            else:
-                # A later stint.  first_trending_at is deliberately re-used from
-                # the existing record and never recomputed.
-                self._records[mint] = replace(
+                events.append(self._event(enter_kind, row, snapshot, grade=grade))
+            elif not existing.entry_proven:
+                # We had found it on the board without seeing it arrive; it has
+                # since left and come back, and THIS arrival we did witness.
+                #
+                # It is tempting to promote that to a proven first entry.  It is
+                # wrong: this mint's FIRST entry happened before we started
+                # watching, so recording the return as the first entry would
+                # understate how long it had been on the board and flatter every
+                # lead time measured against it.  A missed first entry stays
+                # missed, permanently.  The re-entry is real and is recorded as
+                # exactly that.
+                records[mint] = replace(
                     existing,
                     state=MEMBERSHIP_REENTERED,
                     last_seen_on_board_at=snapshot.observed_at,
@@ -509,17 +840,30 @@ class TrendingGroundTruth:
                     stints=existing.stints + ((snapshot.observed_at, None),),
                 )
                 reentered.append(mint)
-                events.append(self._event(FOMO_TREND_REENTER, row, snapshot))
+                events.append(self._event(reenter_kind, row, snapshot, grade=grade))
+            else:
+                # A later stint.  first_trending_at is re-used from the existing
+                # record and never recomputed.
+                records[mint] = replace(
+                    existing,
+                    state=MEMBERSHIP_REENTERED,
+                    last_seen_on_board_at=snapshot.observed_at,
+                    left_at=None,
+                    entries=existing.entries + 1,
+                    stints=existing.stints + ((snapshot.observed_at, None),),
+                )
+                reentered.append(mint)
+                events.append(self._event(reenter_kind, row, snapshot, grade=grade))
 
         left: list[str] = []
         for mint in sorted(previous - current):
-            existing = self._records.get(mint)
+            existing = records.get(mint)
             if existing is None:
                 continue
             stints = existing.stints
             if stints and stints[-1][1] is None:
                 stints = stints[:-1] + ((stints[-1][0], snapshot.observed_at),)
-            self._records[mint] = replace(
+            records[mint] = replace(
                 existing,
                 state=MEMBERSHIP_LEFT,
                 left_at=snapshot.observed_at,
@@ -528,11 +872,12 @@ class TrendingGroundTruth:
             left.append(mint)
             events.append(
                 TrendEntryEvent(
-                    kind=FOMO_TREND_LEAVE,
+                    kind=leave_kind,
                     mint=mint,
                     occurred_at=snapshot.observed_at,
                     provider=snapshot.provider,
                     source_kind=snapshot.source_kind,
+                    grade=grade,
                     source_at=snapshot.source_at,
                     collector_at=snapshot.observed_at,
                     collector_version=snapshot.collector_version or self.collector_version,
@@ -541,18 +886,22 @@ class TrendingGroundTruth:
 
         active: list[str] = []
         for mint in sorted(current & previous):
-            existing = self._records.get(mint)
+            existing = records.get(mint)
             if existing is not None:
-                self._records[mint] = replace(
+                records[mint] = replace(
                     existing,
-                    state=MEMBERSHIP_ACTIVE,
+                    state=(
+                        MEMBERSHIP_ACTIVE
+                        if existing.entry_proven
+                        else MEMBERSHIP_PRESENT_UNPROVEN
+                    ),
                     last_seen_on_board_at=snapshot.observed_at,
                 )
             active.append(mint)
 
-        self._on_board = set(current)
-        self._last_observed_at = snapshot.observed_at
-        self._last_size = len(snapshot.rows)
+        self._on_board[grade] = set(current)
+        self._last_observed_at[grade] = snapshot.observed_at
+        self._last_size[grade] = len(snapshot.rows)
 
         return SnapshotOutcome(
             validity=validity,
@@ -561,11 +910,14 @@ class TrendingGroundTruth:
             reentered=tuple(reentered),
             left=tuple(left),
             active=tuple(active),
+            present_unproven=tuple(unproven),
+            grade=grade,
+            after_coverage_gap=not witnessed,
         )
 
     # ------------------------------------------------------------------
     def _event(
-        self, kind: str, row: BoardRow, snapshot: TrendingSnapshot
+        self, kind: str, row: BoardRow, snapshot: TrendingSnapshot, *, grade: str
     ) -> TrendEntryEvent:
         return TrendEntryEvent(
             kind=kind,
@@ -584,6 +936,7 @@ class TrendingGroundTruth:
             pair_age_seconds=row.pair_age_seconds,
             provider=snapshot.provider,
             source_kind=snapshot.source_kind,
+            grade=grade,
             source_at=row.source_at if row.source_at is not None else snapshot.source_at,
             collector_at=snapshot.observed_at,
             collector_version=snapshot.collector_version or self.collector_version,
@@ -594,6 +947,7 @@ class TrendingGroundTruth:
     def health(self, *, now: int | None = None) -> dict[str, Any]:
         moment = now if now is not None else int(time.time())
         total = self.accepted_snapshots + self.rejected_snapshots
+        last_fomo = self._last_observed_at[GRADE_FOMO]
         return {
             "accepted_snapshots": self.accepted_snapshots,
             "rejected_snapshots": self.rejected_snapshots,
@@ -601,11 +955,20 @@ class TrendingGroundTruth:
                 None if total == 0 else round(self.accepted_snapshots / total, 4)
             ),
             "rejections": dict(sorted(self.rejections.items())),
-            "tracked_mints": len(self._records),
-            "on_board": len(self._on_board),
-            "last_accepted_at": self._last_observed_at,
-            "seconds_since_accepted": (
-                None if self._last_observed_at is None else moment - self._last_observed_at
+            "coverage_gaps": self.coverage_gaps,
+            "fomo_tracked_mints": len(self._records[GRADE_FOMO]),
+            "proxy_tracked_mints": len(self._records[GRADE_PROXY]),
+            "fomo_on_board": len(self._on_board[GRADE_FOMO]),
+            "proxy_on_board": len(self._on_board[GRADE_PROXY]),
+            # The number that actually matters: how many supervised targets
+            # exist.  A deployment running on the proxy will show zero here
+            # forever, which is the honest answer.
+            "usable_labels": len(self.label_map()),
+            "entry_unproven": len(self.entry_unproven_mints()),
+            "last_fomo_snapshot_at": last_fomo,
+            "last_proxy_snapshot_at": self._last_observed_at[GRADE_PROXY],
+            "seconds_since_fomo_snapshot": (
+                None if last_fomo is None else moment - last_fomo
             ),
         }
 

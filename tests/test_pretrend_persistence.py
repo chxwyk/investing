@@ -50,6 +50,7 @@ async def store(tmp_path):
 
 
 def board(mints: list[str], *, at: int, **kwargs) -> TrendingSnapshot:
+    kwargs.setdefault("source_kind", "FOMO_TRENDING")
     return TrendingSnapshot(
         observed_at=at,
         rows=tuple(
@@ -57,9 +58,34 @@ def board(mints: list[str], *, at: int, **kwargs) -> TrendingSnapshot:
             for index, item in enumerate(mints, start=1)
         ),
         provider="test",
-        source_kind="FOMO_TRENDING",
         **kwargs,
     )
+
+
+def witnessed(mints: list[str], *, newcomer: str, at: int = 1_000) -> TrendingGroundTruth:
+    """A tracker that has WITNESSED ``newcomer`` arriving.
+
+    Two snapshots, not one: the first establishes coverage, the second contains
+    the transition.  A single snapshot can only ever establish presence.
+    """
+
+    truth = TrendingGroundTruth()
+    truth.ingest(board(mints, at=at))
+    truth.ingest(board([newcomer, *mints], at=at + 30))
+    return truth
+
+
+async def persist_witnessed(
+    store: PretrendStore, mints: list[str], *, newcomer: str, at: int = 1_000
+) -> TrendingGroundTruth:
+    """Witness an arrival and persist BOTH the events and the membership rows."""
+
+    truth = TrendingGroundTruth()
+    for snapshot in (board(mints, at=at), board([newcomer, *mints], at=at + 30)):
+        outcome = truth.ingest(snapshot)
+        await store.record_trend_events(outcome.events)
+    await store.upsert_membership(list(truth.records.values()))
+    return truth
 
 
 # --- migrations --------------------------------------------------------------
@@ -97,32 +123,32 @@ async def test_the_new_tables_do_not_disturb_existing_ones(tmp_path) -> None:
 
 # --- write-once discipline ---------------------------------------------------
 async def test_first_trending_at_cannot_be_moved_by_a_later_write(store) -> None:
-    truth = TrendingGroundTruth()
     others = filler(6)
-    outcome = truth.ingest(board([ALPHA, *others], at=1_000))
-    await store.record_trend_events(outcome.events)
+    truth = witnessed(others, newcomer=ALPHA, at=1_000)
     await store.upsert_membership(list(truth.records.values()))
+    assert (await store.first_trending_map())[ALPHA] == 1_030
 
     # Leave and return, then persist again -- the path a re-entry takes.
     truth.ingest(board(others + [mint("z")], at=1_060))
-    again = truth.ingest(board([ALPHA, *others], at=1_120))
+    again = truth.ingest(board([ALPHA, *others], at=1_090))
     await store.record_trend_events(again.events)
     await store.upsert_membership(list(truth.records.values()))
 
-    assert (await store.first_trending_map())[ALPHA] == 1_000
+    assert (await store.first_trending_map())[ALPHA] == 1_030, "the first entry moved"
 
     # And a direct attempt to write a different first entry is ignored.
     await store.upsert_membership(
         [
             type(truth.record(ALPHA))(
                 mint=ALPHA,
+                first_observed_on_board_at=9_999,
                 first_trending_at=9_999,
                 first_rank=1,
                 first_market_cap_usd=Decimal("1"),
             )
         ]
     )
-    assert (await store.first_trending_map())[ALPHA] == 1_000
+    assert (await store.first_trending_map())[ALPHA] == 1_030
 
 
 async def test_a_cross_source_first_seen_is_written_once(store) -> None:
@@ -213,9 +239,7 @@ async def test_actor_observations_include_tokens_that_never_trended(store) -> No
                 )
             ]
         )
-    truth = TrendingGroundTruth()
-    outcome = truth.ingest(board([ALPHA, *filler(6)], at=1_200))
-    await store.record_trend_events(outcome.events)
+    truth = witnessed(filler(6), newcomer=ALPHA, at=1_170)
     await store.upsert_membership(list(truth.records.values()))
 
     observations = await store.actor_observations()
@@ -272,9 +296,7 @@ async def test_a_silent_prediction_is_still_recorded(store) -> None:
 
 
 async def test_prediction_metrics_carry_the_base_rate_and_refuse_thin_samples(store) -> None:
-    truth = TrendingGroundTruth()
-    outcome = truth.ingest(board([ALPHA, *filler(6)], at=1_400))
-    await store.record_trend_events(outcome.events)
+    truth = witnessed(filler(6), newcomer=ALPHA, at=1_370)
     await store.upsert_membership(list(truth.records.values()))
 
     for index, token in enumerate((ALPHA, BRAVO)):
@@ -307,10 +329,8 @@ async def test_prediction_metrics_carry_the_base_rate_and_refuse_thin_samples(st
 async def test_missed_entries_exclude_alerts_fired_after_the_entry(store) -> None:
     """An alert after the fact is a reaction, not a catch."""
 
-    truth = TrendingGroundTruth()
-    outcome = truth.ingest(board([ALPHA, *filler(6)], at=1_000))
-    await store.record_trend_events(outcome.events)
-    await store.upsert_membership(list(truth.records.values()))
+    truth = await persist_witnessed(store, filler(6), newcomer=ALPHA, at=970)
+    assert truth.first_trending_at(ALPHA) == 1_000
 
     await store.record_alert(
         alert_id="late",
@@ -378,15 +398,12 @@ async def test_the_runtime_restores_the_alert_budget_from_storage(store) -> None
 async def test_the_runtime_restores_membership_so_first_entries_are_not_re_emitted(
     store,
 ) -> None:
-    truth = TrendingGroundTruth()
-    mints = [ALPHA, *filler(6)]
-    outcome = truth.ingest(board(mints, at=1_000))
-    await store.record_trend_events(outcome.events)
+    truth = witnessed(filler(6), newcomer=ALPHA, at=1_000)
     await store.upsert_membership(list(truth.records.values()))
 
     runtime = PretrendRuntime(store, config=PretrendConfig())
     await runtime.restore(now=1_100)
-    assert runtime.ground_truth.first_trending_at(ALPHA) == 1_000
+    assert runtime.ground_truth.first_trending_at(ALPHA) == 1_030
 
 
 # --- the runtime path --------------------------------------------------------
@@ -431,7 +448,15 @@ async def test_the_observer_turns_a_raised_error_into_a_refused_snapshot(store) 
     assert result.left == ()
 
 
-async def test_a_board_cycle_records_ground_truth_and_confirms_the_entry(store) -> None:
+async def test_a_first_snapshot_establishes_presence_and_says_nothing(store) -> None:
+    """The shipped default: collect everything, publish nothing.
+
+    The first version of this test asserted seven confirmation callbacks from a
+    single first snapshot under a config with alerting disabled -- which was the
+    bug, written down as an expectation. Both halves were wrong: a first
+    snapshot proves no entry, and a silent lane publishes nothing.
+    """
+
     mints = [ALPHA, *filler(6)]
     client = _FakeClient(
         [[_Observation(item, index) for index, item in enumerate(mints, start=1)]]
@@ -449,13 +474,101 @@ async def test_a_board_cycle_records_ground_truth_and_confirms_the_entry(store) 
     )
     result = await runtime.collect_board(now=5_000)
 
-    assert result.snapshot_accepted
-    assert ALPHA in result.entered
-    assert len(confirmations) == 7
-    assert (await store.first_trending_map())[ALPHA] == 5_000
+    assert result.snapshot_accepted, "the snapshot is still collected"
+    assert result.entered == (), "nothing on a first snapshot just entered"
+    assert len(result.present_unproven) == 7
+    assert confirmations == [], "the silent default publishes nothing"
+    assert await store.first_trending_map() == {}, "and establishes no labels"
 
-    alpha_confirmation = next(item for item in confirmations if item.mint == ALPHA)
-    assert not alpha_confirmation.predicted, "no alert preceded it, so it was missed"
+
+async def test_a_witnessed_entry_confirms_only_when_alerting_is_enabled(store) -> None:
+    mints = [ALPHA, *filler(6)]
+    pages = [
+        [_Observation(item, index) for index, item in enumerate(filler(6), start=1)],
+        [_Observation(item, index) for index, item in enumerate(mints, start=1)],
+    ]
+    observer = BoardObserver(
+        _FakeClient(pages), provider="test", source_kind="FOMO_TRENDING"
+    )
+    confirmations = []
+
+    async def confirm(confirmation):
+        confirmations.append(confirmation)
+        return True
+
+    runtime = PretrendRuntime(
+        store,
+        observer=observer,
+        config=PretrendConfig(alerting_enabled=True),
+        confirm=confirm,
+    )
+    await runtime.collect_board(now=5_000)
+    result = await runtime.collect_board(now=5_030)
+
+    assert ALPHA in result.entered
+    assert [item.mint for item in confirmations] == [ALPHA]
+    assert (await store.first_trending_map())[ALPHA] == 5_030
+    assert not confirmations[0].predicted, "no alert preceded it, so it was missed"
+
+
+async def test_a_silent_lane_records_no_alert_rows(store) -> None:
+    """An unsent confirmation must not be counted as a delivered alert.
+
+    Recording one would inflate the alert-rate metric and, worse, would make
+    ``/pretrend missed`` believe a token had been covered when nobody was told.
+    """
+
+    mints = [ALPHA, *filler(6)]
+    pages = [
+        [_Observation(item, index) for index, item in enumerate(filler(6), start=1)],
+        [_Observation(item, index) for index, item in enumerate(mints, start=1)],
+    ]
+    observer = BoardObserver(
+        _FakeClient(pages), provider="test", source_kind="FOMO_TRENDING"
+    )
+    published = []
+
+    async def confirm(confirmation):
+        published.append(confirmation)
+        return True
+
+    runtime = PretrendRuntime(
+        store, observer=observer, config=PretrendConfig(), confirm=confirm
+    )
+    await runtime.collect_board(now=6_000)
+    result = await runtime.collect_board(now=6_030)
+
+    assert ALPHA in result.entered, "ground truth is still recorded"
+    assert (await store.first_trending_map())[ALPHA] == 6_030
+    assert published == [], "but nothing was published"
+    assert await store.recent_alert_times(since=0) == (), "and nothing was logged as sent"
+    assert runtime.suppressed_confirmations == 1
+
+
+async def test_a_confirmation_the_surface_refuses_is_not_recorded_as_sent(store) -> None:
+    mints = [ALPHA, *filler(6)]
+    pages = [
+        [_Observation(item, index) for index, item in enumerate(filler(6), start=1)],
+        [_Observation(item, index) for index, item in enumerate(mints, start=1)],
+    ]
+    observer = BoardObserver(
+        _FakeClient(pages), provider="test", source_kind="FOMO_TRENDING"
+    )
+
+    async def refuse(confirmation):
+        return False
+
+    runtime = PretrendRuntime(
+        store,
+        observer=observer,
+        config=PretrendConfig(alerting_enabled=True),
+        confirm=refuse,
+    )
+    await runtime.collect_board(now=7_000)
+    await runtime.collect_board(now=7_030)
+
+    assert await store.recent_alert_times(since=0) == ()
+    assert runtime.undelivered_confirmations == 1
 
 
 async def test_an_unconfigured_activity_lane_is_reported_not_silently_empty(store) -> None:
@@ -545,29 +658,24 @@ async def test_a_provider_outage_does_not_stop_the_lane(store) -> None:
     """One failed snapshot must not crash the loop or corrupt ground truth."""
 
     mints = [ALPHA, *filler(6)]
-    client = _FakeClient(
-        [
-            [_Observation(item, index) for index, item in enumerate(mints, start=1)],
-            [],  # outage
-            [_Observation(item, index) for index, item in enumerate(mints, start=1)],
-        ]
-    )
+    rows = [_Observation(item, index) for index, item in enumerate(mints, start=1)]
+    client = _FakeClient([rows, rows, [], rows])
     observer = BoardObserver(client, provider="test", source_kind="FOMO_TRENDING")
     runtime = PretrendRuntime(store, observer=observer, config=PretrendConfig())
 
-    first = await runtime.collect_board(now=1_000)
+    await runtime.collect_board(now=1_000)  # coverage established
+    steady = await runtime.collect_board(now=1_030)
     outage = await runtime.collect_board(now=1_060)
-    recovered = await runtime.collect_board(now=1_120)
+    recovered = await runtime.collect_board(now=1_090)
 
-    assert first.snapshot_accepted
+    assert steady.snapshot_accepted
     assert not outage.snapshot_accepted
     assert outage.left == (), "an outage is not a mass departure"
     assert recovered.snapshot_accepted
     assert recovered.entered == (), "and recovery is not a mass arrival"
-    assert (await store.first_trending_map())[ALPHA] == 1_000
 
     health = await store.snapshot_health()
-    assert health["accepted"] == 2
+    assert health["accepted"] == 3
     assert health["rejected"] == 1
 
 
@@ -679,9 +787,7 @@ async def test_a_signal_that_never_trends_resolves_as_a_loss(store) -> None:
 
 
 async def test_a_signal_that_trends_resolves_with_its_lead_time(store) -> None:
-    truth = TrendingGroundTruth()
-    outcome = truth.ingest(board([ALPHA, *filler(6)], at=1_400))
-    await store.record_trend_events(outcome.events)
+    truth = witnessed(filler(6), newcomer=ALPHA, at=1_370)
     await store.upsert_membership(list(truth.records.values()))
 
     runtime = PretrendRuntime(store, config=PretrendConfig())

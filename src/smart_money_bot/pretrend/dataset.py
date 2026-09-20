@@ -145,13 +145,21 @@ def build_dataset(
     first_trending_at: Mapping[str, int],
     horizon_seconds: int,
     data_complete_until: int,
+    entry_unproven_mints: frozenset[str] = frozenset(),
     universe_min_usd: Decimal = DEFAULT_UNIVERSE_MIN_USD,
     universe_max_usd: Decimal = DEFAULT_UNIVERSE_MAX_USD,
     stride_seconds: int = DEFAULT_STRIDE_SECONDS,
     controls_per_positive: int = 4,
     match_controls: bool = True,
 ) -> Dataset:
-    """Join vectors to ground truth, label, thin, audit, and report the counts."""
+    """Join vectors to ground truth, label, thin, audit, and report the counts.
+
+    ``entry_unproven_mints`` are mints observed on a board without witnessing
+    their arrival.  They are excluded from the labelled rows AND from the
+    control pool, because they are neither: their entry time is unknown, and
+    they were demonstrably on the board so they are not examples of "did not
+    trend".
+    """
 
     thinned = thin_by_stride(vectors, stride_seconds=stride_seconds)
     label_sets: list[LabelSet] = []
@@ -171,6 +179,7 @@ def build_dataset(
             universe_min_usd=universe_min_usd,
             universe_max_usd=universe_max_usd,
             data_complete_until=data_complete_until,
+            entry_unproven=vector.mint in entry_unproven_mints,
         )
         label_sets.append(label_set)
 
@@ -184,6 +193,9 @@ def build_dataset(
                 eligible=label_set.eligible,
                 first_trending_at=entered,
                 liquidity_usd=vector.get("liquidity_usd"),
+                # Seen on a board, entry unwitnessed.  Not a positive and
+                # explicitly not a control.
+                seen_on_board=vector.mint in entry_unproven_mints,
             )
         )
 

@@ -50,8 +50,11 @@ from .pretrend.cohorts import (
 )
 from .pretrend.features import FEATURE_VERSION, FeatureVector, build_features
 from .pretrend.groundtruth import (
+    AUTHORISED_SOURCE_KINDS,
     DEFAULT_GROUND_TRUTH_CONFIG,
     FOMO_TREND_ENTER,
+    GRADE_FOMO,
+    GRADE_PROXY,
     GroundTruthConfig,
     TrendingGroundTruth,
     TrendingSnapshot,
@@ -169,6 +172,10 @@ class CycleResult:
     entered: tuple[str, ...] = ()
     reentered: tuple[str, ...] = ()
     left: tuple[str, ...] = ()
+    present_unproven: tuple[str, ...] = ()
+    #: Which namespace this cycle advanced: ``FOMO`` or ``PROXY``.
+    grade: str = GRADE_PROXY
+    after_coverage_gap: bool = False
     activity_events: int = 0
     observations_recorded: int = 0
     candidates_scored: int = 0
@@ -184,6 +191,9 @@ class CycleResult:
             "entered": list(self.entered),
             "reentered": list(self.reentered),
             "left": list(self.left),
+            "present_unproven": list(self.present_unproven),
+            "grade": self.grade,
+            "after_coverage_gap": self.after_coverage_gap,
             "activity_events": self.activity_events,
             "observations_recorded": self.observations_recorded,
             "candidates_scored": self.candidates_scored,
@@ -260,6 +270,12 @@ class PretrendRuntime:
         self._activity_cursor = 0
         self._restored = False
         self.cycles = 0
+        #: Confirmations withheld because the lane is in collect-quietly mode.
+        self.suppressed_confirmations = 0
+        #: Confirmations the surface declined to deliver.
+        self.undelivered_confirmations = 0
+        #: PRE_TREND signals withheld because alerting is disabled.
+        self.suppressed_signals = 0
         self.last_cycle_at: int | None = None
         self.last_error = ""
 
@@ -281,6 +297,17 @@ class PretrendRuntime:
             records=records,
             collector_version=COLLECTOR_VERSION,
         )
+        # Restoring membership is not enough: the tracker also needs to know
+        # when coverage was last good, or the first snapshot after any restart
+        # looks like a coverage gap and voids a legitimate entry.  A restart
+        # that took longer than the gap bound SHOULD void it, which is exactly
+        # what comparing against the real last-accepted time achieves.
+        for grade, last_at in (
+            (GRADE_FOMO, await self.store.last_accepted_snapshot_at(grade=GRADE_FOMO)),
+            (GRADE_PROXY, await self.store.last_accepted_snapshot_at(grade=GRADE_PROXY)),
+        ):
+            if last_at is not None:
+                self.ground_truth.note_coverage(grade=grade, at=last_at)
         for state in await self.store.load_states():
             self._states[state.mint] = state
         self.gate.restore(await self.store.recent_alert_times(since=moment - 3600))
@@ -306,23 +333,35 @@ class PretrendRuntime:
         if not outcome.accepted:
             self.last_error = outcome.validity.detail
             return CycleResult(
-                snapshot_accepted=False, snapshot_reason=outcome.validity.reason
+                snapshot_accepted=False,
+                snapshot_reason=outcome.validity.reason,
+                grade=outcome.grade,
             )
 
+        # Every event is persisted, proxy and unproven included: raw evidence is
+        # kept so a gap or a source change is explicable later.  What differs is
+        # which of them may become a label, and the event KIND carries that.
         await self.store.record_trend_events(outcome.events)
-        touched = set(outcome.entered) | set(outcome.reentered) | set(outcome.left)
-        await self.store.upsert_membership(
-            [
-                record
-                for mint, record in self.ground_truth.records.items()
-                if mint in touched
-            ]
+        touched = (
+            set(outcome.entered)
+            | set(outcome.reentered)
+            | set(outcome.left)
+            | set(outcome.present_unproven)
         )
-        # A mint on the board is first-seen there, for the cross-source ladder.
+        grade_records = (
+            self.ground_truth.records
+            if outcome.grade == GRADE_FOMO
+            else self.ground_truth.proxy_records()
+        )
+        await self.store.upsert_membership(
+            [record for mint, record in grade_records.items() if mint in touched]
+        )
+        # First-seen is recorded for any board sighting; it is an observation,
+        # not a claim about entry.
         for row in snapshot.rows:
             await self.store.note_first_seen(
                 row.mint,
-                "fomo_trending",
+                "fomo_trending" if outcome.grade == GRADE_FOMO else "trending_proxy",
                 at=snapshot.observed_at,
                 market_cap_usd=row.market_cap_usd,
             )
@@ -336,21 +375,51 @@ class PretrendRuntime:
             entered=outcome.entered,
             reentered=outcome.reentered,
             left=outcome.left,
+            present_unproven=outcome.present_unproven,
+            grade=outcome.grade,
+            after_coverage_gap=outcome.after_coverage_gap,
             confirmations=confirmations,
         )
+
+    @property
+    def may_send(self) -> bool:
+        """Whether this lane may put ANYTHING in front of a human.
+
+        One predicate, consulted by every publish path in this class.  The first
+        version of this lane gated the PRE_TREND card on ``alerting_enabled``
+        and then published the confirmation card unconditionally, so the
+        "collect quietly" default still pinged once per board entry -- and on a
+        proxy board, once per row of the very first snapshot.  Routing every
+        send through a single predicate is what stops the next publish path
+        somebody adds from reintroducing that.
+        """
+
+        return self.config.enabled and self.config.alerting_enabled
 
     async def _confirm_entries(
         self, events: Sequence[Any], *, at: int
     ) -> tuple[TrendConfirmation, ...]:
-        """Emit the ground-truth confirmation for each first entry.
+        """Advance state for each witnessed FOMO entry; publish only if permitted.
 
-        This message is never rate-limited: it is the one that tells the
-        operator whether the earlier messages were right.
+        Ground truth is recorded either way -- that is the whole point of the
+        collect-quietly default. What is conditional is the message.
+
+        Two separate gates apply, and both are about honesty rather than taste:
+
+        * Only a **witnessed FOMO entry** produces a confirmation at all. A
+          proxy-board arrival is a different event on a different board, and a
+          presence we never saw arrive is not an entry we can date.
+        * An alert row is written **only when the card was actually delivered**.
+          Recording an unsent confirmation as a delivered alert would corrupt
+          the alert-rate metric and, worse, would make ``/pretrend missed``
+          believe a token had been covered when nobody was told anything.
         """
 
         confirmations: list[TrendConfirmation] = []
         for event in events:
-            if event.kind != FOMO_TREND_ENTER:
+            # grade + kind together: a PROXY_BOARD_ENTER must never reach here,
+            # and neither must a FOMO_BOARD_PRESENT_UNPROVEN.
+            if not getattr(event, "establishes_label", False):
                 continue
             state = self._states.get(event.mint) or TokenState(
                 mint=event.mint, state=STATE_DISCOVERED, first_seen_at=at
@@ -377,6 +446,18 @@ class PretrendRuntime:
                 first_alert_market_cap_usd=decision.state.first_pretrend_market_cap_usd,
             )
             confirmations.append(confirmation)
+
+            if not self.may_send:
+                self.suppressed_confirmations += 1
+                continue
+
+            delivered = True
+            if self._confirm is not None:
+                delivered = await self._confirm(confirmation)
+            if not delivered:
+                self.undelivered_confirmations += 1
+                continue
+
             await self.store.record_alert(
                 alert_id=_prediction_id(event.mint, event.occurred_at, "confirm", "gt"),
                 mint=event.mint,
@@ -387,8 +468,6 @@ class PretrendRuntime:
                 market_cap_usd=event.market_cap_usd,
                 payload=confirmation.to_json(),
             )
-            if self._confirm is not None:
-                await self._confirm(confirmation)
         return tuple(confirmations)
 
     # ------------------------------------------------------------------
@@ -516,8 +595,7 @@ class PretrendRuntime:
 
         model_positives = getattr(self.model, "trained_positives", 0)
         may_alert = (
-            self.config.alerting_enabled
-            and model_positives >= self.config.min_positives_to_alert
+            self.may_send and model_positives >= self.config.min_positives_to_alert
         )
 
         signals: list[PretrendSignal] = []
@@ -562,6 +640,8 @@ class PretrendRuntime:
             )
             # The gate classifies regardless; only delivery is gated by config.
             send = decision.send and may_alert
+            if decision.send and not may_alert:
+                self.suppressed_signals += 1
             self._states[mint] = decision.state
             await self.store.save_state(decision.state)
 
@@ -732,12 +812,18 @@ class PretrendRuntime:
         activity = self.activity_provider
         activity_available = bool(getattr(activity, "available", False))
         model = await self.store.active_model(lane=self.lane)
+        label_health = await self.store.label_health()
+        source_kind = getattr(self.observer, "source_kind", "") if self.observer else ""
+        authorised = source_kind in AUTHORISED_SOURCE_KINDS
         return {
+            # --- what is actually switched on, read from config, not asserted --
             "enabled": self.config.enabled,
             "collection_enabled": self.config.collection_enabled,
             "inference_enabled": self.config.inference_enabled,
             "alerting_enabled": self.config.alerting_enabled,
+            "may_send": self.may_send,
             "feature_version": FEATURE_VERSION,
+            # --- is the collector actually collecting? -------------------------
             "cycles": self.cycles,
             "last_cycle_at": self.last_cycle_at,
             "board": (
@@ -745,10 +831,25 @@ class PretrendRuntime:
                 if self.observer is not None
                 else {"configured": False}
             ),
+            # --- can this source establish labels at all? ----------------------
+            "label_source": {
+                "source_kind": source_kind or "UNKNOWN",
+                "authorised_for_fomo_labels": authorised,
+                "detail": (
+                    "Authorised FOMO Trending feed; board entries establish labels."
+                    if authorised
+                    else (
+                        "This source is a PROXY approximation, not the FOMO "
+                        "Trending board. Its rows are collected and stored, but "
+                        "they cannot establish FOMO labels, confirmations or "
+                        "training targets. Set FOMO_TRENDING_API_URL to an "
+                        "authorised feed to produce usable labels."
+                    )
+                ),
+            },
             "ground_truth": self.ground_truth.health(now=moment),
-            "snapshot_health": await self.store.snapshot_health(
-                since=moment - 86_400
-            ),
+            "labels": label_health,
+            "snapshot_health": await self.store.snapshot_health(since=moment - 86_400),
             "activity_lane": {
                 "configured": activity_available,
                 "provider": getattr(activity, "name", "none"),
@@ -758,6 +859,11 @@ class PretrendRuntime:
             "affinity_actors": len(self._affinities),
             "affinity_computed_at": self._affinity_computed_at,
             "gate": self.gate.stats(now=moment),
+            "suppressed": {
+                "confirmations": self.suppressed_confirmations,
+                "signals": self.suppressed_signals,
+                "undelivered_confirmations": self.undelivered_confirmations,
+            },
             "alert_rate_24h": await self.store.alert_rate(since=moment - 86_400),
             "model": (
                 None

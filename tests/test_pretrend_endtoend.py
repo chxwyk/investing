@@ -117,7 +117,21 @@ async def _run_market(store: PretrendStore, *, runtime: PretrendRuntime) -> dict
             )
         await runtime.score_candidates([WINNER, LOSER], now=at)
 
-    # The winner reaches the board at minute 12.
+    # Coverage must be established BEFORE the entry, or the arrival is not
+    # witnessed and cannot be a label. Two snapshots: the board without the
+    # winner, then the board with it.
+    warmup_at = base + 12 * 60 - 30
+    await runtime.ingest_snapshot(
+        TrendingSnapshot(
+            observed_at=warmup_at,
+            rows=tuple(
+                BoardRow(mint=item, rank=index, market_cap_usd=Decimal("120000"))
+                for index, item in enumerate(filler(6), start=1)
+            ),
+            provider="test",
+            source_kind="FOMO_TRENDING",
+        )
+    )
     entry_at = base + 12 * 60
     snapshot = TrendingSnapshot(
         observed_at=entry_at,

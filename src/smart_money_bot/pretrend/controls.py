@@ -60,6 +60,10 @@ class CandidateRow:
     first_trending_at: int | None = None
     launch_source: str = ""
     liquidity_usd: Decimal | None = None
+    #: True when this mint was observed on a board without witnessing its
+    #: arrival.  Such a mint is never a valid control: it WAS trending, we just
+    #: cannot date the entry.
+    seen_on_board: bool = False
 
     @property
     def mc_cohort(self) -> str:
@@ -71,7 +75,15 @@ class CandidateRow:
 
     @property
     def ever_trended(self) -> bool:
-        return self.first_trending_at is not None
+        """Whether this mint is disqualified from the control pool.
+
+        Deliberately broader than "has a proven entry": a mint we merely FOUND
+        on the board is disqualified too.  A control is supposed to be a token
+        that did not trend, and one we watched sit on the board plainly is not,
+        however little we know about when it arrived.
+        """
+
+        return self.first_trending_at is not None or self.seen_on_board
 
 
 @dataclass(frozen=True, slots=True)

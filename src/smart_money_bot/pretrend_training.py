@@ -246,6 +246,7 @@ def train_once(
     first_trending_at: dict[str, int],
     horizon_seconds: int,
     data_complete_until: int,
+    entry_unproven_mints: frozenset[str] = frozenset(),
     universe_min_usd: Decimal,
     universe_max_usd: Decimal,
     fold_seconds: int = 86_400,
@@ -260,10 +261,24 @@ def train_once(
         first_trending_at=first_trending_at,
         horizon_seconds=horizon_seconds,
         data_complete_until=data_complete_until,
+        entry_unproven_mints=entry_unproven_mints,
         universe_min_usd=universe_min_usd,
         universe_max_usd=universe_max_usd,
     )
 
+    if not first_trending_at:
+        return TrainingOutcome(
+            horizon_seconds=horizon_seconds,
+            dataset=dataset,
+            refusal_reason=(
+                "no witnessed FOMO board entries exist, so there are no supervised "
+                "targets to fit. This is the expected state on a deployment whose "
+                "Trending source is a PROXY approximation rather than an authorised "
+                "FOMO feed: proxy rows are collected but cannot establish FOMO labels."
+            ),
+            trained_at=moment,
+            training_cutoff_at=data_complete_until,
+        )
     if not dataset.clean:
         return TrainingOutcome(
             horizon_seconds=horizon_seconds,
@@ -427,12 +442,14 @@ async def train_and_store(
         horizon_seconds=horizon_seconds,
     )
     first_trending = await store.first_trending_map()
+    unproven = await store.entry_unproven_mints()
 
     outcome = train_once(
         vectors,
         first_trending_at=first_trending,
         horizon_seconds=horizon_seconds,
         data_complete_until=cutoff,
+        entry_unproven_mints=unproven,
         universe_min_usd=universe_min_usd,
         universe_max_usd=universe_max_usd,
         fold_seconds=fold_seconds,

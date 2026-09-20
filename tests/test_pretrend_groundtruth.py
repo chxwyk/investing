@@ -18,6 +18,7 @@ from smart_money_bot.pretrend.groundtruth import (
     FOMO_TREND_REENTER,
     MEMBERSHIP_ACTIVE,
     MEMBERSHIP_LEFT,
+    MEMBERSHIP_PRESENT_UNPROVEN,
     MEMBERSHIP_REENTERED,
     SNAPSHOT_DUPLICATE,
     SNAPSHOT_EMPTY,
@@ -68,6 +69,19 @@ def filler(count: int) -> list[str]:
     return [mint(chr(ord("d") + index)) for index in range(count)]
 
 
+def warmed(mints: list[str], *, at: int) -> TrendingGroundTruth:
+    """A tracker with coverage already established.
+
+    Every test of a witnessed transition needs this, because the first snapshot
+    of a run can only establish presence -- we were not watching before it, so
+    nothing on it can be said to have arrived.
+    """
+
+    truth = TrendingGroundTruth()
+    truth.ingest(board(mints, at=at))
+    return truth
+
+
 # --- identity ----------------------------------------------------------------
 def test_the_exact_mint_is_the_only_identity() -> None:
     left = {"mint": ALPHA, "symbol": "CAT"}
@@ -116,26 +130,47 @@ def test_two_mints_in_one_blob_of_text_resolve_to_nothing() -> None:
 
 
 # --- first entry -------------------------------------------------------------
-def test_first_entry_emits_exactly_one_enter_event() -> None:
+def test_the_first_snapshot_establishes_presence_not_entry() -> None:
+    """We started watching; nothing on that snapshot "just entered".
+
+    Recording the collector's start time as an entry would fabricate a cohort
+    of entries dated to the exact moment no model could have predicted them.
+    """
+
     truth = TrendingGroundTruth()
     outcome = truth.ingest(board([ALPHA, *filler(6)], at=1_000))
 
     assert outcome.accepted
+    assert outcome.entered == ()
+    assert len(outcome.present_unproven) == 7
+    assert truth.first_trending_at(ALPHA) is None
+    assert truth.label_map() == {}
+    assert ALPHA in truth.entry_unproven_mints()
+    assert "not witnessed" in truth.describe(ALPHA)
+
+
+def test_a_witnessed_arrival_after_coverage_is_a_real_entry() -> None:
+    others = filler(6)
+    truth = warmed(others, at=1_000)
+    outcome = truth.ingest(board([ALPHA, *others], at=1_030))
+
     enters = [event for event in outcome.events if event.kind == FOMO_TREND_ENTER]
-    assert len(enters) == 7
-    assert truth.first_trending_at(ALPHA) == 1_000
+    assert [event.mint for event in enters] == [ALPHA]
+    assert truth.first_trending_at(ALPHA) == 1_030
+    assert truth.label_map() == {ALPHA: 1_030}
+    assert enters[0].establishes_label
 
 
 def test_first_trending_at_is_never_overwritten_by_a_reentry() -> None:
     """Without this, every late alert looks early in hindsight."""
 
-    truth = TrendingGroundTruth()
     others = filler(6)
-    truth.ingest(board([ALPHA, *others], at=1_000))
+    truth = warmed(others, at=1_000)
+    truth.ingest(board([ALPHA, *others], at=1_030))  # ALPHA's witnessed entry
     truth.ingest(board(others + [mint("z")], at=1_060))  # ALPHA leaves
-    outcome = truth.ingest(board([ALPHA, *others], at=1_120))  # and returns
+    outcome = truth.ingest(board([ALPHA, *others], at=1_090))  # and returns
 
-    assert truth.first_trending_at(ALPHA) == 1_000, "the first entry moved"
+    assert truth.first_trending_at(ALPHA) == 1_030, "the first entry moved"
     kinds = {event.kind for event in outcome.events if event.mint == ALPHA}
     assert kinds == {FOMO_TREND_REENTER}
     record = truth.record(ALPHA)
@@ -146,9 +181,9 @@ def test_first_trending_at_is_never_overwritten_by_a_reentry() -> None:
 
 
 def test_leaving_the_board_records_a_leave_and_keeps_the_first_entry() -> None:
-    truth = TrendingGroundTruth()
     others = filler(6)
-    truth.ingest(board([ALPHA, *others], at=1_000))
+    truth = warmed(others, at=1_000)
+    truth.ingest(board([ALPHA, *others], at=1_030))
     outcome = truth.ingest(board(others + [mint("z")], at=1_060))
 
     assert ALPHA in outcome.left
@@ -158,17 +193,22 @@ def test_leaving_the_board_records_a_leave_and_keeps_the_first_entry() -> None:
     record = truth.record(ALPHA)
     assert record is not None
     assert record.state == MEMBERSHIP_LEFT
-    assert record.first_trending_at == 1_000
+    assert record.first_trending_at == 1_030
 
 
-def test_a_mint_present_across_snapshots_becomes_active_without_new_events() -> None:
-    truth = TrendingGroundTruth()
+def test_a_mint_present_across_snapshots_stays_put_without_new_events() -> None:
     mints = [ALPHA, *filler(6)]
-    truth.ingest(board(mints, at=1_000))
-    outcome = truth.ingest(board(mints, at=1_060))
+    truth = warmed(mints, at=1_000)
+    outcome = truth.ingest(board(mints, at=1_030))
 
     assert outcome.events == ()
-    assert truth.record(ALPHA).state == MEMBERSHIP_ACTIVE
+    # Still unproven: it was there when we arrived and it has not left since.
+    assert truth.record(ALPHA).state == MEMBERSHIP_PRESENT_UNPROVEN
+
+    later = warmed(filler(6), at=2_000)
+    later.ingest(board([ALPHA, *filler(6)], at=2_030))
+    later.ingest(board([ALPHA, *filler(6)], at=2_060))
+    assert later.record(ALPHA).state == MEMBERSHIP_ACTIVE
 
 
 # --- snapshot validity -------------------------------------------------------
@@ -180,11 +220,10 @@ def test_a_failed_snapshot_never_empties_the_board() -> None:
     fabricated ground-truth events, permanently in the training labels.
     """
 
-    truth = TrendingGroundTruth()
     mints = [ALPHA, BRAVO, *filler(6)]
-    truth.ingest(board(mints, at=1_000))
+    truth = warmed(mints, at=1_000)
 
-    failed = TrendingSnapshot(observed_at=1_060, rows=(), provider="test", error="timeout")
+    failed = TrendingSnapshot(observed_at=1_030, rows=(), provider="test", error="timeout")
     outcome = truth.ingest(failed)
 
     assert not outcome.accepted
@@ -194,26 +233,24 @@ def test_a_failed_snapshot_never_empties_the_board() -> None:
     assert truth.on_board() == frozenset(mints), "membership must be untouched"
 
     # And the next good snapshot produces no spurious re-entries.
-    recovered = truth.ingest(board(mints, at=1_120))
+    recovered = truth.ingest(board(mints, at=1_060))
     assert recovered.entered == ()
     assert recovered.reentered == ()
 
 
 def test_an_empty_payload_without_an_error_is_still_refused() -> None:
-    truth = TrendingGroundTruth()
-    truth.ingest(board([ALPHA, *filler(6)], at=1_000))
-    outcome = truth.ingest(TrendingSnapshot(observed_at=1_060, rows=(), provider="test"))
+    truth = warmed([ALPHA, *filler(6)], at=1_000)
+    outcome = truth.ingest(TrendingSnapshot(observed_at=1_030, rows=(), provider="test"))
     assert outcome.validity.reason == SNAPSHOT_EMPTY
     assert outcome.left == ()
 
 
 def test_a_partial_board_is_refused_rather_than_read_as_mass_departure() -> None:
-    truth = TrendingGroundTruth()
     mints = [ALPHA, BRAVO, CHARLIE, *filler(9)]
-    truth.ingest(board(mints, at=1_000))
-    # Twelve rows collapse to five: a shrink of ~58% is below the 60% default,
-    # so push it further to prove the guard fires.
-    outcome = truth.ingest(board(mints[:3], at=1_060))
+    truth = warmed(mints, at=1_000)
+    # Twelve rows collapse to three, far past the 60% default, so the guard
+    # must treat it as a partial response rather than nine departures.
+    outcome = truth.ingest(board(mints[:3], at=1_030))
     assert not outcome.accepted
     assert outcome.validity.reason == SNAPSHOT_TOO_SHORT
     assert outcome.left == ()
@@ -254,10 +291,9 @@ def test_a_stale_provider_timestamp_is_refused() -> None:
 def test_a_partial_read_with_rows_and_an_error_is_refused() -> None:
     """Rows plus an error means an incomplete board, which fabricates departures."""
 
-    truth = TrendingGroundTruth()
     mints = [ALPHA, BRAVO, *filler(6)]
-    truth.ingest(board(mints, at=1_000))
-    partial = board(mints[:6], at=1_060, error="upstream 502 on page 2")
+    truth = warmed(mints, at=1_000)
+    partial = board(mints[:6], at=1_030, error="upstream 502 on page 2")
     outcome = truth.ingest(partial)
     assert not outcome.accepted
     assert outcome.left == ()
@@ -276,10 +312,9 @@ def test_a_board_row_requires_a_mint() -> None:
 
 # --- health and rank ---------------------------------------------------------
 def test_rejections_are_counted_so_a_gap_is_explainable() -> None:
-    truth = TrendingGroundTruth()
-    truth.ingest(board([ALPHA, *filler(6)], at=1_000))
-    truth.ingest(TrendingSnapshot(observed_at=1_060, rows=(), provider="t", error="boom"))
-    truth.ingest(TrendingSnapshot(observed_at=1_120, rows=(), provider="t"))
+    truth = warmed([ALPHA, *filler(6)], at=1_000)
+    truth.ingest(TrendingSnapshot(observed_at=1_030, rows=(), provider="t", error="boom"))
+    truth.ingest(TrendingSnapshot(observed_at=1_060, rows=(), provider="t"))
 
     health = truth.health(now=1_200)
     assert health["accepted_snapshots"] == 1
