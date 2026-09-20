@@ -320,6 +320,67 @@ class Settings:
     fomo_trending_off_board_exception_enabled: bool
     fomo_trending_stale_snapshot_seconds: int
 
+    # --- alert policy (v2.55) ----------------------------------------------
+    #: Which lanes may interrupt a human.  One table, applied at the single
+    #: publication choke point, because per-lane caps cannot bound the total
+    #: rate an operator actually experiences.  Defaults to LEGACY so this
+    #: release changes no existing lane's behaviour until opted into.
+    #: SILENT | GROUND_TRUTH | CURATED | LEGACY
+    alert_policy_mode: str
+
+    # --- FOMO PRE-TREND INTELLIGENCE (v2.55) -------------------------------
+    # The research lane.  Its defaults are chosen so that enabling the release
+    # changes nothing an operator can hear: collection is ON (it is the only
+    # part that must run from day one, because a model trained later can only
+    # learn from data collected earlier), while inference and alerting are OFF
+    # until a model has been trained and validated walk-forward.
+    pretrend_enabled: bool
+    pretrend_collection_enabled: bool
+    pretrend_inference_enabled: bool
+    pretrend_alerting_enabled: bool
+    #: How often the board is snapshotted for ground truth.  Faster sampling
+    #: measures entry timing more precisely; it does not make the bot louder.
+    pretrend_board_poll_seconds: int
+    #: How often candidate observations are appended.
+    pretrend_observation_seconds: int
+    #: Horizon the production model predicts (2m/5m/10m/20m are all labelled).
+    pretrend_horizon_seconds: int
+    #: The research universe.  Tokens outside it are not scored at all.
+    pretrend_universe_min_mc_usd: Decimal
+    pretrend_universe_max_mc_usd: Decimal
+    #: Calibrated probability required to enter PRE_TREND, and to enter the
+    #: silent WATCH state.
+    pretrend_alert_threshold: Decimal
+    pretrend_watch_threshold: Decimal
+    #: The alert budget.  Three exceptional alerts beat eighty mediocre ones.
+    pretrend_max_alerts_per_hour: int
+    pretrend_cooldown_seconds: int
+    pretrend_new_quality_traders_for_realert: int
+    #: Ground-truth snapshot validation.  A board shorter than the floor, or one
+    #: that shrank by more than the ratio in a single step, is treated as a
+    #: partial response rather than as a real market event.
+    pretrend_min_board_rows: int
+    pretrend_max_board_shrink_ratio: Decimal
+    #: A gap longer than this between accepted snapshots means we cannot claim
+    #: to have witnessed anything that appeared during it.
+    pretrend_max_coverage_gap_seconds: int
+    #: The authorised FOMO activity feed.  There is no default endpoint and no
+    #: discovery path: without this the FOMO-native lane reports itself
+    #: unconfigured and every FOMO feature is UNKNOWN rather than zero.
+    pretrend_activity_api_url: str | None
+    pretrend_activity_api_key: str | None
+    pretrend_activity_poll_seconds: int
+    #: How often pre-trend affinity is recomputed (a full-table pass).
+    pretrend_affinity_refresh_seconds: int
+    #: Minimum board entries behind a model before it may alert at all.
+    pretrend_min_positives_to_alert: int
+    #: Training cadence and walk-forward fold width.
+    pretrend_training_enabled: bool
+    pretrend_training_interval_seconds: int
+    pretrend_fold_seconds: int
+    #: Candidates evaluated per cycle, bounding the cost of the lane.
+    pretrend_max_candidates_per_cycle: int
+
     # --- Terminal-style trenches intelligence (v2.43) ----------------------
     # Every value has a safe code default.  The whole engine runs on public
     # Solana RPC and Pump.fun program state, so no paid provider is required.
@@ -922,6 +983,51 @@ class Settings:
             ),
             fomo_trending_stale_snapshot_seconds=_int(
                 "FOMO_TRENDING_STALE_SNAPSHOT_SECONDS", 600
+            ),
+            alert_policy_mode=os.getenv("ALERT_POLICY_MODE", "LEGACY").strip(),
+            pretrend_enabled=_bool("PRETREND_ENABLED", True),
+            pretrend_collection_enabled=_bool("PRETREND_COLLECTION_ENABLED", True),
+            pretrend_inference_enabled=_bool("PRETREND_INFERENCE_ENABLED", False),
+            pretrend_alerting_enabled=_bool("PRETREND_ALERTING_ENABLED", False),
+            pretrend_board_poll_seconds=_int("PRETREND_BOARD_POLL_SECONDS", 30),
+            pretrend_observation_seconds=_int("PRETREND_OBSERVATION_SECONDS", 60),
+            pretrend_horizon_seconds=_int("PRETREND_HORIZON_SECONDS", 300),
+            pretrend_universe_min_mc_usd=_decimal("PRETREND_UNIVERSE_MIN_MC_USD", "20000"),
+            pretrend_universe_max_mc_usd=_decimal(
+                "PRETREND_UNIVERSE_MAX_MC_USD", "1000000"
+            ),
+            pretrend_alert_threshold=_decimal("PRETREND_ALERT_THRESHOLD", "0.20"),
+            pretrend_watch_threshold=_decimal("PRETREND_WATCH_THRESHOLD", "0.05"),
+            pretrend_max_alerts_per_hour=_int("PRETREND_MAX_ALERTS_PER_HOUR", 4),
+            pretrend_cooldown_seconds=_int("PRETREND_COOLDOWN_SECONDS", 1800),
+            pretrend_new_quality_traders_for_realert=_int(
+                "PRETREND_NEW_QUALITY_TRADERS_FOR_REALERT", 2
+            ),
+            pretrend_min_board_rows=_int("PRETREND_MIN_BOARD_ROWS", 5),
+            pretrend_max_board_shrink_ratio=_decimal(
+                "PRETREND_MAX_BOARD_SHRINK_RATIO", "0.6"
+            ),
+            pretrend_max_coverage_gap_seconds=_int(
+                "PRETREND_MAX_COVERAGE_GAP_SECONDS", 180
+            ),
+            pretrend_activity_api_url=(
+                os.getenv("PRETREND_ACTIVITY_API_URL", "").strip() or None
+            ),
+            pretrend_activity_api_key=(
+                os.getenv("PRETREND_ACTIVITY_API_KEY", "").strip() or None
+            ),
+            pretrend_activity_poll_seconds=_int("PRETREND_ACTIVITY_POLL_SECONDS", 20),
+            pretrend_affinity_refresh_seconds=_int(
+                "PRETREND_AFFINITY_REFRESH_SECONDS", 900
+            ),
+            pretrend_min_positives_to_alert=_int("PRETREND_MIN_POSITIVES_TO_ALERT", 30),
+            pretrend_training_enabled=_bool("PRETREND_TRAINING_ENABLED", True),
+            pretrend_training_interval_seconds=_int(
+                "PRETREND_TRAINING_INTERVAL_SECONDS", 21600
+            ),
+            pretrend_fold_seconds=_int("PRETREND_FOLD_SECONDS", 86400),
+            pretrend_max_candidates_per_cycle=_int(
+                "PRETREND_MAX_CANDIDATES_PER_CYCLE", 60
             ),
             fomo_trenches_enabled=_bool("FOMO_TRENCHES_ENABLED", True),
             # 30s is comfortable against a public RPC once curve reads are
