@@ -2114,6 +2114,98 @@ class Database:
             );
             CREATE INDEX IF NOT EXISTS idx_pretrend_paper_open
                 ON pretrend_paper_observations(outcome, signalled_at DESC);
+
+            -- ================================================================
+            -- EARLY TRACTION (v2.56).  Additive and IF NOT EXISTS throughout.
+            --
+            -- Forward outcomes deliberately do NOT get new tables: runner_outcomes
+            -- already stores (mint, horizon_seconds) with price/mcap return,
+            -- rugged and liquidity_disappeared, and RUNNER_HORIZONS_SECONDS
+            -- already covers +5m/+15m/+1h/+24h.  Duplicating that would split the
+            -- forward-observation history this lane exists to contribute to.
+            -- ================================================================
+
+            -- One row per mint, ever.  The dedupe key: a mint that has a row here
+            -- has been alerted and must never be alerted again, across restarts.
+            -- alerted_at is written by INSERT OR IGNORE and never updated, so a
+            -- restart cannot resurrect a token as newly-alerted.
+            CREATE TABLE IF NOT EXISTS traction_alerts (
+                mint TEXT PRIMARY KEY,
+                alerted_at INTEGER NOT NULL,
+                launchpad TEXT NOT NULL DEFAULT '',
+                migration_state TEXT NOT NULL DEFAULT 'MIGRATION_UNKNOWN',
+                name TEXT NOT NULL DEFAULT '',
+                symbol TEXT NOT NULL DEFAULT '',
+                chain_created_at INTEGER,
+                detected_at INTEGER,
+                market_cap_at_alert_usd REAL,
+                volume_at_alert_usd REAL,
+                liquidity_at_alert_usd REAL,
+                age_at_alert_seconds INTEGER,
+                x_link TEXT NOT NULL DEFAULT '',
+                x_handle TEXT NOT NULL DEFAULT '',
+                x_link_class TEXT NOT NULL DEFAULT '',
+                momentum_state TEXT NOT NULL DEFAULT 'UNKNOWN',
+                quality_state TEXT NOT NULL DEFAULT 'UNKNOWN',
+                -- Discord message coordinates, so enrichment can EDIT the card
+                -- it already sent rather than sending a second one.
+                discord_channel_id INTEGER,
+                discord_message_id INTEGER,
+                enriched_at INTEGER,
+                -- Set once this mint has been handed to the shared forward-
+                -- observation history, so a restart does not register it twice.
+                forward_registered_at INTEGER,
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_traction_alerts_recent
+                ON traction_alerts(alerted_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_traction_alerts_pending
+                ON traction_alerts(enriched_at, alerted_at)
+                WHERE enriched_at IS NULL;
+
+            -- Every X identity we have ever seen attached to a mint.  This table
+            -- is what makes "the same X account is on six different tokens"
+            -- answerable for free -- it is our own history, no provider call.
+            CREATE TABLE IF NOT EXISTS traction_x_links (
+                handle TEXT NOT NULL,
+                mint TEXT NOT NULL,
+                first_seen_at INTEGER NOT NULL,
+                link_class TEXT NOT NULL DEFAULT '',
+                tweet_id TEXT NOT NULL DEFAULT '',
+                raw_link TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (handle, mint)
+            );
+            CREATE INDEX IF NOT EXISTS idx_traction_x_links_handle
+                ON traction_x_links(handle, first_seen_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_traction_x_links_tweet
+                ON traction_x_links(tweet_id, first_seen_at DESC);
+
+            -- Latency samples.  Separate from pump_discovery_latency because that
+            -- table is keyed by mint with one source; this one records the full
+            -- creation -> detection -> alert ladder for this lane specifically.
+            CREATE TABLE IF NOT EXISTS traction_latency (
+                mint TEXT PRIMARY KEY,
+                chain_created_at INTEGER,
+                detected_at INTEGER NOT NULL,
+                alert_sent_at INTEGER,
+                source TEXT NOT NULL DEFAULT '',
+                launchpad TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_traction_latency_recent
+                ON traction_latency(detected_at DESC);
+
+            -- Why a mint did not qualify, kept so thresholds can be tuned against
+            -- real near-misses rather than guesses.  Bounded by its own sweep.
+            CREATE TABLE IF NOT EXISTS traction_rejections (
+                mint TEXT NOT NULL,
+                decided_at INTEGER NOT NULL,
+                reasons_json TEXT NOT NULL DEFAULT '[]',
+                measured_json TEXT NOT NULL DEFAULT '{}',
+                terminal INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (mint, decided_at)
+            );
+            CREATE INDEX IF NOT EXISTS idx_traction_rejections_recent
+                ON traction_rejections(decided_at DESC);
             """
         )
         await self._migrate_pump_launch_status_constraint()
@@ -2193,6 +2285,9 @@ class Database:
             ("organic_score", "REAL"),
         ):
             await self._ensure_column("runner_candidates", column, definition)
+        # v2.56: a checkout that ran an earlier build of this branch already has
+        # traction_alerts without this column.
+        await self._ensure_column("traction_alerts", "forward_registered_at", "INTEGER")
         await self.db.execute(
             """
             UPDATE runner_candidates

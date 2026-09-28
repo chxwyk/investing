@@ -669,6 +669,20 @@ def test_only_earned_classes_may_interrupt_the_user() -> None:
     truth: it is the card that says whether the prediction was right, so
     demoting it to the radar would mean the scoreboard arrives more quietly
     than the claim it settles.
+
+    v2.56 adds EARLY_TRACTION, and it is the hardest one to justify because it
+    is the *least* selective card here: it applies the operator's own Axiom
+    screen (launchpad, age, market cap, volume, an X link) and deliberately
+    gates on no safety metric at all.  It earns the ping on latency alone.  A
+    token minted ninety seconds ago that is already trading is a window that
+    closes while the radar is being scrolled, so a silent EARLY_TRACTION card
+    is a card that arrives after the thing it describes has finished happening
+    -- the one failure mode this lane exists to prevent.  What keeps it from
+    becoming noise is not selectivity but a hard budget: TRACTION_MAX_ALERTS_
+    PER_HOUR caps the lane, one alert per mint is claimed atomically in
+    ``traction_alerts``, and the safety block that would normally gate a ping
+    is still shown -- loudly, as its own field -- so the interruption carries
+    the risk with it instead of implying its absence.
     """
 
     assert set(fa.PINGABLE) == {
@@ -687,6 +701,7 @@ def test_only_earned_classes_may_interrupt_the_user() -> None:
         fa.GMGN_SMART_MONEY_ALERT,
         fa.PRE_TREND_SIGNAL,
         fa.TRENDING_CONFIRMED_ALERT,
+        fa.EARLY_TRACTION_ALERT,
     }
     assert fa.GMGN_KOL_ALERT not in fa.PINGABLE
     assert fa.NOTABLE_TRADER_LATE not in fa.PINGABLE

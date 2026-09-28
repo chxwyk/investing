@@ -80,11 +80,12 @@ jobs:
           import importlib, pkgutil
           import smart_money_bot
           import smart_money_bot.pretrend as pretrend
+          import smart_money_bot.traction as traction
 
           # Import every shipped module, so a missing file fails here rather
           # than at 3am on a Railway boot.
           missing = []
-          for package in (smart_money_bot, pretrend):
+          for package in (smart_money_bot, pretrend, traction):
               for info in pkgutil.walk_packages(package.__path__, package.__name__ + "."):
                   try:
                       importlib.import_module(info.name)
@@ -100,5 +101,24 @@ jobs:
           assert settings.pretrend_inference_enabled is False
           assert settings.pretrend_alerting_enabled is False
           assert settings.alert_policy_mode == "LEGACY"
+          # v2.56: the Early Traction screen ships as the operator dictated it,
+          # including the parts that are deliberately off.
+          assert settings.traction_enabled is True
+          assert settings.traction_max_age_seconds == 1500
+          assert str(settings.traction_min_market_cap_usd) == "8000"
+          assert str(settings.traction_min_volume_usd) == "5000"
+          assert settings.traction_require_x_link is True
+          assert settings.traction_require_dex_paid is False
+          assert settings.traction_include_ink is False
+
+          # The launchpad registry must refuse to invent a program address: only
+          # Pump, whose address this repository already uses in production,
+          # resolves without operator configuration.
+          from smart_money_bot.rotation import PUMP_PROGRAM_ID
+          from smart_money_bot.traction.launchpads import build_registry
+
+          registry = build_registry(pump_program_id=PUMP_PROGRAM_ID)
+          assert [a.name for a in registry.enabled] == ["PUMP"], registry.status()
+          assert build_registry().enabled == (), "an address was invented"
           print("wheel imports cleanly and ships the documented defaults")
           PY

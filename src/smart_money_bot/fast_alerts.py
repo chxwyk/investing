@@ -115,6 +115,13 @@ PRE_TREND_SIGNAL = "PRE_TREND_SIGNAL"
 #: the scoreboard cannot be filtered down to the wins.
 TRENDING_CONFIRMED_ALERT = "TRENDING_CONFIRMED"
 
+# --- Early Traction (v2.56) --------------------------------------------------
+#: A token matching the operator's Axiom Discover screen: young, with real
+#: market cap and volume and an X link. Its own class because it deliberately
+#: applies NO safety gate -- the card reports risk instead of filtering on it,
+#: so it must never be confused with a class that did screen for safety.
+EARLY_TRACTION_ALERT = "EARLY_TRACTION"
+
 ALERT_CLASSES: tuple[str, ...] = (
     FAST_WATCH,
     NOTABLE_TRADER_EARLY,
@@ -141,6 +148,7 @@ ALERT_CLASSES: tuple[str, ...] = (
     GMGN_KOL_ALERT,
     PRE_TREND_SIGNAL,
     TRENDING_CONFIRMED_ALERT,
+    EARLY_TRACTION_ALERT,
 )
 
 #: Classes that may interrupt the user.  A late observation never does — it is
@@ -170,6 +178,9 @@ PINGABLE: frozenset[str] = frozenset(
         # here, so these two cannot be a source of volume.
         PRE_TREND_SIGNAL,
         TRENDING_CONFIRMED_ALERT,
+        # Early Traction is a speed lane: a card that arrives silently is
+        # not what it is for. Its own hourly cap bounds the volume.
+        EARLY_TRACTION_ALERT,
         # A promotion is by definition the moment the evidence became worth
         # an interruption, so it is the one card that must reach the human.
         EARLY_PROMOTION,
@@ -220,6 +231,10 @@ URGENT_CLASSES: frozenset[str] = frozenset(
         # anything else here.
         PRE_TREND_SIGNAL,
         TRENDING_CONFIRMED_ALERT,
+        # Early Traction pings: it is a fast lane and a card that arrives
+        # silently 20 minutes later is not what was asked for. Its own
+        # hourly cap bounds the volume.
+        EARLY_TRACTION_ALERT,
     }
 )
 

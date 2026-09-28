@@ -54,6 +54,7 @@ from .execution import ShadowExecutionProvider, gates_from_settings
 from .executor import ExecutionManager
 from .fast_alerts import (
     ALMOST_BONDED_ALERT,
+    EARLY_TRACTION_ALERT,
     GMGN_KOL_ALERT,
     GMGN_SMART_MONEY_ALERT,
     LANE_RADAR,
@@ -283,6 +284,7 @@ from .models import (
     RunnerForensics,
     RunnerFundingObservation,
     RunnerMarketSnapshot,
+    RunnerScoreBreakdown,
     ScoredTrader,
     Side,
     Signal,
@@ -345,7 +347,7 @@ from .quality import (
     rank_for_attention,
 )
 from .risk import RiskEngine
-from .rotation import CandidateRotator, RotationResult, is_pump_mint
+from .rotation import PUMP_PROGRAM_ID, CandidateRotator, RotationResult, is_pump_mint
 from .rpc import SolanaRPC
 from .runner import (
     RUNNER_HORIZONS_SECONDS,
@@ -400,6 +402,12 @@ from .token_presentation import (
 from .token_presentation import (
     merge as merge_presentation,
 )
+from .traction.launchpads import build_registry as build_traction_registry
+from .traction.profile import TractionProfile
+from .traction.safety import DeveloperHistory, build_safety
+from .traction_cards import build_traction_card
+from .traction_runtime import TractionConfig, TractionRuntime
+from .traction_store import TractionStore
 from .trenches import (
     CadenceConfig,
     TokenMetadata,
@@ -866,6 +874,61 @@ class SmartMoneyEngine:
         self._alert_mode = alert_policy_mode(settings.alert_policy_mode)
         self.alerts_policy_suppressed = 0
         self.alerts_policy_demoted = 0
+        # --- EARLY TRACTION (v2.56) ----------------------------------------
+        # Mirrors the operator's Axiom Discover screen. It reuses the existing
+        # Pump creation stream for push intake and the existing DEX Screener
+        # client for cheap batched market reads, so it adds no new provider and
+        # spends no new credits. Read-only by construction: no executor, no
+        # signer, no path to spend SOL.
+        self.traction_store = TractionStore(self.database)
+        self.traction_registry = build_traction_registry(
+            requested=settings.traction_launchpads,
+            program_ids=settings.traction_launchpad_program_ids,
+            pump_program_id=PUMP_PROGRAM_ID,
+        )
+        traction_chains = {"solana"}
+        if settings.traction_include_ink:
+            # Accepted into the profile so the operator's setting is honoured,
+            # but there is no Ink ingestion in this codebase, so nothing will
+            # ever arrive on it. Reported in status rather than silently ignored.
+            traction_chains.add("ink")
+        self.traction = TractionRuntime(
+            self.traction_store,
+            registry=self.traction_registry,
+            config=TractionConfig(
+                enabled=settings.traction_enabled,
+                profile=TractionProfile(
+                    max_age_seconds=settings.traction_max_age_seconds,
+                    min_market_cap_usd=settings.traction_min_market_cap_usd,
+                    min_volume_usd=settings.traction_min_volume_usd,
+                    require_x_link=settings.traction_require_x_link,
+                    require_dex_paid=settings.traction_require_dex_paid,
+                    include_pre_migration=settings.traction_include_pre_migration,
+                    include_post_migration=settings.traction_include_post_migration,
+                    chains=frozenset(traction_chains),
+                    volume_window=settings.traction_volume_window,
+                ),
+                poll_seconds=settings.traction_poll_seconds,
+                recheck_seconds=settings.traction_recheck_seconds,
+                max_reads_per_minute=settings.traction_max_reads_per_minute,
+                max_pool=settings.traction_max_pool,
+                batch_size=settings.traction_batch_size,
+                max_batches_per_pass=settings.traction_max_batches_per_pass,
+                max_alerts_per_hour=settings.traction_max_alerts_per_hour,
+                max_send_attempts=settings.traction_max_send_attempts,
+                send_backoff_seconds=float(settings.traction_send_backoff_seconds),
+                x_reuse_window_seconds=settings.traction_x_reuse_window_seconds,
+                enrich_timeout_seconds=settings.traction_enrich_timeout_seconds,
+            ),
+            market_reader=self._traction_market_read,
+            enricher=self._traction_enrich,
+            publisher=self._publish_traction,
+            editor=self._edit_traction,
+            forward_tracker=self._traction_register_forward,
+        )
+        self._traction_task: asyncio.Task[None] | None = None
+        #: Alert objects kept only until their enrichment edit lands.
+        self._traction_alerts: dict[str, FastAlert] = {}
         self._pretrend_board_task: asyncio.Task[None] | None = None
         self._pretrend_activity_task: asyncio.Task[None] | None = None
         self._pretrend_training_task: asyncio.Task[None] | None = None
@@ -1275,6 +1338,18 @@ class SmartMoneyEngine:
                 self._run_fomo_radar(),
                 name="smart-money-fomo-radar",
             )
+        # --- Early Traction (v2.56) ---------------------------------------
+        # The sweep runs whenever the lane is on. Intake is pushed from the
+        # existing creation stream, so this loop only re-checks the young pool.
+        if self.settings.traction_enabled:
+            self._traction_task = asyncio.create_task(
+                self._run_traction(), name="smart-money-early-traction"
+            )
+            logger.info(
+                "Early Traction listening to %s; unavailable: %s",
+                self.traction_registry.status()["enabled"] or "nothing",
+                sorted(self.traction_registry.status()["unavailable"]) or "none",
+            )
         # --- FOMO pre-trend intelligence (v2.55) --------------------------
         # The board loop runs whenever the lane is enabled, even with inference
         # off, because collection is the part that cannot be deferred: a model
@@ -1333,6 +1408,7 @@ class SmartMoneyEngine:
             self._pretrend_board_task,
             self._pretrend_activity_task,
             self._pretrend_training_task,
+            self._traction_task,
         )
         for task in background:
             if task:
@@ -1341,6 +1417,7 @@ class SmartMoneyEngine:
             if task:
                 with suppress(asyncio.CancelledError):
                     await task
+        self._traction_task = None
         self._pretrend_board_task = None
         self._pretrend_activity_task = None
         self._pretrend_training_task = None
@@ -7133,6 +7210,17 @@ class SmartMoneyEngine:
                 created_at=creation.observed_at,
                 source=SOURCE_CREATION_STREAM,
             )
+        # Early Traction intake. Deliberately right here, beside the other
+        # first-observation writes: the whole lane is judged on creation-to-alert
+        # latency, so its clock must start in the same instant as everything
+        # else's rather than after an enrichment hop.
+        await self.note_traction_creation(
+            creation.mint,
+            launchpad="PUMP",
+            chain_created_at=creation.observed_at,
+            at=creation.observed_at,
+            source=SOURCE_CREATION_STREAM,
+        )
         # Open the mint's lifecycle at the earliest moment anything sees it, so
         # source lead is measurable against a real first observation (§27).
         with suppress(Exception):
@@ -7514,6 +7602,286 @@ class SmartMoneyEngine:
             except Exception as exc:
                 await self.notifier.on_error("Trending radar", exc)
             await asyncio.sleep(self.settings.fomo_trending_poll_seconds)
+
+    # ------------------------------------------------------------------
+    # EARLY TRACTION (v2.56)
+    # ------------------------------------------------------------------
+    async def _traction_market_read(
+        self, mints: Sequence[str]
+    ) -> dict[str, dict[str, Any]]:
+        """Cheap batched market data for the young pool.
+
+        Uses the DEX Screener client this bot already has. It is the *cheap*
+        tier on purpose: no safety provider, no holder read, no X lookup. Those
+        cost real budget and run only for mints that have already qualified,
+        which is what keeps the fast path fast and stops an unattended discovery
+        loop from burning credits.
+        """
+
+        results: dict[str, dict[str, Any]] = {}
+        for mint in mints:
+            try:
+                snapshot = await self.dex_screener.snapshot(mint)
+            except Exception:
+                continue
+            if not snapshot.available:
+                continue
+            results[mint] = {
+                "market_cap_usd": snapshot.market_cap_usd,
+                "liquidity_usd": snapshot.liquidity_usd,
+                # The profile's volume floor is a 5-minute figure by default, and
+                # this is the 5-minute column -- matched deliberately so the card
+                # states the window it actually measured.
+                "volume_usd": snapshot.volume_5m_usd,
+                "x_link": (
+                    f"https://x.com/{snapshot.x_handle}" if snapshot.x_handle else ""
+                ),
+                "dex_paid": bool(snapshot.active_boosts) if snapshot.available else None,
+                "chain_created_at": (
+                    None
+                    if snapshot.pair_age_minutes is None
+                    else int(time.time()) - snapshot.pair_age_minutes * 60
+                ),
+            }
+        return results
+
+    async def _traction_enrich(self, candidate: Any) -> Any:
+        """The SAFETY block. Runs only for mints that already qualified.
+
+        Every field is optional and a failure to read one leaves it ``unknown``
+        rather than zero, because the block's whole value is that the operator
+        can tell which risks were actually measured.
+        """
+
+        mint = candidate.mint
+        top10 = dev_percent = insider = bundler = None
+        holders = None
+        notes: list[str] = []
+        developer = DeveloperHistory()
+
+        with suppress(Exception):
+            risk = await self.token_risk.snapshot(mint)
+            top10 = risk.top10_percent
+            insider = risk.insiders_percent
+            bundler = risk.bundlers_percent
+
+        with suppress(Exception):
+            holders = await self._holder_count(mint, now=int(time.time()))
+
+        with suppress(Exception):
+            profile = await self.trenches_store.dev_profile_for(mint)
+            if profile:
+                developer = DeveloperHistory(
+                    wallet=str(profile.get("wallet") or ""),
+                    tokens_created=profile.get("tokens_created"),
+                    graduated=profile.get("graduated"),
+                    collapsed=profile.get("collapsed"),
+                    source="pump_dev_profiles",
+                )
+                dev_percent = profile.get("creator_percent")
+
+        if top10 is None:
+            notes.append("top-10 concentration could not be read from any provider")
+
+        return build_safety(
+            mint,
+            top10_percent=top10,
+            dev_holding_percent=dev_percent,
+            insider_percent=insider,
+            bundler_percent=bundler,
+            holder_count=holders,
+            developer=developer,
+            notes=tuple(notes),
+            source="traction_enrichment",
+            enriched_at=int(time.time()),
+        )
+
+    async def _traction_register_forward(self, candidate: Any) -> bool:
+        """Put one alerted mint into the shared v2.34 forward-observation history.
+
+        This goes through the runner lane's **own** writer on purpose.
+        ``runner_candidates.payload_json`` is a typed ``RunnerCandidate`` blob and
+        ``runner_outcomes`` has a foreign key onto that table, so the row has to
+        exist and it has to be the right shape. An earlier version of this lane
+        wrote its own shape there with raw SQL, which parsed fine going in and
+        then raised ``KeyError: 'first'`` in ``runner_candidate_from_json`` when
+        ``runner_due_mints`` picked the mint up 45 seconds later -- wedging the
+        runner outcome loop on that mint and emitting an error card every poll.
+
+        Once the row exists the existing machinery needs no changes at all:
+        ``runner_due_mints`` schedules it, ``analyze_runner`` refreshes it, and
+        ``_record_runner_outcomes`` writes +1m/+5m/+15m/+30m/+1h/+4h/+24h returns
+        measured from ``first_seen_at`` -- which this sets to our own detection
+        timestamp, so the horizons start when *we* saw the token.
+
+        The runner lane owns ``tier`` and will overwrite ``EARLY_TRACTION`` with
+        its own on the first refresh. That is correct: this lane contributes an
+        observation, it does not get to keep another lane's label.
+        """
+
+        observation = candidate.observation
+        now = int(time.time())
+        detected_at = int(candidate.detected_at or candidate.alert_sent_at or now)
+        # One immutable time-T baseline, from the values on the card that was
+        # sent. Nothing here is re-fetched: the entry numbers must be the ones
+        # the operator actually saw.
+        first = RunnerMarketSnapshot(
+            mint=candidate.mint,
+            captured_at=detected_at,
+            price_usd=observation.price_usd,
+            market_cap_usd=observation.market_cap_usd,
+            liquidity_usd=observation.liquidity_usd,
+            volume_5m_usd=observation.volume_usd or Decimal("0"),
+        )
+        runner_candidate = RunnerCandidate(
+            mint=candidate.mint,
+            symbol=observation.symbol or None,
+            name=observation.name or None,
+            first_seen_at=detected_at,
+            graduated_at=None,
+            graduation_source=f"EARLY_TRACTION:{candidate.launchpad}",
+            first=first,
+            current=first,
+            score=Decimal("0"),
+            tier="EARLY_TRACTION",
+            breakdown=RunnerScoreBreakdown(),
+            research_only=True,
+            generated_at=now,
+            chain_created_at=observation.chain_created_at,
+            radar_first_seen_at=detected_at,
+            first_market_data_at=detected_at,
+            first_discord_visible_at=candidate.alert_sent_at or now,
+        )
+        await self.database.store_runner_candidate(
+            runner_candidate,
+            payload_json=runner_candidate_to_json(runner_candidate),
+            snapshot_json=runner_snapshot_to_json(first),
+        )
+        return True
+
+    async def _publish_traction(self, candidate: Any) -> tuple[int, int] | None:
+        """Publish the card through the single publication choke point.
+
+        Returns Discord coordinates so the runtime can edit this exact message
+        later, or ``None`` so it can retry with backoff. Returning ``None``
+        rather than raising is what lets a rate limit cost a delay instead of
+        the alert.
+        """
+
+        card = build_traction_card(candidate)
+        alert = FastAlert(
+            kind=EARLY_TRACTION_ALERT,
+            mint=candidate.mint,
+            token_mint=candidate.mint,
+            alert_key=f"traction:{candidate.mint}",
+            spec=card,
+            ping=True,
+            ping_reason="EARLY_TRACTION_PROFILE_MATCH",
+            lane=LANE_URGENT,
+            # Read-only research lane: never a trade CTA.
+            trade_eligible=False,
+        )
+        self._traction_alerts[candidate.mint] = alert
+        if not await self._dispatch_card(alert):
+            return None
+        message = self._fast_alert_messages.get(alert.alert_key)
+        if message is None:
+            # Delivered, but we cannot address it for an edit. Report success so
+            # the alert is not re-sent; the safety block will be stored even
+            # though it cannot be rendered onto the card.
+            return (0, 0)
+        return (
+            int(getattr(getattr(message, "channel", None), "id", 0) or 0),
+            int(getattr(message, "id", 0) or 0),
+        )
+
+    async def _edit_traction(self, candidate: Any) -> bool:
+        """Edit the card already on screen with the safety block.
+
+        Never sends a second message: a second card for one token is exactly the
+        noise this lane exists to avoid.
+        """
+
+        alert = self._traction_alerts.get(candidate.mint)
+        if alert is None:
+            return False
+        card = build_traction_card(candidate)
+        published = await self.notifier.on_fast_alert_enrichment(
+            alert, EnrichmentUpdate(alert_key=alert.alert_key, replacement=card)
+        )
+        self._traction_alerts.pop(candidate.mint, None)
+        return bool(published)
+
+    async def _run_traction(self) -> None:
+        """The young-pool sweep. Cheap, bounded, and it never blocks an alert."""
+
+        passes = 0
+        while True:
+            try:
+                result = await self.traction.run_pass()
+                if result.error:
+                    logger.debug("Early Traction pass: %s", result.error)
+                passes += 1
+                # Forward registration happens after the send, so a redeploy in
+                # between leaves an alerted mint with no forward record. Sweep for
+                # those occasionally rather than on every pass: it is a recovery
+                # path, not a hot one.
+                if passes == 1 or passes % 60 == 0:
+                    recovered = await self.traction.retry_forward_registration()
+                    if recovered:
+                        logger.info(
+                            "Early Traction re-registered %s alert(s) for forward "
+                            "observation after a restart",
+                            recovered,
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await self.notifier.on_error("Early Traction", exc)
+            await asyncio.sleep(max(1, self.settings.traction_poll_seconds))
+
+    async def note_traction_creation(
+        self,
+        mint: str,
+        *,
+        launchpad: str,
+        chain_created_at: int | None,
+        at: int | None = None,
+        name: str = "",
+        symbol: str = "",
+        x_link: str = "",
+        source: str = "creation_stream",
+    ) -> bool:
+        """Intake hook for the creation stream. Must never raise into the stream."""
+
+        if not self.settings.traction_enabled:
+            return False
+        try:
+            return await self.traction.observe_creation(
+                mint=mint,
+                launchpad=launchpad,
+                chain_created_at=chain_created_at,
+                now=at,
+                name=name,
+                symbol=symbol,
+                x_link=x_link,
+                source=source,
+            )
+        except Exception:
+            logger.debug("Early Traction intake failed for %s", mint[:8], exc_info=True)
+            return False
+
+    async def traction_status(self) -> dict[str, Any]:
+        return await self.traction.status()
+
+    async def traction_latency(self, *, days: int = 1) -> dict[str, Any]:
+        report = await self.traction.latency_report(
+            since=int(time.time()) - max(1, days) * 86_400
+        )
+        return report.to_json()
+
+    async def traction_tracked(self, *, limit: int = 25) -> tuple[dict[str, Any], ...]:
+        return await self.traction_store.tracked_alert_rows(limit=limit)
 
     # ------------------------------------------------------------------
     # FOMO PRE-TREND INTELLIGENCE (v2.55)

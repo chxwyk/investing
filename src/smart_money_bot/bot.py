@@ -2937,6 +2937,7 @@ class SmartMoneyBot(commands.Bot):
         await self.add_cog(SmartMoneyCommands(self))
         await self.add_cog(FomoCommands(self))
         await self.add_cog(PretrendCommands(self))
+        await self.add_cog(TractionCommands(self))
         if self.settings.discord_guild_id:
             guild = discord.Object(id=self.settings.discord_guild_id)
             # Testing uses guild-scoped commands so updates appear immediately. Clear the
@@ -9453,6 +9454,228 @@ class PretrendCommands(
             )
         await self._resolve(interaction, embed=_clamp_embed(embed))
 
+
+class TractionCommands(
+    commands.GroupCog,
+    group_name="traction",
+    group_description="Early Traction: the Axiom screen, its latency and its forward record.",
+):
+    """Its own cog, for the same reason ``/pretrend`` has one: ``/fomo`` is full.
+
+    Three surfaces, and all three exist to make a claim checkable rather than to
+    make one.  ``status`` says which launchpads are actually being listened to
+    (most are not).  ``latency`` reports the number this lane is judged on,
+    including the samples it had to exclude.  ``tracked`` reads the forward
+    record back out of the shared observation tables, so the thresholds can
+    eventually be tuned against outcomes instead of taste.
+
+    Nothing here can trade, and nothing here predicts a price.
+    """
+
+    def __init__(self, bot: SmartMoneyBot) -> None:
+        self.bot = bot
+
+    async def _require_admin(self, interaction: discord.Interaction) -> bool:
+        if _member_is_admin(interaction.user, self.bot.settings):
+            return True
+        await interaction.response.send_message(
+            "You need Administrator or a configured bot-admin role for this.",
+            ephemeral=True,
+        )
+        return False
+
+    async def _resolve(
+        self,
+        interaction: discord.Interaction,
+        *,
+        content: str | None = None,
+        embed: discord.Embed | None = None,
+    ) -> None:
+        try:
+            await interaction.edit_original_response(content=content, embed=embed)
+        except discord.HTTPException:
+            await interaction.edit_original_response(
+                content=(content or "The card could not be rendered.")[:1900],
+                embed=None,
+            )
+
+    @app_commands.command(
+        name="status",
+        description="Early Traction profile, which launchpads are live, and the lane's counters.",
+    )
+    async def status(self, interaction: discord.Interaction) -> None:
+        if not await self._require_admin(interaction):
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        status = await self.bot.engine.traction_status()
+        profile = status["profile"]
+        launchpads = status["launchpads"]
+
+        embed = discord.Embed(
+            title="EARLY TRACTION — lane status",
+            colour=0x5DADE2,
+            description=(
+                "Read-only research lane. No buy, sell, signing or SOL spend "
+                "originates here."
+            ),
+        )
+        embed.add_field(
+            name="PROFILE",
+            value=(
+                f"age ≤ **{_secs(profile['max_age_seconds'])}** · "
+                f"mcap ≥ **{_usd(profile['min_market_cap_usd'])}** · "
+                f"vol({profile['volume_window']}) ≥ **{_usd(profile['min_volume_usd'])}**\n"
+                f"X link required: **{'yes' if profile['require_x_link'] else 'no'}** · "
+                f"dex paid required: **{'yes' if profile['require_dex_paid'] else 'no'}**\n"
+                f"pre-migration: {'yes' if profile['include_pre_migration'] else 'no'} · "
+                f"post-migration: {'yes' if profile['include_post_migration'] else 'no'}\n"
+                f"chains: {', '.join(profile['chains'])}\n"
+                f"safety gates: **{profile['safety_gates']}**"
+            ),
+            inline=False,
+        )
+        # The unavailable list comes before the counters on purpose: a lane
+        # listening to one venue out of five explains a low alert count far
+        # better than any counter does.
+        embed.add_field(
+            name="LAUNCHPADS LISTENING",
+            value=", ".join(launchpads["enabled"]) or "**none** — nothing can arrive",
+            inline=False,
+        )
+        if launchpads["unavailable"]:
+            embed.add_field(
+                name="LAUNCHPADS NOT LISTENING",
+                value="\n".join(
+                    f"**{name}**: {detail}"
+                    for name, detail in sorted(launchpads["unavailable"].items())
+                )[:1024],
+                inline=False,
+            )
+        embed.add_field(
+            name="LANE",
+            value=(
+                f"enabled: **{'yes' if status['enabled'] else 'no'}** · "
+                f"pool: **{status['pool_size']}**\n"
+                f"intake: {status['intake']} · "
+                f"dropped (not a listened launchpad): {status['dropped_unknown_launchpad']}\n"
+                f"alerts sent: **{status['alerts_sent']}** "
+                f"({status['alerts_last_hour']}/{status['max_alerts_per_hour']} this hour)\n"
+                f"send failures: {status['alerts_failed']} · "
+                f"held by the hourly cap: {status['rate_limited']}\n"
+                f"enrichment ok/failed: {status['enrichments_ok']}/"
+                f"{status['enrichments_failed']}"
+            ),
+            inline=False,
+        )
+        stages = status["latency"]["stages"]
+        embed.add_field(
+            name="LATENCY (24h)",
+            value="\n".join(
+                f"{name}: p50 {stage['p50_seconds'] or '?'}s · "
+                f"p95 {stage['p95_seconds'] or '?'}s · n={stage['samples']}"
+                for name, stage in stages.items()
+            )[:1024]
+            or "no samples yet",
+            inline=False,
+        )
+        if status["last_error"]:
+            embed.add_field(
+                name="LAST ERROR", value=status["last_error"][:300], inline=False
+            )
+        await self._resolve(interaction, embed=_clamp_embed(embed))
+
+    @app_commands.command(
+        name="latency",
+        description="creation → detection → alert at p50, p95 and max, with excluded samples.",
+    )
+    @app_commands.describe(days="How many days of samples to summarise")
+    async def latency(self, interaction: discord.Interaction, days: int = 1) -> None:
+        if not await self._require_admin(interaction):
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        report = await self.bot.engine.traction_latency(days=max(1, min(days, 30)))
+
+        embed = discord.Embed(
+            title="EARLY TRACTION — measured latency",
+            colour=0x5DADE2,
+            description=(
+                "Anchored to the on-chain creation timestamp. Samples without "
+                "one are excluded from the percentiles and counted separately — "
+                "averaging them in as zero would flatter every figure here."
+            ),
+        )
+        for name, stage in report["stages"].items():
+            embed.add_field(
+                name=name,
+                value=(
+                    f"p50 **{stage['p50_seconds'] or 'unknown'}s** · "
+                    f"p95 **{stage['p95_seconds'] or 'unknown'}s** · "
+                    f"max {stage['max_seconds'] or 'unknown'}s\n"
+                    f"n={stage['samples']}"
+                    f"{'' if stage['sufficient'] else ' (thin sample)'} · "
+                    f"excluded (no creation time): {stage['unknown_grade']}"
+                ),
+                inline=False,
+            )
+        if report["by_source"]:
+            embed.add_field(
+                name="BY SOURCE (creation → detection)",
+                value="\n".join(
+                    f"{source}: p50 {stat['p50_seconds'] or '?'}s · "
+                    f"p95 {stat['p95_seconds'] or '?'}s · n={stat['samples']}"
+                    for source, stat in sorted(report["by_source"].items())
+                )[:1024],
+                inline=False,
+            )
+        await self._resolve(interaction, embed=_clamp_embed(embed))
+
+    @app_commands.command(
+        name="tracked",
+        description="Alerted candidates and whatever forward outcome has accrued so far.",
+    )
+    @app_commands.describe(limit="How many recent alerts to list")
+    async def tracked(self, interaction: discord.Interaction, limit: int = 15) -> None:
+        if not await self._require_admin(interaction):
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        rows = await self.bot.engine.traction_tracked(limit=max(1, min(limit, 25)))
+
+        embed = discord.Embed(
+            title="EARLY TRACTION — forward record",
+            colour=0x5DADE2,
+            description=(
+                "Every alerted mint, joined to the shared forward-observation "
+                "history. `horizons: 0` means no outcome has been observed yet, "
+                "which is the honest state for a token alerted minutes ago."
+            ),
+        )
+        if not rows:
+            embed.add_field(
+                name="NOTHING ALERTED YET",
+                value=(
+                    "No Early Traction candidate has been published. Check "
+                    "`/traction status` for which launchpads are actually live."
+                ),
+                inline=False,
+            )
+        for row in rows:
+            embed.add_field(
+                name=(
+                    f"${row.get('symbol') or '?'} · {row.get('launchpad') or '?'} · "
+                    f"{_secs(row.get('age_at_alert_seconds'))} old at alert"
+                )[:256],
+                value=(
+                    f"`{row['mint']}`\n"
+                    f"mcap at alert: {_usd(row.get('market_cap_at_alert_usd'))} · "
+                    f"momentum: {row.get('momentum_state') or '?'} · "
+                    f"quality: {row.get('quality_state') or '?'}\n"
+                    f"X link: {row.get('x_link_class') or 'unknown'} · "
+                    f"horizons observed: {row.get('horizons_observed') or 0}"
+                    f"{' · **rug flagged**' if row.get('ever_rugged') else ''}"
+                )[:1024],
+                inline=False,
+            )
+        await self._resolve(interaction, embed=_clamp_embed(embed))
 
 
 def _pct(value: object) -> str:

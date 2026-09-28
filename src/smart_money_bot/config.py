@@ -119,6 +119,22 @@ def _address_tuple(name: str, default: str = "") -> tuple[str, ...]:
     return tuple(dict.fromkeys(item.strip() for item in raw.split(",") if item.strip()))
 
 
+def _csv_upper(name: str, default: str = "") -> tuple[str, ...]:
+    """Comma-separated names, upper-cased and de-duplicated in order.
+
+    Used for launchpad lists, where the operator's spelling and spacing should
+    not decide whether a venue is covered.
+    """
+
+    raw = os.getenv(name, default)
+    seen: list[str] = []
+    for part in raw.split(","):
+        token = part.strip().upper()
+        if token and token not in seen:
+            seen.append(token)
+    return tuple(seen)
+
+
 def _int_tuple(name: str, default: str = "") -> tuple[int, ...]:
     raw = os.getenv(name, default)
     return tuple(int(item.strip()) for item in raw.split(",") if item.strip())
@@ -319,6 +335,39 @@ class Settings:
     fomo_trending_shadow_enabled: bool
     fomo_trending_off_board_exception_enabled: bool
     fomo_trending_stale_snapshot_seconds: int
+
+    # --- EARLY TRACTION (v2.56) --------------------------------------------
+    # A mirror of the operator's Axiom Discover screen. Every threshold is an
+    # env var. NOTE the absence of safety thresholds: the screen leaves top-10,
+    # dev, insider, bundler and holder count blank, so this lane reports them
+    # and never filters on them.
+    traction_enabled: bool
+    #: Comma-separated launchpad names the profile covers.
+    traction_launchpads: tuple[str, ...]
+    #: Program address per launchpad. Only PUMP has a built-in default, because
+    #: it is the only one whose address this repository already uses.
+    traction_launchpad_program_ids: dict[str, str]
+    traction_max_age_seconds: int
+    traction_min_market_cap_usd: Decimal
+    traction_min_volume_usd: Decimal
+    traction_volume_window: str
+    traction_require_x_link: bool
+    traction_require_dex_paid: bool
+    traction_include_pre_migration: bool
+    traction_include_post_migration: bool
+    #: Ink is OFF and unsupported: this codebase has no Ink data source at all.
+    traction_include_ink: bool
+    traction_poll_seconds: int
+    traction_recheck_seconds: int
+    traction_max_reads_per_minute: int
+    traction_max_pool: int
+    traction_batch_size: int
+    traction_max_batches_per_pass: int
+    traction_max_alerts_per_hour: int
+    traction_max_send_attempts: int
+    traction_send_backoff_seconds: Decimal
+    traction_x_reuse_window_seconds: int
+    traction_enrich_timeout_seconds: int
 
     # --- alert policy (v2.55) ----------------------------------------------
     #: Which lanes may interrupt a human.  One table, applied at the single
@@ -984,6 +1033,45 @@ class Settings:
             fomo_trending_stale_snapshot_seconds=_int(
                 "FOMO_TRENDING_STALE_SNAPSHOT_SECONDS", 600
             ),
+            traction_enabled=_bool("TRACTION_ENABLED", True),
+            traction_launchpads=_csv_upper(
+                "TRACTION_LAUNCHPADS", "PUMP,BAGS,BONK,LIQUIDAF,HEAVEN"
+            ),
+            traction_launchpad_program_ids={
+                name: os.getenv(f"TRACTION_LAUNCHPAD_{name}_PROGRAM_ID", "").strip()
+                for name in ("PUMP", "BAGS", "BONK", "LIQUIDAF", "HEAVEN")
+                if os.getenv(f"TRACTION_LAUNCHPAD_{name}_PROGRAM_ID", "").strip()
+            },
+            traction_max_age_seconds=_int("TRACTION_MAX_AGE_SECONDS", 1500),
+            traction_min_market_cap_usd=_decimal("TRACTION_MIN_MARKET_CAP_USD", "8000"),
+            traction_min_volume_usd=_decimal("TRACTION_MIN_VOLUME_USD", "5000"),
+            traction_volume_window=os.getenv("TRACTION_VOLUME_WINDOW", "5m").strip(),
+            traction_require_x_link=_bool("TRACTION_REQUIRE_X_LINK", True),
+            traction_require_dex_paid=_bool("TRACTION_REQUIRE_DEX_PAID", False),
+            traction_include_pre_migration=_bool(
+                "TRACTION_INCLUDE_PRE_MIGRATION", True
+            ),
+            traction_include_post_migration=_bool(
+                "TRACTION_INCLUDE_POST_MIGRATION", True
+            ),
+            traction_include_ink=_bool("TRACTION_INCLUDE_INK", False),
+            traction_poll_seconds=_int("TRACTION_POLL_SECONDS", 5),
+            # 20s matches DexScreenerClient's own response cache: a faster
+            # re-read returns identical bytes and only spends budget.
+            traction_recheck_seconds=_int("TRACTION_RECHECK_SECONDS", 20),
+            traction_max_reads_per_minute=_int("TRACTION_MAX_READS_PER_MINUTE", 240),
+            traction_max_pool=_int("TRACTION_MAX_POOL", 600),
+            traction_batch_size=_int("TRACTION_BATCH_SIZE", 30),
+            traction_max_batches_per_pass=_int("TRACTION_MAX_BATCHES_PER_PASS", 6),
+            traction_max_alerts_per_hour=_int("TRACTION_MAX_ALERTS_PER_HOUR", 30),
+            traction_max_send_attempts=_int("TRACTION_MAX_SEND_ATTEMPTS", 5),
+            traction_send_backoff_seconds=_decimal(
+                "TRACTION_SEND_BACKOFF_SECONDS", "1.0"
+            ),
+            traction_x_reuse_window_seconds=_int(
+                "TRACTION_X_REUSE_WINDOW_SECONDS", 604800
+            ),
+            traction_enrich_timeout_seconds=_int("TRACTION_ENRICH_TIMEOUT_SECONDS", 20),
             alert_policy_mode=os.getenv("ALERT_POLICY_MODE", "LEGACY").strip(),
             pretrend_enabled=_bool("PRETREND_ENABLED", True),
             pretrend_collection_enabled=_bool("PRETREND_COLLECTION_ENABLED", True),

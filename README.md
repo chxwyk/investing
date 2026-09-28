@@ -7,6 +7,53 @@ transactions, and mirrors every newly detected hot-wallet swap in PAPER mode. PA
 as either a forced source-price observation ledger or an executable Jupiter quote-shadow
 trial; the two answer different questions and are labeled separately.
 
+Version 2.56.0 adds **EARLY TRACTION**: the operator's own Axiom Discover screen, run
+continuously and wired to a Discord ping instead of a browser tab. Solana, five named
+launchpads, pre- and post-migration, age ≤ 25m, market cap ≥ $8,000, volume ≥ $5,000, and an
+X link present. Dex-paid is not required.
+
+**The most important thing about that list is what is not in it.** Top-10 concentration, dev
+holding, insider share, bundler share and holder count are all blank on the operator's screen,
+so this lane does not filter on any of them. It computes them and prints them in their own
+labelled SAFETY block, and the token passes regardless. The split is structural, not a matter
+of discipline: `traction/profile.py` decides pass or fail and does not import
+`traction/safety.py` at all, and `SafetyReport` deliberately exposes no `passed`, `safe` or
+`blocked` property for anything to gate on. Seeing a candidate with 62% in the top ten wallets
+and deciding against it is a different and better outcome than never seeing it.
+
+**Momentum, quality and safety are three fields, never one score.** A blended number lets a
+strong momentum reading cancel a 70% top-ten holding and produce a confident figure that
+describes neither — the exact failure v2.54 was written to fix.
+
+**It is a speed lane, so it was measured before it was optimised.** Detection is push: the
+intake hook sits beside the other first-observation writes in the Pump creation-stream handler,
+so the clock starts in the same instant as everything else's. The cheap filters (launchpad, age,
+market cap, volume, X-link presence) run in memory; no safety provider, holder read or X lookup
+touches the fast path. The card is sent the moment the screen matches, with safety rendered as
+explicitly **pending**, and enrichment then **edits that same message** — it never sends a
+second one. `/traction latency` reports creation→detection, detection→alert and creation→alert
+at p50, p95 and max, and counts the samples it had to exclude for lacking an on-chain creation
+timestamp rather than averaging them in as zero.
+
+**One launchpad is live and the other four say so.** Pump ships enabled because
+`PUMP_PROGRAM_ID` is already in this repository and already subscribed to in production. Bags,
+Bonk, LiquidAF and Heaven ship `NOT_CONFIGURED`, and `/traction status` names the exact variable
+that turns each one on. This is not caution for its own sake: a guessed program address
+subscribes successfully and then either goes quiet or decodes unrelated instructions into
+plausible "launches", which is strictly worse than a lane that admits it is off. **There is also
+no Ink data anywhere in this codebase**, so `TRACTION_INCLUDE_INK` defaults to `false` and
+setting it true would accept a chain nothing can ever arrive on.
+
+**The X link is graded, not just counted.** A launchpad metadata field called "twitter" accepts
+any string, so "has an X link" is a weak fact. Structurally, for free and with no network call,
+the lane separates a real account page from an `/i/communities/…` page (no owner, no follower
+count, no history to judge) and from a `/status/…` link (very often someone else's tweet, reused
+to borrow its engagement). A valid-looking handle is reported as `ACCOUNT_UNVERIFIED`, never as
+verified, because existence costs an X-API call. And **reuse is the highest-signal check here and
+it is free**: one X identity attached to six mints this afternoon is a stronger statement than
+any single token's metadata, and it is answered from our own `traction_x_links` table. Reuse is
+reported, never filtered on, consistent with the no-safety-gates rule.
+
 Version 2.55.0 adds **FOMO PRE-TREND INTELLIGENCE**: a research lane that asks the opposite
 question to every other lane in this bot. The rest of the system looks at what is already on
 the FOMO Trending board and asks whether it is still tradeable. This one asks what measurably
@@ -1273,6 +1320,159 @@ The bot needs these Discord application permissions:
 - Use Application Commands
 
 No privileged Discord gateway intents are required.
+
+## Early traction: the Axiom screen, at speed (v2.56)
+
+### The screen, exactly
+
+| Filter | Value | Env var |
+|---|---|---|
+| Chain | Solana | `TRACTION_INCLUDE_INK` (off; see below) |
+| Launchpads | Pump, Bags, Bonk, LiquidAF, Heaven | `TRACTION_LAUNCHPADS` |
+| Migration | pre **and** post | `TRACTION_INCLUDE_PRE_MIGRATION`, `TRACTION_INCLUDE_POST_MIGRATION` |
+| Age | ≤ 25 minutes | `TRACTION_MAX_AGE_SECONDS` |
+| Market cap | ≥ $8,000 | `TRACTION_MIN_MARKET_CAP_USD` |
+| Volume | ≥ $5,000 (5m window) | `TRACTION_MIN_VOLUME_USD`, `TRACTION_VOLUME_WINDOW` |
+| X / Twitter link | required | `TRACTION_REQUIRE_X_LINK` |
+| Dex paid | **not** required | `TRACTION_REQUIRE_DEX_PAID` |
+| Top-10 / dev / insider / bundler / holders | **no gate at all** | — reported, never filtered |
+
+`/traction status` prints this table back with `safety gates: NONE — safety is reported, never
+filtered on`, so an operator reading it can see that the absence is deliberate rather than an
+oversight.
+
+### A screen is not a snapshot of the instant of creation
+
+Nothing meets a $5,000 volume floor in its first second, so a lane that evaluated once at mint
+time would alert on nothing. New mints instead enter a bounded in-memory pool and are re-checked
+as they develop. Failure reasons are classified:
+
+* **"not yet"** (market cap or volume below the floor, X link not yet in the metadata, age not
+  yet readable) — the mint stays in the pool.
+* **"no"** (wrong launchpad, wrong chain, older than the ceiling, an excluded migration side) —
+  the mint is evicted immediately and never re-read.
+
+One terminal reason makes the whole verdict terminal, because no amount of traction makes a token
+younger. An unknown value fails the check it belongs to rather than passing it: admitting an
+unreadable market cap "because we are not sure" would quietly widen the screen.
+
+### Safety is loud and powerless
+
+`traction/safety.py` assembles top-10 %, dev holding %, insider %, bundler %, holder count and
+the deployer's prior-launch record into its own field. Two rules keep it honest:
+
+* **Unknown prints as `unknown`, never as `0%`.** The block's entire value is that the operator
+  can see which risks were actually measured, and a comfortable default destroys exactly that.
+  The field also states its own completeness (`2/5 measured`).
+* **Nothing accuses anybody.** "Insider" and "bundler" are provider classifications of on-chain
+  patterns, reproduced with attribution, not findings of fact about a person.
+
+Before enrichment returns, the field reads `⏳ enrichment in flight — these are not yet measured`
+rather than being omitted. An absent block reads as "no risks found"; a pending one reads as "not
+checked yet", and on a two-minute-old token those are very different statements.
+
+### Send first, enrich second, edit the same message
+
+```
+creation stream (push)  →  stamp detection  →  cheap in-memory filters
+                                                   ↓ qualifies
+                        claim (atomic)  →  SEND CARD (safety: pending)
+                                                   ↓ detached
+                        enrichment  →  EDIT that card  →  never a second message
+```
+
+The claim is an `INSERT OR IGNORE` on `traction_alerts.mint`, so the dedupe check and the dedupe
+claim are one statement — a `SELECT` then `INSERT` leaves a window in which two concurrent
+evaluations both decide to send. Because the claim lives in the database, **it survives restarts
+by construction**.
+
+Delivery retries with bounded exponential backoff, so a Discord rate limit costs a delay rather
+than the alert. If delivery fails permanently the claim is **released**, because a held claim on
+an undelivered card is permanent silent loss — one outage would otherwise make that mint
+unalertable forever while the database said it had been alerted.
+
+### Provider cost is bounded, deliberately
+
+Two limits, both because the instruction was "no discovery loops that can burn credits
+unattended":
+
+* **`TRACTION_RECHECK_SECONDS` (20s)** is the floor on how often *one* mint is re-read. It is
+  matched to `DexScreenerClient.snapshot`'s own 20-second response cache: below it the client
+  returns the identical bytes, so a faster sweep buys no freshness, spends budget, and fills the
+  momentum block with duplicate readings that make a flat token look repeatedly measured.
+* **`TRACTION_MAX_READS_PER_MINUTE` (240)** is a hard sliding-window ceiling across the whole
+  lane. Without it, a launch storm filling the pool to `TRACTION_MAX_POOL` would issue one
+  request per mint per recheck interval — 1,800 a minute at 600 mints — against a public endpoint
+  documented at 300. Overflow is not dropped; it waits for the next sweep, oldest-first, and
+  `/traction status` reports `reads_deferred_for_budget` so the clamp is visible rather than
+  mysterious.
+
+**No new provider was added.** The lane reuses the DEX Screener client this bot already has for
+the cheap tier, and the existing token-risk / holder / dev-profile readers for enrichment — and
+enrichment runs only for mints that have already qualified.
+
+### Forward outcomes go into the existing history, through its own writer
+
+Every alerted mint is contributed to the v2.34 forward-observation tables, so returns accrue at
++1m/+5m/+15m/+30m/+1h/+4h/+24h alongside every other lane. Two things about how:
+
+* **It reuses `runner_candidates` / `runner_outcomes`** rather than starting a parallel history
+  that would have to be reconciled before either could be trusted. `runner_outcomes` already
+  records `(mint, horizon_seconds)` with price and market-cap return, `rugged` and
+  `liquidity_disappeared`, and it has a foreign key onto `runner_candidates` — so the candidate
+  row has to exist.
+* **The row is written by the runner lane's own writer, from the engine.** An earlier build of
+  this branch wrote Early Traction's own JSON shape into `runner_candidates.payload_json` with
+  raw SQL. It inserted cleanly and then broke a lane this release was told not to touch:
+  `runner_due_mints` picks the mint up 45 seconds later, `runner_candidate_from_json` raises
+  `KeyError: 'first'` on the foreign payload, and the runner outcome loop wedges on that mint
+  while emitting an error card every poll. `_traction_register_forward` now builds a real
+  `RunnerCandidate` and persists it through `store_runner_candidate`, and a regression test
+  asserts the whole round trip through that lane's own reader.
+
+`first_seen_at` is set to **our** detection timestamp, so the horizons start when this lane saw
+the token. `first_market_cap_usd` is the value on the card that was actually sent — nothing is
+re-fetched, because the entry number must be the one the operator saw. `first_price_usd` is left
+null: the cheap DEX Screener snapshot this lane uses carries no price field, so **market-cap
+return is measured and price return is not** for mints this lane sees first. The existing outcome
+readers already fall back to market cap when price is absent.
+
+Registration happens after the send, so a redeploy in between would leave an alerted mint with no
+forward record. `retry_forward_registration()` sweeps for those on startup and periodically;
+`/traction status` reports `forward_pending`.
+
+### Why it is allowed to ping
+
+`EARLY_TRACTION` is in `PINGABLE`, and it is the least selective card in that set — it gates on
+no safety metric by design. It earns the interruption on latency alone: a token minted ninety
+seconds ago that is already trading is a window that closes while the radar is being scrolled, so
+a silent Early Traction card arrives after the thing it describes has finished happening. What
+keeps it from becoming noise is not selectivity but a hard budget — `TRACTION_MAX_ALERTS_PER_HOUR`
+caps the lane, one alert per mint is claimed atomically, and the safety block that would normally
+gate a ping is shown anyway, loudly, so the interruption carries the risk with it instead of
+implying its absence.
+
+### Read-only, structurally
+
+No module in `traction/`, `traction_store.py`, `traction_runtime.py` or `traction_cards.py`
+imports an executor, a signer, a keypair or a wallet, references a transaction send, or has any
+path to spend SOL. The test suite parses each module's AST and asserts it, the same way the
+shadow lane's isolation is asserted. The card's colour is deliberately not green, and its
+description says so in words.
+
+### What this release does not claim
+
+* **No forward record for these thresholds yet.** $8,000 / $5,000 / 25 minutes are the operator's
+  numbers, reproduced faithfully. Nothing here has measured whether they are *good* numbers, and
+  the card predicts no outcome. `/traction tracked` and the rejection log exist so they can be
+  tuned against real observations later; until then a confident phrasing would be asserting
+  something nobody has measured.
+* **Four of five launchpads are not being listened to.** That is a supplied-configuration gap, not
+  a bug, and it is reported in every `/traction status`.
+* **The X check is structural.** Whether a structurally valid handle belongs to a real, live
+  account needs the budgeted X API and is not on the fast path.
+* **Nothing was live-tested.** Every claim above is from the local suite; no alert has been
+  published to a real Discord channel from this branch.
 
 ## Alert policy: which lanes may interrupt you (v2.55)
 
@@ -3001,6 +3201,110 @@ transaction, an order execution call or a swap. The test suite and the self-chec
 module's AST and assert it.
 
 ## Railway deployment
+
+### v2.56.0 Railway changes
+
+Every new setting has a safe code default, so **no Railway variable has to be added**. The schema
+block is additive `CREATE TABLE IF NOT EXISTS` throughout plus one `ALTER TABLE ... ADD COLUMN`
+on the new `traction_alerts` table only — no existing table is altered, no production row is
+touched, and no forward history is reset. Nothing here enables live trading; the lane has no path
+to spend SOL.
+
+**ADD:** none required.  **CHANGE:** none required.
+
+**OPTIONAL — the screen itself:**
+
+```text
+TRACTION_ENABLED=true                     # the Early Traction lane as a whole
+TRACTION_LAUNCHPADS=PUMP,BAGS,BONK,LIQUIDAF,HEAVEN
+TRACTION_MAX_AGE_SECONDS=1500             # 25 minutes
+TRACTION_MIN_MARKET_CAP_USD=8000
+TRACTION_MIN_VOLUME_USD=5000
+TRACTION_VOLUME_WINDOW=5m                 # 1m | 5m | 1h | 6h | 24h
+TRACTION_REQUIRE_X_LINK=true
+TRACTION_REQUIRE_DEX_PAID=false           # your screen leaves this off
+TRACTION_INCLUDE_PRE_MIGRATION=true       # bonding curve
+TRACTION_INCLUDE_POST_MIGRATION=true      # migrated to an AMM pool
+TRACTION_INCLUDE_INK=false                # see the warning below before enabling
+```
+
+**OPTIONAL — launchpad program addresses.** Only Pump resolves without one of these. Each variable
+takes the program address from that launchpad's **own** documentation; this repository ships no
+default for them and will not guess, because a wrong address subscribes successfully and then
+emits plausible nonsense.
+
+```text
+TRACTION_LAUNCHPAD_BAGS_PROGRAM_ID=
+TRACTION_LAUNCHPAD_BONK_PROGRAM_ID=
+TRACTION_LAUNCHPAD_LIQUIDAF_PROGRAM_ID=
+TRACTION_LAUNCHPAD_HEAVEN_PROGRAM_ID=
+```
+
+**OPTIONAL — cost, cadence and alert volume:**
+
+```text
+TRACTION_POLL_SECONDS=5                   # how often the sweep wakes up
+TRACTION_RECHECK_SECONDS=20               # floor per mint; matches the DEX client's cache TTL
+TRACTION_MAX_READS_PER_MINUTE=240         # hard provider ceiling for this lane
+TRACTION_MAX_POOL=600                     # bound on the young pool
+TRACTION_BATCH_SIZE=30                    # mints per market read group
+TRACTION_MAX_BATCHES_PER_PASS=6           # bounds the cost of one sweep
+TRACTION_MAX_ALERTS_PER_HOUR=30           # hourly ceiling for this lane
+TRACTION_MAX_SEND_ATTEMPTS=5              # Discord retries before the claim is released
+TRACTION_SEND_BACKOFF_SECONDS=1           # first backoff step; doubles, capped at 30s
+TRACTION_X_REUSE_WINDOW_SECONDS=604800    # how far back the X-reuse query looks
+TRACTION_ENRICH_TIMEOUT_SECONDS=20        # expiring leaves safety unmeasured, never blocks the card
+```
+
+**Deployment steps**
+
+1. Deploy as normal. No variable changes are required; the lane starts on Pump only.
+2. Run `/traction status`. Expect `LAUNCHPADS LISTENING: PUMP` and a `LAUNCHPADS NOT LISTENING`
+   block naming Bags, Bonk, LiquidAF and Heaven with the variable that enables each. That is the
+   correct day-one state, not a failure.
+3. Confirm the profile block reads your numbers back (`age ≤ 25m`, `mcap ≥ $8.0K`,
+   `vol(5m) ≥ $5.0K`) and that `safety gates: NONE — safety is reported, never filtered on`.
+4. Wait for the first card. It should arrive with the SAFETY field titled
+   `SAFETY — pending (this profile does NOT filter on these)` and then **change in place** within
+   about twenty seconds as enrichment lands. **If a second card appears for the same mint, that is
+   a bug — report it.**
+5. Run `/traction latency` after an hour. This is the number to judge the lane on. Read `p95`, not
+   just `p50`, and read `excluded (no creation time)` beside them — a large exclusion count means
+   the creation timestamps are not arriving, and the percentiles are describing a subset.
+6. Run `/traction tracked`. Recent rows will read `horizons observed: 0`; that is honest, not
+   empty. Rows should accumulate horizons over the following day.
+7. To add a launchpad, set its `..._PROGRAM_ID` from that launchpad's own documentation and
+   redeploy. `/traction status` will move it from the "not listening" block to the "listening"
+   line, or report `INVALID_ADDRESS` if it was pasted wrong.
+
+**Verification procedure**
+
+* `/traction status` — the profile as configured, which launchpads are live, pool size, alerts this
+  hour against the cap, `reads_deferred_for_budget`, `forward_pending`, and the last error.
+* `/traction latency` — creation→detection, detection→alert, creation→alert at p50/p95/max, split
+  by source, with excluded samples counted separately.
+* `/traction tracked` — every alerted mint with its entry market cap, momentum and quality states,
+  X-link class, and how many forward horizons have been observed.
+
+**Worth knowing without changing anything:**
+
+* **`TRACTION_INCLUDE_INK=true` will do nothing useful.** There is no Ink ingestion anywhere in
+  this codebase — no client, no stream, no address format handling. The setting is honoured so the
+  profile is not silently overriding you, and reported in `/traction status`, but no token will
+  ever arrive on that chain.
+* **Lowering `TRACTION_RECHECK_SECONDS` below 20 does not make the lane faster.** The market
+  client caches its own responses for 20 seconds, so a faster re-read returns identical bytes. It
+  spends request budget and adds duplicate momentum readings, and nothing else.
+* **Raising `TRACTION_MAX_ALERTS_PER_HOUR` is the one setting that can make this noisy.** The lane
+  has no safety gate by design, so the hourly cap is doing the work that a threshold does
+  elsewhere. Alerts held by the cap are counted in `/traction status` rather than discarded
+  silently.
+* **The X-link check costs nothing and the account check is not running.** Structural
+  classification and cross-mint reuse are free and always on. Confirming a handle exists needs the
+  budgeted X API and is deliberately off the fast path.
+* **Storage is bounded.** One row per alert in `traction_alerts`, one per `(handle, mint)` in
+  `traction_x_links`, one per detected mint in `traction_latency`, and a rejection log with its own
+  sweep.
 
 ### v2.55.0 Railway changes
 
