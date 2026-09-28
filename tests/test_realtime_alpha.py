@@ -659,6 +659,30 @@ def test_only_earned_classes_may_interrupt_the_user() -> None:
     provider classifies as smart money entering while the edge is live is worth
     a look; a famous account buying is attention, and attention belongs on the
     radar until our own forward record says it is worth more than that.
+
+    v2.55 adds the two pre-trend classes.  PRE_TREND_SIGNAL is the only card in
+    this list whose claim is a falsifiable prediction about a future event
+    rather than a description of a token's present state, and it does not reach
+    a human until a model has cleared walk-forward validation *and* its own
+    gate's four-an-hour budget, per-mint cooldown and material-change rule --
+    a tighter path than any other class here.  TRENDING_CONFIRMED is ground
+    truth: it is the card that says whether the prediction was right, so
+    demoting it to the radar would mean the scoreboard arrives more quietly
+    than the claim it settles.
+
+    v2.56 adds EARLY_TRACTION, and it is the hardest one to justify because it
+    is the *least* selective card here: it applies the operator's own Axiom
+    screen (launchpad, age, market cap, volume, an X link) and deliberately
+    gates on no safety metric at all.  It earns the ping on latency alone.  A
+    token minted ninety seconds ago that is already trading is a window that
+    closes while the radar is being scrolled, so a silent EARLY_TRACTION card
+    is a card that arrives after the thing it describes has finished happening
+    -- the one failure mode this lane exists to prevent.  What keeps it from
+    becoming noise is not selectivity but a hard budget: TRACTION_MAX_ALERTS_
+    PER_HOUR caps the lane, one alert per mint is claimed atomically in
+    ``traction_alerts``, and the safety block that would normally gate a ping
+    is still shown -- loudly, as its own field -- so the interruption carries
+    the risk with it instead of implying its absence.
     """
 
     assert set(fa.PINGABLE) == {
@@ -675,6 +699,9 @@ def test_only_earned_classes_may_interrupt_the_user() -> None:
         fa.PUBLIC_TRENDING_ALERT,
         fa.EARLY_PROMOTION,
         fa.GMGN_SMART_MONEY_ALERT,
+        fa.PRE_TREND_SIGNAL,
+        fa.TRENDING_CONFIRMED_ALERT,
+        fa.EARLY_TRACTION_ALERT,
     }
     assert fa.GMGN_KOL_ALERT not in fa.PINGABLE
     assert fa.NOTABLE_TRADER_LATE not in fa.PINGABLE

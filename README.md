@@ -7,6 +7,107 @@ transactions, and mirrors every newly detected hot-wallet swap in PAPER mode. PA
 as either a forced source-price observation ledger or an executable Jupiter quote-shadow
 trial; the two answer different questions and are labeled separately.
 
+Version 2.56.0 adds **EARLY TRACTION**: the operator's own Axiom Discover screen, run
+continuously and wired to a Discord ping instead of a browser tab. Solana, five named
+launchpads, pre- and post-migration, age ≤ 25m, market cap ≥ $8,000, volume ≥ $5,000, and an
+X link present. Dex-paid is not required.
+
+**The most important thing about that list is what is not in it.** Top-10 concentration, dev
+holding, insider share, bundler share and holder count are all blank on the operator's screen,
+so this lane does not filter on any of them. It computes them and prints them in their own
+labelled SAFETY block, and the token passes regardless. The split is structural, not a matter
+of discipline: `traction/profile.py` decides pass or fail and does not import
+`traction/safety.py` at all, and `SafetyReport` deliberately exposes no `passed`, `safe` or
+`blocked` property for anything to gate on. Seeing a candidate with 62% in the top ten wallets
+and deciding against it is a different and better outcome than never seeing it.
+
+**Momentum, quality and safety are three fields, never one score.** A blended number lets a
+strong momentum reading cancel a 70% top-ten holding and produce a confident figure that
+describes neither — the exact failure v2.54 was written to fix.
+
+**It is a speed lane, so it was measured before it was optimised.** Detection is push: the
+intake hook sits beside the other first-observation writes in the Pump creation-stream handler,
+so the clock starts in the same instant as everything else's. The cheap filters (launchpad, age,
+market cap, volume, X-link presence) run in memory; no safety provider, holder read or X lookup
+touches the fast path. The card is sent the moment the screen matches, with safety rendered as
+explicitly **pending**, and enrichment then **edits that same message** — it never sends a
+second one. `/traction latency` reports creation→detection, detection→alert and creation→alert
+at p50, p95 and max, and counts the samples it had to exclude for lacking an on-chain creation
+timestamp rather than averaging them in as zero.
+
+**One launchpad is live and the other four say so.** Pump ships enabled because
+`PUMP_PROGRAM_ID` is already in this repository and already subscribed to in production. Bags,
+Bonk, LiquidAF and Heaven ship `NOT_CONFIGURED`, and `/traction status` names the exact variable
+that turns each one on. This is not caution for its own sake: a guessed program address
+subscribes successfully and then either goes quiet or decodes unrelated instructions into
+plausible "launches", which is strictly worse than a lane that admits it is off. **There is also
+no Ink data anywhere in this codebase**, so `TRACTION_INCLUDE_INK` defaults to `false` and
+setting it true would accept a chain nothing can ever arrive on.
+
+**The X link is graded, not just counted.** A launchpad metadata field called "twitter" accepts
+any string, so "has an X link" is a weak fact. Structurally, for free and with no network call,
+the lane separates a real account page from an `/i/communities/…` page (no owner, no follower
+count, no history to judge) and from a `/status/…` link (very often someone else's tweet, reused
+to borrow its engagement). A valid-looking handle is reported as `ACCOUNT_UNVERIFIED`, never as
+verified, because existence costs an X-API call. And **reuse is the highest-signal check here and
+it is free**: one X identity attached to six mints this afternoon is a stronger statement than
+any single token's metadata, and it is answered from our own `traction_x_links` table. Reuse is
+reported, never filtered on, consistent with the no-safety-gates rule.
+
+Version 2.55.0 adds **FOMO PRE-TREND INTELLIGENCE**: a research lane that asks the opposite
+question to every other lane in this bot. The rest of the system looks at what is already on
+the FOMO Trending board and asks whether it is still tradeable. This one asks what measurably
+happens *before* an exact Solana mint first appears there, and whether that state can be
+detected early enough, and quietly enough, to be worth acting on.
+
+The honest reason it exists is that the previous alerting could not be tuned. Its decision
+variable was a hand-weighted 0-100 score compared against a threshold, and **no weight in it
+was ever fitted to an outcome** — because the repository had no label for "entered FOMO
+Trending" at all. With no label there is no precision, with no precision there is no way to
+choose a threshold, and so the threshold was chosen by feel and the alert volume was capped
+by a rate limit instead. A rate limit trades recall for quiet; it cannot make a signal better.
+
+So v2.55 starts at the bottom. It defines one canonical event (`FOMO_TREND_ENTER`: an exact
+mint absent from the previous *valid* board snapshot and present in the next), records it
+write-once, collects append-only point-in-time observations of tokens that have **not** yet
+trended, labels them at 2/5/10/20-minute horizons, matches every winner against look-alikes
+that never trended, and only then fits anything. The model layer is a transparent heuristic, a
+regularized logistic regression and boosted trees — tried in that order, validated with
+chronological walk-forward folds only, and **refused** unless it beats the heuristic, clears a
+lift floor over the measured base rate, and rests on at least thirty distinct positive mints.
+
+**The lane ships collecting and silent.** `PRETREND_INFERENCE_ENABLED` and
+`PRETREND_ALERTING_ENABLED` both default to `false`, because no model has earned the right to
+interrupt anybody yet. Collection defaults to `true` because it is the only part that cannot be
+deferred: a model trained next month can only learn from observations recorded today. When a
+model is eventually promoted, its own budget is four alerts an hour with per-mint cooldowns and
+a material-change rule, so 41% → 42% → 43% is one message rather than four.
+
+**The default Trending source cannot produce labels at all, and the system says so.** With no
+`FOMO_TRENDING_API_URL` configured, this bot's Trending source is a DexScreener paid-boost
+ordering stamped `TRENDING_PROXY` — a legitimate attention approximation, and emphatically not
+the FOMO Trending board. Proxy rows are collected and stored, but they emit `PROXY_BOARD_*`
+events, never `FOMO_TREND_ENTER`, and `/pretrend modelhealth` reports
+`usable labels: 0` with the reason. Labelling proxy data as FOMO entries would have meant every
+downstream number — lead time, affinity, precision, base rate — described a different event
+from the one it was named after. **A deployment without an authorised feed collects usefully
+and can never train.** That is the honest state, not a bug.
+
+**Presence is not entry.** A token already on the board when collection starts did not just
+arrive; we started watching. Such mints get a `first_observed_on_board_at` and **no**
+`first_trending_at`, and are excluded from the dataset in both directions — they cannot be
+positives (the entry time is unknown) and must not be controls (they demonstrably *were*
+trending). The same rule applies after any coverage gap longer than
+`PRETREND_MAX_COVERAGE_GAP_SECONDS`. A first entry we missed stays missed permanently: a later
+witnessed return is recorded as a re-entry and is never back-filled as the first.
+
+This deployment has **no authorised FOMO-native activity feed**, and this release does not
+invent one — it will not scrape, reuse a browser session, replay a cookie or reverse a private
+endpoint. The interfaces, schema, mocks, rolling-window features and tests for that lane are
+all built and exercised; without `PRETREND_ACTIVITY_API_URL` every FOMO-native feature reports
+`UNKNOWN` rather than `0`, and the cards say so. That is a real limit on what can currently be
+measured, and it is recorded as a blocker rather than papered over.
+
 Version 2.54.0 takes the headline away from the builders. A card reading **🔥 WATCH —
 HEATING UP** above its own body saying `Safety: UNKNOWN • Route: UNKNOWN • Independent
 notable wallets: 0` was telling the operator two opposite things and letting the louder one
@@ -1219,6 +1320,374 @@ The bot needs these Discord application permissions:
 - Use Application Commands
 
 No privileged Discord gateway intents are required.
+
+## Early traction: the Axiom screen, at speed (v2.56)
+
+### The screen, exactly
+
+| Filter | Value | Env var |
+|---|---|---|
+| Chain | Solana | `TRACTION_INCLUDE_INK` (off; see below) |
+| Launchpads | Pump, Bags, Bonk, LiquidAF, Heaven | `TRACTION_LAUNCHPADS` |
+| Migration | pre **and** post | `TRACTION_INCLUDE_PRE_MIGRATION`, `TRACTION_INCLUDE_POST_MIGRATION` |
+| Age | ≤ 25 minutes | `TRACTION_MAX_AGE_SECONDS` |
+| Market cap | ≥ $8,000 | `TRACTION_MIN_MARKET_CAP_USD` |
+| Volume | ≥ $5,000 (5m window) | `TRACTION_MIN_VOLUME_USD`, `TRACTION_VOLUME_WINDOW` |
+| X / Twitter link | required | `TRACTION_REQUIRE_X_LINK` |
+| Dex paid | **not** required | `TRACTION_REQUIRE_DEX_PAID` |
+| Top-10 / dev / insider / bundler / holders | **no gate at all** | — reported, never filtered |
+
+`/traction status` prints this table back with `safety gates: NONE — safety is reported, never
+filtered on`, so an operator reading it can see that the absence is deliberate rather than an
+oversight.
+
+### A screen is not a snapshot of the instant of creation
+
+Nothing meets a $5,000 volume floor in its first second, so a lane that evaluated once at mint
+time would alert on nothing. New mints instead enter a bounded in-memory pool and are re-checked
+as they develop. Failure reasons are classified:
+
+* **"not yet"** (market cap or volume below the floor, X link not yet in the metadata, age not
+  yet readable) — the mint stays in the pool.
+* **"no"** (wrong launchpad, wrong chain, older than the ceiling, an excluded migration side) —
+  the mint is evicted immediately and never re-read.
+
+One terminal reason makes the whole verdict terminal, because no amount of traction makes a token
+younger. An unknown value fails the check it belongs to rather than passing it: admitting an
+unreadable market cap "because we are not sure" would quietly widen the screen.
+
+### Safety is loud and powerless
+
+`traction/safety.py` assembles top-10 %, dev holding %, insider %, bundler %, holder count and
+the deployer's prior-launch record into its own field. Two rules keep it honest:
+
+* **Unknown prints as `unknown`, never as `0%`.** The block's entire value is that the operator
+  can see which risks were actually measured, and a comfortable default destroys exactly that.
+  The field also states its own completeness (`2/5 measured`).
+* **Nothing accuses anybody.** "Insider" and "bundler" are provider classifications of on-chain
+  patterns, reproduced with attribution, not findings of fact about a person.
+
+Before enrichment returns, the field reads `⏳ enrichment in flight — these are not yet measured`
+rather than being omitted. An absent block reads as "no risks found"; a pending one reads as "not
+checked yet", and on a two-minute-old token those are very different statements.
+
+### Send first, enrich second, edit the same message
+
+```
+creation stream (push)  →  stamp detection  →  cheap in-memory filters
+                                                   ↓ qualifies
+                        claim (atomic)  →  SEND CARD (safety: pending)
+                                                   ↓ detached
+                        enrichment  →  EDIT that card  →  never a second message
+```
+
+The claim is an `INSERT OR IGNORE` on `traction_alerts.mint`, so the dedupe check and the dedupe
+claim are one statement — a `SELECT` then `INSERT` leaves a window in which two concurrent
+evaluations both decide to send. Because the claim lives in the database, **it survives restarts
+by construction**.
+
+Delivery retries with bounded exponential backoff, so a Discord rate limit costs a delay rather
+than the alert. If delivery fails permanently the claim is **released**, because a held claim on
+an undelivered card is permanent silent loss — one outage would otherwise make that mint
+unalertable forever while the database said it had been alerted.
+
+### Provider cost is bounded, deliberately
+
+Two limits, both because the instruction was "no discovery loops that can burn credits
+unattended":
+
+* **`TRACTION_RECHECK_SECONDS` (20s)** is the floor on how often *one* mint is re-read. It is
+  matched to `DexScreenerClient.snapshot`'s own 20-second response cache: below it the client
+  returns the identical bytes, so a faster sweep buys no freshness, spends budget, and fills the
+  momentum block with duplicate readings that make a flat token look repeatedly measured.
+* **`TRACTION_MAX_READS_PER_MINUTE` (240)** is a hard sliding-window ceiling across the whole
+  lane. Without it, a launch storm filling the pool to `TRACTION_MAX_POOL` would issue one
+  request per mint per recheck interval — 1,800 a minute at 600 mints — against a public endpoint
+  documented at 300. Overflow is not dropped; it waits for the next sweep, oldest-first, and
+  `/traction status` reports `reads_deferred_for_budget` so the clamp is visible rather than
+  mysterious.
+
+**No new provider was added.** The lane reuses the DEX Screener client this bot already has for
+the cheap tier, and the existing token-risk / holder / dev-profile readers for enrichment — and
+enrichment runs only for mints that have already qualified.
+
+### Forward outcomes go into the existing history, through its own writer
+
+Every alerted mint is contributed to the v2.34 forward-observation tables, so returns accrue at
++1m/+5m/+15m/+30m/+1h/+4h/+24h alongside every other lane. Two things about how:
+
+* **It reuses `runner_candidates` / `runner_outcomes`** rather than starting a parallel history
+  that would have to be reconciled before either could be trusted. `runner_outcomes` already
+  records `(mint, horizon_seconds)` with price and market-cap return, `rugged` and
+  `liquidity_disappeared`, and it has a foreign key onto `runner_candidates` — so the candidate
+  row has to exist.
+* **The row is written by the runner lane's own writer, from the engine.** An earlier build of
+  this branch wrote Early Traction's own JSON shape into `runner_candidates.payload_json` with
+  raw SQL. It inserted cleanly and then broke a lane this release was told not to touch:
+  `runner_due_mints` picks the mint up 45 seconds later, `runner_candidate_from_json` raises
+  `KeyError: 'first'` on the foreign payload, and the runner outcome loop wedges on that mint
+  while emitting an error card every poll. `_traction_register_forward` now builds a real
+  `RunnerCandidate` and persists it through `store_runner_candidate`, and a regression test
+  asserts the whole round trip through that lane's own reader.
+
+`first_seen_at` is set to **our** detection timestamp, so the horizons start when this lane saw
+the token. `first_market_cap_usd` is the value on the card that was actually sent — nothing is
+re-fetched, because the entry number must be the one the operator saw. `first_price_usd` is left
+null: the cheap DEX Screener snapshot this lane uses carries no price field, so **market-cap
+return is measured and price return is not** for mints this lane sees first. The existing outcome
+readers already fall back to market cap when price is absent.
+
+Registration happens after the send, so a redeploy in between would leave an alerted mint with no
+forward record. `retry_forward_registration()` sweeps for those on startup and periodically;
+`/traction status` reports `forward_pending`.
+
+### Why it is allowed to ping
+
+`EARLY_TRACTION` is in `PINGABLE`, and it is the least selective card in that set — it gates on
+no safety metric by design. It earns the interruption on latency alone: a token minted ninety
+seconds ago that is already trading is a window that closes while the radar is being scrolled, so
+a silent Early Traction card arrives after the thing it describes has finished happening. What
+keeps it from becoming noise is not selectivity but a hard budget — `TRACTION_MAX_ALERTS_PER_HOUR`
+caps the lane, one alert per mint is claimed atomically, and the safety block that would normally
+gate a ping is shown anyway, loudly, so the interruption carries the risk with it instead of
+implying its absence.
+
+### Read-only, structurally
+
+No module in `traction/`, `traction_store.py`, `traction_runtime.py` or `traction_cards.py`
+imports an executor, a signer, a keypair or a wallet, references a transaction send, or has any
+path to spend SOL. The test suite parses each module's AST and asserts it, the same way the
+shadow lane's isolation is asserted. The card's colour is deliberately not green, and its
+description says so in words.
+
+### What this release does not claim
+
+* **No forward record for these thresholds yet.** $8,000 / $5,000 / 25 minutes are the operator's
+  numbers, reproduced faithfully. Nothing here has measured whether they are *good* numbers, and
+  the card predicts no outcome. `/traction tracked` and the rejection log exist so they can be
+  tuned against real observations later; until then a confident phrasing would be asserting
+  something nobody has measured.
+* **Four of five launchpads are not being listened to.** That is a supplied-configuration gap, not
+  a bug, and it is reported in every `/traction status`.
+* **The X check is structural.** Whether a structurally valid handle belongs to a real, live
+  account needs the budgeted X API and is not on the fast path.
+* **Nothing was live-tested.** Every claim above is from the local suite; no alert has been
+  published to a real Discord channel from this branch.
+
+## Alert policy: which lanes may interrupt you (v2.55)
+
+Adding a quiet new lane does not fix over-alerting, because the volume never came from one
+place. This bot has several independent publishers — the early lane, fast alerts, the runner
+lanes, the trenches lanes, GMGN participants, Trending, and now pre-trend — and each enforced
+its own threshold and its own hourly cap. **The rate a human experiences is the sum of those
+caps, and no single lane could see that total.**
+
+So the decision moved to one table in `alert_policy.py`, consulted at the single publication
+choke point (`_dispatch_card`) that every card already passes through. Each alert class maps to
+one of three dispositions per mode:
+
+| | Meaning |
+|---|---|
+| `PING` | Publishes and may interrupt (role mention, push). |
+| `RADAR` | Publishes to the channel with the interruption removed. Still scrollable, no longer claiming urgency. |
+| `SUPPRESS` | Not published. Collection, persistence, scoring and the forward record are untouched. |
+
+That last row is what makes the quiet modes safe: **suppressing a card never suppresses the
+observation behind it.** A mode change costs visibility and never costs research.
+
+### Modes
+
+| Mode | Classes that may ping | What it is for |
+|---|---|---|
+| `SILENT` | none | Run the bot as a pure data collector. |
+| `GROUND_TRUTH` | `TRENDING_CONFIRMED` only | See what actually reached the board and nothing predictive. The mode to evaluate the pre-trend research in. |
+| `CURATED` | `PRE_TREND_SIGNAL`, `TRENDING_CONFIRMED` | The one that actually implements "three exceptional alerts beat eighty mediocre ones": exactly one lane may interrupt, and its own budget is 4/hour with cooldowns. Every legacy lane is demoted to radar — still visible, never interrupting. |
+| `LEGACY` **(default)** | all 15 previously-pinging classes | Pre-release behaviour, unchanged. |
+
+`LEGACY` is the default deliberately. Defaulting to `CURATED` would have been a silent change
+to the behaviour of lanes this work did not otherwise touch, which is the kind of surprise that
+makes a release untrustworthy even when the new behaviour is better. Set
+`ALERT_POLICY_MODE=CURATED` to opt in. An unrecognised value falls back to `LEGACY` rather than
+to silence — a typo must not quietly switch alerting off.
+
+**WATCH** is absent from the table because WATCH never produces a card in any mode. It is a
+state in the pre-trend state machine with no publisher at all, which is what "silent WATCH"
+means: interesting enough to keep watching, not interesting enough to say anything about.
+
+## FOMO pre-trend intelligence (v2.55)
+
+### The question, stated so it can fail
+
+> Using only information available at moment `T`, can we identify a repeatable behavioural
+> state that occurs **before** an exact Solana mint enters FOMO Trending — early enough to
+> matter, and with few enough false alerts to be useful?
+
+Every layer below is built so the answer is allowed to be *no*, and so that a *yes* would be
+hard to fake. The `/pretrend` commands will say "not enough data to quote a number" for as
+long as that is true, and `/pretrend modelhealth` will name the specific reason the lane is
+still silent.
+
+### Ground truth: one event, written once
+
+`FOMO_TREND_ENTER` is defined as: an exact mint was **absent** from the previous **valid**
+Trending snapshot and **present** in the next one. Three words carry the definition.
+
+*Exact mint.* A board row whose mint cannot be resolved is dropped, not keyed by ticker. Two
+tokens called `$CAT` are two tokens.
+
+*Valid.* A snapshot is valid only when the provider actually answered. An empty payload, a
+timeout, an HTTP error, a board below the row floor, or a board that shrank by more than 60%
+in one step is an **unknown**, not "Trending is now empty". This is not a nicety: one network
+blip read as an empty board would emit a LEFT event for every mint and an ENTER for all of
+them on the next success — hundreds of fabricated ground-truth events from one hiccup,
+permanently in the training labels. Invalid snapshots are still *stored*, with their reason,
+because a gap in the record is only interpretable if the failures that caused it are on it.
+
+*First.* `first_trending_at` is written by an `INSERT OR IGNORE` and appears in **no**
+`UPDATE SET` clause anywhere in the codebase; an architecture test asserts this. A re-entry
+produces `FOMO_TREND_REENTER` with its own timestamp and leaves the first entry frozen.
+Without that rule, "was the alert early?" becomes unanswerable, because a re-entry two hours
+later would silently redefine the target and make every late alert look prescient.
+
+### Labels, controls and the things that fake an edge
+
+At observation time `T`, `TREND_H` is true when the mint's `first_trending_at` lands in
+`(T, T+H]` for H in 2m / 5m / 10m / 20m.
+
+* A mint **already on the board at `T`** is not a prediction opportunity and is refused
+  outright. Labelling those positive is the single easiest way to report 95% precision: the
+  model simply learns to recognise "already trending".
+* A horizon that extends past the end of our record is **censored**, not negative. Calling it
+  negative would teach the model that the most recent — and most relevant — rows never trend.
+* Every positive is matched against controls from the same market-cap cohort, age cohort and
+  **time window**, because market regime is shared by every token alive at once. A positive
+  from a hot Tuesday compared against a dead Sunday would "discover" that activity predicts
+  trending.
+* A mint that ever trended is never used as a control, at any timestamp.
+
+### Leakage is checked mechanically, not carefully
+
+`smart_money_bot.pretrend.leakage` exists to prove the rest of the package is cheating, and it
+runs as tests. It catches future source timestamps, future samples inside an input series,
+feature *names* that could only be known after the event (`trending_rank`, `peak_market_cap`,
+`future_*`), duplicate `(mint, timestamp)` rows, the same mint on both sides of a split, a test
+fold that predates its training fold, and a stored value that changed for one observation
+instant — which would prove the store is being rewritten rather than appended to.
+
+One leak was found this way during development and is worth naming, because it is the kind
+that survives review. The `quality_fomo_buyers` family depends on each account's pre-trend
+affinity, and affinity is computed from **outcomes**. Building one affinity table from the
+whole dataset and using it to generate features for every training row would feed the labels
+back into the inputs — the model would learn to recognise accounts it had already been told
+were winners, and the backtest would report that circularity as skill. Affinity is therefore
+bucketed and strictly backward-looking: a row in bucket *N* sees only actor observations whose
+outcome had already resolved before bucket *N* began.
+
+### Affinity: measured, shrunk, and never called an insider score
+
+For each public account: of the tokens they were observed entering, what fraction subsequently
+reached Trending? That is all it is. Everything measured is public behaviour, and being
+repeatedly early is evidence of taste, speed or a shared information source — the code does not
+claim to distinguish those and does not allege access to anything non-public.
+
+Three of three is **not** a 100% hit rate; it is three observations. With a 1% base rate, a
+population of 50,000 accounts produces 3/3 accounts by the dozen daily, and ranking on raw
+precision surfaces exactly those. The headline figure is a Beta-Binomial posterior shrunk
+toward the population base rate, so 3/3 lands near 8% while 80/120 lands near 50%. Every record
+carries its raw rate, its shrunk rate, the baseline, the lift, a Wilson interval and `n`.
+
+### Independence: ten buyers, or one buyer and nine followers?
+
+Ten independent accounts reaching a token separately is ten pieces of evidence. One account
+buying and nine copy-trading it six seconds later is one piece and nine echoes. Arrival timing
+cannot *prove* independence, so the engine measures the pattern — burst detection, arrival
+entropy, concentration, median inter-arrival gap — and reports a *suspected*
+`possible_follow_cluster_count` alongside the raw count. On-chain wallets get the stronger
+signal already in this repository: a shared funding source collapses five wallets into one
+actor regardless of how their arrivals looked.
+
+### Which signal moves first is measured, not assumed
+
+The tempting story — sharp trader buys, thesis appears, independent buyers follow, volume
+lifts, holders grow, social amplifies, price runs, Trending notices — is plausible and is
+**not hardcoded anywhere**. `smart_money_bot.pretrend.cascade` records the first measurable
+acceleration per signal family and reports each family's lead over the board entry as a
+distribution. If FOMO-native attention turns out to arrive *after* the move, `summarise_leads`
+returns `LAGS` for it and the honest conclusion is that it is a confirmation signal, not a
+prediction signal.
+
+### Validation has no random-split option
+
+There is no random split in the validation module and no way to request one; a test asserts
+the module contains no shuffling primitive. Folds are chronological, with an embargo equal to
+the label horizon (a training row five minutes before the boundary has an outcome that
+resolves *inside* the test window), and any mint straddling a boundary is dropped from the test
+side. Metrics are PR-AUC rather than ROC-AUC — at a 1% base rate a useless model still scores
+a respectable ROC — plus Brier score, reliability buckets, precision@K, alerts/hour, and the
+base rate beside every precision figure.
+
+A model is promoted only if the dataset is leakage-clean, there are ≥30 **distinct positive
+mints** (not rows: one token producing forty rows is one token), there are ≥3 walk-forward
+folds, pooled lift clears 3x, the chosen threshold can actually hold the alert budget, **and**
+the learned model beat the transparent heuristic baseline. A learned model that cannot beat a
+five-rule heuristic has not found anything; it has fitted the same signal less legibly.
+
+### Replay is a clock, not a dataframe
+
+`smart_money_bot.pretrend.replay` advances in fixed ticks and, at each one, truncates every
+input to that instant and calls the same feature builder, the same model and the same alert
+gate production uses — including the hourly budget, the cooldowns and the material-change rule,
+because those change *which* alerts happen and therefore the measured precision. It audits its
+own inputs for leakage as it goes, and an alert on a token that never trended counts against
+precision rather than being quietly excluded.
+
+### Sample output
+
+```text
+**FOMO TREND FORENSICS — `WWWW…WWWW`**
+
+**FIRST FOMO TRENDING**
+  when: 2024-… (epoch 1729200)
+  initial rank: 1
+  tier (raw, uninterpreted): $$
+  MC: $126.0K • LIQ: unknown
+  provider: operator_feed (FOMO_TRENDING)
+
+**PRE-ENTRY TIMELINE** (reconstructed with the live feature code; nothing below reads past its own offset)
+offset          MC  fomoBuy1m  qual  indep  thesis  onchain  holders  complete
+T-20m       $38.0K          0     0      0       0       18      180    0.5291
+T-10m       $62.0K          0     0      0       0       48      290    0.6502
+T-5m        $74.0K          5     0      0       1       63      345    0.7489
+T-1m        $83.6K          5     0      0       0       75      389    0.7489
+T0          $83.6K          4     0      0       0       75      389    0.6996
+
+**EARLIEST NOTABLE FOMO ACCOUNTS** (public activity; not insiders)
+  • @early0 — BUY 8m before entry at MC $66.8K; record n=1, adj rate 0.000000 [sample too thin to rank]
+
+**WHAT CHANGED BEFORE TRENDING** (T-10m → T0)
+  • unique_buyers_level_1m: 48 → 75 (1.56x)
+  • volume_usd_level_5m: 92000 → 142000 (1.54x)
+  • market_cap_usd: 62000 → 83600 (1.35x)
+  • holders_level_1m: 290 → 389 (1.34x)
+
+**OUR CALL:** alerted 7m early at MC $69.2K with P=61.0%
+```
+
+Note what that output does *not* do. The accounts are marked `[sample too thin to rank]`
+because they have one observation each. `adj rate` is `0.000000` because those buys landed
+eight minutes out, outside the 5-minute horizon being measured — the number is small because
+the behaviour did not qualify, not because something failed. `LIQ: unknown` is printed rather
+than `$0`.
+
+### What this release does not claim
+
+* **No edge has been demonstrated.** No model is promoted, because no data has been collected
+  yet. Everything above is machinery for answering the question, not an answer.
+* **The FOMO-native lane is unconfigured** in this deployment and every feature it would
+  produce currently reports `UNKNOWN`.
+* **Prediction is decoupled from execution by construction.** The lane has no reference to the
+  executor, the paper engine or any trading surface, and an architecture test parses the source
+  to keep it that way.
 
 ## The headline is the verdict (v2.54)
 
@@ -2733,6 +3202,201 @@ module's AST and assert it.
 
 ## Railway deployment
 
+### v2.56.0 Railway changes
+
+Every new setting has a safe code default, so **no Railway variable has to be added**. The schema
+block is additive `CREATE TABLE IF NOT EXISTS` throughout plus one `ALTER TABLE ... ADD COLUMN`
+on the new `traction_alerts` table only — no existing table is altered, no production row is
+touched, and no forward history is reset. Nothing here enables live trading; the lane has no path
+to spend SOL.
+
+**ADD:** none required.  **CHANGE:** none required.
+
+**OPTIONAL — the screen itself:**
+
+```text
+TRACTION_ENABLED=true                     # the Early Traction lane as a whole
+TRACTION_LAUNCHPADS=PUMP,BAGS,BONK,LIQUIDAF,HEAVEN
+TRACTION_MAX_AGE_SECONDS=1500             # 25 minutes
+TRACTION_MIN_MARKET_CAP_USD=8000
+TRACTION_MIN_VOLUME_USD=5000
+TRACTION_VOLUME_WINDOW=5m                 # 1m | 5m | 1h | 6h | 24h
+TRACTION_REQUIRE_X_LINK=true
+TRACTION_REQUIRE_DEX_PAID=false           # your screen leaves this off
+TRACTION_INCLUDE_PRE_MIGRATION=true       # bonding curve
+TRACTION_INCLUDE_POST_MIGRATION=true      # migrated to an AMM pool
+TRACTION_INCLUDE_INK=false                # see the warning below before enabling
+```
+
+**OPTIONAL — launchpad program addresses.** Only Pump resolves without one of these. Each variable
+takes the program address from that launchpad's **own** documentation; this repository ships no
+default for them and will not guess, because a wrong address subscribes successfully and then
+emits plausible nonsense.
+
+```text
+TRACTION_LAUNCHPAD_BAGS_PROGRAM_ID=
+TRACTION_LAUNCHPAD_BONK_PROGRAM_ID=
+TRACTION_LAUNCHPAD_LIQUIDAF_PROGRAM_ID=
+TRACTION_LAUNCHPAD_HEAVEN_PROGRAM_ID=
+```
+
+**OPTIONAL — cost, cadence and alert volume:**
+
+```text
+TRACTION_POLL_SECONDS=5                   # how often the sweep wakes up
+TRACTION_RECHECK_SECONDS=20               # floor per mint; matches the DEX client's cache TTL
+TRACTION_MAX_READS_PER_MINUTE=240         # hard provider ceiling for this lane
+TRACTION_MAX_POOL=600                     # bound on the young pool
+TRACTION_BATCH_SIZE=30                    # mints per market read group
+TRACTION_MAX_BATCHES_PER_PASS=6           # bounds the cost of one sweep
+TRACTION_MAX_ALERTS_PER_HOUR=30           # hourly ceiling for this lane
+TRACTION_MAX_SEND_ATTEMPTS=5              # Discord retries before the claim is released
+TRACTION_SEND_BACKOFF_SECONDS=1           # first backoff step; doubles, capped at 30s
+TRACTION_X_REUSE_WINDOW_SECONDS=604800    # how far back the X-reuse query looks
+TRACTION_ENRICH_TIMEOUT_SECONDS=20        # expiring leaves safety unmeasured, never blocks the card
+```
+
+**Deployment steps**
+
+1. Deploy as normal. No variable changes are required; the lane starts on Pump only.
+2. Run `/traction status`. Expect `LAUNCHPADS LISTENING: PUMP` and a `LAUNCHPADS NOT LISTENING`
+   block naming Bags, Bonk, LiquidAF and Heaven with the variable that enables each. That is the
+   correct day-one state, not a failure.
+3. Confirm the profile block reads your numbers back (`age ≤ 25m`, `mcap ≥ $8.0K`,
+   `vol(5m) ≥ $5.0K`) and that `safety gates: NONE — safety is reported, never filtered on`.
+4. Wait for the first card. It should arrive with the SAFETY field titled
+   `SAFETY — pending (this profile does NOT filter on these)` and then **change in place** within
+   about twenty seconds as enrichment lands. **If a second card appears for the same mint, that is
+   a bug — report it.**
+5. Run `/traction latency` after an hour. This is the number to judge the lane on. Read `p95`, not
+   just `p50`, and read `excluded (no creation time)` beside them — a large exclusion count means
+   the creation timestamps are not arriving, and the percentiles are describing a subset.
+6. Run `/traction tracked`. Recent rows will read `horizons observed: 0`; that is honest, not
+   empty. Rows should accumulate horizons over the following day.
+7. To add a launchpad, set its `..._PROGRAM_ID` from that launchpad's own documentation and
+   redeploy. `/traction status` will move it from the "not listening" block to the "listening"
+   line, or report `INVALID_ADDRESS` if it was pasted wrong.
+
+**Verification procedure**
+
+* `/traction status` — the profile as configured, which launchpads are live, pool size, alerts this
+  hour against the cap, `reads_deferred_for_budget`, `forward_pending`, and the last error.
+* `/traction latency` — creation→detection, detection→alert, creation→alert at p50/p95/max, split
+  by source, with excluded samples counted separately.
+* `/traction tracked` — every alerted mint with its entry market cap, momentum and quality states,
+  X-link class, and how many forward horizons have been observed.
+
+**Worth knowing without changing anything:**
+
+* **`TRACTION_INCLUDE_INK=true` will do nothing useful.** There is no Ink ingestion anywhere in
+  this codebase — no client, no stream, no address format handling. The setting is honoured so the
+  profile is not silently overriding you, and reported in `/traction status`, but no token will
+  ever arrive on that chain.
+* **Lowering `TRACTION_RECHECK_SECONDS` below 20 does not make the lane faster.** The market
+  client caches its own responses for 20 seconds, so a faster re-read returns identical bytes. It
+  spends request budget and adds duplicate momentum readings, and nothing else.
+* **Raising `TRACTION_MAX_ALERTS_PER_HOUR` is the one setting that can make this noisy.** The lane
+  has no safety gate by design, so the hourly cap is doing the work that a threshold does
+  elsewhere. Alerts held by the cap are counted in `/traction status` rather than discarded
+  silently.
+* **The X-link check costs nothing and the account check is not running.** Structural
+  classification and cross-mint reuse are free and always on. Confirming a handle exists needs the
+  budgeted X API and is deliberately off the fast path.
+* **Storage is bounded.** One row per alert in `traction_alerts`, one per `(handle, mint)` in
+  `traction_x_links`, one per detected mint in `traction_latency`, and a rejection log with its own
+  sweep.
+
+### v2.55.0 Railway changes
+
+Every new setting has a safe code default, so **no Railway variable has to be added**. The
+release is deliberately safe to deploy untouched: the pre-trend lane starts **collecting** and
+stays **silent**. Nothing here enables live trading, no forward history is reset, and the
+schema block is additive `CREATE TABLE IF NOT EXISTS` throughout — no existing table is altered
+and no production row is touched, so a rollback loses only the new lane.
+
+**ADD:** none required.  **CHANGE:** none required.
+
+**OPTIONAL:**
+
+```text
+PRETREND_ENABLED=true                     # the research lane as a whole
+PRETREND_COLLECTION_ENABLED=true          # board snapshots + point-in-time observations
+PRETREND_INFERENCE_ENABLED=false          # scoring; stays off until a model is validated
+PRETREND_ALERTING_ENABLED=false           # pinging; stays off even when inference is on
+PRETREND_BOARD_POLL_SECONDS=30            # ground-truth sampling cadence
+PRETREND_OBSERVATION_SECONDS=60           # candidate observation cadence
+PRETREND_HORIZON_SECONDS=300              # the horizon the production model predicts
+PRETREND_UNIVERSE_MIN_MC_USD=20000        # research universe floor
+PRETREND_UNIVERSE_MAX_MC_USD=1000000      # research universe ceiling
+PRETREND_ALERT_THRESHOLD=0.20             # calibrated probability required to enter PRE_TREND
+PRETREND_WATCH_THRESHOLD=0.05             # the silent WATCH tier
+PRETREND_MAX_ALERTS_PER_HOUR=4            # hourly ceiling; three good beats eighty mediocre
+PRETREND_COOLDOWN_SECONDS=1800            # per-mint cooldown between pre-trend pings
+PRETREND_NEW_QUALITY_TRADERS_FOR_REALERT=2
+PRETREND_MIN_BOARD_ROWS=5                 # below this, a snapshot is a partial response
+PRETREND_MAX_BOARD_SHRINK_RATIO=0.6       # a bigger one-step shrink is refused
+PRETREND_MIN_POSITIVES_TO_ALERT=30        # board entries required before any ping
+PRETREND_TRAINING_ENABLED=true            # periodic retrain; promotion is separately gated
+PRETREND_TRAINING_INTERVAL_SECONDS=21600
+PRETREND_FOLD_SECONDS=86400               # walk-forward fold width
+PRETREND_MAX_CANDIDATES_PER_CYCLE=60
+PRETREND_AFFINITY_REFRESH_SECONDS=900
+PRETREND_ACTIVITY_API_URL=                # authorised FOMO-native feed; no default, ever
+PRETREND_ACTIVITY_API_KEY=
+PRETREND_ACTIVITY_POLL_SECONDS=20
+PRETREND_MAX_COVERAGE_GAP_SECONDS=180     # longer gap => arrivals are unprovable
+ALERT_POLICY_MODE=LEGACY                  # SILENT | GROUND_TRUTH | CURATED | LEGACY
+```
+
+**Deployment steps**
+
+1. Deploy as normal. No variable changes are required.
+2. Confirm the lane started: `/pretrend modelhealth` should report
+   `collection: on • training: on • inference: off • alerting: off` and `NO ACTIVE MODEL`.
+   That is the correct state on day one, not a failure.
+3. Check `/pretrend modelhealth` for the **LABEL SOURCE** block. Without an authorised feed it
+   reads `⚠️ LABEL SOURCE — NOT AUTHORISED FOR FOMO LABELS` and `usable labels: 0`, and it will
+   keep reading that no matter how long it collects. Proxy rows accumulate as evidence; they
+   cannot become training targets. If you want this lane to ever produce a model, an authorised
+   `FOMO_TRENDING_API_URL` is a hard prerequisite, not an optimisation.
+4. With an authorised feed, `/pretrend stats` should show a rising **board entries observed**
+   count and a snapshot acceptance rate near 1.0. A low acceptance rate names its reason
+   (`PROVIDER_ERROR`, `TOO_SHORT`, `STALE`). Expect `entry unproven` to be non-zero right after
+   startup — that is the collector correctly declining to date entries it did not witness.
+5. Leave it collecting. Nothing will ping. `/pretrend modelhealth` will keep naming the reason
+   promotion was refused — most often "only N distinct positive mints; 30 required".
+6. Once `/pretrend stats` reports `sufficient: yes` and `/pretrend modelhealth` shows a
+   promoted model, set `PRETREND_INFERENCE_ENABLED=true` to begin shadow scoring. Predictions
+   are recorded silently. Review `/pretrend stats` and `/pretrend falsepositives` for a few
+   days.
+7. Only then consider `PRETREND_ALERTING_ENABLED=true`, and consider
+   `ALERT_POLICY_MODE=CURATED` if you want the legacy lanes to stop interrupting.
+
+**Verification procedure**
+
+* `/pretrend stats` — sample counts first, precision only if the sample supports it.
+* `/pretrend modelhealth` — training cutoff, rows, positives, threshold, and the refusal reason
+  for recent non-promoted runs.
+* `/pretrend patterns` — winners versus matched look-alikes, per feature, with effect sizes. If
+  no feature separates the two groups once the sample has grown, the honest conclusion is that
+  the hypothesis is not supported.
+* `/pretrend trendforensics <exact mint>` — after any token you saw reach Trending, reconstruct
+  what was knowable beforehand.
+* `/pretrend missed` and `/pretrend falsepositives` — the two failure lists, unfiltered.
+
+**Worth knowing without changing anything:**
+
+* **Collection is the part that cannot be deferred.** A model trained next month can only learn
+  from observations recorded today. `PRETREND_COLLECTION_ENABLED=false` does not just pause the
+  lane, it means the research cannot start.
+* **The FOMO-native lane is off unless you supply an endpoint.** There is no default URL and no
+  discovery path. Without `PRETREND_ACTIVITY_API_URL` every FOMO-native feature is `UNKNOWN`,
+  the boot log says so once, and the cards say so too.
+* **Storage cost is bounded by the observation cadence.** Roughly one row per tracked mint per
+  `PRETREND_OBSERVATION_SECONDS`, plus one board snapshot per `PRETREND_BOARD_POLL_SECONDS`.
+* **Provider cost is zero above what the Trending lane already spends.** The board observer
+  wraps the *existing* Trending client rather than opening a second feed.
+
 ### v2.43.0 Railway changes
 
 Every new setting has a safe code default, so **no Railway variable has to be added**. Nothing
@@ -3273,6 +3937,13 @@ in that URL private. Helius documents the endpoint format as
 | `/smartmoney kill-switch` | Immediately pause discovery, scanning, and new paper actions. |
 | `/smartmoney launch-check` | Read-only J7/IPFS/public-wallet/limit/reservation readiness check. |
 | `/smartmoney launch-lab mode:production` | Browse, edit, re-art, and deliberately confirm a qualifying recent J7-only candidate. |
+| `/pretrend stats` | Pre-trend sample count, base rate, out-of-sample precision, lead time and alert rate. Refuses to quote precision on a thin sample. |
+| `/pretrend forensics` | Reconstruct what was knowable before an exact mint entered Trending, using the live feature code. |
+| `/pretrend patterns` | Future trenders versus matched look-alikes that never trended, per feature, with effect sizes. |
+| `/pretrend missed` | Board entries the model did not alert on — the false negatives, unfiltered. |
+| `/pretrend falsepositives` | PRE_TREND alerts whose token never entered Trending. Losing signals are retained permanently. |
+| `/pretrend modelhealth` | Training cutoff, sample, threshold, and the named reason recent runs were not promoted. |
+| `/pretrend traders` | Public FOMO accounts with a statistically meaningful early record — shrunk rate, baseline, lift, interval and `n`. |
 | `/smartmoney launch-lab mode:test` | Immediately inspect real recent RSS evidence and test art/X without bypassing live J7 eligibility. |
 | `/smartmoney status` | Check RPC and scanner health. |
 | `/smartmoney limits` | Show active risk limits. |

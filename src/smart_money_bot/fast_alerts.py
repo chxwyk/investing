@@ -103,6 +103,25 @@ GMGN_SMART_MONEY_ALERT = "GMGN_SMART_MONEY"
 #: so the forward record can answer whether famous buyers are worth anything.
 GMGN_KOL_ALERT = "GMGN_KOL"
 
+# --- FOMO pre-trend intelligence (v2.55) -------------------------------------
+#: A calibrated probability that a NOT-yet-trending mint is about to enter the
+#: FOMO Trending board.  Its own class because it is a different claim from
+#: every other card here: those describe a token's present state, this one
+#: makes a falsifiable prediction about a specific future event, and it is
+#: scored against that event whether it was right or wrong.
+PRE_TREND_SIGNAL = "PRE_TREND_SIGNAL"
+#: Ground truth: an exact mint entered FOMO Trending for the FIRST time.  This
+#: card always states whether we predicted it, including when we did not, so
+#: the scoreboard cannot be filtered down to the wins.
+TRENDING_CONFIRMED_ALERT = "TRENDING_CONFIRMED"
+
+# --- Early Traction (v2.56) --------------------------------------------------
+#: A token matching the operator's Axiom Discover screen: young, with real
+#: market cap and volume and an X link. Its own class because it deliberately
+#: applies NO safety gate -- the card reports risk instead of filtering on it,
+#: so it must never be confused with a class that did screen for safety.
+EARLY_TRACTION_ALERT = "EARLY_TRACTION"
+
 ALERT_CLASSES: tuple[str, ...] = (
     FAST_WATCH,
     NOTABLE_TRADER_EARLY,
@@ -127,6 +146,9 @@ ALERT_CLASSES: tuple[str, ...] = (
     EARLY_PROMOTION,
     GMGN_SMART_MONEY_ALERT,
     GMGN_KOL_ALERT,
+    PRE_TREND_SIGNAL,
+    TRENDING_CONFIRMED_ALERT,
+    EARLY_TRACTION_ALERT,
 )
 
 #: Classes that may interrupt the user.  A late observation never does — it is
@@ -151,6 +173,14 @@ PINGABLE: frozenset[str] = frozenset(
         TRENCH_RUNNER_ALERT,
         ALMOST_BONDED_ALERT,
         PUBLIC_TRENDING_ALERT,
+        # The pre-trend lane's own budget (four an hour by default, with
+        # cooldowns and a material-change rule) is far tighter than anything
+        # here, so these two cannot be a source of volume.
+        PRE_TREND_SIGNAL,
+        TRENDING_CONFIRMED_ALERT,
+        # Early Traction is a speed lane: a card that arrives silently is
+        # not what it is for. Its own hourly cap bounds the volume.
+        EARLY_TRACTION_ALERT,
         # A promotion is by definition the moment the evidence became worth
         # an interruption, so it is the one card that must reach the human.
         EARLY_PROMOTION,
@@ -194,6 +224,17 @@ URGENT_CLASSES: frozenset[str] = frozenset(
         # interruption, so it belongs in the lane interruptions live in.
         EARLY_PROMOTION,
         GMGN_SMART_MONEY_ALERT,
+        # The pre-trend lane's two classes.  A calibrated prediction that clears
+        # a validated threshold, and the ground-truth entry that scores it, are
+        # both interruptions rather than radar entries -- which is exactly why
+        # the lane's own budget is four an hour with cooldowns, far tighter than
+        # anything else here.
+        PRE_TREND_SIGNAL,
+        TRENDING_CONFIRMED_ALERT,
+        # Early Traction pings: it is a fast lane and a card that arrives
+        # silently 20 minutes later is not what was asked for. Its own
+        # hourly cap bounds the volume.
+        EARLY_TRACTION_ALERT,
     }
 )
 

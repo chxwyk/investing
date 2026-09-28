@@ -15,6 +15,9 @@ from decimal import Decimal
 from typing import Any, Protocol, cast
 from zoneinfo import ZoneInfo
 
+from .alert_policy import decide as alert_policy_decide
+from .alert_policy import describe_policy as alert_policy_describe
+from .alert_policy import normalise_mode as alert_policy_mode
 from .callouts import (
     CoinCalloutAnalyzer,
     DexScreenerClient,
@@ -51,13 +54,17 @@ from .execution import ShadowExecutionProvider, gates_from_settings
 from .executor import ExecutionManager
 from .fast_alerts import (
     ALMOST_BONDED_ALERT,
+    EARLY_TRACTION_ALERT,
     GMGN_KOL_ALERT,
     GMGN_SMART_MONEY_ALERT,
     LANE_RADAR,
+    LANE_URGENT,
+    PRE_TREND_SIGNAL,
     PUBLIC_TRENDING_ALERT,
     TRENCH_RUNNER_ALERT,
     TRENDING_ACCELERATION_ALERT,
     TRENDING_ALPHA,
+    TRENDING_CONFIRMED_ALERT,
     TRENDING_CONTINUATION_ALERT,
     CardField,
     EnrichmentUpdate,
@@ -277,6 +284,7 @@ from .models import (
     RunnerForensics,
     RunnerFundingObservation,
     RunnerMarketSnapshot,
+    RunnerScoreBreakdown,
     ScoredTrader,
     Side,
     Signal,
@@ -290,6 +298,40 @@ from .news import (
     XFilteredNewsStream,
     is_coin_actionable_news,
 )
+from .pretrend.cascade import SIGNAL_FOMO_BUY_NOTIONAL as PRETREND_SIGNAL_FOMO_BUY_NOTIONAL
+from .pretrend.cascade import SIGNAL_FOMO_THESES as PRETREND_SIGNAL_FOMO_THESES
+from .pretrend.cascade import (
+    SIGNAL_FOMO_UNIQUE_BUYERS as PRETREND_SIGNAL_FOMO_UNIQUE_BUYERS,
+)
+from .pretrend.cascade import SIGNAL_HOLDERS as PRETREND_SIGNAL_HOLDERS
+from .pretrend.cascade import SIGNAL_LIQUIDITY as PRETREND_SIGNAL_LIQUIDITY
+from .pretrend.cascade import SIGNAL_MARKET_CAP as PRETREND_SIGNAL_MARKET_CAP
+from .pretrend.cascade import (
+    SIGNAL_ONCHAIN_UNIQUE_BUYERS as PRETREND_SIGNAL_ONCHAIN_UNIQUE_BUYERS,
+)
+from .pretrend.cascade import SIGNAL_ONCHAIN_VOLUME as PRETREND_SIGNAL_ONCHAIN_VOLUME
+from .pretrend.cascade import SIGNAL_PRICE as PRETREND_SIGNAL_PRICE
+from .pretrend.cascade import SIGNAL_SOCIAL as PRETREND_SIGNAL_SOCIAL
+from .pretrend.cascade import build_cascade as build_pretrend_cascade
+from .pretrend.dataset import build_dataset as build_pretrend_dataset
+from .pretrend.dataset import compare_features as compare_pretrend_features
+from .pretrend.dataset import restrict_to_matched as restrict_pretrend_to_matched
+from .pretrend.features import FEATURE_VERSION as PRETREND_FEATURE_VERSION
+from .pretrend.forensics import build_forensics as build_pretrend_forensics
+from .pretrend.groundtruth import GroundTruthConfig
+from .pretrend.providers import BoardObserver, build_activity_provider
+from .pretrend.states import GateConfig
+from .pretrend.windows import Series
+from .pretrend_cards import build_confirmation_card, build_pretrend_card
+from .pretrend_runtime import (
+    PretrendConfig,
+    PretrendRuntime,
+    PretrendSignal,
+    TrendConfirmation,
+)
+from .pretrend_store import PretrendStore
+from .pretrend_training import collect_vectors as pretrend_collect_vectors
+from .pretrend_training import load_active_model, train_and_store
 from .pump_chain import PumpChainReader
 from .pump_stream import PumpCreation, PumpCreationStream
 from .quality import (
@@ -305,7 +347,7 @@ from .quality import (
     rank_for_attention,
 )
 from .risk import RiskEngine
-from .rotation import CandidateRotator, RotationResult, is_pump_mint
+from .rotation import PUMP_PROGRAM_ID, CandidateRotator, RotationResult, is_pump_mint
 from .rpc import SolanaRPC
 from .runner import (
     RUNNER_HORIZONS_SECONDS,
@@ -360,6 +402,12 @@ from .token_presentation import (
 from .token_presentation import (
     merge as merge_presentation,
 )
+from .traction.launchpads import build_registry as build_traction_registry
+from .traction.profile import TractionProfile
+from .traction.safety import DeveloperHistory, build_safety
+from .traction_cards import build_traction_card
+from .traction_runtime import TractionConfig, TractionRuntime
+from .traction_store import TractionStore
 from .trenches import (
     CadenceConfig,
     TokenMetadata,
@@ -768,6 +816,123 @@ class SmartMoneyEngine:
             enrich=self._enrich_trending,
             publish=self._publish_trending,
         )
+        # --- FOMO PRE-TREND INTELLIGENCE (v2.55) ---------------------------
+        # A research lane that runs beside the existing Trending lane rather
+        # than replacing it.  It observes the SAME board through the SAME
+        # client, but asks the opposite question: not "is this trending token
+        # still tradeable?" but "which NOT-yet-trending mint is about to be?"
+        #
+        # Collection is on by default and inference is off, so shipping this
+        # changes nothing an operator can hear until a model has been trained
+        # and validated walk-forward.  Nothing in this lane touches the
+        # executor, the paper engine or any trading surface.
+        self.pretrend_store = PretrendStore(self.database)
+        self.pretrend_activity, self.pretrend_activity_status = build_activity_provider(
+            url=settings.pretrend_activity_api_url,
+            api_key=settings.pretrend_activity_api_key,
+        )
+        self.pretrend = PretrendRuntime(
+            self.pretrend_store,
+            observer=BoardObserver(
+                self.trending_client,
+                provider=self.trending_source.provider,
+                source_kind=self.trending_source.kind,
+                limit=settings.fomo_trending_max_tracked,
+            ),
+            activity_provider=self.pretrend_activity,
+            config=PretrendConfig(
+                enabled=settings.pretrend_enabled,
+                collection_enabled=settings.pretrend_collection_enabled,
+                inference_enabled=settings.pretrend_inference_enabled,
+                alerting_enabled=settings.pretrend_alerting_enabled,
+                horizon_seconds=settings.pretrend_horizon_seconds,
+                universe_min_usd=settings.pretrend_universe_min_mc_usd,
+                universe_max_usd=settings.pretrend_universe_max_mc_usd,
+                max_candidates_per_cycle=settings.pretrend_max_candidates_per_cycle,
+                gate=GateConfig(
+                    pretrend_threshold=settings.pretrend_alert_threshold,
+                    watch_threshold=settings.pretrend_watch_threshold,
+                    cooldown_seconds=settings.pretrend_cooldown_seconds,
+                    max_alerts_per_hour=settings.pretrend_max_alerts_per_hour,
+                    new_quality_traders_for_realert=(
+                        settings.pretrend_new_quality_traders_for_realert
+                    ),
+                ),
+                ground_truth=GroundTruthConfig(
+                    min_rows=settings.pretrend_min_board_rows,
+                    max_shrink_ratio=settings.pretrend_max_board_shrink_ratio,
+                    max_coverage_gap_seconds=(
+                        settings.pretrend_max_coverage_gap_seconds
+                    ),
+                ),
+                affinity_refresh_seconds=settings.pretrend_affinity_refresh_seconds,
+                min_positives_to_alert=settings.pretrend_min_positives_to_alert,
+            ),
+            publish=self._publish_pretrend,
+            confirm=self._publish_trend_confirmation,
+        )
+        self._alert_mode = alert_policy_mode(settings.alert_policy_mode)
+        self.alerts_policy_suppressed = 0
+        self.alerts_policy_demoted = 0
+        # --- EARLY TRACTION (v2.56) ----------------------------------------
+        # Mirrors the operator's Axiom Discover screen. It reuses the existing
+        # Pump creation stream for push intake and the existing DEX Screener
+        # client for cheap batched market reads, so it adds no new provider and
+        # spends no new credits. Read-only by construction: no executor, no
+        # signer, no path to spend SOL.
+        self.traction_store = TractionStore(self.database)
+        self.traction_registry = build_traction_registry(
+            requested=settings.traction_launchpads,
+            program_ids=settings.traction_launchpad_program_ids,
+            pump_program_id=PUMP_PROGRAM_ID,
+        )
+        traction_chains = {"solana"}
+        if settings.traction_include_ink:
+            # Accepted into the profile so the operator's setting is honoured,
+            # but there is no Ink ingestion in this codebase, so nothing will
+            # ever arrive on it. Reported in status rather than silently ignored.
+            traction_chains.add("ink")
+        self.traction = TractionRuntime(
+            self.traction_store,
+            registry=self.traction_registry,
+            config=TractionConfig(
+                enabled=settings.traction_enabled,
+                profile=TractionProfile(
+                    max_age_seconds=settings.traction_max_age_seconds,
+                    min_market_cap_usd=settings.traction_min_market_cap_usd,
+                    min_volume_usd=settings.traction_min_volume_usd,
+                    require_x_link=settings.traction_require_x_link,
+                    require_dex_paid=settings.traction_require_dex_paid,
+                    include_pre_migration=settings.traction_include_pre_migration,
+                    include_post_migration=settings.traction_include_post_migration,
+                    chains=frozenset(traction_chains),
+                    volume_window=settings.traction_volume_window,
+                ),
+                poll_seconds=settings.traction_poll_seconds,
+                recheck_seconds=settings.traction_recheck_seconds,
+                max_reads_per_minute=settings.traction_max_reads_per_minute,
+                max_pool=settings.traction_max_pool,
+                batch_size=settings.traction_batch_size,
+                max_batches_per_pass=settings.traction_max_batches_per_pass,
+                max_alerts_per_hour=settings.traction_max_alerts_per_hour,
+                max_send_attempts=settings.traction_max_send_attempts,
+                send_backoff_seconds=float(settings.traction_send_backoff_seconds),
+                x_reuse_window_seconds=settings.traction_x_reuse_window_seconds,
+                enrich_timeout_seconds=settings.traction_enrich_timeout_seconds,
+            ),
+            market_reader=self._traction_market_read,
+            enricher=self._traction_enrich,
+            publisher=self._publish_traction,
+            editor=self._edit_traction,
+            forward_tracker=self._traction_register_forward,
+        )
+        self._traction_task: asyncio.Task[None] | None = None
+        #: Alert objects kept only until their enrichment edit lands.
+        self._traction_alerts: dict[str, FastAlert] = {}
+        self._pretrend_board_task: asyncio.Task[None] | None = None
+        self._pretrend_activity_task: asyncio.Task[None] | None = None
+        self._pretrend_training_task: asyncio.Task[None] | None = None
+        self._pretrend_last_trained_at = 0
         self.strategy = ConsensusStrategy(
             self.database,
             minimum_traders=settings.consensus_min_traders,
@@ -1173,6 +1338,41 @@ class SmartMoneyEngine:
                 self._run_fomo_radar(),
                 name="smart-money-fomo-radar",
             )
+        # --- Early Traction (v2.56) ---------------------------------------
+        # The sweep runs whenever the lane is on. Intake is pushed from the
+        # existing creation stream, so this loop only re-checks the young pool.
+        if self.settings.traction_enabled:
+            self._traction_task = asyncio.create_task(
+                self._run_traction(), name="smart-money-early-traction"
+            )
+            logger.info(
+                "Early Traction listening to %s; unavailable: %s",
+                self.traction_registry.status()["enabled"] or "nothing",
+                sorted(self.traction_registry.status()["unavailable"]) or "none",
+            )
+        # --- FOMO pre-trend intelligence (v2.55) --------------------------
+        # The board loop runs whenever the lane is enabled, even with inference
+        # off, because collection is the part that cannot be deferred: a model
+        # trained next month can only learn from observations recorded today.
+        if self.settings.pretrend_enabled:
+            self._pretrend_board_task = asyncio.create_task(
+                self._run_pretrend_board(), name="smart-money-pretrend-board"
+            )
+            if getattr(self.pretrend_activity, "available", False):
+                self._pretrend_activity_task = asyncio.create_task(
+                    self._run_pretrend_activity(),
+                    name="smart-money-pretrend-activity",
+                )
+            else:
+                logger.info(
+                    "Pre-trend FOMO-native lane is unconfigured: %s",
+                    self.pretrend_activity_status.detail,
+                )
+            if self.settings.pretrend_training_enabled:
+                self._pretrend_training_task = asyncio.create_task(
+                    self._run_pretrend_training(),
+                    name="smart-money-pretrend-training",
+                )
         if self.settings.fomo_runner_enabled:
             self._runner_outcome_task = asyncio.create_task(
                 self._run_runner_outcomes(),
@@ -1205,6 +1405,10 @@ class SmartMoneyEngine:
             self._trenches_task,
             self._pump_creation_task,
             self._pump_creation_consumer_task,
+            self._pretrend_board_task,
+            self._pretrend_activity_task,
+            self._pretrend_training_task,
+            self._traction_task,
         )
         for task in background:
             if task:
@@ -1213,6 +1417,12 @@ class SmartMoneyEngine:
             if task:
                 with suppress(asyncio.CancelledError):
                     await task
+        self._traction_task = None
+        self._pretrend_board_task = None
+        self._pretrend_activity_task = None
+        self._pretrend_training_task = None
+        with suppress(Exception):
+            await self.pretrend_activity.close()
         self._news_stream_task = None
         self._news_rss_task = None
         self._x_radar_task = None
@@ -1961,6 +2171,27 @@ class SmartMoneyEngine:
         first_seen_row = timeline.get(STAGE_BOT_FIRST_SEEN, {})
         first_seen_at = int(first_seen_row.get("occurred_at") or now)
         first_seen_mc = _engine_decimal(first_seen_row.get("market_cap_usd"))
+
+        # Append this reading to the pre-trend research record.  The early lane
+        # is the right hook because it already holds an exact-mint DEX snapshot
+        # for a NOT-yet-trending token, which is precisely the population the
+        # pre-trend question is about.  It cannot raise into this lane.
+        await self.note_pretrend_observation(
+            mint,
+            now=now,
+            market_cap_usd=snapshot.market_cap_usd,
+            liquidity_usd=snapshot.liquidity_usd,
+            volume_usd=snapshot.volume_5m_usd,
+            buys=snapshot.buys_5m,
+            sells=snapshot.sells_5m,
+            token_age_seconds=(
+                None
+                if snapshot.pair_age_minutes is None
+                else snapshot.pair_age_minutes * 60
+            ),
+            provider="dexscreener",
+            source="dexscreener",
+        )
 
         signals = EarlySignals(
             mint=mint,
@@ -5607,9 +5838,44 @@ class SmartMoneyEngine:
         """
 
         guarded = self._guard_publication(alert)
+
+        # v2.55: the alert POLICY is applied here, at the same choke point and
+        # for the same reason.  Per-lane thresholds cannot bound the rate a
+        # human experiences, because that rate is the sum across lanes and no
+        # lane can see it.  One table, one place, every card.
+        decision = alert_policy_decide(guarded.kind, mode=self._resolve_alert_mode())
+        if not decision.publish:
+            self.alerts_policy_suppressed = getattr(self, "alerts_policy_suppressed", 0) + 1
+            logger.debug("Alert policy suppressed a card: %s", decision.reason)
+            return False
+        if not decision.may_ping and guarded.ping:
+            # Demoted, not dropped: the card still reaches the channel, it just
+            # stops claiming urgency.
+            self.alerts_policy_demoted = getattr(self, "alerts_policy_demoted", 0) + 1
+            guarded = replace(
+                guarded, ping=False, ping_reason="", lane=LANE_RADAR
+            )
+
         if guarded is not alert:
             self._fast_alerts[guarded.alert_key] = guarded
         return await self.notifier.on_fast_alert(guarded)
+
+    def _resolve_alert_mode(self) -> str:
+        """The active alert mode, resolved defensively.
+
+        Falls back through the cached value, then settings, then ``LEGACY``.
+        A partially-constructed engine -- which the test suite builds routinely
+        -- must not silently land in a mode that suppresses cards: failing open
+        to prior behaviour is the safe direction for a policy that governs
+        whether a human hears anything at all.
+        """
+
+        cached = getattr(self, "_alert_mode", None)
+        if cached:
+            return cached
+        return alert_policy_mode(
+            getattr(getattr(self, "settings", None), "alert_policy_mode", None)
+        )
 
     def _refuses_publication(self, mint: str) -> bool:
         """Whether the evidence for this mint forbids a card at all.
@@ -6944,6 +7210,17 @@ class SmartMoneyEngine:
                 created_at=creation.observed_at,
                 source=SOURCE_CREATION_STREAM,
             )
+        # Early Traction intake. Deliberately right here, beside the other
+        # first-observation writes: the whole lane is judged on creation-to-alert
+        # latency, so its clock must start in the same instant as everything
+        # else's rather than after an enrichment hop.
+        await self.note_traction_creation(
+            creation.mint,
+            launchpad="PUMP",
+            chain_created_at=creation.observed_at,
+            at=creation.observed_at,
+            source=SOURCE_CREATION_STREAM,
+        )
         # Open the mint's lifecycle at the earliest moment anything sees it, so
         # source lead is measurable against a real first observation (§27).
         with suppress(Exception):
@@ -7325,6 +7602,689 @@ class SmartMoneyEngine:
             except Exception as exc:
                 await self.notifier.on_error("Trending radar", exc)
             await asyncio.sleep(self.settings.fomo_trending_poll_seconds)
+
+    # ------------------------------------------------------------------
+    # EARLY TRACTION (v2.56)
+    # ------------------------------------------------------------------
+    async def _traction_market_read(
+        self, mints: Sequence[str]
+    ) -> dict[str, dict[str, Any]]:
+        """Cheap batched market data for the young pool.
+
+        Uses the DEX Screener client this bot already has. It is the *cheap*
+        tier on purpose: no safety provider, no holder read, no X lookup. Those
+        cost real budget and run only for mints that have already qualified,
+        which is what keeps the fast path fast and stops an unattended discovery
+        loop from burning credits.
+        """
+
+        results: dict[str, dict[str, Any]] = {}
+        for mint in mints:
+            try:
+                snapshot = await self.dex_screener.snapshot(mint)
+            except Exception:
+                continue
+            if not snapshot.available:
+                continue
+            results[mint] = {
+                "market_cap_usd": snapshot.market_cap_usd,
+                "liquidity_usd": snapshot.liquidity_usd,
+                # The profile's volume floor is a 5-minute figure by default, and
+                # this is the 5-minute column -- matched deliberately so the card
+                # states the window it actually measured.
+                "volume_usd": snapshot.volume_5m_usd,
+                "x_link": (
+                    f"https://x.com/{snapshot.x_handle}" if snapshot.x_handle else ""
+                ),
+                "dex_paid": bool(snapshot.active_boosts) if snapshot.available else None,
+                "chain_created_at": (
+                    None
+                    if snapshot.pair_age_minutes is None
+                    else int(time.time()) - snapshot.pair_age_minutes * 60
+                ),
+            }
+        return results
+
+    async def _traction_enrich(self, candidate: Any) -> Any:
+        """The SAFETY block. Runs only for mints that already qualified.
+
+        Every field is optional and a failure to read one leaves it ``unknown``
+        rather than zero, because the block's whole value is that the operator
+        can tell which risks were actually measured.
+        """
+
+        mint = candidate.mint
+        top10 = dev_percent = insider = bundler = None
+        holders = None
+        notes: list[str] = []
+        developer = DeveloperHistory()
+
+        with suppress(Exception):
+            risk = await self.token_risk.snapshot(mint)
+            top10 = risk.top10_percent
+            insider = risk.insiders_percent
+            bundler = risk.bundlers_percent
+
+        with suppress(Exception):
+            holders = await self._holder_count(mint, now=int(time.time()))
+
+        with suppress(Exception):
+            profile = await self.trenches_store.dev_profile_for(mint)
+            if profile:
+                developer = DeveloperHistory(
+                    wallet=str(profile.get("wallet") or ""),
+                    tokens_created=profile.get("tokens_created"),
+                    graduated=profile.get("graduated"),
+                    collapsed=profile.get("collapsed"),
+                    source="pump_dev_profiles",
+                )
+                dev_percent = profile.get("creator_percent")
+
+        if top10 is None:
+            notes.append("top-10 concentration could not be read from any provider")
+
+        return build_safety(
+            mint,
+            top10_percent=top10,
+            dev_holding_percent=dev_percent,
+            insider_percent=insider,
+            bundler_percent=bundler,
+            holder_count=holders,
+            developer=developer,
+            notes=tuple(notes),
+            source="traction_enrichment",
+            enriched_at=int(time.time()),
+        )
+
+    async def _traction_register_forward(self, candidate: Any) -> bool:
+        """Put one alerted mint into the shared v2.34 forward-observation history.
+
+        This goes through the runner lane's **own** writer on purpose.
+        ``runner_candidates.payload_json`` is a typed ``RunnerCandidate`` blob and
+        ``runner_outcomes`` has a foreign key onto that table, so the row has to
+        exist and it has to be the right shape. An earlier version of this lane
+        wrote its own shape there with raw SQL, which parsed fine going in and
+        then raised ``KeyError: 'first'`` in ``runner_candidate_from_json`` when
+        ``runner_due_mints`` picked the mint up 45 seconds later -- wedging the
+        runner outcome loop on that mint and emitting an error card every poll.
+
+        Once the row exists the existing machinery needs no changes at all:
+        ``runner_due_mints`` schedules it, ``analyze_runner`` refreshes it, and
+        ``_record_runner_outcomes`` writes +1m/+5m/+15m/+30m/+1h/+4h/+24h returns
+        measured from ``first_seen_at`` -- which this sets to our own detection
+        timestamp, so the horizons start when *we* saw the token.
+
+        The runner lane owns ``tier`` and will overwrite ``EARLY_TRACTION`` with
+        its own on the first refresh. That is correct: this lane contributes an
+        observation, it does not get to keep another lane's label.
+        """
+
+        observation = candidate.observation
+        now = int(time.time())
+        detected_at = int(candidate.detected_at or candidate.alert_sent_at or now)
+        # One immutable time-T baseline, from the values on the card that was
+        # sent. Nothing here is re-fetched: the entry numbers must be the ones
+        # the operator actually saw.
+        first = RunnerMarketSnapshot(
+            mint=candidate.mint,
+            captured_at=detected_at,
+            price_usd=observation.price_usd,
+            market_cap_usd=observation.market_cap_usd,
+            liquidity_usd=observation.liquidity_usd,
+            volume_5m_usd=observation.volume_usd or Decimal("0"),
+        )
+        runner_candidate = RunnerCandidate(
+            mint=candidate.mint,
+            symbol=observation.symbol or None,
+            name=observation.name or None,
+            first_seen_at=detected_at,
+            graduated_at=None,
+            graduation_source=f"EARLY_TRACTION:{candidate.launchpad}",
+            first=first,
+            current=first,
+            score=Decimal("0"),
+            tier="EARLY_TRACTION",
+            breakdown=RunnerScoreBreakdown(),
+            research_only=True,
+            generated_at=now,
+            chain_created_at=observation.chain_created_at,
+            radar_first_seen_at=detected_at,
+            first_market_data_at=detected_at,
+            first_discord_visible_at=candidate.alert_sent_at or now,
+        )
+        await self.database.store_runner_candidate(
+            runner_candidate,
+            payload_json=runner_candidate_to_json(runner_candidate),
+            snapshot_json=runner_snapshot_to_json(first),
+        )
+        return True
+
+    async def _publish_traction(self, candidate: Any) -> tuple[int, int] | None:
+        """Publish the card through the single publication choke point.
+
+        Returns Discord coordinates so the runtime can edit this exact message
+        later, or ``None`` so it can retry with backoff. Returning ``None``
+        rather than raising is what lets a rate limit cost a delay instead of
+        the alert.
+        """
+
+        card = build_traction_card(candidate)
+        alert = FastAlert(
+            kind=EARLY_TRACTION_ALERT,
+            mint=candidate.mint,
+            token_mint=candidate.mint,
+            alert_key=f"traction:{candidate.mint}",
+            spec=card,
+            ping=True,
+            ping_reason="EARLY_TRACTION_PROFILE_MATCH",
+            lane=LANE_URGENT,
+            # Read-only research lane: never a trade CTA.
+            trade_eligible=False,
+        )
+        self._traction_alerts[candidate.mint] = alert
+        if not await self._dispatch_card(alert):
+            return None
+        message = self._fast_alert_messages.get(alert.alert_key)
+        if message is None:
+            # Delivered, but we cannot address it for an edit. Report success so
+            # the alert is not re-sent; the safety block will be stored even
+            # though it cannot be rendered onto the card.
+            return (0, 0)
+        return (
+            int(getattr(getattr(message, "channel", None), "id", 0) or 0),
+            int(getattr(message, "id", 0) or 0),
+        )
+
+    async def _edit_traction(self, candidate: Any) -> bool:
+        """Edit the card already on screen with the safety block.
+
+        Never sends a second message: a second card for one token is exactly the
+        noise this lane exists to avoid.
+        """
+
+        alert = self._traction_alerts.get(candidate.mint)
+        if alert is None:
+            return False
+        card = build_traction_card(candidate)
+        published = await self.notifier.on_fast_alert_enrichment(
+            alert, EnrichmentUpdate(alert_key=alert.alert_key, replacement=card)
+        )
+        self._traction_alerts.pop(candidate.mint, None)
+        return bool(published)
+
+    async def _run_traction(self) -> None:
+        """The young-pool sweep. Cheap, bounded, and it never blocks an alert."""
+
+        passes = 0
+        while True:
+            try:
+                result = await self.traction.run_pass()
+                if result.error:
+                    logger.debug("Early Traction pass: %s", result.error)
+                passes += 1
+                # Forward registration happens after the send, so a redeploy in
+                # between leaves an alerted mint with no forward record. Sweep for
+                # those occasionally rather than on every pass: it is a recovery
+                # path, not a hot one.
+                if passes == 1 or passes % 60 == 0:
+                    recovered = await self.traction.retry_forward_registration()
+                    if recovered:
+                        logger.info(
+                            "Early Traction re-registered %s alert(s) for forward "
+                            "observation after a restart",
+                            recovered,
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await self.notifier.on_error("Early Traction", exc)
+            await asyncio.sleep(max(1, self.settings.traction_poll_seconds))
+
+    async def note_traction_creation(
+        self,
+        mint: str,
+        *,
+        launchpad: str,
+        chain_created_at: int | None,
+        at: int | None = None,
+        name: str = "",
+        symbol: str = "",
+        x_link: str = "",
+        source: str = "creation_stream",
+    ) -> bool:
+        """Intake hook for the creation stream. Must never raise into the stream."""
+
+        if not self.settings.traction_enabled:
+            return False
+        try:
+            return await self.traction.observe_creation(
+                mint=mint,
+                launchpad=launchpad,
+                chain_created_at=chain_created_at,
+                now=at,
+                name=name,
+                symbol=symbol,
+                x_link=x_link,
+                source=source,
+            )
+        except Exception:
+            logger.debug("Early Traction intake failed for %s", mint[:8], exc_info=True)
+            return False
+
+    async def traction_status(self) -> dict[str, Any]:
+        return await self.traction.status()
+
+    async def traction_latency(self, *, days: int = 1) -> dict[str, Any]:
+        report = await self.traction.latency_report(
+            since=int(time.time()) - max(1, days) * 86_400
+        )
+        return report.to_json()
+
+    async def traction_tracked(self, *, limit: int = 25) -> tuple[dict[str, Any], ...]:
+        return await self.traction_store.tracked_alert_rows(limit=limit)
+
+    # ------------------------------------------------------------------
+    # FOMO PRE-TREND INTELLIGENCE (v2.55)
+    # ------------------------------------------------------------------
+    async def _publish_pretrend(self, signal: PretrendSignal) -> bool:
+        """Publish a PRE_TREND card through the single publication choke point.
+
+        The runtime has already applied the state machine, the material-change
+        rule, the per-mint cooldown and the hourly budget; this method only
+        renders.  It deliberately does not second-guess the gate, because two
+        places deciding whether to send is how a cooldown gets bypassed.
+        """
+
+        presentation = await self.resolve_presentation(signal.mint)
+        card = build_pretrend_card(
+            signal,
+            referral_code=self.settings.fomo_referral_code,
+            symbol=presentation.symbol,
+            name=presentation.name,
+        )
+        alert = FastAlert(
+            kind=PRE_TREND_SIGNAL,
+            mint=signal.mint,
+            token_mint=signal.mint,
+            alert_key=f"pretrend:{signal.mint}:{signal.at}",
+            spec=card,
+            ping=True,
+            ping_reason=signal.reason,
+            lane=LANE_URGENT,
+            # A prediction is never a trade CTA.  This lane is decoupled from
+            # execution by construction (section 89), and the card says so.
+            trade_eligible=False,
+            identity_verified=presentation.identity_verified,
+        )
+        return await self._dispatch_card(alert)
+
+    async def _publish_trend_confirmation(self, confirmation: TrendConfirmation) -> bool:
+        """Publish the ground-truth entry card — the scoreboard, win or lose."""
+
+        presentation = await self.resolve_presentation(confirmation.mint)
+        enriched = replace(
+            confirmation,
+            symbol=confirmation.symbol or presentation.symbol,
+            name=confirmation.name or presentation.name,
+        )
+        card = build_confirmation_card(
+            enriched, referral_code=self.settings.fomo_referral_code
+        )
+        alert = FastAlert(
+            kind=TRENDING_CONFIRMED_ALERT,
+            mint=confirmation.mint,
+            token_mint=confirmation.mint,
+            alert_key=f"pretrend-confirm:{confirmation.mint}:{confirmation.entered_at}",
+            spec=card,
+            ping=True,
+            ping_reason="FOMO_TREND_ENTER",
+            lane=LANE_URGENT,
+            trade_eligible=False,
+            identity_verified=presentation.identity_verified,
+        )
+        return await self._dispatch_card(alert)
+
+    async def _run_pretrend_board(self) -> None:
+        """Snapshot the board for ground truth, and score candidates.
+
+        This loop runs even with inference disabled.  Collection is the part
+        that cannot be deferred: a model trained in three weeks can only ever
+        learn from observations recorded today, so a week with this loop off is
+        a week of research permanently lost.
+        """
+
+        while True:
+            try:
+                result = await self.pretrend.collect_board()
+                if not result.snapshot_accepted and result.snapshot_reason not in {
+                    "VALID",
+                    "DUPLICATE",
+                }:
+                    logger.debug(
+                        "Pre-trend board snapshot refused: %s", result.snapshot_reason
+                    )
+                await self.pretrend.refresh_affinity()
+                if self.settings.pretrend_inference_enabled:
+                    candidates = await self.pretrend_store.observation_mints(
+                        since=int(time.time()) - 3600,
+                        limit=self.settings.pretrend_max_candidates_per_cycle,
+                    )
+                    if candidates:
+                        await self.pretrend.score_candidates(candidates)
+                await self.pretrend.resolve_outcomes()
+                # Losing signals resolve too.  A paper record that only ever
+                # closes on a win is a scoreboard with the failures filtered out.
+                await self.pretrend.track_paper_observations()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await self.notifier.on_error("Pre-trend board", exc)
+            await asyncio.sleep(self.settings.pretrend_board_poll_seconds)
+
+    async def _run_pretrend_activity(self) -> None:
+        """Pull the FOMO-native tape forward, when a feed is configured."""
+
+        while True:
+            try:
+                await self.pretrend.collect_activity()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await self.notifier.on_error("Pre-trend activity", exc)
+            await asyncio.sleep(self.settings.pretrend_activity_poll_seconds)
+
+    async def _run_pretrend_training(self) -> None:
+        """Retrain periodically, and load the model only if it was promoted.
+
+        A refused run leaves the previous model in place and the lane quiet.
+        That is the intended steady state until the data supports otherwise.
+        """
+
+        while True:
+            try:
+                now = int(time.time())
+                outcome = await train_and_store(
+                    self.pretrend_store,
+                    horizon_seconds=self.settings.pretrend_horizon_seconds,
+                    universe_min_usd=self.settings.pretrend_universe_min_mc_usd,
+                    universe_max_usd=self.settings.pretrend_universe_max_mc_usd,
+                    fold_seconds=self.settings.pretrend_fold_seconds,
+                    target_alerts_per_hour=Decimal(
+                        self.settings.pretrend_max_alerts_per_hour
+                    ),
+                    now=now,
+                )
+                self._pretrend_last_trained_at = now
+                if outcome.promoted:
+                    model, threshold, why_not = await load_active_model(
+                        self.pretrend_store
+                    )
+                    if model is not None:
+                        self.pretrend.model = model
+                        self.pretrend.gate.config = replace(
+                            self.pretrend.gate.config, pretrend_threshold=threshold
+                        )
+                        logger.info(
+                            "Pre-trend model promoted: %s rows, %s positives, "
+                            "threshold %s",
+                            outcome.model.trained_rows if outcome.model else 0,
+                            outcome.model.trained_positives if outcome.model else 0,
+                            threshold,
+                        )
+                    else:
+                        logger.info("Pre-trend model not loaded: %s", why_not)
+                else:
+                    logger.info(
+                        "Pre-trend model NOT promoted: %s", outcome.refusal_reason
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await self.notifier.on_error("Pre-trend training", exc)
+            await asyncio.sleep(self.settings.pretrend_training_interval_seconds)
+
+    async def note_pretrend_observation(
+        self,
+        mint: str,
+        *,
+        now: int | None = None,
+        market_cap_usd: Decimal | None = None,
+        price_usd: Decimal | None = None,
+        liquidity_usd: Decimal | None = None,
+        volume_usd: Decimal | None = None,
+        buys: int | None = None,
+        sells: int | None = None,
+        unique_buyers: int | None = None,
+        holders: int | None = None,
+        token_age_seconds: int | None = None,
+        provider: str = "",
+        source: str = "",
+    ) -> bool:
+        """Record one point-in-time candidate observation from any lane.
+
+        Called by the existing discovery paths.  It is intentionally cheap and
+        failure-tolerant: a discovery lane must never be slowed down or broken
+        by the research lane's bookkeeping.
+        """
+
+        if not self.settings.pretrend_enabled:
+            return False
+        try:
+            return await self.pretrend.record_candidate(
+                mint=mint,
+                at=now if now is not None else int(time.time()),
+                market_cap_usd=market_cap_usd,
+                price_usd=price_usd,
+                liquidity_usd=liquidity_usd,
+                volume_usd=volume_usd,
+                buys=buys,
+                sells=sells,
+                unique_buyers=unique_buyers,
+                holders=holders,
+                token_age_seconds=token_age_seconds,
+                provider=provider,
+                source=source,
+            )
+        except Exception:
+            logger.debug("Pre-trend observation failed for %s", mint, exc_info=True)
+            return False
+
+    def alert_policy(self) -> dict[str, Any]:
+        """The active alert policy, generated from the table that enforces it."""
+
+        payload = alert_policy_describe(self._alert_mode)
+        payload["suppressed_cards"] = self.alerts_policy_suppressed
+        payload["demoted_cards"] = self.alerts_policy_demoted
+        return payload
+
+    async def pretrend_status(self) -> dict[str, Any]:
+        status = await self.pretrend.status()
+        status["activity_lane_detail"] = self.pretrend_activity_status.to_json()
+        status["last_trained_at"] = self._pretrend_last_trained_at
+        return status
+
+    async def pretrend_stats(self, *, days: int = 7) -> dict[str, Any]:
+        """Sample count, base rate, precision, lead time and alert rate.
+
+        Every figure is returned with the count behind it so the renderer can
+        refuse to quote a precision built on nine observations.
+        """
+
+        now = int(time.time())
+        since = now - days * 86_400
+        metrics = await self.pretrend_store.prediction_metrics(
+            since=since,
+            lane="production",
+            threshold=float(self.settings.pretrend_alert_threshold),
+        )
+        entries = await self.pretrend_store.trend_entries(since=since, limit=1000)
+        return {
+            "days": days,
+            "feature_version": PRETREND_FEATURE_VERSION,
+            "trend_entries": len(entries),
+            "metrics": metrics,
+            "alert_rate": await self.pretrend_store.alert_rate(since=since),
+            "snapshot_health": await self.pretrend_store.snapshot_health(since=since),
+            "paper": await self.pretrend_store.paper_summary(since=since),
+            "model": await self.pretrend_store.active_model(lane="production"),
+            "activity_lane": self.pretrend_activity_status.to_json(),
+        }
+
+    async def pretrend_forensics(self, mint: str) -> dict[str, Any]:
+        """Reconstruct what was knowable before ``mint`` entered the board."""
+
+        entry = await self.pretrend_store.trend_entry(mint)
+        if entry is None:
+            return {"mint": mint, "entry": None}
+        state = await self.pretrend_store.rebuild_state(mint, until=entry.occurred_at)
+        # Which signal actually moved first, measured against this entry rather
+        # than assumed from a plausible story about cascades.
+        cascade = build_pretrend_cascade(
+            mint,
+            {
+                PRETREND_SIGNAL_FOMO_UNIQUE_BUYERS: state.tape.buys
+                if state.tape is not None
+                else Series("fomo_buys"),
+                PRETREND_SIGNAL_FOMO_BUY_NOTIONAL: state.tape.buy_usd
+                if state.tape is not None
+                else Series("fomo_buy_usd"),
+                PRETREND_SIGNAL_FOMO_THESES: state.tape.theses
+                if state.tape is not None
+                else Series("fomo_theses"),
+                PRETREND_SIGNAL_ONCHAIN_UNIQUE_BUYERS: state.market.unique_buyers,
+                PRETREND_SIGNAL_ONCHAIN_VOLUME: state.market.volume_usd,
+                PRETREND_SIGNAL_HOLDERS: state.market.holders,
+                PRETREND_SIGNAL_MARKET_CAP: state.market.market_cap_usd,
+                PRETREND_SIGNAL_PRICE: state.market.price_usd,
+                PRETREND_SIGNAL_LIQUIDITY: state.market.liquidity_usd,
+                PRETREND_SIGNAL_SOCIAL: state.market.social_engagement,
+            },
+            reference_at=entry.occurred_at,
+        )
+        states = await self.pretrend_store.load_states()
+        token_state = next((item for item in states if item.mint == mint), None)
+        report = build_pretrend_forensics(
+            state,
+            entry=entry,
+            affinities=self.pretrend.affinities,
+            cascade=cascade,
+            predicted=None if token_state is None else token_state.predicted,
+            first_alert_at=(
+                None if token_state is None else token_state.first_pretrend_alert_at
+            ),
+            first_alert_probability=(
+                None
+                if token_state is None
+                else token_state.first_pretrend_probability
+            ),
+            first_alert_market_cap_usd=(
+                None
+                if token_state is None
+                else token_state.first_pretrend_market_cap_usd
+            ),
+        )
+        return {"mint": mint, "report": report}
+
+    async def pretrend_missed(self, *, limit: int = 15) -> tuple[dict[str, Any], ...]:
+        return await self.pretrend_store.missed_trends(limit=limit)
+
+    async def pretrend_false_positives(
+        self, *, limit: int = 15
+    ) -> tuple[dict[str, Any], ...]:
+        return await self.pretrend_store.false_positives(
+            limit=limit, threshold=float(self.settings.pretrend_alert_threshold)
+        )
+
+    async def pretrend_model_health(self) -> dict[str, Any]:
+        """Model state plus the ACTUAL lane settings and collector health.
+
+        Every switch here is read from the live runtime and the database rather
+        than asserted.  The first version of the command printed
+        ``collection: on`` as a hardcoded string, which would have reported a
+        healthy collector on a deployment where collection was switched off or
+        the loop had never started -- the one failure the command exists to
+        surface.
+        """
+
+        rows = await self.pretrend_store.model_health()
+        active = await self.pretrend_store.active_model(lane="production")
+        status = await self.pretrend.status()
+        return {
+            "feature_version": PRETREND_FEATURE_VERSION,
+            "active": active,
+            "history": rows,
+            "last_trained_at": self._pretrend_last_trained_at,
+            # --- configured switches, read from settings ----------------------
+            "enabled": self.settings.pretrend_enabled,
+            "collection_enabled": self.settings.pretrend_collection_enabled,
+            "training_enabled": self.settings.pretrend_training_enabled,
+            "inference_enabled": self.settings.pretrend_inference_enabled,
+            "alerting_enabled": self.settings.pretrend_alerting_enabled,
+            # --- whether the loop is actually running -------------------------
+            "board_loop_running": bool(
+                self._pretrend_board_task is not None
+                and not self._pretrend_board_task.done()
+            ),
+            "activity_loop_running": bool(
+                self._pretrend_activity_task is not None
+                and not self._pretrend_activity_task.done()
+            ),
+            "training_loop_running": bool(
+                self._pretrend_training_task is not None
+                and not self._pretrend_training_task.done()
+            ),
+            "cycles": status["cycles"],
+            "last_cycle_at": status["last_cycle_at"],
+            "board": status["board"],
+            "snapshot_health": status["snapshot_health"],
+            # --- can this source produce labels at all? -----------------------
+            "label_source": status["label_source"],
+            "labels": status["labels"],
+            "may_send": status["may_send"],
+            "suppressed": status["suppressed"],
+            "activity_lane": status["activity_lane"],
+        }
+
+    async def pretrend_traders(self, *, limit: int = 15) -> dict[str, Any]:
+        """Public FOMO accounts with a statistically meaningful early record."""
+
+        await self.pretrend.refresh_affinity(force=True)
+        records = self.pretrend.notable_actors(limit=limit)
+        return {
+            "records": [record.to_json() for record in records],
+            "population": len(self.pretrend.affinities),
+            "activity_lane": self.pretrend_activity_status.to_json(),
+        }
+
+    async def pretrend_patterns(self, *, days: int = 7) -> dict[str, Any]:
+        """Winners versus matched look-alikes, per feature (section 39)."""
+
+        now = int(time.time())
+        cutoff = now - 1_200
+        vectors = await pretrend_collect_vectors(
+            self.pretrend_store, since=now - days * 86_400, until=cutoff
+        )
+        if not vectors:
+            return {"available": False, "reason": "no observations collected yet"}
+        dataset = build_pretrend_dataset(
+            vectors,
+            first_trending_at=await self.pretrend_store.first_trending_map(),
+            entry_unproven_mints=await self.pretrend_store.entry_unproven_mints(),
+            horizon_seconds=self.settings.pretrend_horizon_seconds,
+            data_complete_until=cutoff,
+            universe_min_usd=self.settings.pretrend_universe_min_mc_usd,
+            universe_max_usd=self.settings.pretrend_universe_max_mc_usd,
+        )
+        matched = restrict_pretrend_to_matched(dataset)
+        return {
+            "available": True,
+            "dataset": dataset.to_json(),
+            "matched": matched.to_json(),
+            "comparisons": [
+                comparison.to_json()
+                for comparison in compare_pretrend_features(matched)[:15]
+            ],
+        }
 
     async def _run_trending_hot_watch(self) -> None:
         """The fast recheck lane.  A strong near miss is not left for 30 minutes."""

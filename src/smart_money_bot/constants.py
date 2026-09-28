@@ -2,7 +2,7 @@
 
 from urllib.parse import urlencode
 
-BOT_VERSION = "2.54.0"
+BOT_VERSION = "2.55.0"
 PAPER_DEMO_MINT = "PAPER-DEMO-ONLY"
 PAPER_DEMO_ENTRY_PRICE_USD = "1"
 
@@ -23,6 +23,29 @@ FOMO_SOLANA_CHAIN_ID = "1399811149"
 #: button entirely; it must always carry ``{mint}``, because a link that
 #: identifies a token by anything other than its address is the wrong link.
 TERMINAL_TOKEN_URL_TEMPLATE = "https://trade.padre.gg/trade/solana/{mint}"
+
+#: Axiom's public per-token page, built from the exact mint.  Same rules as the
+#: template above and here for the same reason: one URL template, in one place,
+#: so there is exactly one thing for an audit to check.  Navigation only —
+#: nothing in this codebase authenticates against Axiom, reads it back, or treats
+#: it as a data source.  It must always carry ``{mint}``.
+AXIOM_TOKEN_URL_TEMPLATE = "https://axiom.trade/t/{mint}"
+
+
+def axiom_token_url(mint: str) -> str:
+    """The Axiom page for one exact mint, or an empty string if disabled."""
+
+    if not AXIOM_TOKEN_URL_TEMPLATE or not mint:
+        return ""
+    return AXIOM_TOKEN_URL_TEMPLATE.replace("{mint}", mint)
+
+
+def terminal_token_url(mint: str) -> str:
+    """The Terminal page for one exact mint, or an empty string if disabled."""
+
+    if not TERMINAL_TOKEN_URL_TEMPLATE or not mint:
+        return ""
+    return TERMINAL_TOKEN_URL_TEMPLATE.replace("{mint}", mint)
 
 
 def fomo_coin_url(mint: str, referral_code: str | None = None) -> str:
