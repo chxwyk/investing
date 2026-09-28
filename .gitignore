@@ -4,6 +4,10 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+# Release bundles handed to the operator. Built from the tagged commit on
+# demand, so committing one would be storing a second copy of history that can
+# silently drift from the source it was cut from.
+*.zip
 
 # Virtual environments
 .venv/
